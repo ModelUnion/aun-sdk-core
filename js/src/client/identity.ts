@@ -14,20 +14,14 @@ export class IdentityRuntimeManager {
       throw new StateError(`loadIdentity not allowed in state ${publicState}`);
     }
     client._applyAidRuntimeContext(aid);
-    client._currentAid = aid;
-    client._aid = aid.aid;
-    client._identity = {
+    this.runtime.identity.setLoadedIdentity(aid, {
       aid: aid.aid,
       private_key_pem: aid.privateKeyPem,
       public_key_der_b64: aid.publicKey,
       cert: aid.certPem,
-    };
-    client._auth.setIdentity(client._identity);
-    client._state = 'standby';
-    client._closing = false;
-    client._lastError = null;
-    client._lastErrorCode = null;
-    client._retryAttempt = 0;
-    client._nextRetryAt = null;
+    });
+    this.runtime.lifecycle.setState('standby');
+    this.runtime.lifecycle.setClosing(false);
+    this.runtime.lifecycle.clearRetryState();
   }
 }

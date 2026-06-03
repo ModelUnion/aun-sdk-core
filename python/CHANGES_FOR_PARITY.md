@@ -1,10 +1,133 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.8）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.9）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → 工作区 (v0.4.8)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → 工作区 (v0.4.9)。
+
+---
+
+## v0.4.9 — 相对于 v0.4.8 的变更
+
+### `_client/runtime.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| — | 重写 | `ClientRuntime` | 从占位类扩展为完整运行时入口，持有 7 个分区子对象：`identity`、`lifecycle`、`rpc`、`delivery`、`v2`、`group_state`、`services` |
+| +98 | 新增 | `ClientRuntime.coerce(runtime_or_client)` | 类方法工厂：传入 `ClientRuntime` 直接返回，传入含 `_client_runtime` 属性的客户端则提取，否则新建；供所有子组件构造函数统一调用 |
+| +107 | 新增 | `class _RuntimeSection` | 所有分区基类，持有 `runtime` 引用，通过 `self.client` property 间接访问客户端 |
+| +116 | 新增 | `class RuntimeIdentityState` | 身份分区：`set_loaded_identity`、`set_identity`、`set_aid`、`set_instance_context`、`clear`、`apply_runtime_context`；`apply_runtime_context` 原子更新客户端的 `_config_model/_device_id/_slot_id/_log/_net/_discovery/_token_store/_auth/_transport` 等全部运行时字段 |
+| +209 | 新增 | `class RuntimeLifecycleState` | 生命周期分区：`set_state`、`set_closing`、`set_gateway_url`、`set_loop`、`set_session`、`set_error`/`clear_error`、`set_connected_at`、`set_retry_backoff`、`set/clear_reconnect_task`、`set_heartbeat/token_refresh_task`、`increment_token_refresh_failures`、`set_connection_failed`、`reset_for_disconnect`、`reset_for_close` 等完整状态机 setter |
+| +334 | 新增 | `class RuntimeRpcState` | RPC 分区：`protected_headers` 读写 property；`pull_gates` lazy 初始化 property |
+| +355 | 新增 | `class RuntimeDeliveryState` | 消息投递分区：`seq_tracker`、`pending_ordered`、`pending_p2p_pull_upper`（均 lazy 初始化 property）；`set_online_unread_hint_task`、`set_gap_fill_active`；`reset_seq_tracking_state(*, next_context, reset_context)` 统一两个清状态路径 |
+| +411 | 新增 | `class RuntimeV2State` | V2 E2EE 分区：`session` 读写 property；`bootstrap_cache` lazy property；`reset_for_identity`；`group_spk_registration_inflight`、`group_spk_rotation_inflight`、`group_spk_peer_fallback_registered`（均 lazy set property） |
+| +461 | 新增 | `class RuntimeGroupState` | 群状态分区：`state_chains`、`security_levels`（均 lazy dict property） |
+| +479 | 新增 | `class RuntimeServices` | 服务分区：通过 `__getattr__` 代理以 `_name` 命名的客户端属性；`set_agent_md_manager` |
+
+### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +9 | 新增 import | `ClientRuntime` | — |
+| +22 | 修改 | `MessageDeliveryEngine.__init__` 参数 | `client: Any` → `runtime: Any`；构造时调用 `ClientRuntime.coerce(runtime)`，`self.client` 改为 `self.runtime.client` |
+| +28 | 修改 | `pending_ordered()` | 删除 `getattr` + 懒初始化逻辑，改为 `return self.runtime.delivery.pending_ordered` |
+| +43 | 修改 | `_schedule_online_unread_hint_if_needed()` | `client._online_unread_hint_task = ...` → `self.runtime.delivery.set_online_unread_hint_task(...)` |
+| +52 | 修改 | `drain_online_unread_hints()` finally 块 | `client._online_unread_hint_task = None` → `self.runtime.delivery.set_online_unread_hint_task(None)` |
+| +62 | 修改 | `fill_p2p_gap()` | `client._gap_fill_active = True/False` → `self.runtime.delivery.set_gap_fill_active(True/False)` |
+| +82 | 修改 | `record_pending_p2p_pull()` | `getattr(client, "_pending_p2p_pull_upper", None)` 懒初始化 → `self.runtime.delivery.pending_p2p_pull_upper` |
+| +88 | 修改 | `reset_seq_tracking_state()` | 删除 15 行内联清理逻辑，改为 `self.runtime.delivery.reset_seq_tracking_state(reset_context=True)` |
+| +108 | 修改 | `refresh_seq_tracking_context()` | 删除 15 行内联清理 + 上下文切换逻辑，改为 `self.runtime.delivery.reset_seq_tracking_state(next_context=next_context)` |
+
+### `_client/group_state.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +7 | 新增 import | `ClientRuntime` | — |
+| +11 | 修改 | `GroupStateCoordinator.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+
+### `_client/identity.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +13 | 新增 import | `ClientRuntime` | — |
+| +21 | 修改 | `IdentityRuntimeManager.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+| +28 | 修改 | `load_identity()` | 删除 8 行直接赋值客户端字段（`_current_aid`、`_aid`、`_state`、`_closing` 等），改为调用 `self.runtime.identity.set_loaded_identity`、`self.runtime.lifecycle.set_state/set_closing/clear_retry_state` |
+| +80 | 修改 | `rebuild_runtime_for_identity()` | 删除 30 行逐字段赋值（`client._config_model`、`client._log`、`client._net` 等），改为先构造 `log/net/discovery/token_store/auth/transport` 局部变量，再一次性调用 `self.runtime.identity.apply_runtime_context(...)` |
+| +122 | 修改 | `rebuild_runtime_for_identity()` 末尾 | `client._agent_md_manager = ...` → `self.runtime.services.set_agent_md_manager(...)` |
+
+### `_client/lifecycle.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +17 | 新增 import | `ClientRuntime` | — |
+| +22 | 修改 | `LifecycleController.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+| — | 修改 | `authenticate()` | `client._gateway_url = ...` → `self.runtime.lifecycle.set_gateway_url`；`client._aid = ...` → `self.runtime.identity.set_aid`；`client._identity = ...` → `self.runtime.identity.set_identity`；`client._state = ...` → `self.runtime.lifecycle.set_state`；error 字段 → `set_error/clear_error` |
+| — | 修改 | `connect()` | 所有直接状态赋值全部改为对应 runtime 分区 setter；`set_session` 原子设置 `_session_params` + `_session_options` |
+| — | 修改 | `disconnect()` | `client._reconnect_task = None` → `clear_reconnect_task`；多处状态重置 → `reset_for_disconnect(next_state)` |
+| — | 修改 | `close()` | `client._closing = True` → `set_closing(True)`；重复的 15 字段清零逻辑 × 2 → `reset_for_close()`；`client._reconnect_task = None` → `clear_reconnect_task` |
+| — | 修改 | `_connect_once()` | `client._slot_id = ...` + `client._auth.set_instance_context` → `self.runtime.identity.set_instance_context`；其余状态赋值改为 runtime setter |
+| — | 删除 | `_cancel_background_tasks` 中 `_cache_cleanup_task` | 停止清理已删除的 prekey 缓存清理任务 |
+| — | 修改 | `start_heartbeat_task/start_token_refresh_task` | `client._heartbeat_task/token_refresh_task = ...` → runtime lifecycle setter |
+| — | 修改 | `token_refresh_loop` | `client._identity = ...` → `self.runtime.identity.set_identity`；`client._token_refresh_failures` 计数 → `increment_token_refresh_failures/set_token_refresh_failures` |
+| — | 修改 | `handle_server_disconnect` | `client._server_kicked = True` → `set_server_kicked`；`client._last_disconnect_info = ...` → `set_last_disconnect_info`；`reset_for_disconnect` + `set_connection_failed` 替代内联多字段赋值 |
+| — | 修改 | `reconnect_loop` | 所有 `client._retry_attempt`、`client._next_retry_at`、`client._reconnect_task`、`client._state` 赋值全部改为对应 runtime setter；新增 `set_retry_backoff` 原子方法 |
+
+### `_client/peers.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +10 | 新增 import | `ClientRuntime` | — |
+| +25 | 修改 | `PeerDirectory.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+| +58 | 修改 | `discover_gateway_for_aid()` 两处 | `client._gateway_url = ...` → `self.runtime.lifecycle.set_gateway_url(...)` |
+
+### `_client/rpc_pipeline.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +17 | 新增 import | `ClientRuntime` | — |
+| +22 | 修改 | `RpcPipeline.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+| +61 | 修改 | `call()` 末尾 | `client._call_after_pipeline(...)` → `self.call_after_pipeline(...)` |
+| +63 | 新增 | `RpcPipeline.call_after_pipeline()` | 将原 `AUNClient._call_after_pipeline` 整体迁入 RpcPipeline，含 pull gate 串行化、加密路由、签名注入、transport 调用等完整逻辑（约 170 行） |
+| +376 | 修改 | `try_acquire_pull_gate()` | `getattr(client, "_pull_gates", None)` 懒初始化 → `self.runtime.rpc.pull_gates` |
+| +386 | 修改 | `release_pull_gate()` | `client._pull_gates.get(key)` → `self.runtime.rpc.pull_gates.get(key)` |
+
+### `_client/v2_e2ee.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +11 | 新增 import | `ClientRuntime` | — |
+| +21 | 修改 | `V2E2EECoordinator.__init__` 参数 | `client: Any` → `runtime: Any`；调用 `ClientRuntime.coerce` |
+| +53 | 修改 | `on_connected()` | `client._v2_session = V2Session(...)` → `self.runtime.v2.session = V2Session(...)`；`client._v2_bootstrap_cache = {}` → `self.runtime.v2.bootstrap_cache.clear()` |
+| +73 | 修改 | `ensure_group_spk_registered()` | `getattr(client, "_group_spk_registration_inflight", ...)` 懒初始化 → `self.runtime.v2.group_spk_registration_inflight` |
+| +105 | 修改 | `ensure_group_spk_rotated()` | 同上，改用 `self.runtime.v2.group_spk_rotation_inflight` |
+| +133 | 修改 | `schedule_group_spk_registration_after_peer_fallback()` | 改用 `self.runtime.v2.group_spk_peer_fallback_registered` |
+| +587 | **新增** | `pull_v2_p2p` 明文路径（P2P） | 构造 `v1_msg` 后调用 `self.attach_gateway_proximity(v1_msg, msg)`，将 gateway 注入的 `proximity` 字段写入消息事件 payload |
+| +1853 | **新增** | `pull_v2_group` 明文路径（群组） | 同上，群组明文消息投递前补充 `attach_gateway_proximity` 调用 |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +644 | 修改 | `AUNClient.__init__` 子组件初始化 | 7 个子组件从传入 `self` 改为传入 `self._client_runtime`，确保均通过 `ClientRuntime` 获取客户端引用 |
+| +859 | 新增 | `AUNClient._runtime()` | lazy 获取/构建 `ClientRuntime` 的访问器（init 时已建，此处为 fallback 兼容路径） |
+| +704 | 修改 | `_lifecycle/rpc/delivery/_v2_e2ee_coordinator/_group_state` lazy getter | fallback 新建时由 `LifecycleController(self)` 改为 `LifecycleController(self._runtime())` 等 |
+| — | 删除 | `_require_peer_management_state` | 代理方法移除，调用方直接用 `_peer_directory.require_peer_management_state()` |
+| — | 删除 | `_rebuild_runtime_for_identity` | 同上 |
+| — | 删除 | `_issuer_domain_for_aid`、`_discover_gateway_url`、`_load_cached_gateway_url`、`_persist_gateway_url` | 代理方法移除，内部通过 `_peer_directory` 调用 |
+| — | 删除 | `_public_aid_from_cert` | 代理方法移除 |
+| — | 删除 | `_pull_gate_key_for_call`、`_run_pull_serialized` | 已内聚到 `RpcPipeline.call_after_pipeline` |
+| — | 删除 | `_call_after_pipeline` | 整体迁入 `RpcPipeline.call_after_pipeline` |
+| — | 删除 | `_debug_json_default` 静态方法代理 | `MessageDeliveryEngine.debug_json_default` 直接使用 |
+| — | 删除 | `_is_echo_message_params`、`_current_message_delivery_mode` | 代理方法移除 |
+| — | 删除 | `_lazy_sync_group`、`_join_mode_allows_member_epoch_rotation` 等群状态辅助方法 | 已迁入 `GroupStateCoordinator` |
+| — | 删除 | `_list_contains_token`、`_client_uses_v2_p2p/group` | 静态辅助方法移除 |
+| — | 删除 | `_ensure_sender_cert_cached`（兼容别名） | 移除不再需要的旧调用点别名 |
+| — | 删除 | `_extract_consumed_prekey_id` | 静态方法移除 |
+| — | 删除 | `_attach_rotation_id`、`_rotation_expected_members_stale`、`_rotation_retry_delay_s` | 群轮换辅助函数移除 |
+| — | 删除 | `_cache_cleanup_loop` | prekey 列表缓存（`_peer_prekeys_cache`）整体删除，连带清理任务一并移除 |
+| — | 删除 | `_GROUP_ROTATION_*` 常量、`_KEY_WAIT_*` 常量 | 随 `_cache_cleanup_loop` 一并清理 |
+| — | 删除 | `_peer_prekeys_cache`、`_cache_cleanup_task` 字段 | init 中移除初始化 |
+| — | 删除 | `_PEER_PREKEYS_CACHE_TTL` | 常量移除 |
+| — | 删除 | `_decrypt_thought_get_result`、`_metadata_without_auth`、`_v2_envelope_payload_type` 代理方法 | 直接使用 `V2E2EECoordinator` 类方法 |
+| — | 删除 | `_attach_group_dispatch_mode_to_payload` | 静态方法移除 |
+| — | 删除 | `_group_secret_matches_committed_rotation` | 静态方法移除 |
+
+### `version.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1 | 修改 | `__version__` | `"0.4.8"` → `"0.4.9"` |
 
 ---
 

@@ -7,6 +7,7 @@ import {
   type JsonObject,
   type JsonValue,
   type RpcParams,
+  type RpcResult,
 } from '../types.js';
 import type { ClientRuntime } from './runtime.js';
 
@@ -61,6 +62,17 @@ const SIGNED_METHODS = new Set([
 ]);
 
 const PULL_GATE_STALE_MS = 30000;
+const NON_IDEMPOTENT_TIMEOUT = 35;
+const NON_IDEMPOTENT_METHODS = new Set([
+  'message.send', 'group.send', 'group.create', 'group.invite',
+  'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
+  'group.update_name', 'group.update_avatar', 'group.update_announcement',
+  'group.update_settings',
+  'storage.upload', 'storage.complete_upload', 'storage.delete',
+  'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
+  'message.thought.put', 'group.thought.put',
+  'group.add_member',
+]);
 
 export interface RpcPreflightResult {
   params: RpcParams;
@@ -71,6 +83,157 @@ export class RpcPipeline {
 
   constructor(runtime: ClientRuntime) {
     this.runtime = runtime;
+  }
+
+  async call(method: string, params?: RpcParams): Promise<RpcResult> {
+    const client = this.runtime.client;
+    const tStart = Date.now();
+    client._clientLog.debug(`call enter: method=${method}`);
+    try {
+      const result = await this.callImpl(method, params);
+      client._clientLog.debug(`call exit: elapsed=${Date.now() - tStart}ms method=${method}`);
+      return result;
+    } catch (err) {
+      client._clientLog.debug(`call exit (error): elapsed=${Date.now() - tStart}ms method=${method} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
+  private async callImpl(method: string, params?: RpcParams): Promise<RpcResult> {
+    const client = this.runtime.client;
+    const p = this.preflight(method, params).params;
+
+    if (method === 'message.send') {
+      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
+      delete p.encrypt;
+      if (encrypt) {
+        await client._ensureV2SessionReady(
+          'message.send',
+          'V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)',
+        );
+        client._clientLog.debug('call route: message.send -> V2 encrypted send');
+        return await client._sendV2(String(p.to ?? ''), p.payload as Record<string, unknown> ?? {}, {
+          messageId: String(p.message_id ?? '') || undefined,
+          timestamp: p.timestamp as number | undefined,
+          protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
+          context: isJsonObject(p.context) ? p.context : undefined,
+        }) as RpcResult;
+      }
+      client._maybeAppendEchoTraceSend(p);
+    }
+
+    if (method === 'group.send') {
+      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
+      delete p.encrypt;
+      if (encrypt) {
+        await client._ensureV2SessionReady(
+          'group.send',
+          'V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)',
+        );
+        client._clientLog.debug('call route: group.send -> V2 encrypted send');
+        return await client._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown> ?? {}, {
+          messageId: String(p.message_id ?? '') || undefined,
+          timestamp: p.timestamp as number | undefined,
+          protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
+          context: isJsonObject(p.context) ? p.context : undefined,
+        }) as RpcResult;
+      }
+      client._maybeAppendEchoTraceSend(p);
+    }
+
+    if (method === 'group.thought.put') {
+      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
+      delete p.encrypt;
+      if (encrypt) {
+        await client._ensureV2SessionReady(
+          'group.thought.put',
+          'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)',
+        );
+        client._clientLog.debug('call route: group.thought.put -> V2 encrypted put');
+        return await client._putGroupThoughtEncryptedV2(p) as RpcResult;
+      }
+    }
+
+    if (method === 'message.thought.put') {
+      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
+      delete p.encrypt;
+      if (encrypt) {
+        await client._ensureV2SessionReady(
+          'message.thought.put',
+          'V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)',
+        );
+        client._clientLog.debug('call route: message.thought.put -> V2 encrypted put');
+        return await client._putMessageThoughtEncryptedV2(p) as RpcResult;
+      }
+    }
+
+    const pullGateKey = this.pullGateKeyForCall(method, p);
+    if (pullGateKey) {
+      return await this.runPullSerialized(pullGateKey, async () => {
+        return await this.callImplInner(method, p);
+      });
+    }
+
+    return await this.callImplInner(method, p);
+  }
+
+  private async callImplInner(method: string, p: RpcParams): Promise<RpcResult> {
+    const client = this.runtime.client;
+    if (method === 'message.pull') {
+      await client._ensureV2SessionReady('message.pull');
+      client._clientLog.debug('call route: message.pull -> V2 pull');
+      const messages = await client._pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50, { force: p.force === true });
+      return { messages } as RpcResult;
+    }
+
+    if (method === 'message.ack') {
+      await client._ensureV2SessionReady('message.ack');
+      client._clientLog.debug('call route: message.ack -> V2 ack');
+      return await client._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined) as RpcResult;
+    }
+
+    if (method === 'group.pull' && p.group_id) {
+      await client._ensureV2SessionReady('group.pull');
+      client._clientLog.debug('call route: group.pull -> V2 pull');
+      const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
+      const cursorParams = client._explicitGroupCursorParams(p);
+      const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
+      const pullOpts: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = {};
+      if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
+      if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
+      if (!ownsCursor) pullOpts.ownsCursor = false;
+      const messages = await client._pullGroupV2(
+        String(p.group_id),
+        Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
+        Number(p.limit ?? 50) || 50,
+        Object.keys(pullOpts).length > 0 ? pullOpts : undefined,
+      );
+      return { messages } as RpcResult;
+    }
+
+    if (method === 'group.ack_messages' && p.group_id) {
+      await client._ensureV2SessionReady('group.ack_messages');
+      client._clientLog.debug('call route: group.ack_messages -> V2 ack');
+      const cursorParams = client._explicitGroupCursorParams(p);
+      const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
+      if (!ownsCursor) {
+        return await client._rawGroupAckMessages(p) as RpcResult;
+      }
+      return await client._ackGroupV2(
+        String(p.group_id),
+        Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
+      ) as RpcResult;
+    }
+
+    await this.applyClientSignature(method, p);
+
+    const callTimeout = NON_IDEMPOTENT_METHODS.has(method) ? NON_IDEMPOTENT_TIMEOUT : undefined;
+    let result = callTimeout
+      ? await client._transport.call(method, p, callTimeout)
+      : await client._transport.call(method, p);
+
+    result = await this.postprocessResult(method, p, result) as RpcResult;
+    return result;
   }
 
   preflight(method: string, params?: RpcParams): RpcPreflightResult {

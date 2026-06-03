@@ -131,7 +131,7 @@ test.describe('P2P 消息失败路径（浏览器）', () => {
 
   // ── 1. 明文发送不依赖 prekey ──────────────────────────────────
 
-  test('明文发送不依赖 prekey — plaintext send 无需对端 prekey', async ({ page }) => {
+  test('明文发送不依赖 prekey — 无注册设备时应拒绝投递', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const { sleep, makeAndConnect, ensureConnected, runId } = (window as any).__aunP0;
       const rid = runId();
@@ -148,25 +148,26 @@ test.describe('P2P 消息失败路径（浏览器）', () => {
         // target 仅创建 AID，不连接（模拟没有 prekey 的场景）
         await (window as any).AUN_TEST_HELPERS.registerAndLoadIdentity(target, targetAid);
 
-        // Alice 明文发送到 target（encrypt: false）
-        const sendResult = await alice.call('message.send', {
-          to: targetAid,
-          payload: { type: 'text', text: `plain-no-prekey-${rid}` },
-          encrypt: false,
-        });
-
-        return {
-          success: !!sendResult?.message_id,
-          messageId: sendResult?.message_id ?? null,
-        };
+        // Alice 明文发送到 target（encrypt: false）。当前多设备投递语义要求
+        // 接收方至少有一个注册设备，否则持久/默认投递无法确定目标设备。
+        try {
+          await alice.call('message.send', {
+            to: targetAid,
+            payload: { type: 'text', text: `plain-no-prekey-${rid}` },
+            encrypt: false,
+          });
+          return { rejected: false, message: '' };
+        } catch (e: any) {
+          return { rejected: true, message: e?.message ?? String(e) };
+        }
       } finally {
         await alice.close();
         await target.close();
       }
     }, ISSUER);
 
-    expect(result.success).toBe(true);
-    expect(result.messageId).toBeTruthy();
+    expect(result.rejected).toBe(true);
+    expect(result.message).toContain('no registered devices');
   });
 
   // ── 2. 发送到不存在的 AID ─────────────────────────────────────

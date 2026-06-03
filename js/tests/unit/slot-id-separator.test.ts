@@ -47,23 +47,23 @@ describe('normalizeSlotId', () => {
   });
 });
 
-describe('_messageTargetsCurrentInstance', () => {
+describe('_delivery.messageTargetsCurrentInstance', () => {
   it('同隔离键（evolclaw）→ true', () => {
     const client = new AUNClient();
     (client as any)._slotId = 'evolclaw cli';
-    const result = (client as any)._messageTargetsCurrentInstance({ slot_id: 'evolclaw daemon' });
+    const result = (client as any)._delivery.messageTargetsCurrentInstance({ slot_id: 'evolclaw daemon' });
     expect(result).toBe(true);
   });
   it('不同隔离键 → false', () => {
     const client = new AUNClient();
     (client as any)._slotId = 'evolclaw cli';
-    const result = (client as any)._messageTargetsCurrentInstance({ slot_id: 'other daemon' });
+    const result = (client as any)._delivery.messageTargetsCurrentInstance({ slot_id: 'other daemon' });
     expect(result).toBe(false);
   });
   it('消息无 slot_id 字段 → true', () => {
     const client = new AUNClient();
     (client as any)._slotId = 'evolclaw cli';
-    const result = (client as any)._messageTargetsCurrentInstance({ text: 'hello' });
+    const result = (client as any)._delivery.messageTargetsCurrentInstance({ text: 'hello' });
     expect(result).toBe(true);
   });
 });

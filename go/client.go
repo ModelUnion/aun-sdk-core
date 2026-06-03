@@ -972,7 +972,7 @@ func (c *AUNClient) GatewayHealth() *bool {
 func (c *AUNClient) SetIdentity(identity map[string]any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.identity = identity
+	c.getClientRuntime().identity.setIdentity(identity)
 }
 
 // GetIdentity 返回当前身份信息
@@ -1081,43 +1081,7 @@ func (c *AUNClient) listIdentities() (summaries []map[string]any, err error) {
 
 // Disconnect 主动断开连接但保留身份，可重新 Connect（ISSUE-GO-005）
 func (c *AUNClient) Disconnect() (err error) {
-	tStart := time.Now()
-	c.log.Debug("Disconnect enter")
-	defer func() {
-		if err != nil {
-			c.log.Debug("Disconnect exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.log.Debug("Disconnect exit: elapsed=%dms", time.Since(tStart).Milliseconds())
-		}
-	}()
-	c.mu.Lock()
-	state := c.state
-	if state != StateConnected && state != StateReconnecting {
-		c.mu.Unlock()
-		return nil // idle/closed/disconnected 等状态无需操作
-	}
-	cancelFn := c.cancel
-	c.mu.Unlock()
-
-	c.saveSeqTrackerState()
-
-	// 取消后台任务
-	if cancelFn != nil {
-		cancelFn()
-	}
-
-	// 关闭传输层
-	if err := c.transport.Close(); err != nil {
-		c.log.Warn("Disconnect failed to close transport: %v", err)
-	}
-
-	c.mu.Lock()
-	c.state = StateDisconnected
-	c.authenticated = false
-	c.mu.Unlock()
-
-	c.events.Publish("state_change", map[string]any{"state": string(c.ConnectionState())})
-	return nil
+	return c.getLifecycleController().disconnect()
 }
 
 // Logout 完全登出：断开连接、清除 token、关闭客户端（ISSUE-GO-005）
@@ -1158,233 +1122,14 @@ func (c *AUNClient) Logout() (err error) {
 
 // Close 关闭客户端，取消所有后台任务
 func (c *AUNClient) Close() (err error) {
-	tStart := time.Now()
-	c.log.Debug("Close enter")
-	defer func() {
-		if err != nil {
-			c.log.Debug("Close exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.log.Debug("Close exit: elapsed=%dms", time.Since(tStart).Milliseconds())
-		}
-	}()
-	c.mu.Lock()
-	c.closing.Store(true)
-	state := c.state
-	cancelFn := c.cancel
-	c.mu.Unlock()
-
-	c.saveSeqTrackerState()
-
-	// 取消所有后台任务
-	if cancelFn != nil {
-		cancelFn()
-	}
-
-	if state == StateIdle || state == StateClosed {
-		if closer, ok := c.tokenStore.(interface{ Close() }); ok {
-			closer.Close()
-		}
-		if c.dnsNet != nil {
-			c.dnsNet.Close()
-		}
-		c.releaseV2State()
-		c.mu.Lock()
-		c.state = StateClosed
-		c.authenticated = false
-		c.resetSeqTrackingStateLocked()
-		c.mu.Unlock()
-		return nil
-	}
-
-	// 关闭传输层
-	if err := c.transport.Close(); err != nil {
-		c.log.Warn("failed to close transport: %v", err)
-	}
-	if closer, ok := c.tokenStore.(interface{ Close() }); ok {
-		closer.Close()
-	}
-	if c.dnsNet != nil {
-		c.dnsNet.Close()
-	}
-	c.releaseV2State()
-
-	c.mu.Lock()
-	c.state = StateClosed
-	c.authenticated = false
-	c.resetSeqTrackingStateLocked()
-	c.mu.Unlock()
-
-	c.events.Publish("state_change", map[string]any{"state": string(c.ConnectionState())})
-	return nil
+	return c.getLifecycleController().close()
 }
 
 // ── RPC 调用 ──────────────────────────────────────────────
 
 // Call 发送 RPC 调用（自动 E2EE 加解密）
 func (c *AUNClient) Call(ctx context.Context, method string, params map[string]any) (result any, err error) {
-	tStart := time.Now()
-	c.log.Debug("Call enter: method=%s paramsSummary=%s", method, summarizeCallParams(method, params))
-	defer func() {
-		if err != nil {
-			c.log.Debug("Call exit (error): method=%s elapsed=%dms err=%v", method, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.log.Debug("Call exit: method=%s elapsed=%dms", method, time.Since(tStart).Milliseconds())
-		}
-	}()
-
-	preflight, err := c.getRpcPipeline().preflight(method, params)
-	if err != nil {
-		return nil, err
-	}
-	params = preflight.params
-	pullGateLocked := truthyBool(params["_pull_gate_locked"])
-	delete(params, "_pull_gate_locked")
-	pullGateKey := c.getRpcPipeline().pullGateKeyForCall(method, params)
-	if pullGateKey != "" && !pullGateLocked {
-		lockedParams := copyRpcParams(params)
-		lockedParams["_pull_gate_locked"] = true
-		return c.getRpcPipeline().runPullSerialized(ctx, pullGateKey, func() (any, error) {
-			return c.Call(ctx, method, lockedParams)
-		})
-	}
-
-	// 自动加密：message.send 默认加密
-	if method == "message.send" {
-		encrypt := true
-		if enc, ok := params["encrypt"]; ok {
-			if encBool, ok := enc.(bool); ok {
-				encrypt = encBool
-			}
-			delete(params, "encrypt")
-		}
-		if encrypt {
-			// V2-only：必须走 V2 路径
-			if c.v2GetState() != nil {
-				c.log.Debug("call route: message.send → V2 send")
-				return c.sendV2Internal(ctx, params)
-			}
-			return nil, NewStateError("V2 session not initialized, cannot send encrypted message")
-		}
-		// encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
-		c.maybeAppendEchoTraceSend(params)
-	}
-
-	// 自动加密：group.send 默认加密
-	if method == "group.send" {
-		encrypt := true
-		if enc, ok := params["encrypt"]; ok {
-			if encBool, ok := enc.(bool); ok {
-				encrypt = encBool
-			}
-			delete(params, "encrypt")
-		}
-		if encrypt {
-			// V2-only：必须走 V2 路径
-			if c.v2GetState() != nil {
-				c.logEG.Debug("call route: group.send → V2 send")
-				return c.sendGroupV2Internal(ctx, params)
-			}
-			return nil, NewStateError("V2 session not initialized, cannot send encrypted group message")
-		}
-		c.maybeAppendEchoTraceSend(params)
-	}
-
-	// V2 就绪时把 message.pull / message.ack / group.pull / group.ack_messages 路由到 V2 内部方法。
-	if method == "message.pull" && c.v2GetState() != nil {
-		c.log.Debug("call route: message.pull → V2 pull")
-		return c.pullV2Internal(ctx, params)
-	}
-	if method == "message.ack" && c.v2GetState() != nil {
-		c.log.Debug("call route: message.ack → V2 ack")
-		return c.ackV2Internal(ctx, params)
-	}
-	if method == "group.pull" {
-		gid, _ := params["group_id"].(string)
-		if c.v2GetState() != nil && gid != "" {
-			c.logEG.Debug("call route: group.pull → V2 pull group=%s", gid)
-			return c.pullGroupV2Internal(ctx, params)
-		}
-	}
-	if method == "group.ack_messages" {
-		gid, _ := params["group_id"].(string)
-		if c.v2GetState() != nil && gid != "" {
-			if c.groupCursorTargetsCurrentInstance(params) {
-				c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
-				return c.ackGroupV2Internal(ctx, params)
-			}
-			c.logEG.Debug("call route: group.ack_messages external cursor → raw ack group=%s device_id=%s slot_id=%s", gid, stringFromAny(params["device_id"]), stringFromAny(params["slot_id"]))
-		}
-	}
-
-	if method == "group.thought.put" {
-		encrypt := true
-		if enc, ok := params["encrypt"]; ok {
-			if encBool, ok := enc.(bool); ok {
-				encrypt = encBool
-			}
-			delete(params, "encrypt")
-		}
-		if encrypt {
-			gid, _ := params["group_id"].(string)
-			if c.v2GetState() != nil && gid != "" {
-				c.logEG.Debug("call route: group.thought.put → V2 encrypted put group=%s", gid)
-				return c.putGroupThoughtEncryptedV2(ctx, params)
-			}
-			return nil, NewStateError("V2 session not initialized, cannot encrypt group thought")
-		}
-	}
-	if method == "message.thought.put" {
-		encrypt := true
-		if enc, ok := params["encrypt"]; ok {
-			if encBool, ok := enc.(bool); ok {
-				encrypt = encBool
-			}
-			delete(params, "encrypt")
-		}
-		if encrypt {
-			toAID, _ := params["to"].(string)
-			if c.v2GetState() != nil && toAID != "" {
-				c.log.Debug("call route: message.thought.put → V2 encrypted put to=%s", toAID)
-				return c.putMessageThoughtEncryptedV2(ctx, params)
-			}
-			return nil, NewStateError("V2 session not initialized, cannot encrypt message thought")
-		}
-	}
-
-	// 关键操作自动附加客户端签名
-	if err := c.getRpcPipeline().applyClientSignature(method, params); err != nil {
-		return nil, err
-	}
-
-	// P1-23: 非幂等方法使用更长超时
-	callCtx := ctx
-	if nonIdempotentMethods[method] {
-		var cancel context.CancelFunc
-		callCtx, cancel = context.WithTimeout(ctx, nonIdempotentTimeout)
-		defer cancel()
-	}
-
-	if method == "message.thought.get" || method == "group.thought.get" {
-		c.log.Debug("thought.get transport call start: method=%s params=%s", method, summarizeCallParams(method, params))
-	}
-
-	// Pull Gate：序列化同一 key 的 pull 操作
-	if pullGateKey != "" && !pullGateLocked {
-		gatedResult, gatedErr := c.getRpcPipeline().runPullSerialized(callCtx, pullGateKey, func() (any, error) {
-			return c.transport.Call(callCtx, method, params)
-		})
-		if gatedErr != nil {
-			return nil, gatedErr
-		}
-		result = gatedResult
-	} else {
-		result, err = c.transport.Call(callCtx, method, params)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return c.getRpcPipeline().postprocessResult(ctx, method, params, result)
+	return c.getRpcPipeline().call(ctx, method, params)
 }
 
 // signClientOperation 为关键操作附加客户端 ECDSA 签名。
@@ -1580,9 +1325,9 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 }
 
 // lazySyncGroup 惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。
-func (c *AUNClient) lazySyncGroup(groupID string) {
-	c.delivery().lazySyncGroup(groupID)
-}
+// func (c *AUNClient) lazySyncGroup(groupID string) {
+// 	c.delivery().lazySyncGroup(groupID)
+// }
 
 // fillGroupEventGap 后台补齐群事件空洞
 func (c *AUNClient) fillGroupEventGap(groupID string) {
@@ -1977,155 +1722,7 @@ func attachGroupDispatchModeToPayload(message map[string]any) map[string]any {
 
 // connectOnce 单次连接尝试
 func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allowReauth bool) (err error) {
-	tStart := time.Now()
-	gatewayURL := c.resolveGateway(params)
-	c.log.Debug("connectOnce enter: gateway=%s allowReauth=%v", gatewayURL, allowReauth)
-	defer func() {
-		if err != nil {
-			c.log.Debug("connectOnce exit (error): gateway=%s elapsed=%dms err=%v", gatewayURL, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.log.Debug("connectOnce exit: gateway=%s elapsed=%dms", gatewayURL, time.Since(tStart).Milliseconds())
-		}
-	}()
-
-	c.mu.Lock()
-	c.gatewayURL = gatewayURL
-	c.slotID = strings.TrimSpace(fmt.Sprint(params["slot_id"]))
-	if deliveryMode, ok := params["delivery_mode"].(map[string]any); ok {
-		c.connectDeliveryMode = copyMapShallow(deliveryMode)
-	}
-	c.auth.SetInstanceContext(c.deviceID, c.slotID)
-	c.auth.SetDeliveryMode(c.connectDeliveryMode)
-	c.state = StateConnecting
-	// 前置 restore：在 transport.Connect 启动 reader 之前完成，
-	// 避免 reader 把积压 push 交给空 tracker 的 handler，触发 S2 历史 gap 误补拉。
-	c.refreshSeqTrackerContextLocked()
-	c.mu.Unlock()
-	c.restoreSeqTrackerState()
-
-	// 连接 WebSocket
-	c.log.Debug("WebSocket connecting: gateway=%s", gatewayURL)
-	challenge, connErr := c.transport.Connect(ctx, gatewayURL)
-	if connErr != nil {
-		c.log.Error("WebSocket connection failed: gateway=%s err=%v", gatewayURL, connErr)
-		err = connErr
-		return err
-	}
-	// 连接成功：刷新 DNS 缓存
-	if c.dnsNet != nil {
-		c.dnsNet.refreshDNSCacheAfterSuccess(gatewayURL)
-	}
-	c.log.Debug("WebSocket connected, starting auth: gateway=%s", gatewayURL)
-
-	c.mu.Lock()
-	c.state = StateAuthenticating
-	c.mu.Unlock()
-
-	// 认证
-	connectionKind, _ := params["connection_kind"].(string)
-	if connectionKind == "" {
-		connectionKind = "long"
-	}
-	shortTtlMs := 0
-	if v, ok := params["short_ttl_ms"].(int); ok {
-		shortTtlMs = v
-	}
-	var extraInfo map[string]any
-	if ei, ok := params["extra_info"].(map[string]any); ok && len(ei) > 0 {
-		extraInfo = ei
-	}
-
-	if allowReauth {
-		accessToken, _ := params["access_token"].(string)
-		authContext, authErr := c.auth.ConnectSession(ctx, c.transport, challenge, gatewayURL, accessToken, connectionKind, shortTtlMs, extraInfo)
-		if authErr != nil {
-			c.log.Error("auth failed (ConnectSession): gateway=%s err=%v", gatewayURL, authErr)
-			err = authErr
-			return err
-		}
-		if authContext != nil {
-			identity, _ := authContext["identity"].(map[string]any)
-			if identity != nil {
-				c.mu.Lock()
-				c.identity = identity
-				if aidStr, ok := identity["aid"].(string); ok {
-					c.aid = aidStr
-					if c.logger != nil {
-						c.logger.BindAID(aidStr)
-					}
-				}
-				if c.sessionParams != nil {
-					if token, ok := authContext["token"].(string); ok && token != "" {
-						c.sessionParams["access_token"] = token
-					}
-				}
-				c.mu.Unlock()
-			}
-			if hello, ok := authContext["hello"].(map[string]any); ok && hello != nil {
-				if raw, exists := hello["heartbeat_interval"]; exists {
-					c.applyServerHeartbeatInterval(raw, "auth")
-				}
-			}
-		}
-	} else {
-		accessToken, _ := params["access_token"].(string)
-		hello, initErr := c.auth.InitializeWithToken(ctx, c.transport, challenge, accessToken, connectionKind, shortTtlMs, extraInfo)
-		if initErr != nil {
-			c.log.Error("auth failed (InitializeWithToken): gateway=%s err=%v", gatewayURL, initErr)
-			err = initErr
-			return err
-		}
-		c.syncIdentityAfterConnect(accessToken)
-		if hello != nil {
-			if raw, exists := hello["heartbeat_interval"]; exists {
-				c.applyServerHeartbeatInterval(raw, "auth")
-			}
-		}
-	}
-
-	// auth 阶段 aid 可能被 identity 覆盖；若 context 发生变化，重做 refresh + restore 兜底
-	c.mu.Lock()
-	c.state = StateConnected
-	c.connectedAt = time.Now()
-	c.nextRetryAt = time.Time{}
-	prevContext := c.seqTrackerContext
-	c.refreshSeqTrackerContextLocked()
-	contextChanged := c.seqTrackerContext != prevContext
-	c.mu.Unlock()
-
-	c.log.Debug("connection auth completed, state switched to connected: gateway=%s aid=%s", gatewayURL, c.AID())
-	c.events.Publish("state_change", map[string]any{"state": string(c.ConnectionState()), "gateway": gatewayURL})
-
-	// 启动后台任务
-	if contextChanged {
-		c.restoreSeqTrackerState()
-	}
-	c.startBackgroundTasks(ctx)
-
-	// V2 E2EE 必须先初始化，再触发 post-connect 补拉；否则 message.pull 会走旧路径，
-	// 对 V2 设备副本提前 ack，导致后续 message.v2.pull 跳过尚未解密发布的消息。
-	bgSync := true
-	if v, ok := c.sessionOptions["background_sync"].(bool); ok {
-		bgSync = v
-	}
-	c.getV2E2EECoordinator().onConnected(ctx, bgSync)
-
-	// connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
-	// 群消息按惰性触发，不在此处主动 pull
-	// connect/reconnect 成功后自动触发一次 P2P gap fill，补齐离线期间积压
-	// background_sync=false 时跳过（CLI 等短命令场景）
-	if bgSync {
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					c.log.Warn("post-connect P2P gap fill panic: %v", r)
-				}
-			}()
-			c.fillP2pGap()
-		}()
-	}
-
-	return nil
+	return c.getLifecycleController().connectOnce(ctx, params, allowReauth)
 }
 
 func buildSeqTrackerContext(aid, deviceID, slotID string) string {
@@ -2157,57 +1754,11 @@ func buildLengthPrefixedBytesKey(parts ...[]byte) []byte {
 }
 
 func (c *AUNClient) resetSeqTrackingStateLocked() {
-	c.seqTracker = NewSeqTracker()
-	c.seqTrackerContext = ""
-	c.gapFillDoneMu.Lock()
-	c.gapFillDone = make(map[string]bool)
-	c.gapFillDoneMu.Unlock()
-	c.pushedSeqsMu.Lock()
-	c.pushedSeqs = make(map[string]map[int]bool)
-	c.pushedSeqsMu.Unlock()
-	c.pendingOrderedMsgsMu.Lock()
-	c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
-	c.pendingOrderedMsgsMu.Unlock()
-	c.groupSyncedMu.Lock()
-	c.groupSynced = make(map[string]bool)
-	c.groupSyncedMu.Unlock()
-	c.onlineUnreadHintMu.Lock()
-	c.onlineUnreadHintQueue = make(map[string]map[string]any)
-	c.onlineUnreadHintDraining = false
-	c.onlineUnreadHintMu.Unlock()
-	c.v2SenderIKMu.Lock()
-	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
-	c.v2SenderIKFetching = make(map[string]bool)
-	c.v2SenderIKMu.Unlock()
+	c.getClientRuntime().delivery.resetSeqTrackingStateLocked()
 }
 
 func (c *AUNClient) refreshSeqTrackerContextLocked() {
-	nextContext := buildSeqTrackerContext(c.aid, c.deviceID, c.slotID)
-	if nextContext == c.seqTrackerContext {
-		return
-	}
-	c.seqTracker = NewSeqTracker()
-	c.seqTrackerContext = nextContext
-	c.gapFillDoneMu.Lock()
-	c.gapFillDone = make(map[string]bool)
-	c.gapFillDoneMu.Unlock()
-	c.pushedSeqsMu.Lock()
-	c.pushedSeqs = make(map[string]map[int]bool)
-	c.pushedSeqsMu.Unlock()
-	c.pendingOrderedMsgsMu.Lock()
-	c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
-	c.pendingOrderedMsgsMu.Unlock()
-	c.groupSyncedMu.Lock()
-	c.groupSynced = make(map[string]bool)
-	c.groupSyncedMu.Unlock()
-	c.onlineUnreadHintMu.Lock()
-	c.onlineUnreadHintQueue = make(map[string]map[string]any)
-	c.onlineUnreadHintDraining = false
-	c.onlineUnreadHintMu.Unlock()
-	c.v2SenderIKMu.Lock()
-	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
-	c.v2SenderIKFetching = make(map[string]bool)
-	c.v2SenderIKMu.Unlock()
+	c.getClientRuntime().delivery.refreshSeqTrackerContextLocked()
 }
 
 // resolveGateway 解析 Gateway URL
@@ -2249,24 +1800,7 @@ func (c *AUNClient) resolveGateways(params map[string]any) []string {
 
 // syncIdentityAfterConnect 使用 token 连接后同步本地身份
 func (c *AUNClient) syncIdentityAfterConnect(accessToken string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.identity == nil {
-		return
-	}
-	c.identity["access_token"] = accessToken
-	if loadedAID, ok := c.identity["aid"].(string); ok && loadedAID != "" {
-		c.aid = loadedAID
-		if c.logger != nil {
-			c.logger.BindAID(loadedAID)
-		}
-	}
-
-	if _, ok := c.identity["aid"].(string); ok {
-		if err := c.auth.persistIdentity(c.identity); err != nil {
-			c.auth.lastPersistErr = err
-		}
-	}
+	c.getClientRuntime().identity.syncAfterConnect(accessToken)
 }
 
 // ── 后台任务 ──────────────────────────────────────────────
@@ -2276,27 +1810,7 @@ func (c *AUNClient) syncIdentityAfterConnect(accessToken string) {
 // 避免用户传入的短生命周期 context（如 WithTimeout）导致心跳、token 刷新等后台任务被意外取消。
 // 后台任务的生命周期由 Close()/Disconnect() 通过 cancel 函数统一管理。
 func (c *AUNClient) startBackgroundTasks(_ context.Context) {
-	c.mu.Lock()
-	// 取消旧的后台任务
-	if c.cancel != nil {
-		c.cancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	c.ctx = ctx
-	c.cancel = cancel
-	connectionKind := ""
-	if opts := c.sessionOptions; opts != nil {
-		connectionKind, _ = opts["connection_kind"].(string)
-	}
-	c.mu.Unlock()
-
-	// 短连接不启动 heartbeat 与 token 自动刷新（短连接生命周期短，不需要长期会话维护；
-	// 但 auto_reconnect 仍允许，由上层根据 sessionOptions.auto_reconnect 决定）
-	if connectionKind != "short" {
-		go c.heartbeatLoop(ctx)
-		go c.tokenRefreshLoop(ctx)
-	}
-	c.startCacheCleanupTask(ctx)
+	c.getLifecycleController().startBackgroundTasks(context.Background())
 }
 
 // heartbeatLoop 心跳循环；支持运行时通过 applyServerHeartbeatInterval 调整间隔。
@@ -2623,265 +2137,17 @@ var noReconnectCodes = map[int]bool{
 // aid/device_id/slot_id/quota_kind/evicted_by）。
 // 透传到应用层可订阅事件 'gateway.disconnect'，方便业务定位被踢原因。
 func (c *AUNClient) onGatewayDisconnect(payload any) {
-	data, _ := payload.(map[string]any)
-	if data == nil {
-		data = map[string]any{}
-	}
-	code := data["code"]
-	reason := data["reason"]
-	detail, _ := data["detail"].(map[string]any)
-	if detail == nil {
-		detail = map[string]any{}
-	}
-	c.log.Warn("server initiated disconnect: code=%v, reason=%v, detail=%v", code, reason, detail)
-	c.serverKicked.Store(true)
-	// 缓存最近一次 disconnect 信息，让后续 connection.state(connection_failed) 也能带 detail
-	c.lastDisconnectMu.Lock()
-	c.lastDisconnectInfo = map[string]any{
-		"code":   code,
-		"reason": reason,
-		"detail": detail,
-	}
-	c.lastDisconnectMu.Unlock()
-	// 透传给应用层订阅者（与 Python SDK 对齐）
-	c.events.Publish("gateway.disconnect", map[string]any{
-		"code":   code,
-		"reason": reason,
-		"detail": detail,
-	})
+	c.getLifecycleController().onGatewayDisconnect(payload)
 }
 
 // handleTransportDisconnect 传输层断线回调
 func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
-	c.log.Warn("transport disconnected: closeCode=%d err=%v", closeCode, err)
-	// 原子检查+设置状态，避免锁间隙中 close() 被调用后仍启动重连
-	c.mu.Lock()
-	isClosing := c.closing.Load()
-	state := c.state
-	if isClosing || state == StateClosed {
-		c.mu.Unlock()
-		return
-	}
-	c.state = StateDisconnected
-	c.authenticated = false
-	c.nextRetryAt = time.Time{}
-	c.mu.Unlock()
-
-	c.events.Publish("state_change", map[string]any{
-		"state": string(c.ConnectionState()),
-		"error": err,
-	})
-
-	c.mu.RLock()
-	autoReconnect := false
-	if opts := c.sessionOptions; opts != nil {
-		if v, ok := opts["auto_reconnect"].(bool); ok {
-			autoReconnect = v
-		}
-	}
-	c.mu.RUnlock()
-
-	if !autoReconnect {
-		return
-	}
-
-	// 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
-	if c.serverKicked.Load() || noReconnectCodes[closeCode] {
-		c.mu.Lock()
-		c.state = StateTerminalFailed
-		c.nextRetryAt = time.Time{}
-		c.mu.Unlock()
-		reason := "server kicked"
-		if !c.serverKicked.Load() {
-			reason = fmt.Sprintf("close code %d", closeCode)
-		}
-		c.log.Warn("suppressing auto-reconnect: %s", reason)
-		eventPayload := map[string]any{
-			"state":  string(c.ConnectionState()),
-			"error":  err,
-			"reason": reason,
-		}
-		// 把服务端 gateway.disconnect 附带的结构化 detail/code 也带给应用层（与 Python SDK 对齐）
-		c.lastDisconnectMu.Lock()
-		info := c.lastDisconnectInfo
-		c.lastDisconnectMu.Unlock()
-		if info != nil {
-			if detail, ok := info["detail"].(map[string]any); ok && len(detail) > 0 {
-				eventPayload["detail"] = detail
-			}
-			if code, ok := info["code"]; ok && code != nil {
-				eventPayload["code"] = code
-			}
-		}
-		c.events.Publish("state_change", eventPayload)
-		return
-	}
-
-	if c.reconnecting.CompareAndSwap(false, true) {
-		// closeCode == -1 表示网络异常断开（无 close frame），其他 code = 服务端主动关闭
-		serverInitiated := closeCode != -1
-		c.log.Info("triggering auto-reconnect: serverInitiated=%v closeCode=%d", serverInitiated, closeCode)
-		// 创建可取消的 context，供手动 connect 从 reconnecting 状态停止旧 loop
-		reconnCtx, reconnCancel := context.WithCancel(context.Background())
-		c.mu.Lock()
-		c.reconnectCancel = reconnCancel
-		c.mu.Unlock()
-		go c.reconnectLoop(reconnCtx, serverInitiated)
-	}
+	c.getLifecycleController().handleTransportDisconnect(err, closeCode)
 }
 
 // reconnectLoop 重连循环（指数退避 + 固定上限抖动，在不可重试错误、close()、ctx 取消、或超过最大重试次数时终止）
 func (c *AUNClient) reconnectLoop(ctx context.Context, serverInitiated bool) {
-	c.mu.RLock()
-	opts := c.sessionOptions
-	c.mu.RUnlock()
-
-	retryConfig, _ := opts["retry"].(map[string]any)
-	initialDelay := 1.0
-	maxBaseDelay := 64.0
-	maxAttempts := 0 // 0 表示无限重试
-	if retryConfig != nil {
-		if v, ok := retryConfig["initial_delay"].(float64); ok {
-			initialDelay = v
-		}
-		if v, ok := retryConfig["max_delay"].(float64); ok {
-			maxBaseDelay = v
-		}
-		if v, ok := retryConfig["max_attempts"].(float64); ok && v > 0 {
-			maxAttempts = int(v)
-		}
-	}
-	maxBaseDelay = clampReconnectDelaySeconds(maxBaseDelay, reconnectMaxBaseDelaySeconds, reconnectMaxBaseDelaySeconds)
-
-	// 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
-	delay := initialDelay
-	delayFallback := 1.0
-	if serverInitiated {
-		delay = 16.0
-		delayFallback = 16.0
-	}
-	delay = clampReconnectDelaySeconds(delay, delayFallback, maxBaseDelay)
-	for attempt := 1; !c.closing.Load() && ctx.Err() == nil; attempt++ {
-		// 超过最大重试次数时停止
-		if maxAttempts > 0 && attempt > maxAttempts {
-			c.log.Warn("reconnect exceeded max attempts %d, stopping retry", maxAttempts)
-			c.mu.Lock()
-			c.state = StateTerminalFailed
-			c.nextRetryAt = time.Time{}
-			c.mu.Unlock()
-			c.events.Publish("state_change", map[string]any{
-				"state":   string(c.ConnectionState()),
-				"error":   fmt.Errorf("超过最大重连次数 %d", maxAttempts),
-				"attempt": attempt - 1,
-			})
-			c.reconnecting.Store(false)
-			return
-		}
-
-		// 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
-		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全。
-		jitteredDelay := reconnectSleepDelaySeconds(delay, maxBaseDelay)
-		sleepDuration := time.Duration(jitteredDelay * float64(time.Second))
-		nextRetryAt := time.Now().Add(sleepDuration)
-		c.mu.Lock()
-		c.state = StateReconnecting
-		c.retryAttempt = attempt
-		c.nextRetryAt = nextRetryAt
-		c.mu.Unlock()
-
-		c.events.Publish("state_change", map[string]any{
-			"state":         string(c.ConnectionState()),
-			"attempt":       attempt,
-			"next_retry_at": nextRetryAt,
-		})
-
-		// 可中断 sleep：close() 或手动 connect 取消 ctx 时立即退出
-		select {
-		case <-time.After(sleepDuration):
-		case <-ctx.Done():
-			c.reconnecting.Store(false)
-			return
-		}
-
-		// close() 可能在 sleep 期间被调用
-		if c.closing.Load() || ctx.Err() != nil {
-			c.reconnecting.Store(false)
-			return
-		}
-		c.mu.Lock()
-		c.nextRetryAt = time.Time{}
-		c.state = StateReconnecting
-		c.mu.Unlock()
-		c.events.Publish("state_change", map[string]any{
-			"state":   string(c.ConnectionState()),
-			"attempt": attempt,
-		})
-
-		// 重连前先 GET /health 探测，不健康则跳过本轮
-		c.mu.RLock()
-		gw := c.gatewayURL
-		c.mu.RUnlock()
-		if gw != "" {
-			healthy := c.discovery.CheckHealth(context.Background(), gw, 5*time.Second)
-			if !healthy {
-				delay = delay * 2
-				if delay > maxBaseDelay {
-					delay = maxBaseDelay
-				}
-				continue
-			}
-		}
-
-		// 关闭旧连接
-		_ = c.transport.Close()
-
-		// 重新连接
-		c.mu.RLock()
-		params := c.sessionParams
-		c.mu.RUnlock()
-		if params == nil {
-			c.mu.Lock()
-			c.state = StateTerminalFailed
-			c.nextRetryAt = time.Time{}
-			c.mu.Unlock()
-			c.events.Publish("state_change", map[string]any{"state": string(c.ConnectionState())})
-			c.reconnecting.Store(false)
-			return
-		}
-
-		err := c.connectOnce(context.Background(), params, true)
-		if err == nil {
-			c.log.Info("reconnect succeeded: attempt=%d", attempt)
-			c.reconnecting.Store(false)
-			return
-		}
-
-		c.log.Warn("reconnect failed: attempt=%d err=%v", attempt, err)
-		c.events.Publish("connection.error", map[string]any{
-			"error":   err,
-			"attempt": attempt,
-		})
-
-		if !shouldRetryReconnect(err) {
-			c.mu.Lock()
-			c.state = StateTerminalFailed
-			c.nextRetryAt = time.Time{}
-			c.mu.Unlock()
-			c.events.Publish("state_change", map[string]any{
-				"state":   string(c.ConnectionState()),
-				"error":   err,
-				"attempt": attempt,
-			})
-			c.reconnecting.Store(false)
-			return
-		}
-
-		delay = delay * 2
-		if delay > maxBaseDelay {
-			delay = maxBaseDelay
-		}
-	}
-	c.reconnecting.Store(false)
+	c.getLifecycleController().reconnectLoop(ctx, serverInitiated)
 }
 
 // shouldRetryReconnect 判断错误是否应该重试

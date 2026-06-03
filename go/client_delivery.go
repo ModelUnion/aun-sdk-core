@@ -961,15 +961,13 @@ func (d *messageDeliveryEngine) enqueueOnlineUnreadHint(data map[string]any) {
 		return
 	}
 	c.onlineUnreadHintMu.Lock()
-	if c.onlineUnreadHintQueue == nil {
-		c.onlineUnreadHintQueue = make(map[string]map[string]any)
-	}
-	c.onlineUnreadHintQueue[groupID] = copyMapShallow(data)
+	queue := d.runtime.delivery.onlineUnreadHintQueueLocked()
+	queue[groupID] = copyMapShallow(data)
 	if c.onlineUnreadHintDraining {
 		c.onlineUnreadHintMu.Unlock()
 		return
 	}
-	c.onlineUnreadHintDraining = true
+	d.runtime.delivery.setOnlineUnreadHintDrainingLocked(true)
 	c.onlineUnreadHintMu.Unlock()
 	go d.drainOnlineUnreadHints()
 }
@@ -985,7 +983,7 @@ func (d *messageDeliveryEngine) drainOnlineUnreadHints() {
 	}
 	defer func() {
 		c.onlineUnreadHintMu.Lock()
-		c.onlineUnreadHintDraining = false
+		d.runtime.delivery.setOnlineUnreadHintDrainingLocked(false)
 		c.onlineUnreadHintMu.Unlock()
 	}()
 	for {
@@ -1210,13 +1208,11 @@ func (d *messageDeliveryEngine) enqueueOrderedMessage(ns, event string, seq int,
 	}
 	c.pendingOrderedMsgsMu.Lock()
 	defer c.pendingOrderedMsgsMu.Unlock()
-	if c.pendingOrderedMsgs == nil {
-		c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
-	}
-	queue := c.pendingOrderedMsgs[ns]
+	pending := d.runtime.delivery.pendingOrderedMsgsLocked()
+	queue := pending[ns]
 	if queue == nil {
 		queue = make(map[int]pendingOrderedMessage)
-		c.pendingOrderedMsgs[ns] = queue
+		pending[ns] = queue
 	}
 	queue[seq] = pendingOrderedMessage{event: event, payload: payload}
 	if len(queue) > pendingOrderedLimit {

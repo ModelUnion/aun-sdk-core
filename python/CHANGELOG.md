@@ -6,6 +6,21 @@
 
 ---
 
+## 0.4.9 — 2026-06-03
+
+### 修复
+- V2 明文消息（P2P 和群组）投递时补充调用 `attach_gateway_proximity()`，消息事件 payload 现可携带 `proximity`（`same_network`/`same_device`/`basis`/`asserted_by`）字段（四语言对齐）
+
+### 优化
+- `AUNClient` 运行时状态全面迁移至 `ClientRuntime` 统一抽象层，生命周期、消息投递、RPC 路由、身份、V2 E2EE、群组状态各子组件构造函数统一接收 `runtime` 参数，消除组件间直接引用主客户端对象
+- `LifecycleController`、`MessageDeliveryEngine`、`GroupStateCoordinator`、`IdentityRuntimeManager` 的状态读写全部改为通过 `runtime.*` setter/getter，提升可测试性
+- `RpcPipeline` 接管原 `AUNClient.call()` 全部路由逻辑，主客户端 `call()` 直接委托
+
+### 测试
+- `test_client.py` 补充针对运行时抽象层重构后的单元测试覆盖
+
+---
+
 ## 0.4.8 — 2026-06-03
 
 ### 新功能

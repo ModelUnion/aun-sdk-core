@@ -364,16 +364,14 @@ func (g *groupStateCoordinator) maybeTriggerAutoPropose(groupID string) {
 		return
 	}
 	c.v2AutoProposeLocksMu.Lock()
-	if c.v2LazyProposeTriggered == nil {
-		c.v2LazyProposeTriggered = make(map[string]int64)
-	}
+	lazyProposeTriggered := g.runtime.groupState.lazyProposeTriggeredLocked()
 	now := time.Now().Unix()
-	last := c.v2LazyProposeTriggered[groupID]
+	last := lazyProposeTriggered[groupID]
 	if now-last < 10 {
 		c.v2AutoProposeLocksMu.Unlock()
 		return
 	}
-	c.v2LazyProposeTriggered[groupID] = now
+	lazyProposeTriggered[groupID] = now
 	c.v2AutoProposeLocksMu.Unlock()
 	go c.v2AutoProposeStateFromEvent(context.Background(), groupID)
 }

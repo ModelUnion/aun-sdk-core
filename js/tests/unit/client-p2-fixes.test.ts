@@ -105,7 +105,7 @@ describe('P2-6: 补洞路径不应重复调用 onPullResult', () => {
     expect(pullV2Spy).toHaveBeenCalledWith(2, 50);
   });
 
-  it('_fillGroupGap 不应重复调用 onPullResult', async () => {
+  it('_delivery.fillGroupGap 不应重复调用 onPullResult', async () => {
     const messages = [
       { seq: 3, content: 'msg-3' },
       { seq: 4, content: 'msg-4' },
@@ -117,7 +117,7 @@ describe('P2-6: 补洞路径不应重复调用 onPullResult', () => {
     // 模拟已有 seq 1-2 的状态
     (client as any)._seqTracker.onPullResult('group:group-123', [{ seq: 1 }, { seq: 2 }]);
 
-    await (client as any)._fillGroupGap('group-123');
+    await (client as any)._delivery.fillGroupGap('group-123');
 
     expect(pullGroupV2Spy).toHaveBeenCalledTimes(1);
     expect(pullGroupV2Spy).toHaveBeenCalledWith('group-123', 2, 50);
@@ -217,7 +217,7 @@ describe('P2-6.6: group.changed 事件补洞链路', () => {
       return { ok: true };
     });
 
-    await (client as any)._fillGroupEventGap('G1');
+    await (client as any)._delivery.fillGroupEventGap('G1');
 
     expect((client as any)._seqTracker.getContiguousSeq('group_event:G1')).toBe(9);
     expect(transportCalls.some(({ method }) => method === 'group.ack_events')).toBe(false);
@@ -255,7 +255,7 @@ describe('P2-6.6: group.changed 事件补洞链路', () => {
       }
     });
 
-    await (client as any)._fillGroupEventGap('G1');
+    await (client as any)._delivery.fillGroupEventGap('G1');
 
     const ackCalls = transportCalls.filter(({ method }) => method === 'group.ack_events');
     expect(ackCalls).toHaveLength(1);

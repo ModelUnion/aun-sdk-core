@@ -6,6 +6,7 @@ import { ClientRuntime, type ClientHost } from './runtime.js';
 const PUBLIC_CONNECTION_OPTION_KEYS = new Set([
   'auto_reconnect',
   'connect_timeout',
+  'retry',
   'retry_initial_delay',
   'retry_max_delay',
   'retry_max_attempts',
@@ -88,27 +89,25 @@ export class LifecycleController {
     if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
       throw new ValidationError('authenticate options must not include aid or token fields; load an AID object first');
     }
-    client._state = 'connecting';
+    this.runtime.lifecycle.setState('connecting');
     try {
       const gateway = String(client._gatewayUrl ?? await client._resolveGatewayForAid(target)).trim();
       const result = await client._auth.authenticate(gateway, { aid: target });
-      client._gatewayUrl = gatewayFromAuthResult(result, gateway);
+      this.runtime.lifecycle.setGatewayUrl(gatewayFromAuthResult(result, gateway));
       let loadedIdentity: Record<string, unknown> | null = null;
       try {
         loadedIdentity = client._auth.loadIdentityOrNone(target);
       } catch (exc) {
         client._clientLog.debug(`authenticate identity reload skipped: ${exc instanceof Error ? exc.message : String(exc)}`);
       }
-      client._identity = loadedIdentity ?? identityFromAuthResult(client, result, target);
-      client._state = 'authenticated';
-      client._lastError = null;
-      client._lastErrorCode = null;
+      this.runtime.identity.setIdentity(loadedIdentity ?? identityFromAuthResult(client, result, target));
+      this.runtime.lifecycle.setState('authenticated');
+      this.runtime.lifecycle.setError(null, null);
       client._clientLog.debug(`authenticate exit: elapsed=${Date.now() - tStart}ms aid=${target}`);
       return result as Record<string, unknown>;
     } catch (err) {
-      client._state = 'standby';
-      client._lastError = err instanceof Error ? err : new Error(String(err));
-      client._lastErrorCode = 'AUTHENTICATE_FAILED';
+      this.runtime.lifecycle.setState('standby');
+      this.runtime.lifecycle.setError(err instanceof Error ? err : new Error(String(err)), 'AUTHENTICATE_FAILED');
       client._clientLog.debug(`authenticate exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
@@ -137,11 +136,16 @@ export class LifecycleController {
         ...(opts.call_timeout !== undefined ? { call: opts.call_timeout } : {}),
       };
     }
+    if (opts?.retry !== undefined) options.retry = opts.retry;
     if (opts?.retry_initial_delay !== undefined || opts?.retry_max_delay !== undefined || opts?.retry_max_attempts !== undefined) {
+      const baseRetry = isRecord(options.retry)
+        ? { ...options.retry }
+        : { initial_delay: 1, max_delay: 64, max_attempts: 0 };
       options.retry = {
-        initial_delay: opts.retry_initial_delay ?? 1,
-        max_delay: opts.retry_max_delay ?? 64,
-        max_attempts: opts.retry_max_attempts ?? 0,
+        ...baseRetry,
+        ...(opts.retry_initial_delay !== undefined ? { initial_delay: opts.retry_initial_delay } : {}),
+        ...(opts.retry_max_delay !== undefined ? { max_delay: opts.retry_max_delay } : {}),
+        ...(opts.retry_max_attempts !== undefined ? { max_attempts: opts.retry_max_attempts } : {}),
       };
     }
     if (opts?.connection_kind !== undefined) options.connection_kind = opts.connection_kind;
@@ -163,28 +167,26 @@ export class LifecycleController {
       client._stopReconnect();
     }
     if (publicState === ConnectionState.CONNECTION_FAILED) {
-      client._retryAttempt = 0;
-      client._lastError = null;
-      client._lastErrorCode = null;
+      this.runtime.lifecycle.setRetryAttempt(0);
+      this.runtime.lifecycle.setError(null, null);
     }
-    client._nextRetryAt = null;
+    this.runtime.lifecycle.setNextRetryAt(null);
     let authResult: Record<string, unknown> | null = null;
     if (!client._gatewayUrl) {
       authResult = await client.authenticate();
     }
-    client._state = 'connecting';
+    this.runtime.lifecycle.setState('connecting');
     const gateway = String(client._gatewayUrl ?? '').trim();
     const accessToken = accessTokenFromAuthResult(authResult) || cachedAccessToken(client);
     const params = { ...options, gateway, ...(accessToken ? { access_token: accessToken } : {}) };
     const normalized = client._normalizeConnectParams(params);
     client._captureCapabilitiesFromConnect(normalized);
-    client._sessionParams = normalized;
-    client._sessionOptions = client._buildSessionOptions(normalized);
+    this.runtime.lifecycle.setSession(normalized, client._buildSessionOptions(normalized));
     const callTimeoutSec = client._sessionOptions.timeouts.call;
     client._transport.setTimeout(
       callTimeoutSec != null ? callTimeoutSec * 1000 : 35_000,
     );
-    client._closing = false;
+    this.runtime.lifecycle.setClosing(false);
     client._clientLog.debug(`connect enter: gateway=${String(normalized.gateway ?? '')}, device_id=${client._deviceId}`);
 
     const gateways = client._resolveGateways(normalized);
@@ -193,8 +195,7 @@ export class LifecycleController {
       try {
         const gwParams = { ...normalized, gateway: gw };
         await client._connectOnce(gwParams, true);
-        client._lastError = null;
-        client._lastErrorCode = null;
+        this.runtime.lifecycle.setError(null, null);
         client._clientLog.debug(`connect exit: elapsed=${Date.now() - tStart}ms aid=${client._aid ?? ''}, state=${client._state}`);
         return;
       } catch (err) {
@@ -202,16 +203,80 @@ export class LifecycleController {
         if (gateways.length > 1) {
           client._clientLog.warn(`connect: gateway ${gw} failed, trying next: ${formatCaughtError(err)}`);
         }
-        if (client._state !== 'closed') client._state = 'connecting';
+        if (client._state !== 'closed') this.runtime.lifecycle.setState('connecting');
       }
     }
     if (client._state === 'connecting' || client._state === 'authenticating') {
-      client._state = client._currentAid || client._aid ? 'standby' : 'no_identity';
+      this.runtime.lifecycle.setState(client._currentAid || client._aid ? 'standby' : 'no_identity');
     }
-    client._lastError = lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-    client._lastErrorCode = 'CONNECT_FAILED';
+    this.runtime.lifecycle.setError(lastErr instanceof Error ? lastErr : new Error(String(lastErr)), 'CONNECT_FAILED');
     client._clientLog.error(`connect failed: ${formatCaughtError(lastErr)}`, lastErr instanceof Error ? lastErr : undefined);
     client._clientLog.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
     throw lastErr;
+  }
+
+  async close(): Promise<void> {
+    const client = this.runtime.client;
+    const tStart = Date.now();
+    client._clientLog.debug(`close enter: state=${client._state}, aid=${client._aid ?? ''}`);
+    try {
+      this.runtime.lifecycle.setClosing(true);
+      client._saveSeqTrackerState();
+      client._stopBackgroundTasks();
+      client._stopReconnect();
+      if (client.state === ConnectionState.NO_IDENTITY || client.state === ConnectionState.CLOSED) {
+        const closableStore = client._tokenStore as { close?: () => void };
+        closableStore.close?.();
+        this.runtime.lifecycle.setState('closed');
+        client._logger.close();
+        client._resetSeqTrackingState();
+        client._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms (was no_identity/closed)`);
+        return;
+      }
+      await client._transport.close();
+      const closableStore = client._tokenStore as { close?: () => void };
+      closableStore.close?.();
+      this.runtime.lifecycle.setState('closed');
+      client._logger.close();
+      await client._dispatcher.publish('state_change', { state: client._publicState(client._state) });
+      client._resetSeqTrackingState();
+      client._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
+    } catch (err) {
+      client._clientLog.debug(`close exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    const client = this.runtime.client;
+    const tStart = Date.now();
+    client._clientLog.debug(`disconnect enter: state=${client._state}, aid=${client._aid ?? ''}, closing=${client._closing}`);
+    try {
+      if (client._closing) {
+        client._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (closing)`);
+        return;
+      }
+      if (![
+        ConnectionState.AUTHENTICATED,
+        ConnectionState.CONNECTING,
+        ConnectionState.READY,
+        ConnectionState.RETRY_BACKOFF,
+        ConnectionState.RECONNECTING,
+        ConnectionState.CONNECTION_FAILED,
+      ].includes(client.state)) {
+        client._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (state=${client._state})`);
+        return;
+      }
+      client._saveSeqTrackerState();
+      client._stopBackgroundTasks();
+      client._stopReconnect();
+      await client._transport.close();
+      this.runtime.lifecycle.resetForDisconnect('standby');
+      await client._dispatcher.publish('state_change', { state: client._publicState(client._state) });
+      client._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
+    } catch (err) {
+      client._clientLog.debug(`disconnect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 }

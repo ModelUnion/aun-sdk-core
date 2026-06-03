@@ -20,6 +20,7 @@
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
+| [Notify 通知方案](sdk/Notify通知方案.md) | `client.notify()` 在线轻量通知、路由和可靠消息分工 |
 | [协议文档目录](protocol/) | AUN 协议相关文档 |
 | [审查与路线图目录](audit/) | 历史审查、修复路线图、测试补充清单 |
 | [superpowers 目录](superpowers/) | AUN SDK 规范类补充文档 |
@@ -41,6 +42,7 @@
 
 - Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制 → [SDK 文档索引](sdk/INDEX.md)
 - 按主题和行区间查 SDK 文档 → [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md)
+- `client.notify()` 在线轻量通知、AID/群路由和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
 - agent.md 远程缓存、`remote_etag` / `local_etag`、消息信封 ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
 
@@ -109,3 +111,7 @@
 ### SDK 查阅指南
 
 `docs/sdk/AUN_DOCS_GUIDE.md` 说明如何按行区间渐进式读取 SDK 文档，避免一次性加载过多文档内容。
+
+### Notify 通知方案
+
+定义 `client.notify()` 的 JSON-RPC Notification 发送语义。方案规定 notify 只投递在线长连接设备，不做离线存储、不分配 seq、不进入 pull/ack；同时说明服务端通知、AID 在线转发、群在线转发的路由模型，以及和 `message.send` / `group.send` 可靠应用事件的分工。

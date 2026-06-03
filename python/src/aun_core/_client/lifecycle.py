@@ -17,13 +17,15 @@ from ..errors import (
     ValidationError,
 )
 from ..types import ConnectionState
+from .runtime import ClientRuntime
 
 
 class LifecycleController:
     """连接生命周期、后台任务与重连协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     async def authenticate(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """获取访问 token，但不建立长连接。"""
@@ -40,11 +42,10 @@ class LifecycleController:
         try:
             if not gateway_url:
                 gateway_url = await client._discover_gateway_for_aid(client._aid)
-            client._gateway_url = gateway_url
+            self.runtime.lifecycle.set_gateway_url(gateway_url)
             client._log.debug("client", "authenticate enter: aid=%s gateway=%s", client._aid, gateway_url)
             result = await client._auth.authenticate(gateway_url, aid=client._aid)
-            client._aid = str(result.get("aid") or client._aid)
-            client._auth._aid = client._aid
+            self.runtime.identity.set_aid(str(result.get("aid") or client._aid))
             identity = dict(client._identity) if client._identity else {"aid": client._aid}
             access_token = result.get("access_token")
             if access_token:
@@ -55,10 +56,9 @@ class LifecycleController:
             expires_at = result.get("access_token_expires_at", result.get("expires_at"))
             if expires_at is not None:
                 identity["access_token_expires_at"] = expires_at
-            client._identity = identity
-            client._state = ConnectionState.AUTHENTICATED.value
-            client._last_error = None
-            client._last_error_code = None
+            self.runtime.identity.set_identity(identity)
+            self.runtime.lifecycle.set_state(ConnectionState.AUTHENTICATED.value)
+            self.runtime.lifecycle.clear_error()
             client._log.debug(
                 "client",
                 "authenticate exit: elapsed=%.3fs aid=%s",
@@ -67,8 +67,7 @@ class LifecycleController:
             )
             return result
         except Exception as exc:
-            client._last_error = exc
-            client._last_error_code = "authenticate_failed"
+            self.runtime.lifecycle.set_error(exc, "authenticate_failed")
             client._log.debug(
                 "client",
                 "authenticate exit (error): elapsed=%.3fs aid=%s err=%s",
@@ -152,20 +151,18 @@ class LifecycleController:
                 await client._reconnect_task
             except asyncio.CancelledError:
                 pass
-            client._reconnect_task = None
+            self.runtime.lifecycle.clear_reconnect_task()
 
         if client._public_state == ConnectionState.CONNECTION_FAILED:
-            client._retry_attempt = 0
-            client._last_error = None
-            client._last_error_code = None
-        client._next_retry_at = None
+            self.runtime.lifecycle.set_retry_attempt(0)
+            self.runtime.lifecycle.clear_error()
+        self.runtime.lifecycle.set_next_retry_at(None)
 
         normalized = client._normalize_connect_params(params)
-        client._state = ConnectionState.CONNECTING.value
-        client._session_params = normalized
-        client._session_options = client._build_session_options(normalized)
+        self.runtime.lifecycle.set_state(ConnectionState.CONNECTING.value)
+        self.runtime.lifecycle.set_session(normalized, client._build_session_options(normalized))
         client._transport.set_timeout(client._session_options["timeouts"]["call"])
-        client._closing = False
+        self.runtime.lifecycle.set_closing(False)
 
         gateways = client._resolve_gateways(normalized)
         client._log.debug("client", "connect enter: gateways=%s", gateways)
@@ -176,10 +173,9 @@ class LifecycleController:
                 gw_params["gateway"] = gw
                 await client._connect_once(gw_params, allow_reauth=False)
                 if client._public_state != ConnectionState.READY:
-                    client._state = ConnectionState.READY.value
-                client._last_error = None
-                client._last_error_code = None
-                client._next_retry_at = None
+                    self.runtime.lifecycle.set_state(ConnectionState.READY.value)
+                self.runtime.lifecycle.clear_error()
+                self.runtime.lifecycle.set_next_retry_at(None)
                 client._log.debug(
                     "client",
                     "connect exit: elapsed=%.3fs gateway=%s aid=%s",
@@ -193,13 +189,12 @@ class LifecycleController:
                 if len(gateways) > 1:
                     client._log.warn("client", "connect: gateway %s failed, trying next: %s", gw, exc)
                 if client._public_state == ConnectionState.CONNECTING:
-                    client._state = ConnectionState.CONNECTING.value
+                    self.runtime.lifecycle.set_state(ConnectionState.CONNECTING.value)
 
         if client._public_state == ConnectionState.CONNECTING:
-            client._state = ConnectionState.STANDBY.value if client.has_identity else ConnectionState.NO_IDENTITY.value
+            self.runtime.lifecycle.set_state(ConnectionState.STANDBY.value if client.has_identity else ConnectionState.NO_IDENTITY.value)
         if last_error is not None:
-            client._last_error = last_error
-            client._last_error_code = "connect_failed"
+            self.runtime.lifecycle.set_error(last_error, "connect_failed")
         client._log.warn(
             "client",
             "connect exit (error): elapsed=%.3fs gateways=%s err=%s",
@@ -242,18 +237,14 @@ class LifecycleController:
                 await client._reconnect_task
             except asyncio.CancelledError:
                 pass
-            client._reconnect_task = None
+            self.runtime.lifecycle.clear_reconnect_task()
         await client._transport.close()
-        client._identity = None
-        client._next_retry_at = None
-        client._retry_attempt = 0
-        client._last_error = None
-        client._last_error_code = None
-        client._state = (
+        next_state = (
             ConnectionState.STANDBY.value
             if client._current_aid is not None or client._aid
             else ConnectionState.NO_IDENTITY.value
         )
+        self.runtime.lifecycle.reset_for_disconnect(next_state)
         await client._dispatcher.publish("state_change", {"state": client._state})
         client._log.debug("client", "disconnect exit: elapsed=%.3fs state=%s", time.time() - _t_start, client._state)
 
@@ -261,7 +252,7 @@ class LifecycleController:
         client = self.client
         _t_start = time.time()
         client._log.debug("client", "close enter: state=%s", client._state)
-        client._closing = True
+        self.runtime.lifecycle.set_closing(True)
         try:
             # 关闭前保存 SeqTracker 状态
             client._save_seq_tracker_state()
@@ -272,19 +263,9 @@ class LifecycleController:
                     await client._reconnect_task
                 except asyncio.CancelledError:
                     pass  # 任务取消，正常清理
-                client._reconnect_task = None
+                self.runtime.lifecycle.clear_reconnect_task()
             if client._state in {"idle", "closed"}:
-                client._state = "closed"
-                client._current_aid = None
-                client._aid = None
-                client._identity = None
-                client._gateway_url = None
-                client._peer_gateway_cache.clear()
-                client._session_params = None
-                client._next_retry_at = None
-                client._retry_attempt = 0
-                client._last_error = None
-                client._last_error_code = None
+                self.runtime.lifecycle.reset_for_close()
                 client._reset_seq_tracking_state()
                 client._log.debug(
                     "client",
@@ -294,17 +275,7 @@ class LifecycleController:
                 )
                 return
             await client._transport.close()
-            client._state = "closed"
-            client._current_aid = None
-            client._aid = None
-            client._identity = None
-            client._gateway_url = None
-            client._peer_gateway_cache.clear()
-            client._session_params = None
-            client._next_retry_at = None
-            client._retry_attempt = 0
-            client._last_error = None
-            client._last_error_code = None
+            self.runtime.lifecycle.reset_for_close()
             await client._dispatcher.publish("state_change", {"state": client._state})
             client._reset_seq_tracking_state()
             client._log.debug("client", "close exit: elapsed=%.3fs state=%s", time.time() - _t_start, client._state)
@@ -317,15 +288,17 @@ class LifecycleController:
         client = self.client
         _t_start = time.time()
         gateway_url = client._resolve_gateway(params)
-        client._gateway_url = gateway_url
-        client._loop = asyncio.get_running_loop()
-        client._slot_id = normalize_slot_id(params.get("slot_id"))
-        client._connect_delivery_mode = dict(params.get("delivery_mode") or client._connect_delivery_mode)
+        self.runtime.lifecycle.set_gateway_url(gateway_url)
+        self.runtime.lifecycle.set_loop(asyncio.get_running_loop())
+        self.runtime.identity.set_instance_context(
+            device_id=client._device_id,
+            slot_id=normalize_slot_id(params.get("slot_id")),
+        )
+        self.runtime.lifecycle.set_connect_delivery_mode(dict(params.get("delivery_mode") or client._connect_delivery_mode))
         connection_kind = str(params.get("connection_kind") or "long")
         short_ttl_ms = int(params.get("short_ttl_ms") or 0)
         extra_info = params.get("extra_info") if isinstance(params.get("extra_info"), dict) else None
-        client._auth.set_instance_context(device_id=client._device_id, slot_id=client._slot_id)
-        client._state = "connecting"
+        self.runtime.lifecycle.set_state("connecting")
         client._log.debug(
             "client",
             "_connect_once enter: gateway=%s allow_reauth=%s kind=%s",
@@ -348,7 +321,7 @@ class LifecycleController:
                     net._refresh_dns_cache_after_success(gateway_url)
                 except Exception as exc:
                     client._log.debug("client", "DNS cache refresh skipped: %s", exc)
-            client._state = "authenticating"
+            self.runtime.lifecycle.set_state("authenticating")
             client._log.debug("client", "auth phase start: mode=%s", "reauth" if allow_reauth else "token")
             if allow_reauth:
                 auth_context = await client._auth.connect_session(
@@ -365,8 +338,8 @@ class LifecycleController:
                 )
                 identity = auth_context.get("identity") if isinstance(auth_context, dict) else None
                 if isinstance(identity, dict):
-                    client._identity = identity
-                    client._aid = identity.get("aid", client._aid)
+                    self.runtime.identity.set_identity(identity)
+                    self.runtime.identity.set_aid(identity.get("aid", client._aid))
                     if client._session_params is not None:
                         client._session_params["access_token"] = auth_context.get("token", params.get("access_token"))
                 hello = auth_context.get("hello") if isinstance(auth_context, dict) else None
@@ -387,11 +360,10 @@ class LifecycleController:
                 client._sync_identity_after_connect(str(params["access_token"]))
                 if isinstance(hello, dict) and "heartbeat_interval" in hello:
                     client._apply_server_heartbeat_interval(hello.get("heartbeat_interval"), source="auth")
-            client._state = ConnectionState.READY.value
-            client._connected_at = time.time()
-            client._last_error = None
-            client._last_error_code = None
-            client._next_retry_at = None
+            self.runtime.lifecycle.set_state(ConnectionState.READY.value)
+            self.runtime.lifecycle.set_connected_at(time.time())
+            self.runtime.lifecycle.clear_error()
+            self.runtime.lifecycle.set_next_retry_at(None)
             client._log.debug(
                 "client",
                 "auth complete, state changed to ready: gateway=%s aid=%s",
@@ -451,7 +423,6 @@ class LifecycleController:
         for attr in (
             "_heartbeat_task",
             "_token_refresh_task",
-            "_cache_cleanup_task",
             "_online_unread_hint_task",
         ):
             task = getattr(client, attr, None)
@@ -481,14 +452,14 @@ class LifecycleController:
         if interval <= 0:
             return
         if client._heartbeat_nudge is None:
-            client._heartbeat_nudge = asyncio.Event()
-        client._heartbeat_task = asyncio.create_task(client._heartbeat_loop())
+            self.runtime.lifecycle.set_heartbeat_nudge(asyncio.Event())
+        self.runtime.lifecycle.set_heartbeat_task(asyncio.create_task(client._heartbeat_loop()))
 
     def start_token_refresh_task(self) -> None:
         client = self.client
         if client._token_refresh_task is not None and not client._token_refresh_task.done():
             return
-        client._token_refresh_task = asyncio.create_task(client._token_refresh_loop())
+        self.runtime.lifecycle.set_token_refresh_task(asyncio.create_task(client._token_refresh_loop()))
 
     async def heartbeat_loop(self) -> None:
         from ..client import _clamp_heartbeat_interval
@@ -569,7 +540,7 @@ class LifecycleController:
                 if identity is None:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
                     continue
-                client._identity = identity
+                self.runtime.identity.set_identity(identity)
                 expires_at = client._auth.get_access_token_expiry(identity)
                 if expires_at is None:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
@@ -583,28 +554,28 @@ class LifecycleController:
                     if client._public_state != ConnectionState.READY:
                         client._log.debug("client", "token refresh succeeded but state changed, discarding result")
                         return
-                    client._identity = identity
+                    self.runtime.identity.set_identity(identity)
                     if client._session_params is not None and identity.get("access_token"):
                         client._session_params["access_token"] = identity["access_token"]
                     await client._dispatcher.publish("token.refreshed", {
                         "aid": identity.get("aid"),
                         "expires_at": identity.get("access_token_expires_at"),
                     })
-                    client._token_refresh_failures = 0  # 刷新成功，重置连续失败计数
+                    self.runtime.lifecycle.set_token_refresh_failures(0)  # 刷新成功，重置连续失败计数
                 except AuthError as exc:
-                    client._token_refresh_failures += 1
-                    if client._token_refresh_failures >= _TOKEN_REFRESH_MAX_FAILURES:
+                    failures = self.runtime.lifecycle.increment_token_refresh_failures()
+                    if failures >= _TOKEN_REFRESH_MAX_FAILURES:
                         client._log.warn(
                             "client",
                             "token 刷新连续失败 %d 次，停止刷新循环并触发重连",
-                            client._token_refresh_failures,
+                            failures,
                         )
                         await client._dispatcher.publish("token.refresh_exhausted", {
                             "aid": client._identity.get("aid") if client._identity else None,
-                            "consecutive_failures": client._token_refresh_failures,
+                            "consecutive_failures": failures,
                             "last_error": str(exc),
                         })
-                        client._token_refresh_failures = 0
+                        self.runtime.lifecycle.set_token_refresh_failures(0)
                         # 不直接调用 _handle_transport_disconnect（会 cancel 自身导致递归），
                         # 而是关闭 transport 让 on_disconnect 回调自然触发重连。
                         if client._transport and not getattr(client._transport, "_closed", True):
@@ -614,7 +585,7 @@ class LifecycleController:
                         client._log.debug(
                             "client",
                             "token 刷新失败 (%d/%d)，下次检查后重试: %s",
-                            client._token_refresh_failures,
+                            failures,
                             _TOKEN_REFRESH_MAX_FAILURES,
                             exc,
                         )
@@ -641,9 +612,9 @@ class LifecycleController:
             reason,
             detail,
         )
-        client._server_kicked = True
+        self.runtime.lifecycle.set_server_kicked(True)
         # 缓存最近一次 disconnect 信息，让后续 connection.state(terminal_failed) 也能带 detail
-        client._last_disconnect_info = {"code": code, "reason": reason, "detail": detail}
+        self.runtime.lifecycle.set_last_disconnect_info({"code": code, "reason": reason, "detail": detail})
         # 透传给应用层订阅者
         try:
             await client._dispatcher.publish("gateway.disconnect", {
@@ -664,22 +635,20 @@ class LifecycleController:
         except Exception as exc:
             client._log.debug("client", "failed to save SeqTracker on disconnect: %s", exc)
         if not bool(client._session_options["auto_reconnect"]):
-            client._state = ConnectionState.STANDBY.value if client.has_identity else ConnectionState.NO_IDENTITY.value
-            client._identity = None
-            client._next_retry_at = None
-            client._retry_attempt = 0
-            client._last_error = error
-            client._last_error_code = "transport_disconnected" if error else None
+            self.runtime.lifecycle.reset_for_disconnect(
+                ConnectionState.STANDBY.value if client.has_identity else ConnectionState.NO_IDENTITY.value
+            )
+            self.runtime.lifecycle.set_error(error, "transport_disconnected" if error else None)
             await client._dispatcher.publish("state_change", {"state": client._state, "error": error})
             return
         if client._reconnect_task is not None and not client._reconnect_task.done():
             return
         # 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
         if client._server_kicked or (close_code is not None and close_code in client._NO_RECONNECT_CODES):
-            client._state = ConnectionState.CONNECTION_FAILED.value
-            client._last_error = error
-            client._last_error_code = "server_kicked" if client._server_kicked else "no_reconnect_close_code"
-            client._next_retry_at = None
+            self.runtime.lifecycle.set_connection_failed(
+                error=error,
+                code="server_kicked" if client._server_kicked else "no_reconnect_close_code",
+            )
             reason = "server kicked" if client._server_kicked else f"close code {close_code}"
             client._log.warn("client", "suppressing auto-reconnect: %s", reason)
             disconnect_info = getattr(client, "_last_disconnect_info", None) or {}
@@ -697,7 +666,7 @@ class LifecycleController:
         # 1006 = 网络异常断开（无 close frame），1000 = 正常关闭（客户端主动）
         # 其他 code = 服务端主动关闭
         server_initiated = close_code is not None and close_code not in (1000, 1006)
-        client._reconnect_task = asyncio.create_task(client._reconnect_loop(server_initiated))
+        self.runtime.lifecycle.set_reconnect_task(asyncio.create_task(client._reconnect_loop(server_initiated)))
 
     async def reconnect_loop(self, server_initiated: bool = False) -> None:
         from ..client import (
@@ -723,8 +692,8 @@ class LifecycleController:
         )
         delay = base_delay
         attempt = 0
-        client._retry_attempt = 0
-        client._retry_max_attempts = max_attempts
+        self.runtime.lifecycle.set_retry_attempt(0)
+        self.runtime.lifecycle.set_retry_max_attempts(max_attempts)
         client._log.debug(
             "client",
             "reconnect loop started: server_initiated=%s max_attempts=%s base_delay=%.1fs",
@@ -735,10 +704,11 @@ class LifecycleController:
 
         while not client._closing:
             attempt += 1
-            client._retry_attempt = attempt
             sleep_delay = _reconnect_sleep_delay(delay, max_base_delay)
-            client._next_retry_at = time.time() + sleep_delay
-            client._state = ConnectionState.RETRY_BACKOFF.value
+            self.runtime.lifecycle.set_retry_backoff(
+                attempt=attempt,
+                next_retry_at=time.time() + sleep_delay,
+            )
             await client._dispatcher.publish("state_change", {
                 "state": client._state,
                 "attempt": attempt,
@@ -748,24 +718,24 @@ class LifecycleController:
                 # 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
                 await client._reconnect_sleep(sleep_delay)
                 if client._closing:
-                    client._next_retry_at = None
-                    client._reconnect_task = None
+                    self.runtime.lifecycle.set_next_retry_at(None)
+                    self.runtime.lifecycle.clear_reconnect_task()
                     return
-                client._next_retry_at = None
-                client._state = ConnectionState.RECONNECTING.value
+                self.runtime.lifecycle.set_next_retry_at(None)
+                self.runtime.lifecycle.set_state(ConnectionState.RECONNECTING.value)
                 await client._dispatcher.publish("state_change", {
                     "state": client._state,
                     "attempt": attempt,
                 })
                 if client._closing:
-                    client._reconnect_task = None
+                    self.runtime.lifecycle.clear_reconnect_task()
                     return
                 # 重连前先 GET /health 探测，不健康则跳过本轮
                 gateway_url = client.gateway_url
                 if gateway_url:
                     healthy = await client._discovery.check_health(gateway_url)
                     if client._closing:
-                        client._reconnect_task = None
+                        self.runtime.lifecycle.clear_reconnect_task()
                         return
                     if not healthy:
                         client._log.debug(
@@ -774,11 +744,10 @@ class LifecycleController:
                             attempt,
                             gateway_url,
                         )
-                        client._last_error = RuntimeError("gateway health check failed")
-                        client._last_error_code = "gateway_unhealthy"
+                        self.runtime.lifecycle.set_error(RuntimeError("gateway health check failed"), "gateway_unhealthy")
                         if max_attempts > 0 and attempt >= max_attempts:
-                            client._state = ConnectionState.CONNECTION_FAILED.value
-                            client._reconnect_task = None
+                            self.runtime.lifecycle.set_state(ConnectionState.CONNECTION_FAILED.value)
+                            self.runtime.lifecycle.clear_reconnect_task()
                             await client._dispatcher.publish("state_change", {
                                 "state": client._state,
                                 "attempt": attempt,
@@ -789,38 +758,36 @@ class LifecycleController:
                         continue
                 await client._transport.close()
                 if client._closing:
-                    client._reconnect_task = None
+                    self.runtime.lifecycle.clear_reconnect_task()
                     return
                 client._log.debug("client", "reconnect attempting _connect_once: attempt=%d", attempt)
                 await client._invoke_reconnect_connect_once()
                 if client._closing:
-                    client._reconnect_task = None
+                    self.runtime.lifecycle.clear_reconnect_task()
                     return
                 client._log.debug("client", "reconnect success: attempt=%d", attempt)
                 if client._public_state != ConnectionState.READY:
-                    client._state = ConnectionState.READY.value
-                client._last_error = None
-                client._last_error_code = None
-                client._next_retry_at = None
-                client._reconnect_task = None
+                    self.runtime.lifecycle.set_state(ConnectionState.READY.value)
+                self.runtime.lifecycle.clear_error()
+                self.runtime.lifecycle.set_next_retry_at(None)
+                self.runtime.lifecycle.clear_reconnect_task()
                 return
             except asyncio.CancelledError:
-                client._next_retry_at = None
-                client._reconnect_task = None
+                self.runtime.lifecycle.set_next_retry_at(None)
+                self.runtime.lifecycle.clear_reconnect_task()
                 raise
             except Exception as exc:
                 retryable = client._should_retry_reconnect(exc)
-                client._last_error = exc
-                client._last_error_code = "reconnect_failed"
+                self.runtime.lifecycle.set_error(exc, "reconnect_failed")
                 client._log.warn("client", "reconnect failed: attempt=%d error=%s retryable=%s", attempt, exc, retryable)
                 await client._dispatcher.publish("connection.error", {
                     "error": exc,
                     "attempt": attempt,
                 })
                 if not retryable or (max_attempts > 0 and attempt >= max_attempts):
-                    client._state = ConnectionState.CONNECTION_FAILED.value
-                    client._next_retry_at = None
-                    client._reconnect_task = None
+                    self.runtime.lifecycle.set_state(ConnectionState.CONNECTION_FAILED.value)
+                    self.runtime.lifecycle.set_next_retry_at(None)
+                    self.runtime.lifecycle.clear_reconnect_task()
                     await client._dispatcher.publish("state_change", {
                         "state": client._state,
                         "error": exc,

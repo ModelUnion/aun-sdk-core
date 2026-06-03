@@ -10,6 +10,7 @@ from ..config import slot_isolation_key
 from ..group_id import normalize_group_id as _normalize_group_id
 from ..seq_tracker import SeqTracker
 from ..types import ConnectionState
+from .runtime import ClientRuntime
 
 
 _PUSHED_SEQS_LIMIT = 50000
@@ -21,8 +22,9 @@ _ONLINE_UNREAD_HINT_INTERVAL = 0.05
 class MessageDeliveryEngine:
     """消息推送、拉取、有序投递、补洞与 ack 协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     async def postprocess_result(self, method: str, params: dict[str, Any], result: Any) -> Any:
         if method == "message.pull" and isinstance(result, dict):
@@ -101,12 +103,7 @@ class MessageDeliveryEngine:
         return seq in self.client._pending_ordered().get(ns, {})
 
     def pending_ordered(self) -> dict[str, dict[int, tuple[str, Any]]]:
-        client = self.client
-        pending = getattr(client, "_pending_ordered_msgs", None)
-        if pending is None:
-            pending = {}
-            client._pending_ordered_msgs = pending
-        return pending
+        return self.runtime.delivery.pending_ordered
 
     def enqueue_ordered_message(self, ns: str, event: str, seq: int, payload: Any) -> None:
         pending = self.client._pending_ordered()
@@ -856,7 +853,7 @@ class MessageDeliveryEngine:
         if task is not None and not task.done():
             return
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        client._online_unread_hint_task = loop.create_task(client._drain_online_unread_hints())
+        self.runtime.delivery.set_online_unread_hint_task(loop.create_task(client._drain_online_unread_hints()))
 
     async def drain_online_unread_hints(self) -> None:
         client = self.client
@@ -881,7 +878,7 @@ class MessageDeliveryEngine:
         except Exception as exc:
             client._log.debug("client", "online unread hint drain failed: %s", exc)
         finally:
-            client._online_unread_hint_task = None
+            self.runtime.delivery.set_online_unread_hint_task(None)
 
     async def fill_p2p_gap(self) -> None:
         """后台补齐 P2P 消息空洞。"""
@@ -908,14 +905,14 @@ class MessageDeliveryEngine:
         # S1: try/finally 保证 dedup 键在所有出口清理
         try:
             client._log.info("client", "P2P message gap fill start: after_seq=%d device_id=%s", after_seq, client._device_id)
-            client._gap_fill_active = True
+            self.runtime.delivery.set_gap_fill_active(True)
             try:
                 result = await client.call("message.pull", {
                     "after_seq": after_seq,
                     "limit": 50,
                 })
             finally:
-                client._gap_fill_active = False
+                self.runtime.delivery.set_gap_fill_active(False)
             if isinstance(result, dict):
                 messages = result.get("messages", [])
                 if isinstance(messages, list):
@@ -1073,10 +1070,7 @@ class MessageDeliveryEngine:
         client = self.client
         if not ns or seq <= 0:
             return
-        pending = getattr(client, "_pending_p2p_pull_upper", None)
-        if pending is None:
-            pending = {}
-            client._pending_p2p_pull_upper = pending
+        pending = self.runtime.delivery.pending_p2p_pull_upper
         previous = int(pending.get(ns, 0) or 0)
         if seq > previous:
             pending[ns] = seq
@@ -1213,22 +1207,7 @@ class MessageDeliveryEngine:
 
     def reset_seq_tracking_state(self) -> None:
         client = self.client
-        client._seq_tracker = SeqTracker()
-        client._seq_tracker_context = None
-        client._gap_fill_done.clear()
-        client._gap_fill_active = False
-        client._pushed_seqs.clear()
-        client._pending_ordered().clear()
-        if hasattr(client, "_pending_p2p_pull_upper"):
-            client._pending_p2p_pull_upper.clear()
-        if hasattr(client, "_v2_sender_ik_pending"):
-            client._v2_sender_ik_pending.clear()
-        if hasattr(client, "_v2_sender_ik_fetching"):
-            client._v2_sender_ik_fetching.clear()
-        if hasattr(client, "_group_synced"):
-            client._group_synced.clear()
-        if hasattr(client, "_online_unread_hint_queue"):
-            client._online_unread_hint_queue.clear()
+        self.runtime.delivery.reset_seq_tracking_state(reset_context=True)
 
     def refresh_seq_tracking_context(self) -> None:
         client = self.client
@@ -1241,22 +1220,7 @@ class MessageDeliveryEngine:
             "SeqTracker 上下文切换 %s -> %s, 旧 state=%s",
             prev, next_context, old_state,
         )
-        client._seq_tracker = SeqTracker()
-        client._gap_fill_done.clear()
-        client._gap_fill_active = False
-        client._pushed_seqs.clear()
-        client._pending_ordered().clear()
-        if hasattr(client, "_pending_p2p_pull_upper"):
-            client._pending_p2p_pull_upper.clear()
-        if hasattr(client, "_v2_sender_ik_pending"):
-            client._v2_sender_ik_pending.clear()
-        if hasattr(client, "_v2_sender_ik_fetching"):
-            client._v2_sender_ik_fetching.clear()
-        if hasattr(client, "_group_synced"):
-            client._group_synced.clear()
-        if hasattr(client, "_online_unread_hint_queue"):
-            client._online_unread_hint_queue.clear()
-        client._seq_tracker_context = next_context
+        self.runtime.delivery.reset_seq_tracking_state(next_context=next_context)
 
     def persist_seq(self, ns: str, *, force_seq: int | None = None) -> None:
         """即时持久化单个 namespace 的 seq（行级写入）。"""

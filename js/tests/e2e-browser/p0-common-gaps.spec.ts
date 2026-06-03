@@ -126,14 +126,13 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('正常健康检查 — 真实 Gateway 应返回 true', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient();
+      const discovery = new AUN.GatewayDiscovery();
       try {
-        const ok = await client.checkGatewayHealth(`https://gateway.${iss}`, 10000);
-        return { ok, error: null };
+        const gateway = await discovery.discover(`https://${iss}/.well-known/aun-gateway`, 10000);
+        const ok = await discovery.checkHealth(gateway, 10000);
+        return { ok, gateway, error: null };
       } catch (e: any) {
         return { ok: false, error: e.message };
-      } finally {
-        await client.close();
       }
     }, ISSUER);
 
@@ -143,16 +142,14 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('超时 — 不可达地址应返回 false', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient();
+      const discovery = new AUN.GatewayDiscovery();
       try {
         const start = Date.now();
-        const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2000);
+        const ok = await discovery.checkHealth('https://192.0.2.1:9999', 2000);
         const elapsed = Date.now() - start;
         return { ok, elapsed, error: null };
       } catch (e: any) {
         return { ok: false, elapsed: 0, error: e.message };
-      } finally {
-        await client.close();
       }
     });
 
@@ -448,7 +445,7 @@ test.describe('P0-04: Login 重放攻击（浏览器）', () => {
     await installP0Helpers(page);
   });
 
-  test('两次认证 token 不同 — challenge 不可重用', async ({ page }) => {
+  test('同一 client 在 authenticated 状态重复 authenticate 应被状态机拒绝', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const { makeAndConnect } = (window as any).__aunP0;
       const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -464,25 +461,27 @@ test.describe('P0-04: Login 重放攻击（浏览器）', () => {
           return { error: '首次认证未返回 access_token' };
         }
 
-        const auth2 = await client.authenticate();
-        if (!auth2?.access_token) {
-          return { error: '第二次认证未返回 access_token' };
+        try {
+          await client.authenticate();
+          return { error: 'authenticated 状态下重复 authenticate 未被拒绝' };
+        } catch (e: any) {
+          return {
+            first_ok: true,
+            rejected: true,
+            error_name: e?.name ?? '',
+            error_message: e?.message ?? String(e),
+          };
         }
-
-        return {
-          same_token: auth1.access_token === auth2.access_token,
-        };
       } finally {
         await client.close();
       }
     }, ISSUER);
 
     expect((result as any).error).toBeUndefined();
-    if (!(result as any).same_token) {
-      console.log('两次认证返回不同 token（正确 — challenge 不可重用）');
-    } else {
-      console.log('警告: 两次认证返回了相同的 token');
-    }
+    expect((result as any).first_ok).toBe(true);
+    expect((result as any).rejected).toBe(true);
+    expect(String((result as any).error_message)).toContain('authenticate not allowed');
+    console.log(`重复 authenticate 正确被拒绝: ${(result as any).error_message}`);
   });
 });
 
@@ -638,7 +637,7 @@ test.describe('P0-03: Login 过期挑战（浏览器）', () => {
     await installP0Helpers(page);
   });
 
-  test('两次认证应返回不同 token', async ({ page }) => {
+  test('回到 standby 后再次 authenticate 应复用未过期 cached token', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const { sleep, makeAndConnect, ensureConnected } = (window as any).__aunP0;
       const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -655,6 +654,7 @@ test.describe('P0-03: Login 过期挑战（浏览器）', () => {
         }
 
         await sleep(2000);
+        await client.disconnect();
 
         const auth2 = await client.authenticate();
         if (!auth2?.access_token) {
@@ -672,12 +672,8 @@ test.describe('P0-03: Login 过期挑战（浏览器）', () => {
     }, ISSUER);
 
     expect((result as any).error).toBeUndefined();
-    // 两种情况都记录，但不同 token 是期望行为
-    if ((result as any).same_token) {
-      console.log('警告: 两次认证返回了相同的 token');
-    } else {
-      console.log('两次认证返回不同 token（正确）');
-    }
+    expect((result as any).same_token).toBe(true);
+    console.log('回到 standby 后再次 authenticate 复用未过期 cached token');
   });
 });
 
@@ -714,10 +710,11 @@ test.describe('P0-05: Token 并发刷新（浏览器）', () => {
           successes.map((r: any) => r.access_token).filter(Boolean),
         );
 
-        // inflight 标志清理验证 — 并发完成后再发一次应正常
+        // inflight 标志清理验证 — 回到 standby 后再发一次应正常
         await sleep(500);
         let cleanupOk = false;
         try {
+          await client.disconnect();
           const authAfter = await client.authenticate();
           cleanupOk = !!authAfter?.access_token;
         } catch {

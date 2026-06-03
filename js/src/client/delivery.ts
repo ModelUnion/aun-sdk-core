@@ -380,7 +380,7 @@ export class MessageDeliveryEngine {
     const dedupKey = `p2p_pull:${ns}`;
     if (client._gapFillDone.has(dedupKey)) return;
     client._gapFillDone.add(dedupKey);
-    client._gapFillActive = true;
+    this.runtime.delivery.setGapFillActive(true);
     let filled = 0;
     try {
       const messages = await client._pullV2(afterSeq, 50);
@@ -390,7 +390,7 @@ export class MessageDeliveryEngine {
       client._clientLog.warn(`P2P message gap-fill failed:${String(formatDeliveryError(exc))}`);
     } finally {
       client._gapFillDone.delete(dedupKey);
-      client._gapFillActive = false;
+      this.runtime.delivery.setGapFillActive(false);
       if (filled > 0 && client._seqTracker.getContiguousSeq(ns) > afterSeq) {
         client._safeAsync(this.fillP2pGap());
       }
@@ -407,7 +407,7 @@ export class MessageDeliveryEngine {
     const dedupKey = `group_pull:${ns}`;
     if (client._gapFillDone.has(dedupKey)) return;
     client._gapFillDone.add(dedupKey);
-    client._gapFillActive = true;
+    this.runtime.delivery.setGapFillActive(true);
     let filled = 0;
     try {
       const messages = await client._pullGroupV2(groupId, afterSeq, 50);
@@ -417,7 +417,7 @@ export class MessageDeliveryEngine {
       client._clientLog.warn(`group message gap-fill failed:${String(exc)}`);
     } finally {
       client._gapFillDone.delete(dedupKey);
-      client._gapFillActive = false;
+      this.runtime.delivery.setGapFillActive(false);
       if (filled > 0 && client._seqTracker.getContiguousSeq(ns) > afterSeq) {
         client._safeAsync(this.fillGroupGap(groupId));
       }
@@ -432,7 +432,7 @@ export class MessageDeliveryEngine {
     const dedupKey = `group_event_pull:${ns}`;
     if (client._gapFillDone.has(dedupKey)) return;
     client._gapFillDone.add(dedupKey);
-    client._gapFillActive = true;
+    this.runtime.delivery.setGapFillActive(true);
     try {
       let nextAfterSeq = afterSeq;
       const maxPages = 100;
@@ -503,7 +503,7 @@ export class MessageDeliveryEngine {
       client._clientLog.warn(`group event gap-fill failed:${String(exc)}`);
     } finally {
       client._gapFillDone.delete(dedupKey);
-      client._gapFillActive = false;
+      this.runtime.delivery.setGapFillActive(false);
     }
   }
 
@@ -530,16 +530,16 @@ export class MessageDeliveryEngine {
     client._onlineUnreadHintQueue.set(groupId, { ...data });
     if (client._onlineUnreadHintTimer || client._onlineUnreadHintDrainActive) return;
     const delayMs = Math.max(0, Number(client._onlineUnreadHintInitialDelayMs ?? 750) || 0);
-    client._onlineUnreadHintTimer = setTimeout(() => {
-      client._onlineUnreadHintTimer = null;
+    this.runtime.delivery.setOnlineUnreadHintTimer(setTimeout(() => {
+      this.runtime.delivery.setOnlineUnreadHintTimer(null);
       client._safeAsync(this.drainOnlineUnreadHints());
-    }, delayMs);
+    }, delayMs));
   }
 
   async drainOnlineUnreadHints(): Promise<void> {
     const client = this.runtime.client;
     if (client._onlineUnreadHintDrainActive) return;
-    client._onlineUnreadHintDrainActive = true;
+    this.runtime.delivery.setOnlineUnreadHintDrainActive(true);
     try {
       while (client._onlineUnreadHintQueue.size > 0) {
         if (client.state !== 'ready') return;
@@ -558,7 +558,7 @@ export class MessageDeliveryEngine {
     } catch (exc) {
       client._clientLog.debug(`online unread hint drain failed: ${formatDeliveryError(exc)}`);
     } finally {
-      client._onlineUnreadHintDrainActive = false;
+      this.runtime.delivery.setOnlineUnreadHintDrainActive(false);
     }
   }
 
@@ -701,15 +701,15 @@ export class MessageDeliveryEngine {
     }
 
     if (client._v2PullInflight) {
-      client._v2PullPending = true;
+      this.runtime.delivery.setV2PullPending(true);
       return;
     }
-    client._v2PullInflight = true;
+    this.runtime.delivery.setV2PullInflight(true);
     const dedupKey = `p2p_pull:${ns}`;
     client._gapFillDone.add(dedupKey);
     try {
       do {
-        client._v2PullPending = false;
+        this.runtime.delivery.setV2PullPending(false);
         await client._pullV2();
         const newContig = ns ? client._seqTracker.getContiguousSeq(ns) : -1;
         client._clientLog.debug(
@@ -722,7 +722,7 @@ export class MessageDeliveryEngine {
         `V2 push auto-pull failed: contiguous_seq=${contigBefore}->${newContig} err=${exc}`
       );
     } finally {
-      client._v2PullInflight = false;
+      this.runtime.delivery.setV2PullInflight(false);
       client._gapFillDone.delete(dedupKey);
     }
   }

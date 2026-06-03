@@ -2,7 +2,6 @@ package aun
 
 import (
 	"fmt"
-	"time"
 )
 
 type identityRuntimeManager struct {
@@ -24,34 +23,25 @@ func (m *identityRuntimeManager) loadIdentity(aid *AID) error {
 		return NewStateError(fmt.Sprintf("LoadIdentity not allowed in state %s", c.state))
 	}
 	c.rebuildRuntimeForIdentity(aid)
-	c.currentAIDObj = aid
-	c.aid = aid.Aid
+	deviceID := c.deviceID
 	if aid.DeviceID != "" {
-		c.deviceID = aid.DeviceID
+		deviceID = aid.DeviceID
 	}
+	slotID := c.slotID
 	if aid.SlotID != "" {
-		c.slotID = aid.SlotID
+		slotID = aid.SlotID
 	}
-	if c.auth != nil {
-		c.auth.aid = aid.Aid
-		c.auth.SetInstanceContext(c.deviceID, c.slotID)
-		c.auth.SetIdentity(map[string]any{
-			"aid":                aid.Aid,
-			"private_key_pem":    aid.PrivateKeyPem,
-			"public_key_der_b64": aid.PublicKey,
-			"cert":               aid.CertPem,
-		})
-	}
-	c.identity = map[string]any{
+	m.runtime.identity.setInstanceContext(deviceID, slotID)
+	identity := map[string]any{
 		"aid":                aid.Aid,
 		"private_key_pem":    aid.PrivateKeyPem,
 		"public_key_der_b64": aid.PublicKey,
 		"cert":               aid.CertPem,
 	}
-	c.authenticated = false
-	c.lastConnectError = nil
-	c.retryAttempt = 0
-	c.nextRetryAt = time.Time{}
-	c.state = StateIdle
+	m.runtime.identity.setLoadedIdentity(aid, identity)
+	m.runtime.v2.resetForIdentityLocked()
+	m.runtime.lifecycle.setAuthenticatedLocked(false)
+	m.runtime.lifecycle.clearRetryStateLocked()
+	m.runtime.lifecycle.setStateLocked(StateIdle)
 	return nil
 }

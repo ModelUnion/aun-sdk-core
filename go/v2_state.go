@@ -61,10 +61,7 @@ func (c *AUNClient) v2GetSecurityState() *v2StateSecurityState {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.v2Security == nil {
-		c.v2Security = newV2StateSecurityState()
-	}
-	return c.v2Security
+	return c.getClientRuntime().groupState.securityStateLocked()
 }
 
 // ── v2VerifyStateSignature ──────────────────────────────────────────────
@@ -105,16 +102,11 @@ func (c *AUNClient) v2AutoProposeLeaderDelay(ctx context.Context, groupID string
 func (c *AUNClient) v2AutoProposeLock(groupID string) *sync.Mutex {
 	c.v2AutoProposeLocksMu.Lock()
 	defer c.v2AutoProposeLocksMu.Unlock()
-	if c.v2AutoProposeLocks == nil {
-		c.v2AutoProposeLocks = make(map[string]*sync.Mutex)
-	}
-	if c.v2AutoProposeLastSnapshot == nil {
-		c.v2AutoProposeLastSnapshot = make(map[string]string)
-	}
-	lock := c.v2AutoProposeLocks[groupID]
+	locks := c.getClientRuntime().groupState.autoProposeLocksLocked()
+	lock := locks[groupID]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		c.v2AutoProposeLocks[groupID] = lock
+		locks[groupID] = lock
 	}
 	return lock
 }

@@ -158,6 +158,7 @@ interface SessionOptions extends JsonObject {
 export interface ConnectionOptions {
   auto_reconnect?: boolean;
   connect_timeout?: number;
+  retry?: JsonObject;
   retry_initial_delay?: number;
   retry_max_delay?: number;
   retry_max_attempts?: number;
@@ -1070,34 +1071,7 @@ export class AUNClient {
 
   /** 关闭连接 */
   async close(): Promise<void> {
-    const tStart = Date.now();
-    this._clientLog.debug(`close enter: state=${this._state}, aid=${this._aid ?? ''}`);
-    try {
-      this._closing = true;
-      this._saveSeqTrackerState();
-      this._stopBackgroundTasks();
-      this._stopReconnect();
-      if (this.state === ConnectionState.NO_IDENTITY || this.state === ConnectionState.CLOSED) {
-        const closableStore = this._tokenStore as TokenStore & { close?: () => void };
-        closableStore.close?.();
-        this._state = 'closed';
-        this._logger.close();
-        this._resetSeqTrackingState();
-        this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms (was no_identity/closed)`);
-        return;
-      }
-      await this._transport.close();
-      const closableStore = this._tokenStore as TokenStore & { close?: () => void };
-      closableStore.close?.();
-      this._state = 'closed';
-      this._logger.close();
-      await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
-      this._resetSeqTrackingState();
-      this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
-    } catch (err) {
-      this._clientLog.debug(`close exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
+    return this._lifecycle.close();
   }
 
   /**
@@ -1105,36 +1079,7 @@ export class AUNClient {
    * disconnect 是可恢复的：停止心跳、关闭 WebSocket，但不清理 keystore 等状态。
    */
   async disconnect(): Promise<void> {
-    const tStart = Date.now();
-    this._clientLog.debug(`disconnect enter: state=${this._state}, aid=${this._aid ?? ''}, closing=${this._closing}`);
-    try {
-      // 若 close() 已在执行中，跳过 disconnect 避免竞态
-      if (this._closing) {
-        this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (closing)`);
-        return;
-      }
-      if (![
-        ConnectionState.AUTHENTICATED,
-        ConnectionState.CONNECTING,
-        ConnectionState.READY,
-        ConnectionState.RETRY_BACKOFF,
-        ConnectionState.RECONNECTING,
-        ConnectionState.CONNECTION_FAILED,
-      ].includes(this.state)) {
-        this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (state=${this._state})`);
-        return;
-      }
-      this._saveSeqTrackerState();
-      this._stopBackgroundTasks();
-      this._stopReconnect();
-      await this._transport.close();
-      this._state = 'standby';
-      await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
-      this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
-    } catch (err) {
-      this._clientLog.debug(`disconnect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
+    return this._lifecycle.disconnect();
   }
 
   // ── RPC ───────────────────────────────────────────────────
@@ -1144,175 +1089,7 @@ export class AUNClient {
    * 自动处理内部方法限制、E2EE 加解密、客户端签名等。
    */
   async call(method: string, params?: RpcParams): Promise<RpcResult> {
-    const tStart = Date.now();
-    this._clientLog.debug(`call enter: method=${method}`);
-    try {
-    const preflight = this._rpcPipeline.preflight(method, params);
-    const p = preflight.params;
-    const rpcBackground = preflight.rpcBackground;
-    const runWithRpcPriority = async <T>(operation: () => Promise<T> | T): Promise<T> => {
-      if (!rpcBackground) return await operation();
-      return await this._withBackgroundRpc(operation);
-    };
-
-    const pullGateLocked = Boolean((p as Record<string, unknown>)._pull_gate_locked);
-    if ('_pull_gate_locked' in (p as Record<string, unknown>)) {
-      delete (p as Record<string, unknown>)._pull_gate_locked;
-    }
-    const pullGateKey = this._pullGateKeyForCall(method, p);
-    if (pullGateKey && this._isPullResponseProcessing(pullGateKey)) {
-      this._clientLog.debug(`pull skipped while processing pull response: method=${method} key=${pullGateKey}`);
-      return this._emptyPullResultForCall(method);
-    }
-    if (pullGateKey && !pullGateLocked) {
-      const lockedParams = { ...p, _pull_gate_locked: true };
-      if (rpcBackground) (lockedParams as Record<string, unknown>)._rpc_background = true;
-      const result = await this._runPullSerialized(pullGateKey, async () => this.call(method, lockedParams));
-      return result as RpcResult;
-    }
-
-    // 自动加密：message.send 默认加密（encrypt 默认 true）— V2-only
-    if (method === 'message.send') {
-      const encrypt = p.encrypt ?? true;
-      delete p.encrypt;
-      if (encrypt) {
-        return await runWithRpcPriority(() => this._sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
-          messageId: String(p.message_id ?? '') || undefined,
-          timestamp: p.timestamp as number | undefined,
-          protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
-          context: isJsonObject(p.context) ? p.context : undefined,
-        })) as RpcResult;
-      }
-      // encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
-      this._maybeAppendEchoTraceSend(p);
-    }
-
-    // 自动加密：group.send 默认加密（encrypt 默认 true）— V2-only
-    if (method === 'group.send') {
-      const encrypt = p.encrypt ?? true;
-      delete p.encrypt;
-      if (encrypt) {
-        return await runWithRpcPriority(() => this._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
-          messageId: String(p.message_id ?? '') || undefined,
-          timestamp: p.timestamp as number | undefined,
-          protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
-          context: isJsonObject(p.context) ? p.context : undefined,
-        })) as RpcResult;
-      }
-      this._maybeAppendEchoTraceSend(p);
-    }
-    if (method === 'group.thought.put') {
-      const encrypt = p.encrypt ?? true;
-      delete p.encrypt;
-      if (encrypt) {
-        const v2Error = 'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)';
-        if (!this._v2Session || !String(p.group_id ?? '').trim()) {
-          throw new StateError(v2Error);
-        }
-        return await runWithRpcPriority(() => this._putGroupThoughtEncryptedV2(p));
-      }
-    }
-    if (method === 'message.thought.put') {
-      const encrypt = p.encrypt ?? true;
-      delete p.encrypt;
-      if (encrypt) {
-        await this._ensureV2SessionReady(
-          'message.thought.put',
-          'V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)',
-        );
-        return await runWithRpcPriority(() => this._putMessageThoughtEncryptedV2(p));
-      }
-    }
-
-    // V2-only：兼容入口名只作为 SDK 内部适配层存在，底层绝不能降级发 legacy RPC。
-    if (method === 'message.pull' || method === 'message.v2.pull') {
-      await this._ensureV2SessionReady('message.pull');
-      const skipAutoAck = p._skip_auto_ack === true || p.skip_auto_ack === true;
-      const force = p.force === true;
-      const afterSeq = Number(p.after_seq ?? 0) || 0;
-      const limit = Number(p.limit ?? 50) || 50;
-      const messages = skipAutoAck
-        ? await runWithRpcPriority(() => this._pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true, force }))
-        : await runWithRpcPriority(() => this._pullV2(afterSeq, limit, { gateLocked: true, force }));
-      return { messages } as RpcResult;
-    }
-
-    if (method === 'message.ack' || method === 'message.v2.ack') {
-      await this._ensureV2SessionReady('message.ack');
-      return await runWithRpcPriority(() => this._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined)) as RpcResult;
-    }
-
-    if (method === 'group.pull' || method === 'group.v2.pull') {
-      if (!String(p.group_id ?? '').trim()) {
-        throw new ValidationError('group.pull requires group_id');
-      }
-      await this._ensureV2SessionReady('group.pull');
-      const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
-      const cursorParams = this._explicitGroupCursorParams(p);
-      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
-      const pullOpts: { gateLocked: boolean; explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = { gateLocked: true };
-      if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
-      if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
-      if (!ownsCursor) pullOpts.ownsCursor = false;
-      const messages = await runWithRpcPriority(() => this._pullGroupV2(
-        String(p.group_id),
-        Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
-        Number(p.limit ?? 50) || 50,
-        pullOpts,
-      ));
-      return { messages } as RpcResult;
-    }
-
-    if (method === 'group.ack_messages' || method === 'group.v2.ack') {
-      if (!String(p.group_id ?? '').trim()) {
-        throw new ValidationError('group.ack_messages requires group_id');
-      }
-      await this._ensureV2SessionReady('group.ack_messages');
-      const cursorParams = this._explicitGroupCursorParams(p);
-      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
-      if (method === 'group.ack_messages' && !ownsCursor) {
-        return await runWithRpcPriority(() => this._rawGroupAckMessages(p)) as RpcResult;
-      }
-      return await runWithRpcPriority(() => this._ackGroupV2(
-        String(p.group_id),
-        Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
-      )) as RpcResult;
-    }
-
-    if (method === 'message.pull') {
-      delete p._skip_auto_ack;
-      delete p.skip_auto_ack;
-    }
-    delete (p as Record<string, unknown>)._group_cursor_params;
-
-    // 关键操作自动附加客户端签名
-    this._rpcPipeline.applyClientSignature(method, p);
-
-    // P1-23: 非幂等方法使用更长超时
-    const callTimeout = NON_IDEMPOTENT_METHODS.has(method) ? NON_IDEMPOTENT_TIMEOUT_MS : undefined;
-    if (method === 'group.thought.get' || method === 'message.thought.get') {
-      this._clientLog.debug(`thought.get transport call start: method=${method}, params=${this._debugJson(this._messageEnvelopeFieldsForDebug(p))}`);
-    }
-    let result = callTimeout
-      ? (
-        rpcBackground
-          ? await this._transport.call(method, p, callTimeout, undefined, true)
-          : await this._transport.call(method, p, callTimeout)
-      )
-      : (
-        rpcBackground
-          ? await this._transport.call(method, p, undefined, undefined, true)
-          : await this._transport.call(method, p)
-      );
-
-    result = await this._rpcPipeline.postprocessResult(method, p, result) as RpcResult;
-
-    this._clientLog.debug(`call exit: method=${method} elapsed=${Date.now() - tStart}ms`);
-    return result;
-    } catch (err) {
-      this._clientLog.debug(`call exit (error): method=${method} elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
+    return await this._rpcPipeline.call(method, params);
   }
 
   // ── 事件 ──────────────────────────────────────────────────
@@ -1386,39 +1163,14 @@ export class AUNClient {
     return this._delivery.onRawMessageReceived(data);
   }
 
-  /** 实际处理推送消息的异步任务 */
-  private async _processAndPublishMessage(data: EventPayload): Promise<void> {
-    return this._delivery.processAndPublishMessage(data);
-  }
-
   /** 处理群组消息推送：自动解密后 re-publish */
   private async _onRawGroupMessageCreated(data: EventPayload): Promise<void> {
     return this._delivery.onRawGroupMessageCreated(data);
   }
 
-  /**
-   * 处理群组推送消息的异步任务。
-   *
-   * 带 payload 的事件（消息推送）：解密后 re-publish。
-   * 不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
-   */
-  private async _processAndPublishGroupMessage(data: EventPayload): Promise<void> {
-    return this._delivery.processAndPublishGroupMessage(data);
-  }
-
-  /** 后台补齐群消息空洞 */
-  private async _fillGroupGap(groupId: string): Promise<void> {
-    return this._delivery.fillGroupGap(groupId);
-  }
-
   /** 后台补齐 P2P 消息空洞 */
   private async _fillP2pGap(): Promise<void> {
     return this._delivery.fillP2pGap();
-  }
-
-  /** 只按硬上限裁剪 published guard，不能按 contiguousSeq 清理。 */
-  private _prunePushedSeqs(ns: string): void {
-    this._delivery.prunePushedSeqs(ns);
   }
 
   private _recordPendingP2pPull(ns: string, seq: number): void {
@@ -1455,10 +1207,6 @@ export class AUNClient {
 
   private _markPublishedSeq(ns: string, seq: number): void {
     this._delivery.markPublishedSeq(ns, seq);
-  }
-
-  private _attachCurrentInstanceContext(payload: EventPayload): EventPayload {
-    return this._delivery.attachCurrentInstanceContext(payload);
   }
 
   private _publishAppEvent(event: string, payload: EventPayload, source = 'direct'): void | Promise<void> {
@@ -1540,20 +1288,12 @@ export class AUNClient {
     this._delivery.logMessageDebug(stage, source, event, message, opts);
   }
 
-  private _messageTargetsCurrentInstance(message: EventPayload): boolean {
-    return this._delivery.messageTargetsCurrentInstance(message);
-  }
-
   private _tryAcquirePullGate(key: string): number | null {
     return this._rpcPipeline.tryAcquirePullGate(key);
   }
 
   private _releasePullGate(key: string, token: number | null): void {
     this._rpcPipeline.releasePullGate(key, token);
-  }
-
-  private _pullGateKeyForCall(method: string, params: RpcParams): string {
-    return this._rpcPipeline.pullGateKeyForCall(method, params);
   }
 
   private _isPullResponseProcessing(key: string): boolean {
@@ -1687,11 +1427,6 @@ export class AUNClient {
     const before = this._seqTracker.getContiguousSeq(ns);
     this._seqTracker.onMessageSeq(ns, seq);
     return this._seqTracker.getContiguousSeq(ns) !== before;
-  }
-
-  /** 后台补齐群事件空洞 */
-  private async _fillGroupEventGap(groupId: string): Promise<void> {
-    return this._delivery.fillGroupEventGap(groupId);
   }
 
   private _extractGroupIdFromResult(result: JsonObject): string {
@@ -2446,10 +2181,6 @@ export class AUNClient {
     groupId: string;
   }): void {
     return this._v2E2EE.scheduleSenderIKPending(args);
-  }
-
-  private async _resolveV2SenderIKPending(fromAid: string, senderDeviceId: string, groupId: string, fetchKey: string): Promise<void> {
-    return await this._v2E2EE.resolveSenderIKPending(fromAid, senderDeviceId, groupId, fetchKey);
   }
 
   /**
@@ -3219,14 +2950,6 @@ export class AUNClient {
 
   private _validateMessageRecipient(toAid: JsonValue | object | undefined): void {
     this._rpcPipeline.validateMessageRecipient(toAid);
-  }
-
-  private _validateOutboundCall(method: string, params: RpcParams): void {
-    this._rpcPipeline.validateOutboundCall(method, params);
-  }
-
-  private _injectMessageCursorContext(method: string, params: RpcParams): void {
-    this._rpcPipeline.injectMessageCursorContext(method, params);
   }
 
   /** 启动 V2 缓存清理后台任务 */

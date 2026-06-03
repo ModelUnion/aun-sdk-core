@@ -116,31 +116,31 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     };
   });
 
-  it('disconnected 状态 _fillGroupGap 应提前返回', async () => {
+  it('disconnected 状态 _delivery.fillGroupGap 应提前返回', async () => {
     (client as any)._state = 'disconnected';
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('g1');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
-  it('closing 状态 _fillGroupGap 应提前返回', async () => {
+  it('closing 状态 _delivery.fillGroupGap 应提前返回', async () => {
     (client as any)._state = 'connected';
     (client as any)._closing = true;
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('g1');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
-  it('disconnected 状态 _fillGroupEventGap 应提前返回', async () => {
+  it('disconnected 状态 _delivery.fillGroupEventGap 应提前返回', async () => {
     (client as any)._state = 'disconnected';
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._fillGroupEventGap('g1');
+    await (client as any)._delivery.fillGroupEventGap('g1');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
@@ -153,12 +153,12 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     expect(callSpy).not.toHaveBeenCalled();
   });
 
-  it('connected 状态 _fillGroupGap 应正常执行', async () => {
+  it('connected 状态 _delivery.fillGroupGap 应正常执行', async () => {
     (client as any)._state = 'connected';
     (client as any)._closing = false;
     const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([]);
 
-    await (client as any)._fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('g1');
     expect(pullGroupV2Spy).toHaveBeenCalledWith('g1', 5, 50);
   });
 });
@@ -170,7 +170,7 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
     expect((client as any)._gapFillActive).toBe(false);
   });
 
-  it('_fillGroupGap 执行期间 _gapFillActive 应为 true', async () => {
+  it('_delivery.fillGroupGap 执行期间 _gapFillActive 应为 true', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._closing = false;
@@ -189,7 +189,7 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
       return [];
     });
 
-    await (client as any)._fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('g1');
     expect(captured).toBe(true);
     // 完成后应重置
     expect((client as any)._gapFillActive).toBe(false);

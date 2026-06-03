@@ -286,7 +286,7 @@ describe('断线重连集成测试', () => {
       const sawDisconnectEvent = await waitForDisconnectEvent(states, 20000);
       expect(sawDisconnectEvent).toBe(true);
       expect(eventsIncludeDisconnect(states)).toBe(true);
-      expect(['standby', 'reconnecting', 'connecting', 'connecting']).toContain(client.state);
+      expect(['standby', 'retry_backoff', 'reconnecting', 'connecting']).toContain(client.state);
 
       const started = await dockerStart();
       expect(started).toBe(true);

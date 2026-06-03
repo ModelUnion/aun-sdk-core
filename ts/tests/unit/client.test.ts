@@ -441,8 +441,8 @@ describe('AUNClient message.send 接收者校验', () => {
       const pullParams = { after_seq: 0, limit: 10 };
       const ackParams = { seq: 1 };
 
-      (client as any)._injectMessageCursorContext('message.pull', pullParams);
-      (client as any)._injectMessageCursorContext('message.ack', ackParams);
+      (client as any)._rpcPipeline.injectMessageCursorContext('message.pull', pullParams);
+      (client as any)._rpcPipeline.injectMessageCursorContext('message.ack', ackParams);
 
       expect(pullParams).toEqual(expect.objectContaining({
         device_id: 'device-1',
@@ -461,13 +461,13 @@ describe('AUNClient message.send 接收者校验', () => {
     (client as any)._slotId = 'evolclaw cli';
     const params = { after_seq: 0, limit: 10, slot_id: 'evolclaw daemon' };
 
-    (client as any)._injectMessageCursorContext('message.pull', params);
+    (client as any)._rpcPipeline.injectMessageCursorContext('message.pull', params);
 
     expect(params).toEqual(expect.objectContaining({
       device_id: 'device-1',
       slot_id: 'evolclaw cli',
     }));
-    expect(() => (client as any)._injectMessageCursorContext('message.ack', {
+    expect(() => (client as any)._rpcPipeline.injectMessageCursorContext('message.ack', {
       seq: 1,
       slot_id: 'other daemon',
     })).toThrow('slot_id must match');
@@ -2045,7 +2045,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     vi.spyOn(client as any, '_fetchPeerCert').mockRejectedValue(new Error('no cert'));
 
-    await (client as any)._resolveV2SenderIKPending('bob.aid.com', '', '', 'bob.aid.com||');
+    await (client as any)._v2E2EE.resolveSenderIKPending('bob.aid.com', '', '', 'bob.aid.com||');
     const pub = (client as any)._v2Session.getPeerIK('bob.aid.com', '');
 
     expect(Array.from(pub ?? [])).toEqual([1, 2, 3]);
@@ -2811,7 +2811,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.v2.pull 发现空洞时应推进 seq tracker，且不触发后台补洞', async () => {
     const client = makeV2Client();
-    const fillSpy = vi.spyOn(client as any, '_fillGroupGap').mockResolvedValue(undefined);
+    const fillSpy = vi.spyOn((client as any)._delivery, 'fillGroupGap').mockResolvedValue(undefined);
     (client as any)._transport.call = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') {
         return {
@@ -3069,12 +3069,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
   it('thought selector 必须提供 context.type + context.id', async () => {
     const client = new AUNClient();
 
-    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+    expect(() => (client as any)._rpcPipeline.validateOutboundCall('message.thought.put', {
       to: 'bob.aid.com',
       payload: { type: 'thought' },
     })).toThrow('context.type');
 
-    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+    expect(() => (client as any)._rpcPipeline.validateOutboundCall('message.thought.put', {
       to: 'bob.aid.com',
       context: { type: 'run' },
       payload: { type: 'thought' },
@@ -3124,7 +3124,7 @@ describe('有序消息发布', () => {
     expect(published).toEqual([2, 4]);
     expect((client as any)._pushedSeqs.get(ns)?.has(2)).toBe(true);
     expect((client as any)._pushedSeqs.get(ns)?.has(4)).toBe(true);
-    (client as any)._prunePushedSeqs(ns);
+    (client as any)._delivery.prunePushedSeqs(ns);
     expect((client as any)._pushedSeqs.get(ns)?.has(2)).toBe(true);
     expect((client as any)._pushedSeqs.get(ns)?.has(4)).toBe(true);
   });
@@ -3157,7 +3157,7 @@ describe('有序消息发布', () => {
     (client as any)._deviceId = '';
     (client as any)._slotId = 'slot-empty-device';
 
-    const attached = (client as any)._attachCurrentInstanceContext({ seq: 1, payload: { type: 'text' } });
+    const attached = (client as any)._delivery.attachCurrentInstanceContext({ seq: 1, payload: { type: 'text' } });
 
     expect(attached).toHaveProperty('device_id', '');
     expect(attached).toHaveProperty('slot_id', 'slot-empty-device');
@@ -3168,7 +3168,7 @@ describe('有序消息发布', () => {
     (client as any)._deviceId = 'dev-1';
     (client as any)._slotId = 'slot-a';
 
-    const attached = (client as any)._attachCurrentInstanceContext({
+    const attached = (client as any)._delivery.attachCurrentInstanceContext({
       device_id: '',
       seq: 1,
       payload: { type: 'text' },
@@ -3181,11 +3181,11 @@ describe('有序消息发布', () => {
   it('P2P push 显式空 device_id 应按实例值匹配', () => {
     const client = new AUNClient();
     (client as any)._deviceId = 'dev-1';
-    expect((client as any)._messageTargetsCurrentInstance({ device_id: '' })).toBe(false);
+    expect((client as any)._delivery.messageTargetsCurrentInstance({ device_id: '' })).toBe(false);
 
     (client as any)._deviceId = '';
-    expect((client as any)._messageTargetsCurrentInstance({ device_id: '' })).toBe(true);
-    expect((client as any)._messageTargetsCurrentInstance({ device_id: 'dev-1' })).toBe(false);
+    expect((client as any)._delivery.messageTargetsCurrentInstance({ device_id: '' })).toBe(true);
+    expect((client as any)._delivery.messageTargetsCurrentInstance({ device_id: 'dev-1' })).toBe(false);
   });
 
   it('P2P push 明确指向其它 slot 时应忽略', async () => {
@@ -3198,7 +3198,7 @@ describe('有序消息发布', () => {
     const published: any[] = [];
     client.on('message.received', (payload: any) => published.push(payload));
 
-    await (client as any)._processAndPublishMessage({
+    await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-other-slot',
       from: 'bob.aid.com',
       to: 'alice.aid.com',
@@ -3222,7 +3222,7 @@ describe('有序消息发布', () => {
     client.on('message.received', (payload: any) => received.push(payload));
     client.on('message.undecryptable', (payload: any) => undecryptable.push(payload));
 
-    await (client as any)._processAndPublishMessage({
+    await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-raw-encrypted-ok',
       from: 'bob.aid.com',
       to: 'alice.aid.com',
@@ -3261,7 +3261,7 @@ describe('有序消息发布', () => {
     const received: any[] = [];
     client.on('message.received', (payload: any) => received.push(payload));
 
-    await (client as any)._processAndPublishMessage({
+    await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-raw-encrypted-self',
       from: 'alice.aid.com',
       to: 'alice.aid.com',
@@ -3295,7 +3295,7 @@ describe('有序消息发布', () => {
     client.on('message.received', (payload: any) => received.push(payload));
     client.on('message.undecryptable', (payload: any) => undecryptable.push(payload));
 
-    await (client as any)._processAndPublishMessage({
+    await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-raw-encrypted',
       from: 'bob.aid.com',
       to: 'alice.aid.com',
@@ -3338,7 +3338,7 @@ describe('有序消息发布', () => {
     client.on('group.message_created', (payload: any) => created.push(payload));
     client.on('group.message_undecryptable', (payload: any) => undecryptable.push(payload));
 
-    await (client as any)._processAndPublishGroupMessage({
+    await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted-ok',
       group_id: 'g1',
       from: 'bob.aid.com',
@@ -3377,7 +3377,7 @@ describe('有序消息发布', () => {
     const created: any[] = [];
     client.on('group.message_created', (payload: any) => created.push(payload));
 
-    await (client as any)._processAndPublishGroupMessage({
+    await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted-self',
       group_id: 'g1',
       from: 'alice.aid.com',
@@ -3408,7 +3408,7 @@ describe('有序消息发布', () => {
     const published: any[] = [];
     client.on('group.message_created', (payload: any) => published.push(payload));
 
-    await (client as any)._processAndPublishGroupMessage({
+    await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-other-slot',
       group_id: 'g1',
       from: 'bob.aid.com',
@@ -3433,7 +3433,7 @@ describe('有序消息发布', () => {
     client.on('group.message_created', (payload: any) => created.push(payload));
     client.on('group.message_undecryptable', (payload: any) => undecryptable.push(payload));
 
-    await (client as any)._processAndPublishGroupMessage({
+    await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted',
       group_id: 'g1',
       from: 'bob.aid.com',

@@ -128,8 +128,8 @@ describe('AUNClient V2 thought', () => {
     };
 
     vi.spyOn(client as any, '_signClientOperation').mockResolvedValue(undefined);
-    vi.spyOn(client as any, '_validateOutboundCall').mockReturnValue(undefined);
-    vi.spyOn(client as any, '_injectMessageCursorContext').mockReturnValue(undefined);
+    vi.spyOn((client as any)._rpcPipeline, 'validateOutboundCall').mockReturnValue(undefined);
+    vi.spyOn((client as any)._rpcPipeline, 'injectMessageCursorContext').mockReturnValue(undefined);
 
     // 真正的入口：通过 client.call 直接调用 _putMessageThoughtEncryptedV2
     // 注：原 call 已被 mock 拦截，所以这里直接调内部方法

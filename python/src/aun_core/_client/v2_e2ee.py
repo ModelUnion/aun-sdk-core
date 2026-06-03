@@ -8,13 +8,15 @@ import uuid
 from typing import Any
 
 from ..v2.session import V2Session
+from .runtime import ClientRuntime
 
 
 class V2E2EECoordinator:
     """V2 E2EE 会话、bootstrap、加密与解密协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     async def on_connected(self, *, background_sync: bool) -> None:
         """连接成功后的 V2 E2EE 初始化与后台协调。"""
@@ -51,7 +53,7 @@ class V2E2EECoordinator:
         )
 
         db = client._token_store._get_db(client._aid)
-        client._v2_session = V2Session(
+        self.runtime.v2.session = V2Session(
             db,
             client._device_id,
             client._aid,
@@ -59,7 +61,7 @@ class V2E2EECoordinator:
             aid_pub_der=aid_pub_der,
         )
         client._v2_session.ensure_keys()
-        client._v2_bootstrap_cache = {}
+        self.runtime.v2.bootstrap_cache.clear()
         await client._v2_session.ensure_registered(client.call)
         client._log.debug(
             "client",
@@ -73,10 +75,7 @@ class V2E2EECoordinator:
         group_id = str(group_id or "").strip()
         if not group_id or not client._v2_session:
             return
-        inflight = getattr(client, "_group_spk_registration_inflight", None)
-        if inflight is None:
-            inflight = set()
-            client._group_spk_registration_inflight = inflight
+        inflight = self.runtime.v2.group_spk_registration_inflight
         if group_id in inflight:
             return
         inflight.add(group_id)
@@ -106,10 +105,7 @@ class V2E2EECoordinator:
         group_id = str(group_id or "").strip()
         if not group_id or not client._v2_session:
             return
-        inflight = getattr(client, "_group_spk_rotation_inflight", None)
-        if inflight is None:
-            inflight = set()
-            client._group_spk_rotation_inflight = inflight
+        inflight = self.runtime.v2.group_spk_rotation_inflight
         if group_id in inflight:
             return
         inflight.add(group_id)
@@ -137,10 +133,7 @@ class V2E2EECoordinator:
     def schedule_group_spk_registration_after_peer_fallback(self, group_id: str) -> None:
         client = self.client
         group_id = str(group_id or "").strip()
-        registered = getattr(client, "_group_spk_peer_fallback_registered", None)
-        if registered is None:
-            registered = set()
-            client._group_spk_peer_fallback_registered = registered
+        registered = self.runtime.v2.group_spk_peer_fallback_registered
         if not group_id or group_id in registered:
             return
         registered.add(group_id)
@@ -594,6 +587,7 @@ class V2E2EECoordinator:
                             "payload": v1_payload,
                             "encrypted": False,
                         }
+                        self.attach_gateway_proximity(v1_msg, msg)
                         event_name, event_payload = client._delivery().p2p_app_event_for_message(v1_msg)
                         if ns:
                             await client._publish_pulled_message(event_name, ns, seq, event_payload)
@@ -1859,6 +1853,7 @@ class V2E2EECoordinator:
                         "payload": payload,
                         "encrypted": False,
                     }
+                    self.attach_gateway_proximity(v1_msg, msg)
                     await client._publish_pulled_message("group.message_created", ns, seq, v1_msg)
                     decrypted.append(v1_msg)
                     client._log.debug("client", "group.v2.pull plaintext legacy row delivered: group=%s seq=%d", group_id, seq)

@@ -10,7 +10,7 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - `AID`：不可变身份值对象，负责签名、验签和 agent.md 签验。
 - `AUNClient`：认证、连接、状态机、事件和 RPC。
 
-业务操作统一通过 `client.call(method, params)` 调用；消息、群组、存储、meta、stream 的参数见 `09-*-rpc-manual.md`。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。
+业务操作统一通过 `client.call(method, params)` 调用；消息、群组、存储、meta、stream 的参数见 `09-*-rpc-manual.md`。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。在线轻量通知方案见 `Notify通知方案.md`。
 
 ## 渐进式查阅流程
 
@@ -25,7 +25,7 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - 身份与认证：AIDStore / AID / 注册 / 加载 / 证书
 - 连接与状态：AUNClient / 九态状态机 / Gateway / 重连
 - E2EE：默认加密、ProtectedHeaders、P2P / Group V2
-- RPC 与事件：`client.call()`、`client.on()`、RPC 手册
+- RPC 与事件：`client.call()`、`client.on()`、`client.notify()`、RPC 手册
 - agent.md：`AIDStore.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
 - 错误处理：Result、异常、错误码、重试
 
@@ -59,6 +59,7 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 | 状态机和重连 | [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md) |
 | 查方法签名 | [06-API手册](06-API手册.md) |
 | 查消息或群组 RPC | 对应 `09-*-rpc-manual.md` |
+| 查 notify 在线轻量通知 | [Notify通知方案.md](Notify通知方案.md) |
 | 查 payload 格式 | [09-payload-reference.md](09-payload-reference.md) |
 | 排查错误 | [07-错误处理](07-错误处理.md) |
 | 写测试或 demo | [08-最佳实践](08-最佳实践.md) |

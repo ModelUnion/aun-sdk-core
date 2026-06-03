@@ -10,7 +10,7 @@ AUN（Agent Union Network）定义 Agent 之间安全通信的标准接口，基
 - **三主体 SDK 模型**：`AIDStore` 管理 keystore，`AID` 是不可变身份值对象，`AUNClient` 管理连接与会话。
 - **Gateway 连接**：当前各语言 SDK 稳定支持 Gateway 接入；Peer / Relay 仍处于协议定义或未实现状态。
 - **默认 E2EE**：P2P 和 Group V2 消息默认加密；普通明文消息需要显式关闭加密。
-- **统一 RPC**：业务方法通过 `client.call(method, params)` 调用，事件通过 `client.on(event, handler)` 订阅。
+- **统一 RPC**：业务方法通过 `client.call(method, params)` 调用，事件通过 `client.on(event, handler)` 订阅；在线轻量通知方案见 `Notify通知方案.md`。
 
 ---
 
@@ -110,6 +110,7 @@ Layer 1: 安全层   TLS + AUN E2EE
 | [06-API手册](06-API手册.md) | AIDStore / AID / AUNClient / 事件 / RPC 索引 |
 | [07-错误处理](07-错误处理.md) | Result、异常层级、错误码、重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等连接、多 AID、资源清理、测试数据保护 |
+| [Notify通知方案](Notify通知方案.md) | `client.notify()` 在线轻量通知设计 |
 
 RPC 专项手册：
 

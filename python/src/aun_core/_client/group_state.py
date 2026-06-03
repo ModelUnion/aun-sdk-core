@@ -7,12 +7,15 @@ import json
 import time
 from typing import Any
 
+from .runtime import ClientRuntime
+
 
 class GroupStateCoordinator:
     """群 V2 状态链、提案与确认协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     async def postprocess_result(self, method: str, params: dict[str, Any], result: Any) -> Any:
         client = self.client

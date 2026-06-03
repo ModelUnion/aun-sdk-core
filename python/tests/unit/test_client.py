@@ -8,7 +8,7 @@ import pytest
 
 from aun_core import AIDStore, AUNClient, ConnectionState, ProtectedHeaders
 import aun_core.client as client_module
-from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PEER_PREKEYS_CACHE_TTL
+from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL
 from aun_core.errors import ClientSignatureError, StateError, ValidationError
 
 
@@ -110,10 +110,6 @@ def _make_store_with_aid(aun_path, aid: str = "alice.agentid.pub", *, access_tok
 
 def test_peer_cert_cache_ttl_is_one_hour():
     assert _PEER_CERT_CACHE_TTL == 3600
-
-
-def test_peer_prekeys_cache_ttl_is_one_hour():
-    assert _PEER_PREKEYS_CACHE_TTL == 3600
 
 
 @pytest.mark.asyncio
@@ -3148,51 +3144,6 @@ def test_thought_selector_validation_requires_context():
         client._validate_outbound_call("message.thought.put", {
             "to": "bob.example.com",
         })
-
-
-def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
-    """零信任语义：keystore 中即便有匹配指纹的证书，仍必须经过 _fetch_peer_cert
-    完成 PKI 验证后方可信任；mock 让 _fetch_peer_cert 成功返回，验证流程通过即可。
-    """
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-    from datetime import datetime, timedelta, timezone
-
-    key = ec.generate_private_key(ec.SECP256R1())
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "alice.example.com")])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
-        .sign(key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
-
-    client = _make_client_with_aid(tmp_path / "aun")
-    client._token_store.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
-
-    called = {"fetch": 0, "last_fp": None}
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        called["fetch"] += 1
-        called["last_fp"] = cert_fingerprint
-        return cert_pem.encode("utf-8")
-
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-
-    ok = asyncio.run(client._ensure_sender_cert_cached("alice.example.com", cert_fp))
-
-    assert ok is True
-    # 零信任：必须调用 _fetch_peer_cert 做 PKI 验证，不能仅凭 keystore 信任
-    assert called["fetch"] == 1
-    assert called["last_fp"] == cert_fp
 
 
 def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp_path):

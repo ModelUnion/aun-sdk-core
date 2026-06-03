@@ -76,6 +76,164 @@ func newRpcPipeline(runtime *clientRuntime) *rpcPipeline {
 	return &rpcPipeline{runtime: runtime}
 }
 
+func (p *rpcPipeline) call(ctx context.Context, method string, params map[string]any) (result any, err error) {
+	c := p.runtime.client
+	tStart := time.Now()
+	c.log.Debug("Call enter: method=%s paramsSummary=%s", method, summarizeCallParams(method, params))
+	defer func() {
+		if err != nil {
+			c.log.Debug("Call exit (error): method=%s elapsed=%dms err=%v", method, time.Since(tStart).Milliseconds(), err)
+		} else {
+			c.log.Debug("Call exit: method=%s elapsed=%dms", method, time.Since(tStart).Milliseconds())
+		}
+	}()
+
+	preflight, err := p.preflight(method, params)
+	if err != nil {
+		return nil, err
+	}
+	params = preflight.params
+	pullGateLocked := truthyBool(params["_pull_gate_locked"])
+	delete(params, "_pull_gate_locked")
+	pullGateKey := p.pullGateKeyForCall(method, params)
+	if pullGateKey != "" && !pullGateLocked {
+		lockedParams := copyRpcParams(params)
+		lockedParams["_pull_gate_locked"] = true
+		return p.runPullSerialized(ctx, pullGateKey, func() (any, error) {
+			return p.call(ctx, method, lockedParams)
+		})
+	}
+
+	if method == "message.send" {
+		encrypt := true
+		if enc, ok := params["encrypt"]; ok {
+			if encBool, ok := enc.(bool); ok {
+				encrypt = encBool
+			}
+			delete(params, "encrypt")
+		}
+		if encrypt {
+			if c.v2GetState() != nil {
+				c.log.Debug("call route: message.send → V2 send")
+				return c.sendV2Internal(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot send encrypted message")
+		}
+		c.maybeAppendEchoTraceSend(params)
+	}
+
+	if method == "group.send" {
+		encrypt := true
+		if enc, ok := params["encrypt"]; ok {
+			if encBool, ok := enc.(bool); ok {
+				encrypt = encBool
+			}
+			delete(params, "encrypt")
+		}
+		if encrypt {
+			if c.v2GetState() != nil {
+				c.logEG.Debug("call route: group.send → V2 send")
+				return c.sendGroupV2Internal(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot send encrypted group message")
+		}
+		c.maybeAppendEchoTraceSend(params)
+	}
+
+	if method == "message.pull" && c.v2GetState() != nil {
+		c.log.Debug("call route: message.pull → V2 pull")
+		return c.pullV2Internal(ctx, params)
+	}
+	if method == "message.ack" && c.v2GetState() != nil {
+		c.log.Debug("call route: message.ack → V2 ack")
+		return c.ackV2Internal(ctx, params)
+	}
+	if method == "group.pull" {
+		gid, _ := params["group_id"].(string)
+		if c.v2GetState() != nil && gid != "" {
+			c.logEG.Debug("call route: group.pull → V2 pull group=%s", gid)
+			return c.pullGroupV2Internal(ctx, params)
+		}
+	}
+	if method == "group.ack_messages" {
+		gid, _ := params["group_id"].(string)
+		if c.v2GetState() != nil && gid != "" {
+			if c.groupCursorTargetsCurrentInstance(params) {
+				c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
+				return c.ackGroupV2Internal(ctx, params)
+			}
+			c.logEG.Debug("call route: group.ack_messages external cursor → raw ack group=%s device_id=%s slot_id=%s", gid, stringFromAny(params["device_id"]), stringFromAny(params["slot_id"]))
+		}
+	}
+
+	if method == "group.thought.put" {
+		encrypt := true
+		if enc, ok := params["encrypt"]; ok {
+			if encBool, ok := enc.(bool); ok {
+				encrypt = encBool
+			}
+			delete(params, "encrypt")
+		}
+		if encrypt {
+			gid, _ := params["group_id"].(string)
+			if c.v2GetState() != nil && gid != "" {
+				c.logEG.Debug("call route: group.thought.put → V2 encrypted put group=%s", gid)
+				return c.putGroupThoughtEncryptedV2(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot encrypt group thought")
+		}
+	}
+	if method == "message.thought.put" {
+		encrypt := true
+		if enc, ok := params["encrypt"]; ok {
+			if encBool, ok := enc.(bool); ok {
+				encrypt = encBool
+			}
+			delete(params, "encrypt")
+		}
+		if encrypt {
+			toAID, _ := params["to"].(string)
+			if c.v2GetState() != nil && toAID != "" {
+				c.log.Debug("call route: message.thought.put → V2 encrypted put to=%s", toAID)
+				return c.putMessageThoughtEncryptedV2(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot encrypt message thought")
+		}
+	}
+
+	if err := p.applyClientSignature(method, params); err != nil {
+		return nil, err
+	}
+
+	callCtx := ctx
+	if nonIdempotentMethods[method] {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, nonIdempotentTimeout)
+		defer cancel()
+	}
+
+	if method == "message.thought.get" || method == "group.thought.get" {
+		c.log.Debug("thought.get transport call start: method=%s params=%s", method, summarizeCallParams(method, params))
+	}
+
+	if pullGateKey != "" && !pullGateLocked {
+		gatedResult, gatedErr := p.runPullSerialized(callCtx, pullGateKey, func() (any, error) {
+			return c.transport.Call(callCtx, method, params)
+		})
+		if gatedErr != nil {
+			return nil, gatedErr
+		}
+		result = gatedResult
+	} else {
+		result, err = c.transport.Call(callCtx, method, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return p.postprocessResult(ctx, method, params, result)
+}
+
 func (p *rpcPipeline) preflight(method string, params map[string]any) (*rpcPreflightResult, error) {
 	c := p.runtime.client
 	c.mu.RLock()
@@ -259,10 +417,7 @@ func (p *rpcPipeline) mergeInstanceProtectedHeaders(method string, params map[st
 	if !protectedHeadersMergeMethods[method] {
 		return
 	}
-	c := p.runtime.client
-	c.mu.RLock()
-	instance := c.instanceProtectedHeaders
-	c.mu.RUnlock()
+	instance := p.runtime.rpc.protectedHeaders()
 	if len(instance) == 0 {
 		return
 	}

@@ -7,13 +7,15 @@ from cryptography import x509
 from .._cert_utils import cert_common_name, cert_time_error
 from ..aid import AID
 from ..errors import AUNError, StateError, ValidationError
+from .runtime import ClientRuntime
 
 
 class PeerDirectory:
     """Peer AID、证书与网关发现协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     def require_peer_management_state(self) -> None:
         if not self.client.has_identity:
@@ -56,10 +58,10 @@ class PeerDirectory:
             return client._gateway_url
         cached_gateway = self.load_cached_gateway_url(target)
         if cached_gateway:
-            client._gateway_url = cached_gateway
+            self.runtime.lifecycle.set_gateway_url(cached_gateway)
             return cached_gateway
         gateway_url = await self.discover_gateway_url(target)
-        client._gateway_url = gateway_url
+        self.runtime.lifecycle.set_gateway_url(gateway_url)
         self.persist_gateway_url(target, gateway_url)
         return gateway_url
 

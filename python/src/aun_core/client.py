@@ -199,11 +199,6 @@ _PUSHED_SEQS_LIMIT = 50000
 _PENDING_ORDERED_LIMIT = 50000
 _RECONNECT_MIN_BASE_DELAY = 1.0
 _RECONNECT_MAX_BASE_DELAY = 64.0
-_GROUP_ROTATION_LEASE_MS = 120000
-_GROUP_ROTATION_RETRY_MAX_DELAY = 300.0
-_GROUP_JOIN_ROTATION_STAGGER_S = 3.0
-_KEY_WAIT_TIMEOUT_S = 5.0
-_KEY_WAIT_POLL_INTERVAL_S = 0.15
 
 # P1-23: 非幂等方法使用更长超时（35s），避免 SDK 10s 超时 < gateway 30s 处理时间
 _NON_IDEMPOTENT_TIMEOUT = 35.0
@@ -388,7 +383,6 @@ def _build_client_runtime_manager(client: Any) -> AgentMdManager:
 
 
 _PEER_CERT_CACHE_TTL = 3600  # 1 小时
-_PEER_PREKEYS_CACHE_TTL = 3600  # 1 小时
 
 
 @dataclass(slots=True)
@@ -539,7 +533,6 @@ class AUNClient:
         self._v2_bootstrap_cache: dict[str, tuple] = {}
         self._v2_sender_ik_pending: dict[str, dict[str, Any]] = {}
         self._v2_sender_ik_fetching: set[str] = set()
-        self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
         # agent.md 存储路径由 AgentMdManager 固定管理为 {aun_path}/AIDs/{aid}/。
@@ -586,7 +579,6 @@ class AUNClient:
         )
         self._transport.set_meta_observer(self._observe_rpc_meta)
         self._token_refresh_failures = 0  # token 刷新连续失败计数
-        self._cache_cleanup_task: asyncio.Task | None = None
         # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
         self._seq_tracker = SeqTracker()
         self._seq_tracker_context: tuple[str, str, str] | None = None
@@ -652,13 +644,13 @@ class AUNClient:
         self._server_kicked = False
         self._dispatcher.subscribe("_raw.gateway.disconnect", self._on_gateway_disconnect)
         self._client_runtime = ClientRuntime(self)
-        self._identity_runtime = IdentityRuntimeManager(self)
-        self._peer_directory = PeerDirectory(self)
-        self._lifecycle_controller = LifecycleController(self)
-        self._rpc_pipeline = RpcPipeline(self)
-        self._message_delivery = MessageDeliveryEngine(self)
-        self._v2_e2ee = V2E2EECoordinator(self)
-        self._group_state_coordinator = GroupStateCoordinator(self)
+        self._identity_runtime = IdentityRuntimeManager(self._client_runtime)
+        self._peer_directory = PeerDirectory(self._client_runtime)
+        self._lifecycle_controller = LifecycleController(self._client_runtime)
+        self._rpc_pipeline = RpcPipeline(self._client_runtime)
+        self._message_delivery = MessageDeliveryEngine(self._client_runtime)
+        self._v2_e2ee = V2E2EECoordinator(self._client_runtime)
+        self._group_state_coordinator = GroupStateCoordinator(self._client_runtime)
 
     # ── 属性 ──────────────────────────────────────────────
 
@@ -797,9 +789,6 @@ class AUNClient:
     def load_identity(self, aid: AID) -> None:
         self._identity_runtime.load_identity(aid)
 
-    def _require_peer_management_state(self) -> None:
-        self._peer_directory.require_peer_management_state()
-
     def cache_peer(self, aid: AID) -> AID:
         return self._peer_directory.cache_peer(aid)
 
@@ -811,9 +800,6 @@ class AUNClient:
 
     def peers(self) -> list[AID]:
         return self._peer_directory.peers()
-
-    def _rebuild_runtime_for_identity(self, aid: AID) -> None:
-        self._identity_runtime.rebuild_runtime_for_identity(aid)
 
     def set_protected_headers(self, headers: dict[str, Any] | None) -> None:
         if not headers:
@@ -837,27 +823,11 @@ class AUNClient:
     async def _discover_gateway_for_aid(self, aid: str) -> str:
         return await self._peer_directory.discover_gateway_for_aid(aid)
 
-    @staticmethod
-    def _issuer_domain_for_aid(aid: str) -> str:
-        return PeerDirectory.issuer_domain_for_aid(aid)
-
     async def _discover_gateway_for_peer_aid(self, peer_aid: str) -> str:
         return await self._peer_directory.discover_gateway_for_peer_aid(peer_aid)
 
-    async def _discover_gateway_url(self, aid: str) -> str:
-        return await self._peer_directory.discover_gateway_url(aid)
-
-    def _load_cached_gateway_url(self, aid: str) -> str:
-        return self._peer_directory.load_cached_gateway_url(aid)
-
-    def _persist_gateway_url(self, aid: str, gateway_url: str) -> None:
-        self._peer_directory.persist_gateway_url(aid, gateway_url)
-
     async def _resolve_peer_aid(self, aid: str, cert_fingerprint: str | None = None) -> AID:
         return await self._peer_directory.resolve_peer_aid(aid, cert_fingerprint=cert_fingerprint)
-
-    def _public_aid_from_cert(self, aid: str, cert_pem: str) -> AID:
-        return self._peer_directory.public_aid_from_cert(aid, cert_pem)
 
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
@@ -889,38 +859,43 @@ class AUNClient:
         """最近一次 health check 结果，None 表示尚未检查。"""
         return self._discovery.last_healthy
 
+    def _runtime(self) -> ClientRuntime:
+        runtime = ClientRuntime.coerce(self)
+        self._client_runtime = runtime
+        return runtime
+
     def _lifecycle(self) -> LifecycleController:
         controller = getattr(self, "_lifecycle_controller", None)
         if controller is None:
-            controller = LifecycleController(self)
+            controller = LifecycleController(self._runtime())
             self._lifecycle_controller = controller
         return controller
 
     def _rpc(self) -> RpcPipeline:
         pipeline = getattr(self, "_rpc_pipeline", None)
         if pipeline is None:
-            pipeline = RpcPipeline(self)
+            pipeline = RpcPipeline(self._runtime())
             self._rpc_pipeline = pipeline
         return pipeline
 
     def _delivery(self) -> MessageDeliveryEngine:
         engine = getattr(self, "_message_delivery", None)
         if engine is None:
-            engine = MessageDeliveryEngine(self)
+            engine = MessageDeliveryEngine(self._runtime())
             self._message_delivery = engine
         return engine
 
     def _v2_e2ee_coordinator(self) -> V2E2EECoordinator:
         coordinator = getattr(self, "_v2_e2ee", None)
         if coordinator is None:
-            coordinator = V2E2EECoordinator(self)
+            coordinator = V2E2EECoordinator(self._runtime())
             self._v2_e2ee = coordinator
         return coordinator
 
     def _group_state(self) -> GroupStateCoordinator:
         coordinator = getattr(self, "_group_state_coordinator", None)
         if coordinator is None:
-            coordinator = GroupStateCoordinator(self)
+            coordinator = GroupStateCoordinator(self._runtime())
             self._group_state_coordinator = coordinator
         return coordinator
 
@@ -975,206 +950,14 @@ class AUNClient:
 
     # ── Pull Gate ─────────────────────────────────────────────────
 
-    def _pull_gate_key_for_call(self, method: str, params: dict) -> str:
-        return self._rpc().pull_gate_key_for_call(method, params)
-
     def _try_acquire_pull_gate(self, key: str) -> int | None:
         return self._rpc().try_acquire_pull_gate(key)
 
     def _release_pull_gate(self, key: str, token: int | None) -> None:
         self._rpc().release_pull_gate(key, token)
 
-    async def _run_pull_serialized(self, key: str, operation):
-        return await self._rpc().run_pull_serialized(key, operation)
-
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         return await self._rpc().call(method, params, trace=trace)
-
-    async def _call_after_pipeline(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        trace: str | None,
-        started_at: float,
-    ) -> Any:
-        _t_call_start = started_at
-        pull_gate_locked = bool(params.pop("_pull_gate_locked", False))
-        pull_gate_key = self._pull_gate_key_for_call(method, params)
-        if pull_gate_key and not pull_gate_locked:
-            locked_params = dict(params)
-            locked_params["_pull_gate_locked"] = True
-
-            async def _gated_call():
-                return await self._call_after_pipeline(
-                    method,
-                    locked_params,
-                    trace=trace,
-                    started_at=started_at,
-                )
-
-            return await self._run_pull_serialized(pull_gate_key, _gated_call)
-
-        # 自动加密：message.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
-        if method == "message.send":
-            encrypt = params.pop("encrypt", True)
-            self._log_message_debug(
-                "send-input",
-                "message.send",
-                "message.send",
-                params,
-                payload_override=params.get("payload", params.get("content")),
-                extra={"encrypt": encrypt},
-            )
-            self._log.debug("client", "call message.send: to=%s encrypt=%s payload_keys=%s",
-                            params.get("to", "-"), encrypt,
-                            list(params.get("payload", {}).keys()) if isinstance(params.get("payload"), dict) else type(params.get("payload")).__name__)
-            if encrypt:
-                if not self._v2_session:
-                    raise StateError("V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)")
-                self._log.debug("client", "call encrypt branch: method=message.send to=%s v2=True", params.get("to", "-"))
-                try:
-                    result = await self._send_encrypted_v2(params)
-                    self._log.debug("client", "call exit (encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
-                    return result
-                except Exception as exc:
-                    self._log.debug("client", "call exit (encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                    raise
-            # encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
-            self._maybe_append_echo_trace_send(params)
-
-        # 自动加密：group.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
-        if method == "group.send":
-            encrypt = params.pop("encrypt", True)
-            self._log_message_debug(
-                "send-input",
-                "group.send",
-                "group.send",
-                params,
-                payload_override=params.get("payload", params.get("content")),
-                extra={"encrypt": encrypt},
-            )
-            if encrypt:
-                if not self._v2_session:
-                    raise StateError("V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)")
-                self._log.debug("client", "call encrypt branch: method=group.send group_id=%s v2=True", params.get("group_id", "-"))
-                try:
-                    result = await self._send_group_encrypted_v2(params)
-                    self._log.debug("client", "call exit (group-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
-                    return result
-                except Exception as exc:
-                    self._log.debug("client", "call exit (group-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                    raise
-            # encrypt=false：明文走通用 RPC 路径，不受 group epoch 轮换/恢复约束
-            self._maybe_append_echo_trace_send(params)
-
-        # message.pull：V2 就绪时走 V2 pull（V2-only：跳过旧加密 envelope）
-        if method == "message.pull" and getattr(self, "_v2_session", None):
-            self._log.debug("client", "call route: message.pull → V2 pull")
-            return await self._pull_v2_internal(params)
-
-        # message.ack：V2 就绪时走 V2 ack
-        if method == "message.ack" and getattr(self, "_v2_session", None):
-            self._log.debug("client", "call route: message.ack → V2 ack")
-            return await self._ack_v2_internal(params)
-
-        # group.pull：V2 就绪时走 V2 pull
-        if method == "group.pull" and self._v2_session and params.get("group_id"):
-            self._log.debug("client", "call route: group.pull → V2 pull")
-            return await self._pull_group_v2_internal(params)
-
-        # group.ack_messages：V2 就绪时走 V2 ack
-        if method == "group.ack_messages" and self._v2_session and params.get("group_id"):
-            if self._group_cursor_targets_current_instance(params):
-                self._log.debug("client", "call route: group.ack_messages → V2 ack")
-                return await self._ack_group_v2_internal(params)
-            self._log.debug(
-                "client",
-                "call route: group.ack_messages 外部 cursor → 原始 ack device_id=%s slot_id=%s",
-                params.get("device_id"), params.get("slot_id"),
-            )
-        if method == "group.thought.put":
-            encrypt = params.pop("encrypt", True)
-            if encrypt:
-                if not self._v2_session or not params.get("group_id"):
-                    raise StateError("V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)")
-                try:
-                    self._log.debug("client", "call route: group.thought.put → V2 encrypted put")
-                    result = await self._put_group_thought_encrypted_v2(params)
-                    self._log.debug("client", "call exit (thought-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
-                    return result
-                except Exception as exc:
-                    self._log.debug("client", "call exit (thought-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                    raise
-            # encrypt=false：明文走通用 RPC 路径
-        if method == "message.thought.put":
-            encrypt = params.pop("encrypt", True)
-            if encrypt:
-                if not self._v2_session or not params.get("to"):
-                    raise StateError("V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)")
-                try:
-                    self._log.debug("client", "call route: message.thought.put → V2 encrypted put")
-                    result = await self._put_message_thought_encrypted_v2(params)
-                    self._log.debug("client", "call exit (msg-thought-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
-                    return result
-                except Exception as exc:
-                    self._log.debug("client", "call exit (msg-thought-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                    raise
-            # encrypt=false：明文走通用 RPC 路径
-
-        # 关键操作自动附加客户端签名
-        if method in self._SIGNED_METHODS:
-            if self._should_skip_client_signature(method, params):
-                params.pop("client_signature", None)
-            else:
-                self._sign_client_operation(method, params)
-
-        # P1-23: 非幂等方法使用更长超时
-        call_kwargs: dict[str, Any] = {}
-        if method in _NON_IDEMPOTENT_METHODS:
-            call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
-        if trace:
-            call_kwargs["trace"] = trace
-
-        # Pull Gate：序列化同一 key 的 pull 操作
-        if pull_gate_key and not pull_gate_locked:
-            async def _gated_call():
-                if method in ("group.thought.get", "message.thought.get"):
-                    self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
-                try:
-                    return await self._transport.call(method, params, **call_kwargs)
-                except TypeError as exc:
-                    if call_kwargs and "unexpected keyword argument" in str(exc):
-                        call_kwargs.pop("timeout", None)
-                        call_kwargs.pop("trace", None)
-                        return await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
-                    raise
-            try:
-                result = await self._run_pull_serialized(pull_gate_key, _gated_call)
-            except Exception as exc:
-                self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                raise
-        else:
-            if method in ("group.thought.get", "message.thought.get"):
-                self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
-            try:
-                result = await self._transport.call(method, params, **call_kwargs)
-            except TypeError as exc:
-                if call_kwargs and "unexpected keyword argument" in str(exc):
-                    call_kwargs.pop("timeout", None)
-                    call_kwargs.pop("trace", None)
-                    result = await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
-                else:
-                    self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                    raise
-            except Exception as exc:
-                self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-                raise
-
-        result = await self._rpc().postprocess_result(method, params, result)
-
-        self._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
-        return result
 
     @staticmethod
     def _protected_headers_from_params(params: dict[str, Any]) -> dict[str, Any] | ProtectedHeaders | None:
@@ -1205,55 +988,6 @@ class AUNClient:
         except Exception as _fp_exc:
             self._log.debug("client", "failed to extract cert fingerprint: %s", _fp_exc)
             return ""
-
-    async def _lazy_sync_group(self, group_id: str) -> None:
-        """惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。"""
-        self._group_synced.add(group_id)
-        try:
-            ns = f"group:{group_id}"
-            after_seq = self._seq_tracker.get_contiguous_seq(ns)
-            result = await self._transport.call("group.pull", {
-                "group_id": group_id,
-                "after_message_seq": after_seq,
-                "limit": 200,
-            })
-            messages = result.get("messages", []) if isinstance(result, dict) else []
-            for msg in messages:
-                seq = msg.get("seq")
-                if seq is not None:
-                    self._seq_tracker.on_message_seq(ns, int(seq))
-            if messages:
-                self._persist_seq(ns)
-                self._log.info("client", "lazy sync group %s: pulled %d messages, after_seq=%d", group_id, len(messages), after_seq)
-        except Exception as exc:
-            self._log.warn("client", "lazy sync group %s failed: %s", group_id, exc)
-
-
-    def _join_mode_allows_member_epoch_rotation(mode: str) -> bool:
-        return str(mode or "").strip().lower() in {"open", "invite_only", "invite_code"}
-
-    def _group_secret_matches_committed_rotation(
-        secret_data: dict[str, Any] | None,
-        committed_rotation: dict[str, Any] | None,
-        *,
-        local_aid: str = "",
-    ) -> bool:
-        if not isinstance(secret_data, dict):
-            return False
-        committed_commitment = ""
-        if isinstance(committed_rotation, dict):
-            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
-        local_commitment = str(secret_data.get("commitment") or "").strip()
-        if committed_commitment and committed_commitment != local_commitment:
-            return False
-        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "").strip()
-        if not pending_rotation_id:
-            return True
-        if not isinstance(committed_rotation, dict):
-            return False
-        if str(committed_rotation.get("rotation_id") or "").strip() != pending_rotation_id:
-            return False
-        return True
 
     # ── 事件 ──────────────────────────────────────────────
 
@@ -1493,10 +1227,6 @@ class AUNClient:
     def _normalize_published_message_payload(self, event: str, payload: Any) -> Any:
         return self._delivery().normalize_published_message_payload(event, payload)
 
-    @staticmethod
-    def _debug_json_default(value: Any) -> Any:
-        return MessageDeliveryEngine.debug_json_default(value)
-
     @classmethod
     def _debug_json(cls, value: Any) -> str:
         return MessageDeliveryEngine.debug_json(value)
@@ -1551,22 +1281,6 @@ class AUNClient:
 
     def _enforce_pushed_seqs_limit(self, ns: str) -> None:
         return self._delivery().enforce_pushed_seqs_limit(ns)
-
-    def _attach_group_dispatch_mode_to_payload(message: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(message, dict):
-            return message
-        mode = str(message.get("dispatch_mode") or "broadcast").strip().lower()
-        if mode not in {"broadcast", "mention"}:
-            mode = "broadcast"
-        payload = message.get("payload")
-        if not isinstance(payload, dict):
-            return message
-        result = dict(message)
-        payload_view = dict(payload)
-        payload_view["dispatch_mode"] = mode
-        result["payload"] = payload_view
-        result["dispatch_mode"] = mode
-        return result
 
     def _v2_pending_sender_ik_message_key(self, msg: dict[str, Any], group_id: str) -> str:
         return self._v2_e2ee_coordinator().pending_sender_ik_message_key(msg, group_id)
@@ -2063,128 +1777,6 @@ class AUNClient:
             default_key_source=default_key_source,
         )
 
-    @staticmethod
-    def _list_contains_token(value: Any, token: str) -> bool:
-        if not isinstance(value, list):
-            return False
-        return token in value
-
-    def _client_uses_v2_p2p(self) -> bool:
-        """Python SDK 是 V2-only 客户端，P2P 不做 V1 降级。"""
-        return True
-
-    def _client_uses_v2_group(self) -> bool:
-        """Python SDK 是 V2-only 客户端，Group 不做 V1 降级。"""
-        return True
-
-    # 兼容别名：旧调用点仍可用
-    async def _ensure_sender_cert_cached(self, aid: str, cert_fingerprint: str | None = None) -> bool:
-        """确保发送方证书在本地 keystore 中可用且未过期。
-
-        安全要点：不能永久信任旧证书，必须按 TTL 刷新并重新做 PKI 验证
-        （链 + CRL + OCSP + AID 绑定），以使证书吊销和轮换及时生效。
-
-        返回 True 表示证书已就绪（PKI 验证通过），False 表示不可用。
-        """
-        # 内存缓存未过期 → 跳过（_fetch_peer_cert 已做完整 PKI 验证）
-        cache_key = self._cert_cache_key(aid, cert_fingerprint)
-        normalized_fp = str(cert_fingerprint or "").strip().lower()
-        _debug_group_e2ee(
-            "ensure_sender_cert_enter",
-            aid=self._aid or "-",
-            peer=aid,
-            fp=normalized_fp or "-",
-            cache_key=cache_key,
-        )
-        cached = self._cert_cache.get(cache_key)
-        if cached and time.time() < cached.refresh_after:
-            _debug_group_e2ee(
-                "ensure_sender_cert_cache_hit",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                cache_key=cache_key,
-            )
-            return True
-        if cached:
-            _debug_group_e2ee(
-                "ensure_sender_cert_cache_stale",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                cache_key=cache_key,
-            )
-        try:
-            local_cert = self._token_store.load_cert(aid, cert_fingerprint)
-        except TypeError:
-            local_cert = self._token_store.load_cert(aid)
-        except Exception as _lc_exc:
-            _debug_group_e2ee(
-                "ensure_sender_cert_token_store_error",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                error=type(_lc_exc).__name__,
-            )
-            self._log.debug("client", "failed to load peer cert (%s): %s", aid, _lc_exc)
-            local_cert = None
-        if local_cert:
-            _debug_group_e2ee(
-                "ensure_sender_cert_token_store_hit",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-            )
-            # keystore 中有证书，但不直接信任 — 仍需通过 _fetch_peer_cert 做 PKI 验证
-            # 仅在网络不可用时作为降级（见下方 except 分支）
-            pass
-        else:
-            _debug_group_e2ee(
-                "ensure_sender_cert_token_store_miss",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-            )
-        try:
-            # _fetch_peer_cert 内部：下载 → 完整 PKI 验证 → 更新内存缓存
-            cert_bytes = await self._fetch_peer_cert(aid, cert_fingerprint)
-            # _fetch_peer_cert 内部已保存到版本目录，此处无需重复保存
-            _debug_group_e2ee(
-                "ensure_sender_cert_fetch_ok",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                bytes=len(cert_bytes or b""),
-            )
-            return True
-        except Exception as exc:
-            # 刷新失败时：若内存缓存有 PKI 验证过的证书（未过期 × 2 倍 TTL）则继续用
-            if cached and time.time() < cached.validated_at + _PEER_CERT_CACHE_TTL * 2:
-                _debug_group_e2ee(
-                    "ensure_sender_cert_fetch_failed_use_grace",
-                    aid=self._aid or "-",
-                    peer=aid,
-                    fp=normalized_fp or "-",
-                    error=type(exc).__name__,
-                )
-                self._log.debug("client", "refresh sender %s cert failed, continuing with verified memory cache: %s", aid, exc)
-                return True
-            # 超出宽限期或从未验证过 → 不可信
-            _debug_group_e2ee(
-                "ensure_sender_cert_fetch_failed_no_cache",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                error=type(exc).__name__,
-            )
-            self._log.warn("client", 
-                "获取发送方 %s 证书失败且无已验证缓存，拒绝信任 (fp=%s): %s",
-                aid,
-                cert_fingerprint or "",
-                exc,
-            )
-            return False
-
     def _get_verified_peer_cert(self, aid: str, cert_fingerprint: str | None = None) -> str | None:
         """获取经过 PKI 验证的 peer 证书（仅信任内存缓存中已验证的证书）。
 
@@ -2340,16 +1932,6 @@ class AUNClient:
     async def _token_refresh_loop(self) -> None:
         return await self._lifecycle().token_refresh_loop()
 
-    def _extract_consumed_prekey_id(message: dict[str, Any] | None) -> str:
-        if not isinstance(message, dict):
-            return ""
-        e2ee = message.get("e2ee")
-        if not isinstance(e2ee, dict):
-            return ""
-        if e2ee.get("encryption_mode") != "prekey_ecdh_v2":
-            return ""
-        return str(e2ee.get("prekey_id") or "").strip()
-
     def _validate_message_recipient(self, to_aid: Any) -> None:
         if not str(to_aid or "").strip():
             raise ValidationError("message.send requires a non-empty 'to' (recipient AID)")
@@ -2358,9 +1940,6 @@ class AUNClient:
 
     def _normalize_outbound_message_payload(self, params: dict[str, Any], *, method: str = "") -> None:
         self._rpc().normalize_outbound_message_payload(params, method=method)
-
-    def _is_echo_message_params(self, params: dict[str, Any]) -> bool:
-        return self._rpc().is_echo_message_params(params)
 
     def _should_skip_client_signature(self, method: str, params: dict[str, Any]) -> bool:
         return self._rpc().should_skip_client_signature(method, params)
@@ -2412,9 +1991,6 @@ class AUNClient:
     def _validate_outbound_call(self, method: str, params: dict[str, Any]) -> None:
         self._rpc().validate_outbound_call(method, params)
 
-    def _current_message_delivery_mode(self) -> dict[str, Any]:
-        return dict(self._connect_delivery_mode)
-
     def _inject_message_cursor_context(self, method: str, params: dict[str, Any]) -> None:
         self._rpc().inject_message_cursor_context(method, params)
 
@@ -2447,64 +2023,6 @@ class AUNClient:
 
     def _save_seq_tracker_state(self) -> None:
         return self._delivery().save_seq_tracker_state()
-
-    def _attach_rotation_id(info: dict[str, Any], rotation_id: str) -> None:
-        if not rotation_id:
-            return
-        for dist in info.get("distributions", []):
-            if not isinstance(dist, dict):
-                continue
-            payload = dist.get("payload")
-            if isinstance(payload, dict):
-                payload["rotation_id"] = rotation_id
-
-    def _rotation_expected_members_stale(rotation: dict[str, Any], member_aids: list[str]) -> bool:
-        expected = rotation.get("expected_members")
-        if not isinstance(expected, list) or not expected:
-            return False
-        expected_members = sorted({str(item) for item in expected if str(item or "").strip()})
-        current_members = sorted({str(item) for item in member_aids if str(item or "").strip()})
-        return bool(expected_members and current_members and expected_members != current_members)
-
-    def _rotation_retry_delay_s(pending: dict[str, Any] | None) -> float:
-        now_ms = int(time.time() * 1000)
-        lease_expires_at = 0
-        if isinstance(pending, dict):
-            if pending.get("expired") or str(pending.get("status") or "") not in ("", "distributing"):
-                lease_expires_at = 0
-            else:
-                try:
-                    lease_expires_at = int(pending.get("lease_expires_at") or 0)
-                except (TypeError, ValueError):
-                    lease_expires_at = 0
-        base = max(1.0, (lease_expires_at - now_ms) / 1000.0 + 1.0) if lease_expires_at else 5.0
-        return min(base + random.random() * 2.0, _GROUP_ROTATION_RETRY_MAX_DELAY)
-
-    async def _cache_cleanup_loop(self, interval: float) -> None:
-        """定时清理过期的内存缓存条目"""
-        try:
-            while not self._closing:
-                await asyncio.sleep(interval)
-                now = time.time()
-                # 证书缓存
-                for k in list(self._cert_cache):
-                    if now >= self._cert_cache[k].refresh_after:
-                        del self._cert_cache[k]
-                # prekey 列表缓存
-                for k in list(self._peer_prekeys_cache):
-                    _, expire_at = self._peer_prekeys_cache[k]
-                    if now >= expire_at:
-                        del self._peer_prekeys_cache[k]
-                # 补洞去重：清理超过 5 分钟的旧条目（可能是卡住的补洞）
-                gap_cutoff = now - 300
-                stale_keys = [k for k, ts in self._gap_fill_done.items() if ts < gap_cutoff]
-                for k in stale_keys:
-                    self._gap_fill_done.pop(k, None)
-                # e2ee prekey 缓存
-                # auth gateway 缓存
-                self._auth.clean_expired_caches()
-        except asyncio.CancelledError:
-            raise
 
     # ── 内部：断线重连 ────────────────────────────────────
 
@@ -2672,10 +2190,6 @@ class AUNClient:
     async def _decrypt_message_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
         return await self._v2_e2ee_coordinator().decrypt_message_thoughts(result)
 
-    async def _decrypt_thought_get_result(self, result: dict[str, Any], *, group: bool) -> dict[str, Any]:
-        """解密 thought.get 返回中的 V2 envelope，并保留服务端返回的元数据字段。"""
-        return await self._v2_e2ee_coordinator().decrypt_thought_get_result(result, group=group)
-
     @staticmethod
     def _is_v2_thought_envelope(payload: dict[str, Any], *, group: bool) -> bool:
         return V2E2EECoordinator.is_v2_thought_envelope(payload, group=group)
@@ -2683,14 +2197,6 @@ class AUNClient:
     @staticmethod
     def _is_encrypted_thought_payload(payload: dict[str, Any]) -> bool:
         return V2E2EECoordinator.is_encrypted_thought_payload(payload)
-
-    @staticmethod
-    def _metadata_without_auth(value: Any) -> dict[str, Any]:
-        return V2E2EECoordinator.metadata_without_auth(value)
-
-    @staticmethod
-    def _v2_envelope_payload_type(envelope: dict[str, Any], protected_headers: dict[str, Any] | None = None) -> str:
-        return V2E2EECoordinator.v2_envelope_payload_type(envelope, protected_headers)
 
     def _v2_thought_e2ee_metadata(self, envelope: dict[str, Any]) -> dict[str, Any]:
         return self._v2_e2ee_coordinator().v2_thought_e2ee_metadata(envelope)

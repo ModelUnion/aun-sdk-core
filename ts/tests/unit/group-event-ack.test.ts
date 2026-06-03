@@ -167,7 +167,7 @@ describe('group.changed 事件补洞行为', () => {
       return { ok: true };
     });
 
-    await (client as any)._fillGroupEventGap('G1');
+    await (client as any)._delivery.fillGroupEventGap('G1');
 
     expect((client as any)._seqTracker.getContiguousSeq('group_event:g1')).toBe(9);
     expect(transportCalls.some(({ method }) => method === 'group.ack_events')).toBe(false);
@@ -205,7 +205,7 @@ describe('group.changed 事件补洞行为', () => {
       }
     });
 
-    await (client as any)._fillGroupEventGap('G1');
+    await (client as any)._delivery.fillGroupEventGap('G1');
 
     const ackCalls = transportCalls.filter(({ method }) => method === 'group.ack_events');
     expect(ackCalls).toHaveLength(1);

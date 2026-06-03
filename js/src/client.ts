@@ -130,6 +130,7 @@ interface SessionOptions extends JsonObject {
 export interface ConnectionOptions {
   auto_reconnect?: boolean;
   connect_timeout?: number;
+  retry?: JsonObject;
   retry_initial_delay?: number;
   retry_max_delay?: number;
   retry_max_attempts?: number;
@@ -260,7 +261,6 @@ function reconnectSleepDelaySeconds(baseDelay: number, maxBaseDelay: number): nu
 
 /** 对端证书缓存 TTL（秒） */
 const PEER_CERT_CACHE_TTL = 3600;
-const PEER_PREKEYS_CACHE_TTL = 3600;
 
 /** 缓存的对端证书 */
 interface CachedPeerCert {
@@ -1131,73 +1131,12 @@ export class AUNClient {
 
   /** 断开连接但保留本地状态，可再次 connect */
   async disconnect(): Promise<void> {
-    const tStart = Date.now();
-    this._clientLog.debug(`disconnect enter: state=${this._state}`);
-    if (this._closing) {
-      this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms reason=closing`);
-      return;
-    }
-    if (![
-      ConnectionState.AUTHENTICATED,
-      ConnectionState.CONNECTING,
-      ConnectionState.READY,
-      ConnectionState.RETRY_BACKOFF,
-      ConnectionState.RECONNECTING,
-      ConnectionState.CONNECTION_FAILED,
-    ].includes(this.state)) {
-      this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms reason=not_connected`);
-      return;
-    }
-
-    this._saveSeqTrackerState();
-    this._stopBackgroundTasks();
-
-    if (this._reconnectAbort) {
-      this._reconnectAbort.abort();
-      this._reconnectAbort = null;
-      this._reconnectActive = false;
-    }
-
-    await this._transport.close();
-    this._state = 'standby';
-    await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
-    this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
+    return this._lifecycle.disconnect();
   }
 
   /** 关闭连接 */
   async close(): Promise<void> {
-    const tStart = Date.now();
-    this._clientLog.debug(`close enter: state=${this._state}`);
-    this._closing = true;
-    this._saveSeqTrackerState();
-    this._stopBackgroundTasks();
-
-    // 取消进行中的重连
-    if (this._reconnectAbort) {
-      this._reconnectAbort.abort();
-      this._reconnectAbort = null;
-      this._reconnectActive = false;
-    }
-
-    if (this._state === 'idle' || this._state === 'closed') {
-      this._state = 'closed';
-      this._resetSeqTrackingState();
-      this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms reason=already_idle`);
-      return;
-    }
-
-    // 关闭前通知服务端主动退出（best-effort，失败不阻塞）
-    try {
-      await this._transport.call('auth.logout', {});
-    } catch {
-      // auth.logout 失败不影响关闭流程
-    }
-
-    await this._transport.close();
-    this._state = 'closed';
-    await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
-    this._resetSeqTrackingState();
-    this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
+    return this._lifecycle.close();
   }
 
 
@@ -1213,172 +1152,7 @@ export class AUNClient {
     method: string,
     params?: RpcParams,
   ): Promise<RpcResult> {
-    const tStart = Date.now();
-    this._clientLog.debug(`call enter: method=${method}`);
-    try {
-      const result = await this._callImpl(method, params);
-      this._clientLog.debug(`call exit: elapsed=${Date.now() - tStart}ms method=${method}`);
-      return result;
-    } catch (err) {
-      this._clientLog.debug(`call exit (error): elapsed=${Date.now() - tStart}ms method=${method} err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  private async _callImpl(
-    method: string,
-    params?: RpcParams,
-  ): Promise<RpcResult> {
-    const p = this._rpcPipeline.preflight(method, params).params;
-
-    // 自动加密：message.send 默认加密（encrypt 默认 true）— V2-only
-    if (method === 'message.send') {
-      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
-      delete p.encrypt;
-      if (encrypt) {
-        await this._ensureV2SessionReady(
-          'message.send',
-          'V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)',
-        );
-        this._clientLog.debug('call route: message.send → V2 encrypted send');
-        return await this._sendV2(String(p.to ?? ''), p.payload as Record<string, unknown> ?? {}, {
-          messageId: String(p.message_id ?? '') || undefined,
-          timestamp: p.timestamp as number | undefined,
-          protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
-          context: isJsonObject(p.context) ? p.context : undefined,
-        }) as RpcResult;
-      }
-      // encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
-      this._maybeAppendEchoTraceSend(p);
-    }
-
-    // 自动加密：group.send 默认加密（encrypt 默认 true）— V2-only
-    if (method === 'group.send') {
-      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
-      delete p.encrypt;
-      if (encrypt) {
-        await this._ensureV2SessionReady(
-          'group.send',
-          'V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)',
-        );
-        this._clientLog.debug('call route: group.send → V2 encrypted send');
-        return await this._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown> ?? {}, {
-          messageId: String(p.message_id ?? '') || undefined,
-          timestamp: p.timestamp as number | undefined,
-          protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
-          context: isJsonObject(p.context) ? p.context : undefined,
-        }) as RpcResult;
-      }
-      this._maybeAppendEchoTraceSend(p);
-    }
-    if (method === 'group.thought.put') {
-      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
-      delete p.encrypt;
-      if (encrypt) {
-        await this._ensureV2SessionReady(
-          'group.thought.put',
-          'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)',
-        );
-        this._clientLog.debug('call route: group.thought.put → V2 encrypted put');
-        return this._putGroupThoughtEncryptedV2(p);
-      }
-    }
-    if (method === 'message.thought.put') {
-      const encrypt = p.encrypt !== undefined ? p.encrypt : true;
-      delete p.encrypt;
-      if (encrypt) {
-        await this._ensureV2SessionReady(
-          'message.thought.put',
-          'V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)',
-        );
-        this._clientLog.debug('call route: message.thought.put → V2 encrypted put');
-        return this._putMessageThoughtEncryptedV2(p);
-      }
-    }
-
-    // Pull Gate：序列化同一 key 的 pull 操作，防止并发重复拉取
-    const pullGateKey = this._pullGateKeyForCall(method, p);
-    if (pullGateKey) {
-      return await this._runPullSerialized(pullGateKey, async () => {
-        return await this._callImplInner(method, p);
-      });
-    }
-
-    return await this._callImplInner(method, p);
-  }
-
-  /**
-   * _callImpl 的内层：pull gate 之后的实际 RPC 分发逻辑。
-   * 拆分出来以便 pull gate 包裹整个操作。
-   */
-  private async _callImplInner(
-    method: string,
-    p: RpcParams,
-  ): Promise<RpcResult> {
-    // message.pull：V2-only，按需初始化后走 V2 pull
-    if (method === 'message.pull') {
-      await this._ensureV2SessionReady('message.pull');
-      this._clientLog.debug('call route: message.pull → V2 pull');
-      const messages = await this._pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50, { force: p.force === true });
-      return { messages } as RpcResult;
-    }
-
-    // message.ack：V2-only，按需初始化后走 V2 ack
-    if (method === 'message.ack') {
-      await this._ensureV2SessionReady('message.ack');
-      this._clientLog.debug('call route: message.ack → V2 ack');
-      return await this._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined) as RpcResult;
-    }
-
-    // group.pull：V2-only，按需初始化后走 V2 pull
-    if (method === 'group.pull' && p.group_id) {
-      await this._ensureV2SessionReady('group.pull');
-      this._clientLog.debug('call route: group.pull → V2 pull');
-      const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
-      const cursorParams = this._explicitGroupCursorParams(p);
-      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
-      const pullOpts: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = {};
-      if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
-      if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
-      if (!ownsCursor) pullOpts.ownsCursor = false;
-      const messages = await this._pullGroupV2(
-        String(p.group_id),
-        Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
-        Number(p.limit ?? 50) || 50,
-        Object.keys(pullOpts).length > 0 ? pullOpts : undefined,
-      );
-      return { messages } as RpcResult;
-    }
-
-    // group.ack_messages：V2-only，按需初始化后走 V2 ack
-    if (method === 'group.ack_messages' && p.group_id) {
-      await this._ensureV2SessionReady('group.ack_messages');
-      this._clientLog.debug('call route: group.ack_messages → V2 ack');
-      const cursorParams = this._explicitGroupCursorParams(p);
-      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
-      if (!ownsCursor) {
-        return await this._rawGroupAckMessages(p) as RpcResult;
-      }
-      return await this._ackGroupV2(
-        String(p.group_id),
-        Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
-      ) as RpcResult;
-    }
-
-    // 关键操作自动附加客户端签名
-    await this._rpcPipeline.applyClientSignature(method, p);
-
-    // P1-23: 非幂等方法使用更长超时
-    const callTimeout = NON_IDEMPOTENT_METHODS.has(method) ? NON_IDEMPOTENT_TIMEOUT : undefined;
-    let result = callTimeout
-      ? await this._transport.call(method, p, callTimeout)
-      : await this._transport.call(method, p);
-
-    result = await this._rpcPipeline.postprocessResult(method, p, result) as RpcResult;
-
-    // ── Group E2EE 自动编排已移除（V2-only：由 group.v2.bootstrap 驱动）────────
-
-    return result;
+    return await this._rpcPipeline.call(method, params);
   }
 
   private async _callRawV2Rpc(method: string, params?: RpcParams): Promise<RpcResult> {
@@ -1431,11 +1205,6 @@ export class AUNClient {
     this._delivery.onRawMessageReceived(data);
   }
 
-  /** 实际处理推送消息的异步任务（V2-only：明文消息直接透传，V2 加密消息走 _onV2PushNotification） */
-  private async _processAndPublishMessage(data: EventPayload): Promise<void> {
-    return this._delivery.processAndPublishMessage(data);
-  }
-
   /** 处理群组消息推送：re-publish（V2 加密消息走 V2 push 路径） */
   private _onRawGroupMessageCreated(data: EventPayload): void {
     return this._delivery.onRawGroupMessageCreated(data);
@@ -1444,16 +1213,6 @@ export class AUNClient {
   /** 处理 V2 群消息通知：主动 pull V2 envelope，由 pullGroupV2 解密并发布。 */
   private async _onRawGroupV2MessageCreated(data: EventPayload): Promise<void> {
     return this._delivery.onRawGroupV2MessageCreated(data);
-  }
-
-  /**
-   * 处理群组推送消息的异步任务（V2-only：明文消息直接透传）。
-   *
-   * 带 payload 的事件（消息推送）：直接 re-publish。
-   * 不带 payload 的事件（通知）：自动 pull 最新消息。
-   */
-  private async _processAndPublishGroupMessage(data: EventPayload): Promise<void> {
-    return this._delivery.processAndPublishGroupMessage(data);
   }
 
   private async _publishEncryptedPushMessage(
@@ -1471,32 +1230,13 @@ export class AUNClient {
     return await this._v2E2EE.decryptV2PushMessage(data);
   }
 
-  /** 后台补齐群消息空洞 */
-  private async _fillGroupGap(groupId: string): Promise<void> {
-    return this._delivery.fillGroupGap(groupId);
-  }
-
-  /** 后台补齐群事件空洞 */
-  private async _fillGroupEventGap(groupId: string): Promise<void> {
-    return this._delivery.fillGroupEventGap(groupId);
-  }
-
   /** 后台补齐 P2P 消息空洞 */
   private async _fillP2pGap(): Promise<void> {
     return this._delivery.fillP2pGap();
   }
 
-  /** 只按硬上限裁剪 published guard，不能按 contiguousSeq 清理。 */
-  private _prunePushedSeqs(ns: string): void {
-    this._delivery.prunePushedSeqs(ns);
-  }
-
   private _markPublishedSeq(ns: string, seq: number): void {
     this._delivery.markPublishedSeq(ns, seq);
-  }
-
-  private _attachCurrentInstanceContext(payload: EventPayload): EventPayload {
-    return this._delivery.attachCurrentInstanceContext(payload);
   }
 
   private async _publishAppEvent(event: string, payload: EventPayload): Promise<void> {
@@ -1539,10 +1279,6 @@ export class AUNClient {
     const uptime = this._connectedAt ? Math.floor((Date.now() - this._connectedAt) / 1000) : 0;
     const trace = `${this._echoTimestamp()} [AUN-SDK.receive] aid=${this._aid ?? '-'} conn_uptime=${uptime}s`;
     msg.payload = { ...payload, text: payload.text + '\n' + trace };
-  }
-
-  private _messageTargetsCurrentInstance(message: EventPayload): boolean {
-    return this._delivery.messageTargetsCurrentInstance(message);
   }
 
   private async _drainOrderedMessages(ns: string, beforeSeq?: number): Promise<void> {
@@ -1710,72 +1446,6 @@ export class AUNClient {
     const certBytes = pemToArrayBuffer(certPem);
     const digest = await crypto.subtle.digest('SHA-256', certBytes);
     return 'sha256:' + Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  /**
-   * 从 X.509 DER 证书中提取 SubjectPublicKeyInfo 并计算其 SHA-256 指纹。
-   * 返回 "sha256:<hex>"，提取失败返回空串。
-   * 用于 H7 指纹校验（DER 证书指纹 OR SPKI 指纹任一匹配）。
-   */
-  private async _spkiFingerprint(certPem: string): Promise<string> {
-    try {
-      const der = new Uint8Array(pemToArrayBuffer(certPem));
-      // X.509: Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
-      // tbsCertificate ::= SEQUENCE { version?, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, ... }
-      // 逐级解析 SEQUENCE 并定位 SPKI (第 7 个或第 6 个子元素，取决于 version 是否 [0] explicit)。
-      const readLen = (buf: Uint8Array, pos: number): { len: number; next: number } => {
-        const first = buf[pos];
-        if (first < 0x80) return { len: first, next: pos + 1 };
-        const n = first & 0x7f;
-        let len = 0;
-        for (let i = 0; i < n; i++) len = (len << 8) | buf[pos + 1 + i];
-        return { len, next: pos + 1 + n };
-      };
-      // 外层 SEQUENCE
-      if (der[0] !== 0x30) return '';
-      const outer = readLen(der, 1);
-      // tbsCertificate SEQUENCE 起点
-      const tbsStart = outer.next;
-      if (der[tbsStart] !== 0x30) return '';
-      const tbsLen = readLen(der, tbsStart + 1);
-      let p = tbsLen.next;
-      const tbsEnd = tbsLen.next + tbsLen.len;
-      // 跳过 [0] EXPLICIT Version（可选）
-      if (der[p] === 0xa0) {
-        const lv = readLen(der, p + 1);
-        p = lv.next + lv.len;
-      }
-      // 跳过 serialNumber (INTEGER)
-      if (der[p] !== 0x02) return '';
-      let lv = readLen(der, p + 1);
-      p = lv.next + lv.len;
-      // 跳过 signature (SEQUENCE)
-      if (der[p] !== 0x30) return '';
-      lv = readLen(der, p + 1);
-      p = lv.next + lv.len;
-      // 跳过 issuer (SEQUENCE)
-      if (der[p] !== 0x30) return '';
-      lv = readLen(der, p + 1);
-      p = lv.next + lv.len;
-      // 跳过 validity (SEQUENCE)
-      if (der[p] !== 0x30) return '';
-      lv = readLen(der, p + 1);
-      p = lv.next + lv.len;
-      // 跳过 subject (SEQUENCE)
-      if (der[p] !== 0x30) return '';
-      lv = readLen(der, p + 1);
-      p = lv.next + lv.len;
-      // subjectPublicKeyInfo (SEQUENCE) — 连同 tag+length+value 全部即 SPKI DER
-      if (der[p] !== 0x30 || p >= tbsEnd) return '';
-      const spkiStart = p;
-      const spkiLV = readLen(der, p + 1);
-      const spkiEnd = spkiLV.next + spkiLV.len;
-      const spkiDer = der.subarray(spkiStart, spkiEnd);
-      const digest = await crypto.subtle.digest('SHA-256', spkiDer);
-      return 'sha256:' + Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
-    } catch {
-      return '';
-    }
   }
 
   private async _decryptGroupThoughts(result: JsonObject): Promise<JsonObject> {
@@ -2354,14 +2024,6 @@ export class AUNClient {
     this._rpcPipeline.validateMessageRecipient(toAid);
   }
 
-  private _validateOutboundCall(method: string, params: RpcParams): void {
-    this._rpcPipeline.validateOutboundCall(method, params);
-  }
-
-  private _injectMessageCursorContext(method: string, params: RpcParams): void {
-    this._rpcPipeline.injectMessageCursorContext(method, params);
-  }
-
   // ── 内部：断线重连 ────────────────────────────────
 
   /** 不重连 close code 集合：认证失败/权限错误/被踢等，重连无意义 */
@@ -2817,10 +2479,6 @@ export class AUNClient {
     return this._v2E2EE.scheduleSenderIKPending(args);
   }
 
-  private async _resolveV2SenderIKPending(fromAid: string, senderDeviceId: string, groupId: string, fetchKey: string): Promise<void> {
-    return await this._v2E2EE.resolveSenderIKPending(fromAid, senderDeviceId, groupId, fetchKey);
-  }
-
   /**
    * V2 P2P 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
    *
@@ -3247,10 +2905,6 @@ export class AUNClient {
   }
 
   // ── Pull Gate（序列化同一 key 的并发 pull）──────────────────
-
-  private _pullGateKeyForCall(method: string, params: RpcParams): string {
-    return this._rpcPipeline.pullGateKeyForCall(method, params);
-  }
 
   private async _runPullSerialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
     return await this._rpcPipeline.runPullSerialized(key, operation);

@@ -17,13 +17,15 @@ from ..errors import (
 )
 from ..group_id import normalize_group_id as _normalize_group_id
 from ..types import ConnectionState
+from .runtime import ClientRuntime
 
 
 class RpcPipeline:
     """RPC 调用前置校验、路由与后处理协调器。"""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = ClientRuntime.coerce(runtime)
+        self.client = self.runtime.client
 
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         client = self.client
@@ -59,7 +61,171 @@ class RpcPipeline:
         if method.startswith("group.") and "slot_id" not in prepared:
             prepared["slot_id"] = client._slot_id
 
-        return await client._call_after_pipeline(method, prepared, trace=trace, started_at=t_call_start)
+        return await self.call_after_pipeline(method, prepared, trace=trace, started_at=t_call_start)
+
+    async def call_after_pipeline(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        trace: str | None,
+        started_at: float,
+    ) -> Any:
+        from ..client import _NON_IDEMPOTENT_METHODS, _NON_IDEMPOTENT_TIMEOUT
+
+        client = self.client
+        t_call_start = started_at
+        pull_gate_locked = bool(params.pop("_pull_gate_locked", False))
+        pull_gate_key = self.pull_gate_key_for_call(method, params)
+        if pull_gate_key and not pull_gate_locked:
+            locked_params = dict(params)
+            locked_params["_pull_gate_locked"] = True
+
+            async def _gated_call():
+                return await self.call_after_pipeline(
+                    method,
+                    locked_params,
+                    trace=trace,
+                    started_at=started_at,
+                )
+
+            return await self.run_pull_serialized(pull_gate_key, _gated_call)
+
+        if method == "message.send":
+            encrypt = params.pop("encrypt", True)
+            client._log_message_debug(
+                "send-input",
+                "message.send",
+                "message.send",
+                params,
+                payload_override=params.get("payload", params.get("content")),
+                extra={"encrypt": encrypt},
+            )
+            client._log.debug(
+                "client",
+                "call message.send: to=%s encrypt=%s payload_keys=%s",
+                params.get("to", "-"),
+                encrypt,
+                list(params.get("payload", {}).keys()) if isinstance(params.get("payload"), dict) else type(params.get("payload")).__name__,
+            )
+            if encrypt:
+                if not client._v2_session:
+                    raise StateError("V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)")
+                client._log.debug("client", "call encrypt branch: method=message.send to=%s v2=True", params.get("to", "-"))
+                try:
+                    result = await client._send_encrypted_v2(params)
+                    client._log.debug("client", "call exit (encrypted): elapsed=%.3fs method=%s", time.time() - t_call_start, method)
+                    return result
+                except Exception as exc:
+                    client._log.debug("client", "call exit (encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+                    raise
+            client._maybe_append_echo_trace_send(params)
+
+        if method == "group.send":
+            encrypt = params.pop("encrypt", True)
+            client._log_message_debug(
+                "send-input",
+                "group.send",
+                "group.send",
+                params,
+                payload_override=params.get("payload", params.get("content")),
+                extra={"encrypt": encrypt},
+            )
+            if encrypt:
+                if not client._v2_session:
+                    raise StateError("V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)")
+                client._log.debug("client", "call encrypt branch: method=group.send group_id=%s v2=True", params.get("group_id", "-"))
+                try:
+                    result = await client._send_group_encrypted_v2(params)
+                    client._log.debug("client", "call exit (group-encrypted): elapsed=%.3fs method=%s", time.time() - t_call_start, method)
+                    return result
+                except Exception as exc:
+                    client._log.debug("client", "call exit (group-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+                    raise
+            client._maybe_append_echo_trace_send(params)
+
+        if method == "message.pull" and getattr(client, "_v2_session", None):
+            client._log.debug("client", "call route: message.pull -> V2 pull")
+            return await client._pull_v2_internal(params)
+
+        if method == "message.ack" and getattr(client, "_v2_session", None):
+            client._log.debug("client", "call route: message.ack -> V2 ack")
+            return await client._ack_v2_internal(params)
+
+        if method == "group.pull" and client._v2_session and params.get("group_id"):
+            client._log.debug("client", "call route: group.pull -> V2 pull")
+            return await client._pull_group_v2_internal(params)
+
+        if method == "group.ack_messages" and client._v2_session and params.get("group_id"):
+            if client._group_cursor_targets_current_instance(params):
+                client._log.debug("client", "call route: group.ack_messages -> V2 ack")
+                return await client._ack_group_v2_internal(params)
+            client._log.debug(
+                "client",
+                "call route: group.ack_messages external cursor -> raw ack device_id=%s slot_id=%s",
+                params.get("device_id"),
+                params.get("slot_id"),
+            )
+
+        if method == "group.thought.put":
+            encrypt = params.pop("encrypt", True)
+            if encrypt:
+                if not client._v2_session or not params.get("group_id"):
+                    raise StateError("V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)")
+                try:
+                    client._log.debug("client", "call route: group.thought.put -> V2 encrypted put")
+                    result = await client._put_group_thought_encrypted_v2(params)
+                    client._log.debug("client", "call exit (thought-encrypted): elapsed=%.3fs method=%s", time.time() - t_call_start, method)
+                    return result
+                except Exception as exc:
+                    client._log.debug("client", "call exit (thought-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+                    raise
+
+        if method == "message.thought.put":
+            encrypt = params.pop("encrypt", True)
+            if encrypt:
+                if not client._v2_session or not params.get("to"):
+                    raise StateError("V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)")
+                try:
+                    client._log.debug("client", "call route: message.thought.put -> V2 encrypted put")
+                    result = await client._put_message_thought_encrypted_v2(params)
+                    client._log.debug("client", "call exit (msg-thought-encrypted): elapsed=%.3fs method=%s", time.time() - t_call_start, method)
+                    return result
+                except Exception as exc:
+                    client._log.debug("client", "call exit (msg-thought-encrypted-error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+                    raise
+
+        if method in client._SIGNED_METHODS:
+            if self.should_skip_client_signature(method, params):
+                params.pop("client_signature", None)
+            else:
+                self.sign_client_operation(method, params)
+
+        call_kwargs: dict[str, Any] = {}
+        if method in _NON_IDEMPOTENT_METHODS:
+            call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
+        if trace:
+            call_kwargs["trace"] = trace
+
+        if method in ("group.thought.get", "message.thought.get"):
+            client._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
+        try:
+            result = await client._transport.call(method, params, **call_kwargs)
+        except TypeError as exc:
+            if call_kwargs and "unexpected keyword argument" in str(exc):
+                call_kwargs.pop("timeout", None)
+                call_kwargs.pop("trace", None)
+                result = await client._transport.call(method, params, **call_kwargs) if call_kwargs else await client._transport.call(method, params)
+            else:
+                client._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+                raise
+        except Exception as exc:
+            client._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
+            raise
+
+        result = await self.postprocess_result(method, params, result)
+        client._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - t_call_start, method)
+        return result
 
     def merge_instance_protected_headers(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         from ..client import _PROTECTED_HEADERS_METHODS
@@ -210,10 +376,9 @@ class RpcPipeline:
         client = self.client
         if not key:
             return 0
-        if not hasattr(client, "_pull_gates"):
-            client._pull_gates = {}
+        gates = self.runtime.rpc.pull_gates
         now = int(time.time() * 1000)
-        gate = client._pull_gates.get(key, {"inflight": False, "started_at": 0, "token": 0})
+        gate = gates.get(key, {"inflight": False, "started_at": 0, "token": 0})
         if gate["inflight"] and now - gate["started_at"] <= client._PULL_GATE_STALE_MS:
             return None
         if gate["inflight"]:
@@ -221,14 +386,14 @@ class RpcPipeline:
         gate["token"] += 1
         gate["inflight"] = True
         gate["started_at"] = now
-        client._pull_gates[key] = gate
+        gates[key] = gate
         return gate["token"]
 
     def release_pull_gate(self, key: str, token: int | None) -> None:
         client = self.client
         if not key or token is None:
             return
-        gate = client._pull_gates.get(key)
+        gate = self.runtime.rpc.pull_gates.get(key)
         if not gate or gate["token"] != token:
             return
         gate["inflight"] = False

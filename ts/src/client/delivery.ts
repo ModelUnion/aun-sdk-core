@@ -739,16 +739,16 @@ export class MessageDeliveryEngine {
     client._onlineUnreadHintQueue.set(groupId, { ...data });
     if (client._onlineUnreadHintTimer || client._onlineUnreadHintDrainActive) return;
     const delayMs = Math.max(0, Number(client._onlineUnreadHintInitialDelayMs ?? 750) || 0);
-    client._onlineUnreadHintTimer = setTimeout(() => {
-      client._onlineUnreadHintTimer = null;
+    this.runtime.delivery.setOnlineUnreadHintTimer(setTimeout(() => {
+      this.runtime.delivery.setOnlineUnreadHintTimer(null);
       client._safeAsync(this.drainOnlineUnreadHints());
-    }, delayMs);
+    }, delayMs));
   }
 
   async drainOnlineUnreadHints(): Promise<void> {
     const client = this.runtime.client;
     if (client._onlineUnreadHintDrainActive) return;
-    client._onlineUnreadHintDrainActive = true;
+    this.runtime.delivery.setOnlineUnreadHintDrainActive(true);
     try {
       while (client._onlineUnreadHintQueue.size > 0) {
         if (client.state !== 'ready') return;
@@ -767,7 +767,7 @@ export class MessageDeliveryEngine {
     } catch (exc) {
       client._clientLog.debug(`online unread hint drain failed: ${formatDeliveryError(exc)}`);
     } finally {
-      client._onlineUnreadHintDrainActive = false;
+      this.runtime.delivery.setOnlineUnreadHintDrainActive(false);
     }
   }
 

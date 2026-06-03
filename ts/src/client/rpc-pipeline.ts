@@ -9,6 +9,7 @@ import {
   type JsonObject,
   type JsonValue,
   type RpcParams,
+  type RpcResult,
 } from '../types.js';
 import type { ClientRuntime } from './runtime.js';
 
@@ -67,6 +68,17 @@ const SIGNED_METHODS = new Set([
 
 /** pull-gate 防并发窗口，与 client.ts PULL_GATE_STALE_MS 保持一致 */
 const PULL_GATE_STALE_MS = 30000;
+const NON_IDEMPOTENT_TIMEOUT_MS = 35_000;
+const NON_IDEMPOTENT_METHODS = new Set([
+  'message.send', 'group.send', 'group.create', 'group.invite',
+  'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
+  'group.update_name', 'group.update_avatar', 'group.update_announcement',
+  'group.update_settings',
+  'storage.upload', 'storage.complete_upload', 'storage.delete',
+  'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
+  'message.thought.put', 'group.thought.put',
+  'group.add_member',
+]);
 
 export interface RpcPreflightResult {
   params: RpcParams;
@@ -78,6 +90,171 @@ export class RpcPipeline {
 
   constructor(runtime: ClientRuntime) {
     this.runtime = runtime;
+  }
+
+  async call(method: string, params?: RpcParams): Promise<RpcResult> {
+    const client = this.runtime.client;
+    const tStart = Date.now();
+    client._clientLog.debug(`call enter: method=${method}`);
+    try {
+      const preflight = this.preflight(method, params);
+      const p = preflight.params;
+      const rpcBackground = preflight.rpcBackground;
+      const runWithRpcPriority = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+        if (!rpcBackground) return await operation();
+        return await client._withBackgroundRpc(operation);
+      };
+
+      const pullGateLocked = Boolean((p as Record<string, unknown>)._pull_gate_locked);
+      delete (p as Record<string, unknown>)._pull_gate_locked;
+      const pullGateKey = this.pullGateKeyForCall(method, p);
+      if (pullGateKey && this.isPullResponseProcessing(pullGateKey)) {
+        client._clientLog.debug(`pull skipped while processing pull response: method=${method} key=${pullGateKey}`);
+        return client._emptyPullResultForCall(method);
+      }
+      if (pullGateKey && !pullGateLocked) {
+        const lockedParams: RpcParams = { ...p, _pull_gate_locked: true };
+        if (rpcBackground) (lockedParams as Record<string, unknown>)._rpc_background = true;
+        return await this.runPullSerialized(pullGateKey, async () => this.call(method, lockedParams)) as RpcResult;
+      }
+
+      if (method === 'message.send') {
+        const encrypt = p.encrypt ?? true;
+        delete p.encrypt;
+        if (encrypt) {
+          return await runWithRpcPriority(() => client._sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
+            messageId: String(p.message_id ?? '') || undefined,
+            timestamp: p.timestamp as number | undefined,
+            protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
+            context: isJsonObject(p.context) ? p.context : undefined,
+          })) as RpcResult;
+        }
+        client._maybeAppendEchoTraceSend(p);
+      }
+
+      if (method === 'group.send') {
+        const encrypt = p.encrypt ?? true;
+        delete p.encrypt;
+        if (encrypt) {
+          return await runWithRpcPriority(() => client._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
+            messageId: String(p.message_id ?? '') || undefined,
+            timestamp: p.timestamp as number | undefined,
+            protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
+            context: isJsonObject(p.context) ? p.context : undefined,
+          })) as RpcResult;
+        }
+        client._maybeAppendEchoTraceSend(p);
+      }
+
+      if (method === 'group.thought.put') {
+        const encrypt = p.encrypt ?? true;
+        delete p.encrypt;
+        if (encrypt) {
+          const v2Error = 'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)';
+          if (!client._v2Session || !String(p.group_id ?? '').trim()) {
+            throw new StateError(v2Error);
+          }
+          return await runWithRpcPriority(() => client._putGroupThoughtEncryptedV2(p)) as RpcResult;
+        }
+      }
+
+      if (method === 'message.thought.put') {
+        const encrypt = p.encrypt ?? true;
+        delete p.encrypt;
+        if (encrypt) {
+          await client._ensureV2SessionReady(
+            'message.thought.put',
+            'V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)',
+          );
+          return await runWithRpcPriority(() => client._putMessageThoughtEncryptedV2(p)) as RpcResult;
+        }
+      }
+
+      if (method === 'message.pull' || method === 'message.v2.pull') {
+        await client._ensureV2SessionReady('message.pull');
+        const skipAutoAck = p._skip_auto_ack === true || p.skip_auto_ack === true;
+        const force = p.force === true;
+        const afterSeq = Number(p.after_seq ?? 0) || 0;
+        const limit = Number(p.limit ?? 50) || 50;
+        const messages = skipAutoAck
+          ? await runWithRpcPriority(() => client._pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true, force }))
+          : await runWithRpcPriority(() => client._pullV2(afterSeq, limit, { gateLocked: true, force }));
+        return { messages } as RpcResult;
+      }
+
+      if (method === 'message.ack' || method === 'message.v2.ack') {
+        await client._ensureV2SessionReady('message.ack');
+        return await runWithRpcPriority(() => client._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined)) as RpcResult;
+      }
+
+      if (method === 'group.pull' || method === 'group.v2.pull') {
+        if (!String(p.group_id ?? '').trim()) {
+          throw new ValidationError('group.pull requires group_id');
+        }
+        await client._ensureV2SessionReady('group.pull');
+        const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
+        const cursorParams = client._explicitGroupCursorParams(p);
+        const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
+        const pullOpts: { gateLocked: boolean; explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = { gateLocked: true };
+        if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
+        if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
+        if (!ownsCursor) pullOpts.ownsCursor = false;
+        const messages = await runWithRpcPriority(() => client._pullGroupV2(
+          String(p.group_id),
+          Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
+          Number(p.limit ?? 50) || 50,
+          pullOpts,
+        ));
+        return { messages } as RpcResult;
+      }
+
+      if (method === 'group.ack_messages' || method === 'group.v2.ack') {
+        if (!String(p.group_id ?? '').trim()) {
+          throw new ValidationError('group.ack_messages requires group_id');
+        }
+        await client._ensureV2SessionReady('group.ack_messages');
+        const cursorParams = client._explicitGroupCursorParams(p);
+        const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
+        if (method === 'group.ack_messages' && !ownsCursor) {
+          return await runWithRpcPriority(() => client._rawGroupAckMessages(p)) as RpcResult;
+        }
+        return await runWithRpcPriority(() => client._ackGroupV2(
+          String(p.group_id),
+          Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
+        )) as RpcResult;
+      }
+
+      if (method === 'message.pull') {
+        delete p._skip_auto_ack;
+        delete p.skip_auto_ack;
+      }
+      delete (p as Record<string, unknown>)._group_cursor_params;
+
+      this.applyClientSignature(method, p);
+
+      const callTimeout = NON_IDEMPOTENT_METHODS.has(method) ? NON_IDEMPOTENT_TIMEOUT_MS : undefined;
+      if (method === 'group.thought.get' || method === 'message.thought.get') {
+        client._clientLog.debug(`thought.get transport call start: method=${method}, params=${client._debugJson(client._messageEnvelopeFieldsForDebug(p))}`);
+      }
+      let result = callTimeout
+        ? (
+          rpcBackground
+            ? await client._transport.call(method, p, callTimeout, undefined, true)
+            : await client._transport.call(method, p, callTimeout)
+        )
+        : (
+          rpcBackground
+            ? await client._transport.call(method, p, undefined, undefined, true)
+            : await client._transport.call(method, p)
+        );
+
+      result = await this.postprocessResult(method, p, result) as RpcResult;
+      client._clientLog.debug(`call exit: method=${method} elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      client._clientLog.debug(`call exit (error): method=${method} elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   preflight(method: string, params?: RpcParams): RpcPreflightResult {

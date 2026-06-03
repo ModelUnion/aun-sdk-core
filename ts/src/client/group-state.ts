@@ -222,12 +222,10 @@ export class GroupStateCoordinator {
     const gid = normalizedGroupId(groupId);
     if (!gid) return;
     const level = String(bootstrap.e2ee_security_level ?? '').trim() || 'end_to_end';
-    if (!(client._v2GroupSecurityLevels instanceof Map)) {
-      client._v2GroupSecurityLevels = new Map<string, string>();
-    }
-    const previous = client._v2GroupSecurityLevels.get(gid);
+    const securityLevels = this.runtime.groupState.securityLevels;
+    const previous = securityLevels.get(gid);
     if (previous === level) return;
-    client._v2GroupSecurityLevels.set(gid, level);
+    securityLevels.set(gid, level);
     await client._dispatcher.publish('group.v2.security_level', {
       group_id: gid,
       level,
@@ -264,11 +262,9 @@ export class GroupStateCoordinator {
         .update(sigBytes)
         .digest('hex');
 
-      if (!(client._v2SigCache instanceof Map)) {
-        client._v2SigCache = new Map<string, number>();
-      }
+      const sigCache = this.runtime.groupState.sigCache;
       const now = Date.now();
-      const cachedExp = client._v2SigCache.get(cacheKey);
+      const cachedExp = sigCache.get(cacheKey);
       if (cachedExp === undefined || cachedExp <= now) {
         const certPem = await client._fetchPeerCert(actorAid);
         const cert = new crypto.X509Certificate(certPem);
@@ -276,7 +272,7 @@ export class GroupStateCoordinator {
         if (!ok) {
           throw new E2EEError(`V2 state signature verification failed: group=${gid} actor=${actorAid}`);
         }
-        client._v2SigCache.set(cacheKey, now + V2_SIG_CACHE_TTL_MS);
+        sigCache.set(cacheKey, now + V2_SIG_CACHE_TTL_MS);
         this.pruneSigCache(now);
       } else {
         client._clientLog.debug(`V2 state signature cache hit: group=${gid} sv=${stateVersion}`);
@@ -294,12 +290,10 @@ export class GroupStateCoordinator {
     const gid = normalizedGroupId(groupId);
     if (!gid || !serverChain) return;
     try {
-      if (!(client._v2StateChains instanceof Map)) {
-        client._v2StateChains = new Map<string, [number, string]>();
-      }
-      const local = client._v2StateChains.get(gid);
+      const stateChains = this.runtime.groupState.chains;
+      const local = stateChains.get(gid);
       if (!local) {
-        client._v2StateChains.set(gid, [0, serverChain]);
+        stateChains.set(gid, [0, serverChain]);
         return;
       }
       const [localSv, localChain] = local;
@@ -309,7 +303,7 @@ export class GroupStateCoordinator {
         if (isJsonObject(stateResp as JsonValue | object | null | undefined)) {
           const serverSv = Number((stateResp as JsonObject).state_version ?? 0);
           if (serverSv > localSv) {
-            client._v2StateChains.set(gid, [serverSv, serverChain]);
+            stateChains.set(gid, [serverSv, serverChain]);
             return;
           }
           if (serverSv < localSv) {
@@ -334,13 +328,11 @@ export class GroupStateCoordinator {
     const client = this.client;
     const gid = normalizedGroupId(groupId);
     if (!gid) return;
-    if (!(client._v2LazyProposeTriggered instanceof Map)) {
-      client._v2LazyProposeTriggered = new Map<string, number>();
-    }
+    const lazyProposeTriggered = this.runtime.groupState.lazyProposeTriggered;
     const now = Date.now();
-    const last = client._v2LazyProposeTriggered.get(gid) ?? 0;
+    const last = lazyProposeTriggered.get(gid) ?? 0;
     if (now - last < 10000) return;
-    client._v2LazyProposeTriggered.set(gid, now);
+    lazyProposeTriggered.set(gid, now);
     client._safeAsync(client._v2AutoProposeState(gid, { leaderDelay: true }));
   }
 

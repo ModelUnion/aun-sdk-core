@@ -228,7 +228,7 @@ export class V2E2EECoordinator {
   private get bootstrapCache(): Map<string, BootstrapEntry> {
     const client = this.client;
     if (!(client._v2BootstrapCache instanceof Map)) {
-      client._v2BootstrapCache = new Map<string, BootstrapEntry>();
+      this.runtime.v2.setBootstrapCache(new Map<string, BootstrapEntry>());
     }
     return client._v2BootstrapCache as Map<string, BootstrapEntry>;
   }
@@ -353,8 +353,7 @@ export class V2E2EECoordinator {
       if (openedKeyStore) keyStore.close();
       return;
     }
-    client._v2KeyStore = keyStore;
-    client._v2Session = session;
+    this.runtime.v2.setSessionState(keyStore, session);
     client._clientLog.debug(`V2 session initialized aid=${aidAtStart} device=${deviceIdAtStart}`);
   }
 
@@ -362,10 +361,7 @@ export class V2E2EECoordinator {
     const client = this.client;
     const gid = String(groupId ?? '').trim();
     if (!gid || !client._v2Session) return;
-    if (!(client._groupSpkRegistrationInflight instanceof Set)) {
-      client._groupSpkRegistrationInflight = new Set<string>();
-    }
-    const inflight = client._groupSpkRegistrationInflight as Set<string>;
+    const inflight = this.runtime.v2.groupSpkRegistrationInflight;
     if (inflight.has(gid)) return;
     inflight.add(gid);
     client._safeAsync((async () => {
@@ -384,10 +380,7 @@ export class V2E2EECoordinator {
     const client = this.client;
     const gid = String(groupId ?? '').trim();
     if (!gid || !client._v2Session) return;
-    if (!(client._groupSpkRotationInflight instanceof Set)) {
-      client._groupSpkRotationInflight = new Set<string>();
-    }
-    const inflight = client._groupSpkRotationInflight as Set<string>;
+    const inflight = this.runtime.v2.groupSpkRotationInflight;
     if (inflight.has(gid)) return;
     inflight.add(gid);
     client._safeAsync((async () => {
@@ -406,10 +399,7 @@ export class V2E2EECoordinator {
     const client = this.client;
     const gid = String(groupId ?? '').trim();
     if (!gid) return;
-    if (!(client._groupSpkPeerFallbackRegistered instanceof Set)) {
-      client._groupSpkPeerFallbackRegistered = new Set<string>();
-    }
-    const registered = client._groupSpkPeerFallbackRegistered as Set<string>;
+    const registered = this.runtime.v2.groupSpkPeerFallbackRegistered;
     if (registered.has(gid)) return;
     registered.add(gid);
     this.scheduleGroupSpkRegistration(gid, { reason: 'peer_device_prekey_fallback' });
@@ -635,6 +625,7 @@ export class V2E2EECoordinator {
               payload: legacyPayload,
               encrypted: false,
             };
+            attachGatewayProximity(v1Msg, msg);
             const appEvent = client._delivery.p2pAppEventForMessage(v1Msg);
             if (ns) await client._publishPulledMessage(appEvent.event, ns, seq, appEvent.payload);
             else await client._publishAppEvent(appEvent.event, appEvent.payload);
@@ -856,6 +847,7 @@ export class V2E2EECoordinator {
                 payload,
                 encrypted: false,
               };
+              attachGatewayProximity(v1Msg, msg);
               await client._publishPulledMessage('group.message_created', ns, seq, v1Msg);
               decrypted.push(v1Msg);
               continue;
@@ -871,6 +863,7 @@ export class V2E2EECoordinator {
               payload,
               encrypted: false,
             };
+            attachGatewayProximity(v1Msg, msg);
             await client._publishPulledMessage('group.message_created', ns, seq, v1Msg);
             decrypted.push(v1Msg);
             continue;
