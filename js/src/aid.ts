@@ -1,11 +1,14 @@
 import * as codes from './error-codes.js';
 import {
   buildAgentMdSignatureBlock,
+  certMatchesFingerprint,
   certFingerprint,
   extractAgentMdAid,
   normalizeAgentMdPayload,
   parseAgentMdTailSignature,
   parseCertMetadata,
+  publicKeyFingerprint,
+  publicKeyMatchesFingerprint,
   publicKeyDerB64,
   signBytes,
   verifySignatureWithCert,
@@ -17,6 +20,7 @@ export interface VerifyResult {
   payload: string;
   aid?: string;
   cert_fingerprint?: string;
+  public_key_fingerprint?: string;
   timestamp?: number;
   reason?: string;
 }
@@ -104,7 +108,14 @@ export class AID {
     try {
       const payload = normalizeAgentMdPayload(content);
       const signature = await signBytes(this.privateKeyPem, new TextEncoder().encode(payload));
-      return resultOk({ signed: payload + buildAgentMdSignatureBlock(this.certFingerprint, Date.now() / 1000, signature) });
+      return resultOk({
+        signed: payload + buildAgentMdSignatureBlock(
+          this.certFingerprint,
+          Date.now() / 1000,
+          signature,
+          await publicKeyFingerprint(this.certPem),
+        ),
+      });
     } catch (exc) {
       return resultErr(codes.SIGNATURE_OPERATION_ERROR, String(exc), exc);
     }
@@ -117,12 +128,16 @@ export class AID {
       if (!fields) return resultOk(parseError ? { status: 'invalid', payload, reason: parseError } : { status: 'unsigned', payload });
       const payloadAid = extractAgentMdAid(payload);
       if (payloadAid && payloadAid !== this.aid) return resultOk({ status: 'invalid', payload, aid: payloadAid, reason: 'aid mismatch' });
-      if (fields.cert_fingerprint.toLowerCase() !== this.certFingerprint.toLowerCase()) {
+      if (!(await certMatchesFingerprint(this.certPem, fields.cert_fingerprint))) {
         return resultOk({ status: 'invalid', payload, aid: this.aid, reason: 'certificate fingerprint mismatch' });
+      }
+      const publicKeyFp = String(fields.public_key_fingerprint ?? '').trim();
+      if (publicKeyFp && !(await publicKeyMatchesFingerprint(this.certPem, publicKeyFp))) {
+        return resultOk({ status: 'invalid', payload, aid: this.aid, reason: 'public key fingerprint mismatch' });
       }
       const valid = await verifySignatureWithCert(this.certPem, fields.signature, new TextEncoder().encode(payload));
       return resultOk(valid
-        ? { status: 'verified', payload, aid: this.aid, cert_fingerprint: fields.cert_fingerprint, timestamp: Number(fields.timestamp) }
+        ? { status: 'verified', payload, aid: this.aid, cert_fingerprint: fields.cert_fingerprint, public_key_fingerprint: publicKeyFp, timestamp: Number(fields.timestamp) }
         : { status: 'invalid', payload, aid: this.aid, cert_fingerprint: fields.cert_fingerprint, timestamp: Number(fields.timestamp), reason: 'signature verification failed' });
     } catch (exc) {
       return resultErr(codes.VERIFICATION_OPERATION_ERROR, String(exc), exc);

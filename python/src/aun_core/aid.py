@@ -12,11 +12,14 @@ from cryptography.exceptions import InvalidSignature
 from . import error_codes as codes
 from ._cert_utils import (
     build_agent_md_signature_block,
+    cert_matches_fingerprint,
     cert_common_name,
     cert_fingerprint,
     extract_agent_md_aid,
     normalize_agent_md_payload,
     parse_agent_md_tail_signature,
+    public_key_fingerprint,
+    public_key_matches_fingerprint,
     payload_bytes,
     public_key_der_b64,
     sign_bytes,
@@ -142,6 +145,7 @@ class AID:
             signature = sign_bytes(self._private_key_obj, payload.encode("utf-8"))
             block = build_agent_md_signature_block(
                 cert_fingerprint=self.cert_fingerprint,
+                public_key_fingerprint=public_key_fingerprint(self._cert_obj),
                 timestamp=int(time.time()),
                 signature_b64=base64.b64encode(signature).decode("ascii"),
             )
@@ -167,12 +171,20 @@ class AID:
                     "aid": payload_aid,
                     "reason": "aid mismatch",
                 })
-            if fields["cert_fingerprint"].lower() != self.cert_fingerprint.lower():
+            if not cert_matches_fingerprint(self._cert_obj, fields["cert_fingerprint"]):
                 return result_ok({
                     "status": "invalid",
                     "payload": payload,
                     "aid": self.aid,
                     "reason": "certificate fingerprint mismatch",
+                })
+            public_key_fp = str(fields.get("public_key_fingerprint") or "").strip()
+            if public_key_fp and not public_key_matches_fingerprint(self._cert_obj, public_key_fp):
+                return result_ok({
+                    "status": "invalid",
+                    "payload": payload,
+                    "aid": self.aid,
+                    "reason": "public key fingerprint mismatch",
                 })
 
             signature = base64.b64decode(fields["signature"], validate=True)
@@ -193,6 +205,7 @@ class AID:
                 "payload": payload,
                 "aid": self.aid,
                 "cert_fingerprint": fields["cert_fingerprint"],
+                "public_key_fingerprint": public_key_fp,
                 "timestamp": int(fields["timestamp"]),
             })
         except Exception as exc:

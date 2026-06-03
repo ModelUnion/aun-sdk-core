@@ -7,7 +7,7 @@ import { GatewayDiscovery } from './discovery.js';
 import { IdentityConflictError, NotFoundError, ValidationError } from './errors.js';
 import { IndexedDBIdentityStore } from './keystore/indexeddb-identity-store.js';
 import { IndexedDBTokenStore } from './keystore/indexeddb-token-store.js';
-import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
+import { getDeviceId, normalizeSlotId } from './config.js';
 import type { IdentityRecord } from './types.js';
 import { resultErr, resultOk, type Result } from './result.js';
 import { AgentMdManager, type AgentMdCheckResult, type AgentMdDownloadResult } from './agent-md.js';
@@ -209,8 +209,11 @@ function gatewayHttpUrl(gatewayUrl: string, path: string): string {
   return parsed.toString();
 }
 
-function pkiCertUrl(gatewayUrl: string, aid: string): string {
-  return gatewayHttpUrl(gatewayUrl, `/pki/cert/${encodeURIComponent(aid)}`);
+function pkiCertUrl(gatewayUrl: string, aid: string, certFingerprint?: string | null): string {
+  const url = new URL(gatewayHttpUrl(gatewayUrl, `/pki/cert/${encodeURIComponent(aid)}`));
+  const fp = String(certFingerprint ?? '').trim().toLowerCase();
+  if (fp) url.searchParams.set('cert_fingerprint', fp);
+  return url.toString();
 }
 
 async function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = 30000): Promise<Response> {
@@ -256,16 +259,13 @@ export class AIDStore {
   constructor(opts: {
     aunPath: string;
     encryptionSeed: string;
-    deviceId?: string;
     slotId?: string;
     rootCaPem?: string | null;
     verifySsl?: boolean;
   }) {
     this.aunPath = String(opts.aunPath ?? '');
     this._encryptionSeed = String(opts.encryptionSeed ?? '');
-    this.deviceId = opts.deviceId
-      ? normalizeInstanceId(opts.deviceId, 'deviceId', { allowEmpty: true })
-      : getDeviceId();
+    this.deviceId = getDeviceId();
     this.slotId = normalizeSlotId(opts.slotId);
     if (opts.verifySsl === false) {
       console.warn('[aun_core.config] verify_ssl=false 在浏览器环境中不受支持，SSL 证书验证将保持启用。');
@@ -286,12 +286,25 @@ export class AIDStore {
       tokenStore: this._tokenStore,
       aidValidator: (target) => this._registerFlow.validateAidName(target),
       gatewayResolver: (target) => this._resolveGateway(target),
-      peerResolver: async (target) => {
-        const loaded = await this.load(target);
-        if (loaded.ok) return loaded.data.aid;
-        const resolved = await this.resolve(target, { skipAgentMd: true });
-        if (resolved.ok) return resolved.data.aid;
-        throw new Error(resolved.error.message);
+      peerResolver: async (target, certFingerprint) => {
+        const fp = String(certFingerprint ?? '').trim().toLowerCase();
+        const cachedCert = await this._keystore.loadCert(target, fp || undefined);
+        if (cachedCert) {
+          return await AID.create({ aid: target, aunPath: this.aunPath, certPem: cachedCert, privateKeyPem: null, certValid: true, privateKeyValid: false });
+        }
+        if (fp) {
+          const gatewayUrl = await this._resolveGateway(target);
+          const response = await fetchWithTimeout(pkiCertUrl(gatewayUrl, target, fp), { method: 'GET' }, 10000);
+          if (!response.ok) throw new Error(`certificate not found for aid: ${target}`);
+          const certPem = await response.text();
+          await this._keystore.saveCert(target, certPem, fp, { makeActive: false });
+          return await AID.create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false });
+        }
+        const gatewayUrl = await this._resolveGateway(target);
+        const certPem = await this._registerFlow.fetchPeerCert(gatewayUrl, target);
+        if (!certPem) throw new Error(`certificate not found for aid: ${target}`);
+        await this._keystore.saveCert(target, certPem);
+        return await AID.create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false });
       },
     });
   }

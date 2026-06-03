@@ -6,10 +6,9 @@
   2. Alice 断开连接
   3. Alice 用不同 slot_id 重连（同 aid/device_id）
   4. 重连后观察：
-     - SeqTracker 是否重置？
-     - group.pull 是否从 seq=0 拉回旧消息？
-     - 旧消息解密是否成功（group SPK 仍在本地）？
+     - 新 slot 是否继承同成员最小 ack，避免重放已确认历史？
      - 是否出现不必要的解密失败事件？
+     - 是否有密文泄露到应用层？
 
 前置条件：
   - Docker 环境运行中
@@ -195,8 +194,8 @@ async def test_slot_id_change_storm():
         alice_2 = _make_client("alice", rid, slot_suffix="-v2")
 
         print(f"  新 slot_id={_CLIENT_SLOT_IDS.get(alice_2, '')}")
-        print(f"  期望：SeqTracker 重置 → group.pull 从 seq=0 拉回旧消息")
-        print(f"  期望：group SPK 仍在本地 → 旧消息可正常解密")
+        print(f"  期望：新 slot 继承同成员最小 ack → 不重放旧消息")
+        print(f"  期望：不触发 group SPK 解密风暴、不产生 undecryptable")
         print()
         print("  ⬇⬇⬇ 以下 DIAG 日志将显示实际行为 ⬇⬇⬇")
         print()
@@ -229,7 +228,8 @@ async def test_slot_id_change_storm():
         if decrypted_fail:
             print("\n  ⚠️ 存在解密失败的消息泄露到应用层!")
 
-        # 也主动 pull 一次看看
+        # 也主动 pull 一次看看：普通 pull 即使显式 after_seq=0，也应受服务端 cursor 保护，
+        # 避免新 slot 重放已确认历史。
         print("\n--- Step 5: 主动 group.pull（after_seq=0）---")
         pull_result = await alice_2.call("group.pull", {
             "group_id": group_id,
@@ -246,20 +246,19 @@ async def test_slot_id_change_storm():
 
         combined = inbox + pulled_msgs
         found_texts = {_payload_text(m) for m in combined}
-        missing = [text for text in expected_texts if text not in found_texts]
-        print(f"  期望消息数: {len(expected_texts)}")
-        print(f"  成功匹配消息数: {len(expected_texts) - len(missing)}")
-        if missing:
-            print(f"  缺失消息: {missing}")
+        replayed = [text for text in expected_texts if text in found_texts]
+        print(f"  旧消息回放数: {len(replayed)}")
+        if replayed:
+            print(f"  被回放消息: {replayed}")
 
         print("\n" + "=" * 70)
-        if not undecryptable and not decrypted_fail and not missing:
-            print("✅ 无 group SPK 解密风暴 — slot_id 变化后解密仍正常")
+        if not undecryptable and not decrypted_fail and not replayed:
+            print("✅ 无 group SPK 解密风暴 — slot_id 变化后未重放已确认历史")
         else:
             print("❌ 存在问题 — 需要根据上方 DIAG 日志分析根因")
         print("=" * 70)
 
-        return not undecryptable and not decrypted_fail and not missing
+        return not undecryptable and not decrypted_fail and not replayed
     except Exception as e:
         print(f"\n❌ 测试异常: {e}")
         import traceback

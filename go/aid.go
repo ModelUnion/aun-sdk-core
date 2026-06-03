@@ -26,6 +26,7 @@ type AID struct {
 	CertNotAfter    time.Time
 	CertIssuer      string
 	CertFingerprint string // "sha256:" + hex
+	PublicKeyFingerprint string // "sha256:" + SPKI hex
 	DeviceID        string // 设备 ID，由 AIDStore 注入
 	SlotID          string // 密钥槽 ID，由 AIDStore 注入
 	VerifySSL       bool   // 是否校验 TLS 证书，由 AIDStore 注入
@@ -69,6 +70,8 @@ func newAID(
 	if certObj != nil {
 		if der, err := x509.MarshalPKIXPublicKey(certObj.PublicKey); err == nil {
 			a.PublicKey = base64.StdEncoding.EncodeToString(der)
+			fp := sha256.Sum256(der)
+			a.PublicKeyFingerprint = "sha256:" + fmt.Sprintf("%x", fp)
 		}
 		a.CertSubject = certObj.Subject.CommonName
 		a.CertNotBefore = certObj.NotBefore
@@ -130,6 +133,7 @@ func (a *AID) SignAgentMd(content string) (string, error) {
 	}
 	block := aidBuildAgentMdSignatureBlock(
 		a.CertFingerprint,
+		a.PublicKeyFingerprint,
 		time.Now().Unix(),
 		base64.StdEncoding.EncodeToString(sig),
 	)
@@ -142,6 +146,7 @@ type VerifyAgentMdResult struct {
 	Payload         string
 	AID             string
 	CertFingerprint string
+	PublicKeyFingerprint string
 	Timestamp       int64
 	Reason          string
 }
@@ -168,8 +173,12 @@ func (a *AID) VerifyAgentMd(content string) (*VerifyAgentMdResult, error) {
 	if payloadAID != "" && payloadAID != a.Aid {
 		return &VerifyAgentMdResult{Status: "invalid", Payload: payload, AID: payloadAID, Reason: "aid mismatch"}, nil
 	}
-	if !strings.EqualFold(fields["cert_fingerprint"], a.CertFingerprint) {
+	if !matchCertFingerprint([]byte(a.CertPem), fields["cert_fingerprint"]) {
 		return &VerifyAgentMdResult{Status: "invalid", Payload: payload, AID: a.Aid, Reason: "certificate fingerprint mismatch"}, nil
+	}
+	publicKeyFP := strings.TrimSpace(fields["public_key_fingerprint"])
+	if publicKeyFP != "" && !matchPublicKeyFingerprint([]byte(a.CertPem), publicKeyFP) {
+		return &VerifyAgentMdResult{Status: "invalid", Payload: payload, AID: a.Aid, Reason: "public key fingerprint mismatch"}, nil
 	}
 
 	sigBytes, err := base64.StdEncoding.DecodeString(fields["signature"])
@@ -187,6 +196,7 @@ func (a *AID) VerifyAgentMd(content string) (*VerifyAgentMdResult, error) {
 		Payload:         payload,
 		AID:             a.Aid,
 		CertFingerprint: fields["cert_fingerprint"],
+		PublicKeyFingerprint: publicKeyFP,
 		Timestamp:       ts,
 	}, nil
 }
@@ -216,9 +226,20 @@ func aidNormalizeAgentMdPayload(content string) string {
 }
 
 // aidBuildAgentMdSignatureBlock 构造 agent.md 签名块
-func aidBuildAgentMdSignatureBlock(certFingerprint string, timestamp int64, signatureB64 string) string {
-	return fmt.Sprintf("<!-- AUN-SIGNATURE\ncert_fingerprint: %s\ntimestamp: %d\nsignature: %s\n-->",
-		certFingerprint, timestamp, signatureB64)
+func aidBuildAgentMdSignatureBlock(certFingerprint string, publicKeyFingerprint string, timestamp int64, signatureB64 string) string {
+	lines := []string{
+		"<!-- AUN-SIGNATURE",
+		fmt.Sprintf("cert_fingerprint: %s", certFingerprint),
+	}
+	if strings.TrimSpace(publicKeyFingerprint) != "" {
+		lines = append(lines, fmt.Sprintf("public_key_fingerprint: %s", publicKeyFingerprint))
+	}
+	lines = append(lines,
+		fmt.Sprintf("timestamp: %d", timestamp),
+		fmt.Sprintf("signature: %s", signatureB64),
+		"-->",
+	)
+	return strings.Join(lines, "\n")
 }
 
 // aidParseAgentMdTailSignature 解析 agent.md 尾部签名块
@@ -263,6 +284,12 @@ func aidParseAgentMdTailSignature(content string) (string, map[string]string, st
 		if fields[req] == "" {
 			return content[:idx], nil, "signature block missing " + req
 		}
+	}
+	if normalizeFingerprintHex(fields["cert_fingerprint"]) == "" {
+		return content[:idx], nil, "invalid cert_fingerprint"
+	}
+	if fields["public_key_fingerprint"] != "" && normalizeFingerprintHex(fields["public_key_fingerprint"]) == "" {
+		return content[:idx], nil, "invalid public_key_fingerprint"
 	}
 	return content[:idx], fields, ""
 }

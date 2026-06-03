@@ -20,7 +20,7 @@ import { RegisterFlow } from './register-flow.js';
 import { GatewayDiscovery } from './discovery.js';
 import { DnsResilientNet } from './net.js';
 import { AUNLogger } from './logger.js';
-import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
+import { getDeviceId, normalizeSlotId } from './config.js';
 import { IdentityConflictError, NotFoundError, ValidationError } from './errors.js';
 import { AgentMdManager, type AgentMdCheckResult, type AgentMdDownloadResult } from './agent-md.js';
 import { LocalTokenStore } from './keystore/local-token-store.js';
@@ -91,10 +91,13 @@ function httpHead(url: string, verifySsl: boolean, timeoutMs = 5000): Promise<[n
   });
 }
 
-function pkiCertUrl(gatewayUrl: string, aid: string): string {
+function pkiCertUrl(gatewayUrl: string, aid: string, certFingerprint?: string | null): string {
   const parsed = new URL(gatewayUrl);
   const scheme = parsed.protocol === 'wss:' ? 'https:' : 'http:';
-  return `${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`;
+  const url = new URL(`${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`);
+  const fp = String(certFingerprint ?? '').trim().toLowerCase();
+  if (fp) url.searchParams.set('cert_fingerprint', fp);
+  return url.toString();
 }
 
 export class AIDStore {
@@ -119,7 +122,6 @@ export class AIDStore {
   constructor(opts: {
     aunPath: string;
     encryptionSeed: string;
-    deviceId?: string;
     slotId?: string;
     verifySsl?: boolean;
     rootCaPath?: string | null;
@@ -127,7 +129,7 @@ export class AIDStore {
   }) {
     this.aunPath = String(opts.aunPath ?? join(homedir(), '.aun'));
     this._encryptionSeed = String(opts.encryptionSeed ?? '');
-    this.deviceId = opts.deviceId ? normalizeInstanceId(opts.deviceId, 'deviceId', { allowEmpty: true }) : getDeviceId(this.aunPath);
+    this.deviceId = getDeviceId(this.aunPath);
     this.slotId = normalizeSlotId(opts.slotId);
     this._verifySsl = opts.verifySsl ?? false;
     this._rootCaPath = opts.rootCaPath ?? null;
@@ -163,15 +165,25 @@ export class AIDStore {
       logger: this._log.for('aun_core.agent_md'),
       aidValidator: (target) => this._registerFlow.validateAidName(target),
       gatewayResolver: (target) => this._resolveGateway(target),
-      peerResolver: async (target) => {
-        const loaded = this.load(target);
-        if (loaded.ok && loaded.data) return loaded.data.aid;
-        const resolved = await this.resolve(target, { skipAgentMd: true });
-        if (!resolved.ok || !resolved.data) {
-          const err = resultError(resolved);
-          throw new Error(err?.message ?? `certificate not found for aid: ${target}`);
+      peerResolver: async (target, certFingerprint) => {
+        const fp = String(certFingerprint ?? '').trim().toLowerCase();
+        const cachedCert = this._keystore.loadCert(target, fp || undefined);
+        if (cachedCert) {
+          return AID._create({ aid: target, aunPath: this.aunPath, certPem: cachedCert, privateKeyPem: null, certValid: true, privateKeyValid: false, deviceId: this.deviceId, slotId: this.slotId, verifySsl: this._verifySsl, rootCaPath: this._rootCaPath, debug: this._debug });
         }
-        return resolved.data.aid;
+        if (fp) {
+          const gatewayUrl = await this._resolveGateway(target);
+          const certPem = await this._net.httpGetText(pkiCertUrl(gatewayUrl, target, fp), 10_000);
+          this._keystore.saveCert(target, certPem, fp, { makeActive: false });
+          return AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false });
+        }
+        const gatewayUrl = await this._resolveGateway(target);
+        const certPem = await this._registerFlow.fetchPeerCert(gatewayUrl, target);
+        if (!certPem) {
+          throw new Error(`certificate not found for aid: ${target}`);
+        }
+        this._keystore.saveCert(target, certPem);
+        return AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false });
       },
     });
   }

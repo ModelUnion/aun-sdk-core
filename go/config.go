@@ -74,24 +74,25 @@ func GetDeviceID(aunRoot string) string {
 		}
 	}
 
-	// 确保目录存在
-	_ = os.MkdirAll(aunRoot, 0o700)
-
 	deviceIDPath := filepath.Join(aunRoot, ".device_id")
 
-	// 尝试读取已有 ID
-	data, err := os.ReadFile(deviceIDPath)
-	if err == nil {
-		stored := strings.TrimSpace(string(data))
-		if stored != "" {
-			if normalized, normErr := NormalizeInstanceID(stored, "device_id", false); normErr == nil {
-				return normalized
+	if err := os.MkdirAll(aunRoot, 0o700); err == nil {
+		data, readErr := os.ReadFile(deviceIDPath)
+		if readErr == nil {
+			stored := strings.TrimSpace(string(data))
+			if stored != "" {
+				if normalized, normErr := NormalizeInstanceID(stored, "device_id", false); normErr == nil {
+					return normalized
+				}
 			}
 		}
 	}
 
 	// 生成新 UUID v4
-	newID, _ := NormalizeInstanceID(generateUUID4(), "device_id", false)
+	newID, err := NormalizeInstanceID(generateUUID4(), "device_id", false)
+	if err != nil {
+		return "default"
+	}
 
 	// 写入文件
 	if err := os.WriteFile(deviceIDPath, []byte(newID), 0o600); err == nil {
@@ -99,9 +100,10 @@ func GetDeviceID(aunRoot string) string {
 		if runtime.GOOS != "windows" {
 			_ = os.Chmod(deviceIDPath, 0o600)
 		}
+		return newID
 	}
 
-	return newID
+	return "default"
 }
 
 func resolveVerifySSLFromEnv() bool {

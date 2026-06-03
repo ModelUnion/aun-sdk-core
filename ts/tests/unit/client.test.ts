@@ -2494,6 +2494,57 @@ describe('AUNClient E2EE V2-only 编排', () => {
       true,
     );
   });
+
+  it('V2 group online unread hint 应延迟 drain 后再 pull', async () => {
+    const client = makeV2Client();
+    (client as any)._onlineUnreadHintInitialDelayMs = 0;
+    (client as any)._onlineUnreadHintIntervalMs = 0;
+    const transportCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.v2.pull') return { has_more: false, messages: [] };
+      return { ok: true };
+    });
+    (client as any)._transport.call = transportCall;
+
+    await (client as any)._onRawGroupV2MessageCreated({
+      group_id: 'g1',
+      seq: 7,
+      message_id: 'gm-hint-7',
+      sender_aid: 'bob.aid.com',
+      kind: 'group.online_unread_hint',
+    });
+
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.pull')).toBe(false);
+    for (let i = 0; i < 10 && !transportCall.mock.calls.some(([method]) => method === 'group.v2.pull'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(transportCall).toHaveBeenCalledWith(
+      'group.v2.pull',
+      expect.objectContaining({ group_id: 'g1', after_seq: 0 }),
+      undefined,
+      undefined,
+      true,
+    );
+  });
+
+  it('V2 group online unread hint 在 background_sync=false 时应跳过', async () => {
+    const client = makeV2Client();
+    (client as any)._sessionOptions.background_sync = false;
+    (client as any)._onlineUnreadHintInitialDelayMs = 0;
+    const transportCall = vi.fn().mockResolvedValue({ ok: true });
+    (client as any)._transport.call = transportCall;
+
+    await (client as any)._onRawGroupV2MessageCreated({
+      group_id: 'g1',
+      seq: 7,
+      message_id: 'gm-hint-7',
+      sender_aid: 'bob.aid.com',
+      kind: 'group.online_unread_hint',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.pull')).toBe(false);
+  });
+
   it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
     const client = makeV2Client();
     const groupId = 'g1';

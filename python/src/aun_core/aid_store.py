@@ -17,12 +17,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 
 from . import error_codes as codes
-from ._cert_utils import cert_common_name, cert_time_error, public_key_der, sign_bytes, verify_signature
+from ._cert_utils import cert_common_name, cert_matches_fingerprint, cert_time_error, public_key_der, sign_bytes, verify_signature
 from .agent_md import AgentMdManager
 from .auth import AuthFlow
 from .register_flow import RegisterFlow
 from .aid import AID
-from .config import normalize_device_id, normalize_slot_id, resolve_verify_ssl_from_env
+from .config import get_device_id, normalize_slot_id, resolve_verify_ssl_from_env
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
 from .errors import AUNError, ClientSignatureError, ConnectionError, IdentityConflictError, NotFoundError, StateError, ValidationError
@@ -106,7 +106,6 @@ class AIDStore:
         aun_path: str | Path,
         encryption_seed: str,
         *,
-        device_id: str | None = None,
         slot_id: str = "default",
         verify_ssl: bool | None = None,
         root_ca_path: str | None = None,
@@ -115,7 +114,7 @@ class AIDStore:
     ) -> None:
         self.aun_path = str(aun_path)
         self.encryption_seed = str(encryption_seed)
-        self.device_id = normalize_device_id(device_id, self.aun_path)
+        self.device_id = get_device_id(self.aun_path)
         self.slot_id = normalize_slot_id(slot_id)
         self._gateway_cache: dict[str, str] = {}
         self._cert_op_locks: dict[str, asyncio.Lock] = {}
@@ -150,16 +149,59 @@ class AIDStore:
             logger=self._log,
             net=self._net,
         )
-        async def resolve_peer(aid: str) -> AID:
+        async def resolve_peer(aid: str, cert_fingerprint: str | None = None) -> AID:
             target = str(aid or "").strip()
-            loaded = self.load(target)
-            if loaded.ok and loaded.data is not None:
-                return loaded.data["aid"]
-            resolved = await self.resolve(target, {"skip_agent_md": True})
-            if not resolved.ok or resolved.data is None:
-                message = resolved.error.message if resolved.error else f"failed to resolve AID for agent.md: {target}"
-                raise AUNError(message)
-            return resolved.data["aid"]
+            fp = str(cert_fingerprint or "").strip().lower()
+            local_identity = self._keystore.load_identity(target)
+            local_cert = (local_identity or {}).get("cert")
+            local_cert_pem = local_cert if isinstance(local_cert, str) else ""
+            if local_cert_pem.strip():
+                try:
+                    local_obj = x509.load_pem_x509_certificate(local_cert_pem.encode("utf-8"))
+                    if not fp or cert_matches_fingerprint(local_obj, fp):
+                        return AID._create(
+                            aid=target,
+                            aun_path=self.aun_path,
+                            cert_pem=local_cert_pem,
+                            cert_obj=local_obj,
+                            private_key_obj=None,
+                            cert_valid=True,
+                            private_key_valid=False,
+                            device_id=self.device_id,
+                            slot_id=self.slot_id,
+                            verify_ssl=self._verify_ssl,
+                            debug=bool(getattr(self._log, "_debug", False)),
+                        )
+                except Exception:
+                    pass
+            gateway_url = await self._resolved_gateway(target)
+            if fp:
+                cert_pem, _headers, status = await self._http_get_text_with_headers(
+                    self._pki_cert_url(gateway_url, target, fp),
+                    timeout=10.0,
+                )
+                if status < 200 or status >= 300:
+                    raise AUNError(f"certificate not found for aid: {target}")
+                self._keystore.save_cert(target, cert_pem, fp, make_active=False)
+            else:
+                cert_pem = await self._register_flow.fetch_peer_cert(gateway_url, target)
+                if not cert_pem:
+                    raise AUNError(f"certificate not found for aid: {target}")
+                self._keystore.save_cert(target, cert_pem)
+            cert_obj = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+            return AID._create(
+                aid=target,
+                aun_path=self.aun_path,
+                cert_pem=cert_pem,
+                cert_obj=cert_obj,
+                private_key_obj=None,
+                cert_valid=True,
+                private_key_valid=False,
+                device_id=self.device_id,
+                slot_id=self.slot_id,
+                verify_ssl=self._verify_ssl,
+                debug=bool(getattr(self._log, "_debug", False)),
+            )
 
         self._agent_md_manager = AgentMdManager(
             self.aun_path,

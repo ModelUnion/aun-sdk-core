@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -19,7 +20,43 @@ _AGENT_MD_SIGNATURE_RE = re.compile(
     r"<!-- AUN-SIGNATURE\r?\n(?P<body>.*?)\r?\n-->\s*\Z",
     re.DOTALL,
 )
-_AGENT_MD_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_FINGERPRINT_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def normalize_fingerprint_hex(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("sha256:"):
+        text = text.split(":", 1)[1]
+    text = text.replace(":", "")
+    if len(text) not in (16, 64) or not _FINGERPRINT_HEX_RE.fullmatch(text):
+        return ""
+    return text
+
+
+def cert_fingerprint_hexes(cert: x509.Certificate) -> tuple[str, str]:
+    cert_hex = cert.fingerprint(hashes.SHA256()).hex()
+    spki_hex = hashlib.sha256(public_key_der(cert.public_key())).hexdigest()
+    return cert_hex, spki_hex
+
+
+def cert_matches_fingerprint(cert: x509.Certificate, fingerprint: str | None) -> bool:
+    expected = normalize_fingerprint_hex(fingerprint)
+    if not expected:
+        return False
+    cert_hex, spki_hex = cert_fingerprint_hexes(cert)
+    if len(expected) == 16:
+        return cert_hex[:16] == expected or spki_hex[:16] == expected
+    return cert_hex == expected or spki_hex == expected
+
+
+def public_key_matches_fingerprint(cert: x509.Certificate, fingerprint: str | None) -> bool:
+    expected = normalize_fingerprint_hex(fingerprint)
+    if not expected:
+        return False
+    _, spki_hex = cert_fingerprint_hexes(cert)
+    if len(expected) == 16:
+        return spki_hex[:16] == expected
+    return spki_hex == expected
 
 
 def parse_agent_md_tail_signature(content: str) -> tuple[str, dict[str, str] | None, str | None]:
@@ -47,8 +84,10 @@ def parse_agent_md_tail_signature(content: str) -> tuple[str, dict[str, str] | N
     for required in ("cert_fingerprint", "timestamp", "signature"):
         if not fields.get(required):
             return content[:marker_index], None, f"signature block missing {required}"
-    if not _AGENT_MD_FINGERPRINT_RE.fullmatch(fields["cert_fingerprint"]):
+    if not normalize_fingerprint_hex(fields["cert_fingerprint"]):
         return content[:marker_index], None, "invalid cert_fingerprint"
+    if fields.get("public_key_fingerprint") and not normalize_fingerprint_hex(fields["public_key_fingerprint"]):
+        return content[:marker_index], None, "invalid public_key_fingerprint"
     try:
         int(fields["timestamp"])
     except ValueError:
@@ -73,14 +112,25 @@ def extract_agent_md_aid(payload: str) -> str:
     return ""
 
 
-def build_agent_md_signature_block(*, cert_fingerprint: str, timestamp: int, signature_b64: str) -> str:
-    return "\n".join([
+def build_agent_md_signature_block(
+    *,
+    cert_fingerprint: str,
+    timestamp: int,
+    signature_b64: str,
+    public_key_fingerprint: str = "",
+) -> str:
+    lines = [
         "<!-- AUN-SIGNATURE",
         f"cert_fingerprint: {cert_fingerprint}",
+    ]
+    if public_key_fingerprint:
+        lines.append(f"public_key_fingerprint: {public_key_fingerprint}")
+    lines.extend([
         f"timestamp: {int(timestamp)}",
         f"signature: {signature_b64}",
         "-->",
     ])
+    return "\n".join(lines)
 
 
 def normalize_agent_md_payload(content: str) -> str:
@@ -130,6 +180,10 @@ def cert_common_name(cert: x509.Certificate, *, issuer: bool = False) -> str:
 
 def cert_fingerprint(cert: x509.Certificate) -> str:
     return "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+
+
+def public_key_fingerprint(cert: x509.Certificate) -> str:
+    return "sha256:" + hashlib.sha256(public_key_der(cert.public_key())).hexdigest()
 
 
 def public_key_der_b64(cert: x509.Certificate) -> str:

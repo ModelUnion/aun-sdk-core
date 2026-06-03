@@ -6,13 +6,14 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AUNClient } from '../../src/client.js';
 
-function getClientMethodSource(methodName: string): string {
+function getDeliveryMethodSource(methodName: string): string {
   const src = readFileSync(
-    resolve(__dirname, '../../src/client.ts'),
+    resolve(__dirname, '../../src/client/delivery.ts'),
     'utf-8',
   );
-  const start = src.indexOf(`private async ${methodName}`);
-  if (start === -1) throw new Error(`未找到 ${methodName} 方法`);
+  const asyncStart = src.indexOf(`async ${methodName}`);
+  const start = asyncStart >= 0 ? asyncStart : src.indexOf(`${methodName}`);
+  if (start === -1) throw new Error(`未找到 delivery.${methodName} 方法`);
   let braceCount = 0;
   let methodStart = -1;
   for (let i = start; i < src.length; i++) {
@@ -26,7 +27,7 @@ function getClientMethodSource(methodName: string): string {
       }
     }
   }
-  throw new Error(`无法解析 ${methodName} 方法体`);
+  throw new Error(`无法解析 delivery.${methodName} 方法体`);
 }
 
 async function waitForCondition(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
@@ -125,17 +126,17 @@ describe('P2-6: 补洞路径不应重复调用 onPullResult', () => {
 
 describe('P2-6.5: 补洞 after=0 与服务端 cursor floor', () => {
   it('P2P/group/group_event 补洞不应因 afterSeq=0 短路', () => {
-    expect(getClientMethodSource('_fillP2pGap')).not.toContain('afterSeq === 0');
-    expect(getClientMethodSource('_fillGroupGap')).not.toContain('afterSeq === 0');
-    expect(getClientMethodSource('_fillGroupEventGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillP2pGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillGroupGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillGroupEventGap')).not.toContain('afterSeq === 0');
   });
 
   it('group.pull_events 补洞应使用服务端 cursor.current_seq 推进本地 tracker', () => {
-    const methodBody = getClientMethodSource('_fillGroupEventGap');
+    const methodBody = getDeliveryMethodSource('fillGroupEventGap');
     expect(methodBody).toContain('cursor.current_seq');
     expect(methodBody).toContain('forceContiguousSeq');
     expect(methodBody).toContain('group.ack_events');
-    expect(methodBody).toContain('slot_id: this._slotId');
+    expect(methodBody).toContain('slot_id: client._slotId');
   });
 });
 
@@ -291,7 +292,7 @@ describe('P2-7: 断线后应停止后台任务', () => {
     await (client as any)._handleTransportDisconnect(new Error('connection lost'));
 
     expect(stopSpy).toHaveBeenCalled();
-    expect((client as any)._state).toBe('disconnected');
+    expect((client as any)._state).toBe('standby');
   });
 
   it('断线后心跳定时器应被清理', async () => {

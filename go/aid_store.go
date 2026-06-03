@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -119,7 +120,6 @@ type AIDStore struct {
 
 // AIDStoreOptions 创建 AIDStore 的可选参数，与 Python/JS SDK 对齐。
 type AIDStoreOptions struct {
-	DeviceID   string // 设备 ID，空时自动生成
 	SlotID     string // 密钥槽 ID，默认 "default"
 	VerifySSL  *bool  // 是否校验 TLS 证书，nil 时默认 false
 	RootCaPath string // 自定义根证书路径，私有部署使用
@@ -160,7 +160,7 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 	store := &AIDStore{
 		aunPath:        aunPath,
 		encryptionSeed: encryptionSeed,
-		deviceID:       o.DeviceID,
+		deviceID:       GetDeviceID(aunPath),
 		slotID:         o.SlotID,
 		verifySSL:      verifySSL,
 		rootCaPath:     o.RootCaPath,
@@ -581,26 +581,56 @@ func (s *AIDStore) publicAIDFromCert(aid, certPEM string) (*AID, error) {
 	return newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, ""), nil
 }
 
-func (s *AIDStore) resolveAgentMDPeer(ctx context.Context, aid string) (*AID, error) {
+func (s *AIDStore) resolveAgentMDPeer(ctx context.Context, aid string, certFingerprint ...string) (*AID, error) {
 	target := strings.TrimSpace(aid)
-	certPEM, err := s.keyStore.LoadCert(target)
-	if err != nil {
-		return nil, err
+	expectedFP := ""
+	if len(certFingerprint) > 0 {
+		expectedFP = strings.TrimSpace(strings.ToLower(certFingerprint[0]))
 	}
+	certPEM := ""
 	if strings.TrimSpace(certPEM) == "" {
 		gatewayURL, err := s.resolveGateway(ctx, target)
 		if err != nil {
 			return nil, err
 		}
-		certPEM, err = s.registerFlow.FetchPeerCert(ctx, gatewayURL, target)
-		if err != nil {
-			return nil, err
+		if expectedFP != "" {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, buildCertURL(gatewayURL, target, expectedFP), nil)
+			if reqErr != nil {
+				return nil, reqErr
+			}
+			resp, fetchErr := s.httpClient().Do(req)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return nil, fmt.Errorf("certificate not found for aid: %s", target)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				return nil, readErr
+			}
+			certPEM = string(body)
+			if !matchCertFingerprint([]byte(certPEM), expectedFP) {
+				return nil, fmt.Errorf("certificate fingerprint mismatch for aid: %s", target)
+			}
+		} else {
+			certPEM, err = s.registerFlow.FetchPeerCert(ctx, gatewayURL, target)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if strings.TrimSpace(certPEM) == "" {
 			return nil, errCertNotFound
 		}
-		if err := s.keyStore.SaveCert(target, certPEM); err != nil {
-			return nil, err
+		if expectedFP != "" {
+			if err := s.tokenStore.SaveCertVersion(target, certPEM, expectedFP, false); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := s.keyStore.SaveCert(target, certPEM); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return s.publicAIDFromCert(target, certPEM)
@@ -753,7 +783,15 @@ func (s *AIDStore) DownloadAgentMD(ctx context.Context, aid string) Result[Agent
 		}
 		return ResultErr[AgentMDInfo](code, err.Error(), err)
 	}
-	peer, err := s.resolveAgentMDPeer(ctx, target)
+	_, sigFields, _ := aidParseAgentMdTailSignature(downloaded.Content)
+	expectedFP := ""
+	if sigFields != nil {
+		expectedFP = strings.TrimSpace(sigFields["cert_fingerprint"])
+		if expectedFP == "" {
+			expectedFP = strings.TrimSpace(sigFields["public_key_fingerprint"])
+		}
+	}
+	peer, err := s.resolveAgentMDPeer(ctx, target, expectedFP)
 	if err != nil {
 		return ResultErr[AgentMDInfo](ErrCodeNetworkError, err.Error(), err)
 	}

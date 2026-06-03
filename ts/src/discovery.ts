@@ -6,6 +6,46 @@ import type { ModuleLogger } from './logger.js';
 import type { DnsResilientNet } from './net.js';
 
 const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+const _DISCOVERY_RETRY_DELAYS_MS = [50, 100];
+
+function _sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function _errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function _errorCode(err: unknown): string {
+  if (!err || typeof err !== 'object') return '';
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' ? code.toUpperCase() : '';
+}
+
+function _isTransientDiscoveryError(err: unknown): boolean {
+  if (err instanceof ValidationError) return false;
+
+  const code = _errorCode(err);
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) {
+    return true;
+  }
+
+  const message = _errorMessage(err).toLowerCase();
+  if (/^http\s+\d+/.test(message)) return false;
+  return (
+    message.includes('socket hang up') ||
+    message.includes('connection reset') ||
+    message.includes('econnreset') ||
+    message.includes('econnrefused') ||
+    message.includes('etimedout') ||
+    message.includes('epipe') ||
+    message.includes('timeout fetching') ||
+    message.includes('fetch failed') ||
+    message.includes('network error') ||
+    message.includes('getaddrinfo')
+  );
+}
 
 function _httpGetJson(url: string, verifySsl: boolean, timeout: number): Promise<JsonValue> {
   return new Promise((resolve, reject) => {
@@ -122,11 +162,26 @@ export class GatewayDiscovery {
     this._logger.debug(`discoverAll enter: url=${wellKnownUrl}`);
     let payload: GatewayDiscoveryDocument;
     try {
-      let rawPayload: unknown;
-      if (this._net) {
-        rawPayload = await this._net.httpGetJson(wellKnownUrl, timeout) as unknown;
-      } else {
-        rawPayload = await _httpGetJson(wellKnownUrl, this._verifySsl, timeout) as unknown;
+      let rawPayload: unknown = null;
+      const maxAttempts = _DISCOVERY_RETRY_DELAYS_MS.length + 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        try {
+          if (this._net) {
+            rawPayload = await this._net.httpGetJson(wellKnownUrl, timeout) as unknown;
+          } else {
+            rawPayload = await _httpGetJson(wellKnownUrl, this._verifySsl, timeout) as unknown;
+          }
+          break;
+        } catch (err) {
+          const isLastAttempt = attempt >= maxAttempts - 1;
+          if (isLastAttempt || !_isTransientDiscoveryError(err)) {
+            throw err;
+          }
+          this._logger.warn(
+            `gateway discover transient failure, retrying: url=${wellKnownUrl}, attempt=${attempt + 1}/${maxAttempts}, error=${_errorMessage(err)}`,
+          );
+          await _sleep(_DISCOVERY_RETRY_DELAYS_MS[attempt]);
+        }
       }
       if (!isJsonObject(rawPayload as JsonValue)) {
         throw new ValidationError('well-known returned invalid payload');

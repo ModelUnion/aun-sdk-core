@@ -6,6 +6,31 @@
 
 ---
 
+## 0.4.8 — 2026-06-03
+
+### 新功能
+- `cert-utils.ts` 新增 `publicKeyFingerprint`、`certMatchesFingerprint`、`publicKeyMatchesFingerprint`、`normalizeFingerprintHex` 工具函数，支持 DER/SPKI 双格式及 16/64 位短格式（四语言对齐）
+- agent.md 签名块新增 `public_key_fingerprint` 可选字段，签名时自动附加 SPKI 指纹验证时同时校验（四语言对齐）
+- `peerResolver` 接口新增 `certFingerprint` 参数，`AgentMdManager._resolvePeer` 从签名块提取指纹后传入（四语言对齐）
+- `AIDStore.peerResolver` 改造：按指纹优先从 keystore 加载缓存；有指纹时从 PKI 精确拉取并缓存（四语言对齐）
+- `pkiCertUrl` 新增 `certFingerprint` 参数（四语言对齐）
+- 新增 `_v2SessionMatchesIdentity` / `_resetV2IdentityRuntime`，V2 session 校验升级为身份匹配（四语言对齐）
+- 新增在线未读 hint 队列（`_onlineUnreadHintQueue`），同 group 去重 + 延迟 drain（四语言对齐）
+- `_getV2SenderPubDer` 新增 `certFingerprint` 参数，解密时精确锁定发送方证书（四语言对齐）
+
+### 修复
+- `AIDStore` 构造函数移除 `deviceId` 可选参数，统一使用 `getDeviceId(aunPath)` 读取（四语言对齐）
+- `_applyAidRuntimeContext` 切换 AID 时新增旧 transport 清理并调用 `_resetV2IdentityRuntime`，防止 V2 session 残留（四语言对齐）
+- `_fetchPeerCert` 移除带指纹失败后的降级无指纹兜底请求（四语言对齐）
+- cert 缓存只在无 `certFingerprint` 时写裸 key，避免缓存污染（四语言对齐）
+- 指纹验证统一改用 `certMatchesFingerprint`（四语言对齐）
+- 解密结果新增 `attachGatewayProximity`，透传 `proximity`/`same_device`/`same_network`/`same_egress_ip` 字段（四语言对齐）
+
+### 优化
+- `AUNClient` 大规模拆分重构：client.ts 变为薄壳委托层，核心逻辑分散至 `client/` 子目录的 `ClientRuntime`、`LifecycleController`、`RpcPipeline`、`MessageDeliveryEngine`、`V2E2EECoordinator`、`GroupStateCoordinator`、`PeerDirectory`、`IdentityRuntimeManager` 子模块（四语言对齐）
+
+---
+
 ## 0.4.7 — 2026-06-01
 
 ### Added

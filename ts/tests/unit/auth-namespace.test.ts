@@ -305,7 +305,7 @@ describe('AgentMdManager network behavior', () => {
 
       await mgr.download('127.0.0.1');
 
-      expect(peerResolver).toHaveBeenCalledWith('127.0.0.1');
+      expect(peerResolver).toHaveBeenCalledWith('127.0.0.1', null);
     });
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun-browser",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "AUN Protocol Core SDK for Browser",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && esbuild src/index.ts --bundle --format=esm --outfile=dist/bundle.js --platform=browser --target=es2020",
+    "build": "tsc && node scripts/fix-esm-imports.mjs && esbuild src/index.ts --bundle --format=esm --outfile=dist/bundle.js --platform=browser --target=es2020",
     "prepack": "python ../scripts/sync_packed_docs.py js",
     "test": "vitest run --environment jsdom",
     "test:unit": "vitest run --environment jsdom tests/unit",

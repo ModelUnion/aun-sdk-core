@@ -1,3 +1,6 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { AID, AIDStore, AUNClient, GatewayDiscovery } from '../src/index.js';
 
 export type TestAIDStoreOptions = {
@@ -6,13 +9,23 @@ export type TestAIDStoreOptions = {
   verifySsl?: boolean;
   rootCaPath?: string | null;
   debug?: boolean;
-  deviceId?: string;
   slotId?: string;
 };
 
-export type TestClientOptions = TestAIDStoreOptions & {
+export type TestIdentityOptions = TestAIDStoreOptions & {
+  deviceId?: string;
+};
+
+export type TestClientOptions = TestIdentityOptions & {
   requireForwardSecrecy?: boolean;
 };
+
+export function writeTestDeviceId(aunPath: string, deviceId?: string): void {
+  const value = String(deviceId ?? '').trim();
+  if (!value) return;
+  mkdirSync(aunPath, { recursive: true });
+  writeFileSync(join(aunPath, '.device_id'), value, 'utf-8');
+}
 
 export function createAIDStore(opts: TestAIDStoreOptions): AIDStore {
   return new AIDStore({
@@ -21,12 +34,12 @@ export function createAIDStore(opts: TestAIDStoreOptions): AIDStore {
     verifySsl: opts.verifySsl ?? false,
     rootCaPath: opts.rootCaPath ?? null,
     debug: opts.debug ?? false,
-    ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
     ...(opts.slotId ? { slotId: opts.slotId } : {}),
   });
 }
 
-export async function prepareIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AID> {
+export async function prepareIdentity(opts: TestIdentityOptions & { aid: string }): Promise<AID> {
+  writeTestDeviceId(opts.aunPath, opts.deviceId);
   const store = createAIDStore(opts);
   const registered = await store.register(opts.aid);
   if (!registered.ok) {
@@ -43,7 +56,8 @@ export async function prepareIdentity(opts: TestAIDStoreOptions & { aid: string 
   return loaded.data.aid;
 }
 
-export function loadPreparedIdentity(opts: TestAIDStoreOptions & { aid: string }): AID {
+export function loadPreparedIdentity(opts: TestIdentityOptions & { aid: string }): AID {
+  writeTestDeviceId(opts.aunPath, opts.deviceId);
   const store = createAIDStore(opts);
   const loaded = store.load(opts.aid);
   if (!loaded.ok || !loaded.data) {
@@ -52,11 +66,11 @@ export function loadPreparedIdentity(opts: TestAIDStoreOptions & { aid: string }
   return loaded.data.aid;
 }
 
-export async function createClientWithIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AUNClient> {
+export async function createClientWithIdentity(opts: TestIdentityOptions & { aid: string }): Promise<AUNClient> {
   return new AUNClient(await prepareIdentity(opts));
 }
 
-export function createClientFromStore(opts: TestAIDStoreOptions & { aid: string }): AUNClient {
+export function createClientFromStore(opts: TestIdentityOptions & { aid: string }): AUNClient {
   return new AUNClient(loadPreparedIdentity(opts));
 }
 
@@ -112,13 +126,14 @@ function clientDiscoveryPort(client: AUNClient): string {
 export function createAIDStoreForClient(client: AUNClient, slotId?: string): AIDStore {
   const raw = client as any;
   const model = raw._configModel ?? {};
+  const aunPath = clientAunPath(client);
+  writeTestDeviceId(aunPath, raw.__testDeviceId);
   return new AIDStore({
-    aunPath: clientAunPath(client),
+    aunPath,
     encryptionSeed: clientEncryptionSeed(client),
     verifySsl: Boolean(raw.__testVerifySsl ?? model.verifySsl ?? false),
     rootCaPath: raw.__testRootCaPath ?? model.rootCaPath ?? null,
     debug: Boolean(raw.__testDebug ?? model.debug ?? false),
-    ...(raw.__testDeviceId ?? raw._deviceId ? { deviceId: raw.__testDeviceId ?? raw._deviceId } : {}),
     ...(slotId ? { slotId } : {}),
   });
 }
@@ -130,7 +145,10 @@ export function configureTestClient(client: AUNClient, opts: TestClientOptions):
   if (opts.verifySsl !== undefined) raw.__testVerifySsl = opts.verifySsl;
   if (opts.rootCaPath !== undefined) raw.__testRootCaPath = opts.rootCaPath;
   if (opts.debug !== undefined) raw.__testDebug = opts.debug;
-  if (opts.deviceId) raw.__testDeviceId = opts.deviceId;
+  if (opts.deviceId) {
+    raw.__testDeviceId = opts.deviceId;
+    writeTestDeviceId(opts.aunPath, opts.deviceId);
+  }
   if (raw._configModel && opts.requireForwardSecrecy !== undefined) {
     raw._configModel.requireForwardSecrecy = opts.requireForwardSecrecy;
   }

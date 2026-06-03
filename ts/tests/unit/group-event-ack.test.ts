@@ -1,13 +1,30 @@
 /**
  * 群事件推送路径 ack 测试 — ISSUE-TS-002
- * 验证 _onRawGroupChanged 在处理 event_seq 后发送 ack 并持久化状态
+ * 验证群事件组件在处理 event_seq 后发送 ack 并持久化状态
  *
- * 由于 _onRawGroupChanged 是私有方法，通过源码分析验证关键调用存在。
+ * 私有主类方法已拆成 shim，源码审计应落到 MessageDeliveryEngine 组件。
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AUNClient } from '../../src/client.js';
+
+function extractMethodSource(src: string, start: number): string {
+  let braceCount = 0;
+  let methodStart = -1;
+  for (let i = start; i < src.length; i++) {
+    if (src[i] === '{') {
+      if (methodStart === -1) methodStart = i;
+      braceCount++;
+    } else if (src[i] === '}') {
+      braceCount--;
+      if (braceCount === 0) {
+        return src.substring(start, i + 1);
+      }
+    }
+  }
+  throw new Error('无法解析方法体');
+}
 
 function getOnRawGroupChangedSource(): string {
   const src = readFileSync(
@@ -17,44 +34,18 @@ function getOnRawGroupChangedSource(): string {
   // 提取 _onRawGroupChanged 方法体
   const start = src.indexOf('private async _onRawGroupChanged');
   if (start === -1) throw new Error('未找到 _onRawGroupChanged 方法');
-  // 找到方法结束（下一个同级 private/public 方法或类结束）
-  let braceCount = 0;
-  let methodStart = -1;
-  for (let i = start; i < src.length; i++) {
-    if (src[i] === '{') {
-      if (methodStart === -1) methodStart = i;
-      braceCount++;
-    } else if (src[i] === '}') {
-      braceCount--;
-      if (braceCount === 0) {
-        return src.substring(start, i + 1);
-      }
-    }
-  }
-  throw new Error('无法解析 _onRawGroupChanged 方法体');
+  return extractMethodSource(src, start);
 }
 
-function getClientMethodSource(methodName: string): string {
+function getDeliveryMethodSource(methodName: string): string {
   const src = readFileSync(
-    resolve(__dirname, '../../src/client.ts'),
+    resolve(__dirname, '../../src/client/delivery.ts'),
     'utf-8',
   );
-  const start = src.indexOf(`private async ${methodName}`);
-  if (start === -1) throw new Error(`未找到 ${methodName} 方法`);
-  let braceCount = 0;
-  let methodStart = -1;
-  for (let i = start; i < src.length; i++) {
-    if (src[i] === '{') {
-      if (methodStart === -1) methodStart = i;
-      braceCount++;
-    } else if (src[i] === '}') {
-      braceCount--;
-      if (braceCount === 0) {
-        return src.substring(start, i + 1);
-      }
-    }
-  }
-  throw new Error(`无法解析 ${methodName} 方法体`);
+  const asyncStart = src.indexOf(`async ${methodName}`);
+  const start = asyncStart >= 0 ? asyncStart : src.indexOf(`${methodName}`);
+  if (start === -1) throw new Error(`未找到 delivery.${methodName} 方法`);
+  return extractMethodSource(src, start);
 }
 
 async function waitForCondition(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
@@ -67,30 +58,35 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 1000): Pro
 }
 
 describe('群事件推送路径 ack（ISSUE-TS-002）', () => {
-  const methodBody = getOnRawGroupChangedSource();
+  const mainMethodBody = getOnRawGroupChangedSource();
+  const deliveryMethodBody = getDeliveryMethodSource('handleGroupChangedEventSeq');
+
+  it('_onRawGroupChanged 应委托 MessageDeliveryEngine 处理 event_seq', () => {
+    expect(mainMethodBody).toContain('_delivery.handleGroupChangedEventSeq');
+  });
 
   it('event_seq 处理后应调用 _saveSeqTrackerState 持久化', () => {
-    expect(methodBody).toContain('_saveSeqTrackerState');
+    expect(deliveryMethodBody).toContain('this.saveSeqTrackerState');
   });
 
   it('event_seq 处理后应发送 group.ack_events', () => {
-    expect(methodBody).toContain('group.ack_events');
+    expect(deliveryMethodBody).toContain('group.ack_events');
   });
 });
 
 describe('补洞 after=0 与服务端 cursor floor', () => {
   it('P2P/group/group_event 补洞不应因 afterSeq=0 短路', () => {
-    expect(getClientMethodSource('_fillP2pGap')).not.toContain('afterSeq === 0');
-    expect(getClientMethodSource('_fillGroupGap')).not.toContain('afterSeq === 0');
-    expect(getClientMethodSource('_fillGroupEventGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillP2pGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillGroupGap')).not.toContain('afterSeq === 0');
+    expect(getDeliveryMethodSource('fillGroupEventGap')).not.toContain('afterSeq === 0');
   });
 
   it('group.pull_events 补洞应使用服务端 retention_floor_event_seq 推进本地 tracker', () => {
-    const methodBody = getClientMethodSource('_fillGroupEventGap');
+    const methodBody = getDeliveryMethodSource('fillGroupEventGap');
     expect(methodBody).toContain('retention_floor_event_seq');
     expect(methodBody).toContain('forceContiguousSeq');
     expect(methodBody).toContain('group.ack_events');
-    expect(methodBody).toContain('this._gapFillDone.delete(dedupKey)');
+    expect(methodBody).toContain('_gapFillDone.delete(dedupKey)');
   });
 });
 

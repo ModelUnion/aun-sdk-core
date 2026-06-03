@@ -6,6 +6,31 @@
 
 ---
 
+## 0.4.8 — 2026-06-03
+
+### 新功能
+- `_cert_utils.py` 新增 `normalize_fingerprint_hex`、`cert_fingerprint_hexes`、`cert_matches_fingerprint`、`public_key_matches_fingerprint`、`public_key_fingerprint` 指纹工具函数，支持 16 位短指纹、`sha256:` 前缀、冒号分隔等多种格式（四语言对齐）
+- `build_agent_md_signature_block` 新增可选 `public_key_fingerprint` 字段写入签名块（四语言对齐）
+- `aid.py` 签名时写入 `public_key_fingerprint`；验签返回结果携带该字段（四语言对齐）
+- `_v2_sender_pub_der_from_cache_or_cert` 新增 `cert_fingerprint` 参数，缓存命中和 PKI 拉取后均做指纹比对（四语言对齐）
+- `agent_md.py` `_resolve_peer` 新增 `cert_fingerprint` 参数，从签名块提取指纹后精确匹配对端 AID（四语言对齐）
+
+### 修复
+- `aid.py` 证书指纹比较改用 `cert_matches_fingerprint`，兼容短指纹和 SPKI 指纹（四语言对齐）
+- `_fetch_peer_cert` 移除带指纹失败后降级无指纹请求的回退逻辑（四语言对齐）
+- 带指纹的证书缓存只写入带指纹 key，无指纹时才写裸 key，防止旧证书污染新版本查询（四语言对齐）
+- 证书缓存命中时增加指纹二次校验，避免裸缓存被错误复用于带指纹查询（四语言对齐）
+- `AUNClient.__init__` 构建 `raw_config` 时补充 `verify_ssl`、`debug`、`root_ca_path` 字段透传，防止身份加载后配置丢失
+- `_verify_event_signature` 证书指纹比对改用 `cert_matches_fingerprint`（四语言对齐）
+
+### 优化
+- `AUNClient` 大规模拆分重构：核心逻辑分散至 `LifecycleController`、`MessageDeliveryEngine`、`RpcPipeline`、`PeerDirectory`、`IdentityRuntimeManager`、`V2E2EECoordinator`、`GroupStateCoordinator` 子组件（四语言对齐）
+- `AIDStore.__init__` 移除 `device_id` 参数，改为直接调用 `get_device_id`（四语言对齐）
+- `config.py` 以 `get_device_id` 替换 `normalize_device_id`（四语言对齐）
+- `aid_store.py` `resolve_peer` 回调支持按 `cert_fingerprint` 精确拉取对应版本证书（四语言对齐）
+
+---
+
 ## 0.4.7 — 2026-06-01
 
 ### Added

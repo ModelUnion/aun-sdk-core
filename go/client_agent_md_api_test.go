@@ -255,7 +255,7 @@ func TestUploadAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
 	c.agentMD().agentMDOps = &fakeAgentMDOps{
 		signFn: func(_ context.Context, content string) (string, error) {
 			signedInput = content
-			return content + "\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n", nil
+			return content + "\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0000000000000000000000000000000000000000000000000000000000000000\ntimestamp: 1\nsignature: x\n-->\n", nil
 		},
 		uploadFn: func(_ context.Context, content string) (map[string]any, error) {
 			uploaded = content

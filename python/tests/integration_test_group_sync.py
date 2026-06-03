@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
 from aun_core import AUNClient
-from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
+from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -65,8 +65,13 @@ def _make_client() -> AUNClient:
     return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
-async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    return await ensure_connected_identity(client, aid)
+async def _ensure_connected(
+    client: AUNClient,
+    aid: str,
+    *,
+    connect_options: dict | None = None,
+) -> str:
+    return await ensure_connected_identity(client, aid, connect_options=connect_options)
 
 
 async def _create_group_with_bobb(alice: AUNClient, name: str) -> str:
@@ -109,15 +114,25 @@ async def test_message_cursor_ack_and_device_slots():
     rid = uuid.uuid4().hex[:10]
     alice = _make_client()
     bobb = _make_client()
+    bobb_slot_b = _make_client()
     group_id = ""
-    device_a = f"sync-dev-a-{rid}"
-    device_b = f"sync-dev-b-{rid}"
     slot_a = "slot-a"
     slot_b = "slot-b"
+    device_a = ""
+    device_b = ""
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bobb, _BOBB_AID)
+        await ensure_registered_identity(bobb, _BOBB_AID, slot_id=slot_a)
+        await ensure_registered_identity(bobb_slot_b, _BOBB_AID, slot_id=slot_b)
+        # 服务端 add_member 需要目标 AID 已声明 E2EE 能力；短暂上线后断开，
+        # 后续发送消息时 Bob 仍保持离线，用于验证离线 cursor。
+        await _ensure_connected(
+            bobb,
+            _BOBB_AID,
+            connect_options={"slot_id": slot_a, "background_sync": False},
+        )
+        await bobb.disconnect()
         group_id = await _create_group_with_bobb(alice, f"sync-msg-{rid}")
         _ok("创建群并添加 Bob")
 
@@ -126,12 +141,18 @@ async def test_message_cursor_ack_and_device_slots():
         await asyncio.sleep(0.8)
         _ok("发送 3 条明文群消息")
 
+        await _ensure_connected(
+            bobb,
+            _BOBB_AID,
+            connect_options={"slot_id": slot_a, "background_sync": False},
+        )
+        device_a = bobb.device_id
+
         first = await bobb.call("group.pull", {
             "group_id": group_id,
             "after_message_seq": 0,
             "limit": 2,
-            "device_id": device_a,
-            "slot_id": slot_a,
+            "max_pages": 1,
             "device_name": "同步测试设备 A",
             "device_type": "test",
         })
@@ -179,19 +200,23 @@ async def test_message_cursor_ack_and_device_slots():
             "group_id": group_id,
             "after_message_seq": ack_seq,
             "limit": 10,
-            "device_id": device_a,
-            "slot_id": slot_a,
+            "max_pages": 1,
         })
         if len(rest.get("messages", [])) != 1:
             raise AssertionError(f"ack 后应只剩 1 条未拉消息: {rest}")
         _ok("ack 后增量 pull 正确")
 
-        await bobb.call("group.pull", {
+        await _ensure_connected(
+            bobb_slot_b,
+            _BOBB_AID,
+            connect_options={"slot_id": slot_b, "background_sync": False},
+        )
+        device_b = bobb_slot_b.device_id
+        await bobb_slot_b.call("group.pull", {
             "group_id": group_id,
             "after_message_seq": 0,
             "limit": 1,
-            "device_id": device_b,
-            "slot_id": slot_b,
+            "max_pages": 1,
             "device_name": "同步测试设备 B",
             "device_type": "test",
         })
@@ -232,6 +257,7 @@ async def test_message_cursor_ack_and_device_slots():
         await _cleanup_group(alice, group_id)
         await alice.close()
         await bobb.close()
+        await bobb_slot_b.close()
 
 
 async def test_event_cursor_ack_and_future_guard():

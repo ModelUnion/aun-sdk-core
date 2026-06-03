@@ -42,12 +42,13 @@ type v2GroupBootstrapEntry struct {
 }
 
 // SendGroupV2 V2 Group 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
-func (c *AUNClient) sendGroupV2(ctx context.Context, groupID string, payload map[string]any) (map[string]any, error) {
-	return c.SendGroupV2WithOpts(ctx, groupID, payload, e2ee.EncryptOptions{})
+func (v *v2E2EECoordinator) sendGroupV2(ctx context.Context, groupID string, payload map[string]any) (map[string]any, error) {
+	return v.SendGroupV2WithOpts(ctx, groupID, payload, e2ee.EncryptOptions{})
 }
 
 // SendGroupV2WithOpts 与 SendGroupV2 相同，但允许传入 EncryptOptions（含 ProtectedHeaders / Context）。
-func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c := v.runtime.client
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
 		return nil, errors.New("V2 session not initialized (not connected?)")
@@ -60,24 +61,23 @@ func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, pay
 		"payload":  payload,
 	}, payload, nil)
 
-	resp, err := c.v2GroupSendOnce(ctx, state, groupID, payload, true, opts)
+	resp, err := v.v2GroupSendOnce(ctx, state, groupID, payload, true, opts)
 	if err == nil {
 		return resp, nil
 	}
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 Group speculative send rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
-		state.bootstrapCacheM.Lock()
-		delete(state.groupBootstrapCache, groupID)
-		state.bootstrapCacheM.Unlock()
-		return c.v2GroupSendOnce(ctx, state, groupID, payload, false, opts)
+		v.deleteGroupBootstrapCache(groupID)
+		return v.v2GroupSendOnce(ctx, state, groupID, payload, false, opts)
 	}
 	return nil, err
 }
 
 // v2GroupSendOnce 单次 group 发送尝试。
-func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c := v.runtime.client
 	c.logE2.Debug("group.v2.send attempt: group=%s use_cache=%v", groupID, useCache)
-	allDevices, epoch, sc, auditRaw, wrapPolicy, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +178,10 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 
 // v2ResolveGroupBootstrap 解析群 bootstrap（缓存优先）。
 // 返回 (devices, epoch, stateCommitment, auditRecipients, wrapPolicy, error)。
-func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
+func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
+	c := v.runtime.client
 	if useCache {
-		state.bootstrapCacheM.Lock()
-		entry, ok := state.groupBootstrapCache[groupID]
-		state.bootstrapCacheM.Unlock()
+		entry, ok := v.getGroupBootstrapCache(state, groupID)
 		if ok && time.Since(entry.CachedAt) < v2GroupBootstrapTTL {
 			c.logE2.Debug("group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%d", groupID, len(entry.Devices), len(entry.AuditRecipients), entry.Epoch)
 			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, entry.WrapPolicy, nil
@@ -207,6 +206,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 	if err := c.v2VerifyStateSignature(ctx, groupID, bs); err != nil {
 		return nil, 0, nil, nil, nil, err
 	}
+	c.getGroupStateCoordinator().publishGroupSecurityLevel(groupID, bs)
 
 	// 提取 state_commitment
 	sc := &e2ee.StateCommitmentAAD{
@@ -219,16 +219,14 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 	}
 
 	if len(devices) > 0 {
-		state.bootstrapCacheM.Lock()
-		state.groupBootstrapCache[groupID] = &v2GroupBootstrapEntry{
+		v.setGroupBootstrapCache(state, groupID, &v2GroupBootstrapEntry{
 			Devices:         devices,
 			AuditRecipients: auditRecipients,
 			Epoch:           epoch,
 			StateCommitment: sc,
 			CachedAt:        time.Now(),
 			WrapPolicy:      wrapPolicy,
-		}
-		state.bootstrapCacheM.Unlock()
+		})
 	}
 	// lazy sync 触发：发现 pending members 时异步发起提案
 	pendingAdds := v2ToStringList(bs["pending_adds"])
@@ -247,12 +245,13 @@ type groupV2PullOptions struct {
 //
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // limit<=0 时默认 50。
-func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
-	msgs, _, err := c.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{})
+func (v *v2E2EECoordinator) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
+	msgs, _, err := v.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{})
 	return msgs, err
 }
 
-func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, afterSeq int64, limit int, opts groupV2PullOptions) ([]map[string]any, v2PullPageMeta, error) {
+func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID string, afterSeq int64, limit int, opts groupV2PullOptions) ([]map[string]any, v2PullPageMeta, error) {
+	c := v.runtime.client
 	meta := v2PullPageMeta{}
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
@@ -272,7 +271,7 @@ func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, 
 	}
 
 	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ns=%s", groupID, effectiveAfterSeq, limit, ns)
-	raw, err := c.rawGroupV2Pull(ctx, groupID, effectiveAfterSeq, limit, opts.cursorParams)
+	raw, err := v.rawGroupV2Pull(ctx, groupID, effectiveAfterSeq, limit, opts.cursorParams)
 	if err != nil {
 		return nil, meta, err
 	}
@@ -358,7 +357,8 @@ func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, 
 	return decrypted, meta, nil
 }
 
-func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+	c := v.runtime.client
 	params := map[string]any{
 		"group_id":  groupID,
 		"after_seq": afterSeq,
@@ -383,7 +383,8 @@ func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq
 //
 // upToSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // Group 不触发 PFS SPK 销毁。
-func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
+func (v *v2E2EECoordinator) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
+	c := v.runtime.client
 	if groupID == "" {
 		return nil, errors.New("ack_group_v2: group_id 不能为空")
 	}
@@ -416,4 +417,33 @@ func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int6
 	}
 	c.logE2.Debug("group.v2.ack ok: group=%s ns=%s requested=%d result=%v", groupID, ns, seq, result)
 	return result, nil
+}
+
+// AUNClient 兼容门面：V2 Group 主体逻辑由 V2E2EECoordinator 承接。
+func (c *AUNClient) sendGroupV2(ctx context.Context, groupID string, payload map[string]any) (map[string]any, error) {
+	return c.getV2E2EECoordinator().sendGroupV2(ctx, groupID, payload)
+}
+
+func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+	return c.getV2E2EECoordinator().SendGroupV2WithOpts(ctx, groupID, payload, opts)
+}
+
+func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
+	return c.getV2E2EECoordinator().v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+}
+
+func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
+	return c.getV2E2EECoordinator().pullGroupV2(ctx, groupID, afterSeq, limit)
+}
+
+func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, afterSeq int64, limit int, opts groupV2PullOptions) ([]map[string]any, v2PullPageMeta, error) {
+	return c.getV2E2EECoordinator().pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, opts)
+}
+
+func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+	return c.getV2E2EECoordinator().rawGroupV2Pull(ctx, groupID, afterSeq, limit, cursorParams)
+}
+
+func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
+	return c.getV2E2EECoordinator().ackGroupV2(ctx, groupID, upToSeq)
 }

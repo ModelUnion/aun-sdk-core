@@ -112,6 +112,22 @@ describe('ISSUE-JS-004: disconnect() 别名方法', () => {
     expect(client.state).not.toBe('closed');
   });
 
+  it('retry_backoff 状态调用 disconnect() 应停止重连循环', async () => {
+    const client = new AUNClient();
+    const abort = vi.fn();
+    (client as any)._state = 'retry_backoff';
+    (client as any)._reconnectAbort = { abort };
+    (client as any)._reconnectActive = true;
+    (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+
+    await client.disconnect();
+
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect((client as any)._reconnectAbort).toBeNull();
+    expect((client as any)._reconnectActive).toBe(false);
+    expect(client.state).toBe('standby');
+  });
+
   it('idle 状态调用 disconnect() 应安全无操作', async () => {
     const client = new AUNClient();
     await client.disconnect();

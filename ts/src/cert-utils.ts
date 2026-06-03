@@ -8,7 +8,39 @@ import { certificateSha256Fingerprint } from './crypto.js';
 
 const AGENT_MD_SIGNATURE_MARKER = '<!-- AUN-SIGNATURE';
 const AGENT_MD_SIGNATURE_RE = /^<!-- AUN-SIGNATURE\r?\n(?<body>[\s\S]*?)\r?\n-->\s*$/;
-const AGENT_MD_FINGERPRINT_RE = /^sha256:[0-9a-f]{64}$/;
+const FINGERPRINT_HEX_RE = /^[0-9a-f]+$/;
+
+export function normalizeFingerprintHex(value: string | null | undefined): string {
+  let text = String(value ?? '').trim().toLowerCase();
+  if (text.startsWith('sha256:')) text = text.slice('sha256:'.length);
+  text = text.replace(/:/g, '');
+  if (![16, 64].includes(text.length) || !FINGERPRINT_HEX_RE.test(text)) return '';
+  return text;
+}
+
+export function publicKeyFingerprint(certPem: string): string {
+  const cert = new X509Certificate(certPem);
+  const spkiDer = cert.publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+  return `sha256:${createHash('sha256').update(spkiDer).digest('hex')}`;
+}
+
+export function certMatchesFingerprint(certPem: string, fingerprint: string | null | undefined): boolean {
+  const expected = normalizeFingerprintHex(fingerprint);
+  if (!expected) return false;
+  const cert = new X509Certificate(certPem);
+  const derHex = cert.fingerprint256.replace(/:/g, '').toLowerCase();
+  const spkiHex = publicKeyFingerprint(certPem).slice('sha256:'.length);
+  if (expected.length === 16) return derHex.slice(0, 16) === expected || spkiHex.slice(0, 16) === expected;
+  return derHex === expected || spkiHex === expected;
+}
+
+export function publicKeyMatchesFingerprint(certPem: string, fingerprint: string | null | undefined): boolean {
+  const expected = normalizeFingerprintHex(fingerprint);
+  if (!expected) return false;
+  const spkiHex = publicKeyFingerprint(certPem).slice('sha256:'.length);
+  if (expected.length === 16) return spkiHex.slice(0, 16) === expected;
+  return spkiHex === expected;
+}
 
 /** 解析 agent.md 尾部签名块 */
 export function parseAgentMdTailSignature(content: string): {
@@ -41,8 +73,11 @@ export function parseAgentMdTailSignature(content: string): {
       return { payload: content.slice(0, idx), fields: null, parseError: `signature block missing ${req}` };
     }
   }
-  if (!AGENT_MD_FINGERPRINT_RE.test(fields.cert_fingerprint.toLowerCase())) {
+  if (!normalizeFingerprintHex(fields.cert_fingerprint)) {
     return { payload: content.slice(0, idx), fields: null, parseError: 'invalid cert_fingerprint' };
+  }
+  if (fields.public_key_fingerprint && !normalizeFingerprintHex(fields.public_key_fingerprint)) {
+    return { payload: content.slice(0, idx), fields: null, parseError: 'invalid public_key_fingerprint' };
   }
   if (!Number.isFinite(Number(fields.timestamp))) {
     return { payload: content.slice(0, idx), fields: null, parseError: 'invalid timestamp' };
@@ -76,14 +111,19 @@ export function normalizeAgentMdPayload(content: string): string {
 }
 
 /** 构造 agent.md 签名块 */
-export function buildAgentMdSignatureBlock(certFingerprint: string, timestamp: number, signatureB64: string): string {
-  return [
+export function buildAgentMdSignatureBlock(
+  certFingerprint: string,
+  timestamp: number,
+  signatureB64: string,
+  publicKeyFp = '',
+): string {
+  const lines = [
     '<!-- AUN-SIGNATURE',
     `cert_fingerprint: ${certFingerprint}`,
-    `timestamp: ${Math.trunc(timestamp)}`,
-    `signature: ${signatureB64}`,
-    '-->',
-  ].join('\n');
+  ];
+  if (publicKeyFp) lines.push(`public_key_fingerprint: ${publicKeyFp}`);
+  lines.push(`timestamp: ${Math.trunc(timestamp)}`, `signature: ${signatureB64}`, '-->');
+  return lines.join('\n');
 }
 
 /** 使用私钥签名（ECDSA P-256 SHA-256，DER 编码输出） */

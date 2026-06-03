@@ -8,6 +8,29 @@
 
 ---
 
+## 0.4.8 — 2026-06-03
+
+### 新功能
+- `AID` 新增 `PublicKeyFingerprint` 字段（SPKI SHA-256），构造时自动计算
+- agent.md 签名块新增 `public_key_fingerprint` 字段，签名与验签均支持（四语言对齐）
+- 新增 `normalizeFingerprintHex` / `matchPublicKeyFingerprint` 工具函数，支持 16 位短格式指纹匹配（四语言对齐）
+- 新增在线未读 hint 队列（`onlineUnreadHintQueue`），同 group 去重 + 延迟 drain，降低登录瞬时拉取压力（四语言对齐）
+- `verifyAgentMD` 支持从签名块提取 `expectedFP`，优先精确拉取对端证书（四语言对齐）
+- `verifyAgentMDResultToMap` 输出 `public_key_fingerprint` 字段
+
+### 修复
+- agent.md 验签指纹比对改用 `matchCertFingerprint`（兼容 DER/SPKI 双格式），替代原直接字符串比较（四语言对齐）
+- `fetchPeerCert` 移除带指纹失败后降级无指纹重试的回退逻辑（四语言对齐）
+- `resolveAgentMDPeer` 支持按 `certFingerprint` 定向拉取并校验证书（四语言对齐）
+- `DownloadAgentMD` 解析签名块指纹后定向拉取匹配证书（四语言对齐）
+- `GetDeviceID` 目录创建失败时降级返回 `"default"`，修复原有 MkdirAll 失败后仍继续读写的问题
+
+### 优化
+- `AUNClient` 大规模拆分重构：client.go 变为薄层协调者，核心逻辑分散至 `LifecycleController`、`RpcPipeline`、`MessageDeliveryEngine`、`V2E2EECoordinator`、`GroupStateCoordinator`、`PeerDirectory`、`IdentityRuntimeManager` 等子组件
+- `AIDStoreOptions` 移除 `DeviceID` 字段，改为内部自动调用 `GetDeviceID`（四语言对齐）
+
+---
+
 ## 0.4.7 — 2026-06-01
 
 ### Added

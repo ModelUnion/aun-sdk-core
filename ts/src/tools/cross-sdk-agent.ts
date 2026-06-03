@@ -6,7 +6,7 @@ import * as fs from 'node:fs';
 import { URL } from 'node:url';
 import { AUNClient } from '../client.js';
 import { AIDStore } from '../aid-store.js';
-import { certificateSha256Fingerprint } from '../crypto.js';
+import { publicKeyFingerprint } from '../cert-utils.js';
 import type { JsonObject, RpcParams } from '../types.js';
 
 interface ClientInternals {
@@ -187,7 +187,7 @@ class CrossSdkTsAgent {
       device_id: textOf(internal._deviceId ?? ''),
       slot_id: textOf(internal._slotId ?? this.slotId),
       issuer: this.issuer,
-      public_key_fingerprint: cert ? certificateSha256Fingerprint(cert) : '',
+      public_key_fingerprint: cert ? publicKeyFingerprint(cert) : '',
     };
   }
 

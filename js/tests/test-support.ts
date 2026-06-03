@@ -6,9 +6,22 @@ export type TestAIDStoreOptions = {
   verifySsl?: boolean;
   rootCaPem?: string | null;
   debug?: boolean;
-  deviceId?: string;
   slotId?: string;
 };
+
+export type TestIdentityOptions = TestAIDStoreOptions & {
+  deviceId?: string;
+};
+
+export function setStoredTestDeviceId(deviceId?: string): void {
+  const value = String(deviceId ?? '').trim();
+  if (!value) return;
+  try {
+    localStorage.setItem('aun_device_id', value);
+  } catch {
+    // 测试环境没有 localStorage 时保持默认 device_id 路径。
+  }
+}
 
 export function createAIDStore(opts: TestAIDStoreOptions): AIDStore {
   return new AIDStore({
@@ -16,12 +29,12 @@ export function createAIDStore(opts: TestAIDStoreOptions): AIDStore {
     encryptionSeed: opts.encryptionSeed ?? '',
     rootCaPem: opts.rootCaPem ?? null,
     verifySsl: opts.verifySsl ?? true,
-    ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
     ...(opts.slotId ? { slotId: opts.slotId } : {}),
   });
 }
 
-export async function prepareIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AID> {
+export async function prepareIdentity(opts: TestIdentityOptions & { aid: string }): Promise<AID> {
+  setStoredTestDeviceId(opts.deviceId);
   const store = createAIDStore(opts);
   const registered = await store.register(opts.aid);
   if (!registered.ok) {
@@ -38,7 +51,8 @@ export async function prepareIdentity(opts: TestAIDStoreOptions & { aid: string 
   return loaded.data.aid;
 }
 
-export async function loadPreparedIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AID> {
+export async function loadPreparedIdentity(opts: TestIdentityOptions & { aid: string }): Promise<AID> {
+  setStoredTestDeviceId(opts.deviceId);
   const store = createAIDStore(opts);
   const loaded = await store.load(opts.aid);
   if (!loaded.ok || !loaded.data) {
@@ -47,11 +61,11 @@ export async function loadPreparedIdentity(opts: TestAIDStoreOptions & { aid: st
   return loaded.data.aid;
 }
 
-export async function createClientWithIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AUNClient> {
+export async function createClientWithIdentity(opts: TestIdentityOptions & { aid: string }): Promise<AUNClient> {
   return new AUNClient(await prepareIdentity(opts));
 }
 
-export async function createClientFromStore(opts: TestAIDStoreOptions & { aid: string }): Promise<AUNClient> {
+export async function createClientFromStore(opts: TestIdentityOptions & { aid: string }): Promise<AUNClient> {
   return new AUNClient(await loadPreparedIdentity(opts));
 }
 
@@ -100,12 +114,12 @@ export function createAIDStoreForClient(client: AUNClient, slotId?: string): AID
     };
   };
   const model = raw.configModel ?? {};
+  setStoredTestDeviceId(raw.__testDeviceId);
   return new AIDStore({
     aunPath: clientAunPath(client),
     encryptionSeed: clientEncryptionSeed(client),
     rootCaPem: raw.__testRootCaPem ?? model.rootCaPem ?? null,
     verifySsl: Boolean(raw.__testVerifySsl ?? model.verifySsl ?? true),
-    ...(raw.__testDeviceId ?? (raw as any)._deviceId ? { deviceId: raw.__testDeviceId ?? (raw as any)._deviceId } : {}),
     ...(slotId ? { slotId } : {}),
   });
 }

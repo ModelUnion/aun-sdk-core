@@ -11,7 +11,47 @@ import {
 
 const AGENT_MD_SIGNATURE_MARKER = '<!-- AUN-SIGNATURE';
 const AGENT_MD_SIGNATURE_RE = /^<!-- AUN-SIGNATURE\r?\n(?<body>[\s\S]*?)\r?\n-->\s*$/;
-const AGENT_MD_FINGERPRINT_RE = /^sha256:[0-9a-f]{64}$/;
+const FINGERPRINT_HEX_RE = /^[0-9a-f]+$/;
+
+export function normalizeFingerprintHex(value: string | null | undefined): string {
+  let text = String(value ?? '').trim().toLowerCase();
+  if (text.startsWith('sha256:')) text = text.slice('sha256:'.length);
+  text = text.replace(/:/g, '');
+  if (![16, 64].includes(text.length) || !FINGERPRINT_HEX_RE.test(text)) return '';
+  return text;
+}
+
+export async function publicKeyFingerprint(certPem: string): Promise<string> {
+  const spkiB64 = publicKeyDerB64(certPem);
+  if (!spkiB64) return '';
+  const spkiBytes = base64ToUint8(spkiB64);
+  const spkiInput = spkiBytes.buffer.slice(
+    spkiBytes.byteOffset,
+    spkiBytes.byteOffset + spkiBytes.byteLength,
+  ) as ArrayBuffer;
+  const digest = await crypto.subtle.digest('SHA-256', spkiInput);
+  const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `sha256:${hex}`;
+}
+
+export async function certMatchesFingerprint(certPem: string, fingerprint: string | null | undefined): Promise<boolean> {
+  const expected = normalizeFingerprintHex(fingerprint);
+  if (!expected) return false;
+  const derHex = (await certificateSha256Fingerprint(certPem)).slice('sha256:'.length);
+  const spki = await publicKeyFingerprint(certPem);
+  const spkiHex = spki ? spki.slice('sha256:'.length) : '';
+  if (expected.length === 16) return derHex.slice(0, 16) === expected || spkiHex.slice(0, 16) === expected;
+  return derHex === expected || spkiHex === expected;
+}
+
+export async function publicKeyMatchesFingerprint(certPem: string, fingerprint: string | null | undefined): Promise<boolean> {
+  const expected = normalizeFingerprintHex(fingerprint);
+  if (!expected) return false;
+  const spki = await publicKeyFingerprint(certPem);
+  const spkiHex = spki ? spki.slice('sha256:'.length) : '';
+  if (expected.length === 16) return spkiHex.slice(0, 16) === expected;
+  return spkiHex === expected;
+}
 
 export function parseAgentMdTailSignature(content: string): { payload: string; fields: Record<string, string> | null; parseError?: string } {
   const idx = content.lastIndexOf(AGENT_MD_SIGNATURE_MARKER);
@@ -31,8 +71,11 @@ export function parseAgentMdTailSignature(content: string): { payload: string; f
   for (const req of ['cert_fingerprint', 'timestamp', 'signature']) {
     if (!fields[req]) return { payload: content.slice(0, idx), fields: null, parseError: `signature block missing ${req}` };
   }
-  if (!AGENT_MD_FINGERPRINT_RE.test(fields.cert_fingerprint.toLowerCase())) {
+  if (!normalizeFingerprintHex(fields.cert_fingerprint)) {
     return { payload: content.slice(0, idx), fields: null, parseError: 'invalid cert_fingerprint' };
+  }
+  if (fields.public_key_fingerprint && !normalizeFingerprintHex(fields.public_key_fingerprint)) {
+    return { payload: content.slice(0, idx), fields: null, parseError: 'invalid public_key_fingerprint' };
   }
   if (!Number.isFinite(Number(fields.timestamp))) {
     return { payload: content.slice(0, idx), fields: null, parseError: 'invalid timestamp' };
@@ -46,14 +89,19 @@ export function normalizeAgentMdPayload(content: string): string {
   return payload;
 }
 
-export function buildAgentMdSignatureBlock(certFingerprint: string, timestamp: number, signatureB64: string): string {
-  return [
+export function buildAgentMdSignatureBlock(
+  certFingerprint: string,
+  timestamp: number,
+  signatureB64: string,
+  publicKeyFp = '',
+): string {
+  const lines = [
     AGENT_MD_SIGNATURE_MARKER,
     `cert_fingerprint: ${certFingerprint}`,
-    `timestamp: ${Math.trunc(timestamp)}`,
-    `signature: ${signatureB64}`,
-    '-->',
-  ].join('\n');
+  ];
+  if (publicKeyFp) lines.push(`public_key_fingerprint: ${publicKeyFp}`);
+  lines.push(`timestamp: ${Math.trunc(timestamp)}`, `signature: ${signatureB64}`, '-->');
+  return lines.join('\n');
 }
 
 export function extractAgentMdAid(payload: string): string {

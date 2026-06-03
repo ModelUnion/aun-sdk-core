@@ -272,7 +272,7 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
 });
 
 describe('AUNClient.disconnect', () => {
-  it('connected 状态断开后应进入 disconnected', async () => {
+  it('connected 状态断开后应进入 standby', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);

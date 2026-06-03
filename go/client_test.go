@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,32 @@ type testRPCCall struct {
 func TestPeerCertCacheTTLIsOneHour(t *testing.T) {
 	if peerCertCacheTTL != 3600 {
 		t.Fatalf("peer cert cache TTL must be 3600 seconds, got %d", peerCertCacheTTL)
+	}
+}
+
+func TestPublicConnectionOptionsDoNotExposeGatewayOrToken(t *testing.T) {
+	forbidden := []string{
+		"Gateway",
+		"Gateways",
+		"GatewayURL",
+		"GatewayUrl",
+		"AccessToken",
+		"Token",
+		"KiteToken",
+	}
+	types := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{name: "ConnectionOptions", typ: reflect.TypeOf(ConnectionOptions{})},
+		{name: "ConnectOptions", typ: reflect.TypeOf(ConnectOptions{})},
+	}
+	for _, item := range types {
+		for _, field := range forbidden {
+			if _, ok := item.typ.FieldByName(field); ok {
+				t.Fatalf("%s must not expose external %s; gateway/token must be resolved internally", item.name, field)
+			}
+		}
 	}
 }
 
@@ -132,6 +159,37 @@ func TestPulledBatchPublishesInternalGap(t *testing.T) {
 	c.prunePushedSeqs(ns)
 	if !c.isPushedSeq(ns, 2) || !c.isPushedSeq(ns, 4) {
 		t.Fatal("republish guard 不应仅因 contiguous 推进而清理")
+	}
+}
+
+func TestP2PRecallTombstonePublishesRecalledEvent(t *testing.T) {
+	event, payload := p2pAppEventForMessage(map[string]any{
+		"message_id": "recall-1",
+		"from":       "alice.agentid.pub",
+		"to":         "bob.agentid.pub",
+		"seq":        int64(9),
+		"type":       "message.recalled",
+		"payload": map[string]any{
+			"kind":        "message.recalled",
+			"message_ids": []any{"m-1"},
+			"recalled_at": int64(123),
+		},
+	})
+	if event != "message.recalled" {
+		t.Fatalf("recall tombstone 应发布 message.recalled，实际 %s", event)
+	}
+	msg, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload 类型错误: %#v", payload)
+	}
+	if fmt.Sprint(msg["message_ids"]) != "[m-1]" {
+		t.Fatalf("message_ids 归一化错误: %#v", msg["message_ids"])
+	}
+	if msg["tombstone_message_id"] != "recall-1" {
+		t.Fatalf("tombstone_message_id 错误: %#v", msg)
+	}
+	if toInt64(msg["seq"]) != 9 {
+		t.Fatalf("seq 错误: %#v", msg)
 	}
 }
 

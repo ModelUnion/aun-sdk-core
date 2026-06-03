@@ -233,6 +233,78 @@ func TestV2GroupPushNotificationPullsAndPublishes(t *testing.T) {
 	}
 }
 
+func TestV2GroupOnlineUnreadHintDelaysDrainAndPulls(t *testing.T) {
+	groupID := "group.example.com/g1"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "group.v2.pull" {
+			return map[string]any{"messages": []any{}}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	c.onlineUnreadHintInitialDelay = 50 * time.Millisecond
+	c.onlineUnreadHintInterval = 0
+
+	c.events.Publish("_raw.group.v2.message_created", map[string]any{
+		"group_id":   groupID,
+		"seq":        int64(7),
+		"message_id": "gm-online-hint",
+		"sender_aid": "alice.example.com",
+		"kind":       "group.online_unread_hint",
+	})
+
+	time.Sleep(10 * time.Millisecond)
+	for _, call := range getCalls() {
+		if call.Method == "group.v2.pull" {
+			t.Fatalf("online unread hint 不应立即 pull，calls=%#v", getCalls())
+		}
+	}
+	if !waitForParityCondition(time.Second, func() bool {
+		for _, call := range getCalls() {
+			if call.Method == "group.v2.pull" {
+				return int(toInt64(call.Params["after_seq"])) == 0
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("online unread hint drain 后应触发 group.v2.pull，calls=%#v", getCalls())
+	}
+}
+
+func TestV2GroupOnlineUnreadHintSkipsWhenBackgroundSyncDisabled(t *testing.T) {
+	groupID := "group.example.com/g1"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "group.v2.pull" {
+			return map[string]any{"messages": []any{}}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	c.sessionOptions["background_sync"] = false
+	c.onlineUnreadHintInitialDelay = 0
+
+	c.events.Publish("_raw.group.v2.message_created", map[string]any{
+		"group_id":   groupID,
+		"seq":        int64(7),
+		"message_id": "gm-online-hint",
+		"sender_aid": "alice.example.com",
+		"kind":       "group.online_unread_hint",
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	for _, call := range getCalls() {
+		if call.Method == "group.v2.pull" {
+			t.Fatalf("background_sync=false 时 online unread hint 不应 pull，calls=%#v", getCalls())
+		}
+	}
+}
+
 func TestV2P2PPurePushNotificationPullsFromCurrentContiguousSeq(t *testing.T) {
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
@@ -1006,6 +1078,65 @@ func TestV2P2PPullForceTruePassthroughKeepsExplicitAfterZero(t *testing.T) {
 	}
 	if got := c.seqTracker.GetContiguousSeq(ns); got != 9 {
 		t.Fatalf("force pull 空返回不应回退 contiguous_seq，got=%d", got)
+	}
+}
+
+func TestV2P2PPublicPullGateSerializesFullPipeline(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "message.v2.pull":
+			time.Sleep(20 * time.Millisecond)
+			if toInt64(params["after_seq"]) == 0 {
+				return map[string]any{"messages": []any{
+					map[string]any{
+						"version":    "v1",
+						"seq":        1,
+						"message_id": "m-1",
+						"from_aid":   "bob.example.com",
+						"t_server":   int64(1),
+						"legacy_v1": map[string]any{
+							"to":      "alice.example.com",
+							"payload": map[string]any{"type": "text", "text": "m-1"},
+						},
+					},
+				}, "has_more": false}
+			}
+			return map[string]any{"messages": []any{}, "has_more": false}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": 0, "limit": 10})
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("并发 message.pull 失败: %v", err)
+		}
+	}
+
+	var pullCalls []testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.v2.pull" {
+			pullCalls = append(pullCalls, call)
+		}
+	}
+	if len(pullCalls) != 2 {
+		t.Fatalf("应串行执行两次 message.v2.pull，实际: %#v", pullCalls)
+	}
+	if toInt64(pullCalls[0].Params["after_seq"]) != 0 || toInt64(pullCalls[1].Params["after_seq"]) != 1 {
+		t.Fatalf("public pull gate 应保护完整流水线并推进第二次 after_seq，calls=%#v", pullCalls)
 	}
 }
 

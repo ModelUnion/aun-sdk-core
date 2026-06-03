@@ -11,9 +11,12 @@
 | [aun测试运行指南](aun测试运行指南.md) | 当前 Docker 单域、双域、多语言 SDK 测试运行命令 |
 | [AUN SDK 重构修改清单](AUN_SDK_重构修改清单.md) | 本轮 SDK 重构的实际修改点、测试结果和遗留事项 |
 | [AUNClient 拆分重构执行方案](design/AUNClient拆分重构执行方案.md) | Python / Go / TS / JS SDK AUNClient 内部拆分边界、执行步骤和验收矩阵 |
+| [AUNClient 门面化与 Runtime 状态迁移细化方案](design/AUNClient门面化与Runtime状态迁移细化方案.md) | AUNClient 完全门面化、ClientRuntime 单一状态源和四端分批迁移步骤 |
 | [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md) | 多语言 SDK 同网同服、test-runner 控制面的跨语言 E2E 方案 |
 | [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md) | SDK bootstrap 能力声明 + 服务端 policy 控制 1DH/per-AID wrap 的兼容方案 |
 | [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md) | RPC trace 诊断字段与 enter/exit span 设计 |
+| [AUN 服务端消息通信诊断面板方案](design/AUN服务端消息通信诊断面板方案.md) | aun-console 消息通信页的服务端可观察诊断面板总体方案 |
+| [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md) | aun-console 消息通信页的服务端可观察 P0 诊断面板 |
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
@@ -30,6 +33,7 @@
 - 现有测试命令、容器名、单域/双域运行入口 → [aun测试运行指南](aun测试运行指南.md)
 - 本轮 SDK 重构阶段进度、修改点和测试结果 → [AUN SDK 重构修改清单](AUN_SDK_重构修改清单.md)
 - AUNClient 巨类拆分、内部组件边界、逐步迁移和验收矩阵 → [AUNClient 拆分重构执行方案](design/AUNClient拆分重构执行方案.md)
+- AUNClient 完全门面化、Runtime 状态归属、状态写入收口和四端分批实施 → [AUNClient 门面化与 Runtime 状态迁移细化方案](design/AUNClient门面化与Runtime状态迁移细化方案.md)
 - Python / TypeScript / Go / C++ 跨语言容器 E2E、test-runner、test-control API、用例矩阵 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 - 多语言 SDK 测试缺口与补测清单 → [审查与路线图目录](audit/)
 
@@ -43,6 +47,8 @@
 ### 诊断与可观测性
 
 - RPC trace span、跨模块诊断字段、安全字段白名单 → [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md)
+- aun-console 消息通信服务端可观察总体面板、事实/推断边界 → [AUN 服务端消息通信诊断面板方案](design/AUN服务端消息通信诊断面板方案.md)
+- 服务端可观察的消息通信 P0 面板、过滤语义、数据来源 → [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md)
 - 测试日志路径、测试输出、容器日志查看 → [aun测试运行指南](aun测试运行指南.md)
 - 跨语言 E2E trace 字段、日志产物、失败分类 → [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 
@@ -66,7 +72,11 @@
 
 ### AUNClient 拆分重构执行方案
 
-定义在不改变公开 API、协议字段、事件名和默认行为的前提下，如何把 Python / Go / TypeScript / JavaScript SDK 的 `AUNClient` 拆为内部门面、运行时上下文、生命周期控制、RPC 流水线、消息投递、V2 E2EE、群状态和 peer 目录等组件。文档给出 Python 优先落地的 19 个执行步骤，每步包含执行点、注意事项和验收测试，并说明跨 SDK 迁移顺序与风险点。
+定义在不改变公开 API、协议字段、事件名和默认行为的前提下，如何把 Python / Go / TypeScript / JavaScript SDK 的 `AUNClient` 拆为内部门面、运行时上下文、生命周期控制、RPC 流水线、消息投递、V2 E2EE、群状态和 peer 目录等组件。文档给出 19 个执行步骤、跨 SDK 迁移顺序、风险点和验收矩阵，并记录当前进度：Python 已形成组件化参考实现，TS/JS/Go 已完成 runtime、identity、peers、lifecycle 和 `RpcPipeline` preflight/签名/pull gate/raw call 接入。
+
+### AUNClient 门面化与 Runtime 状态迁移细化方案
+
+在既有 AUNClient 拆分方案基础上，进一步定义“完全门面化、状态全部迁入 runtime”的完成标准和分步执行方法。文档给出状态归属表，将身份与配置、基础依赖、生命周期、RPC、消息投递、V2 E2EE、群状态和 peer 状态分别归入 runtime 与对应 coordinator，并按 Step 0 到 Step 10 说明基线建立、ClientRuntime 状态分区、identity/lifecycle/RPC/delivery/V2/group state 迁移、runtime 写入接口收口、shim 清理、四端 parity 验证和回滚策略。
 
 ### 跨语言容器E2E测试方案
 
@@ -79,6 +89,14 @@
 ### AUN RPC Trace 增强设计
 
 设计 RPC trace 的 enter/exit span 结构，补充方法、AID、route、错误码、业务结果等诊断字段，并定义安全字段白名单。目标是在跨模块 RPC 失败时能定位到具体业务原因，而不是只看到模块路径和耗时。
+
+### AUN 服务端消息通信诊断面板方案
+
+记录 aun-console“消息通信”页面的服务端可观察诊断总体方案。方案明确只展示 Gateway、Message/Group、Federation、Service Plane 和模块业务指标可观察事实，不依赖 SDK 诊断模式，不读取 SDK 本地状态，并定义发送端、接收端、消息 ID、Group ID、关键词和任意方向过滤语义。服务端自主 Trace 默认关闭，只能通过面板临时开启。
+
+### 服务端消息通信诊断面板 P0 方案
+
+定义 aun-console 消息通信页的 P0 服务端诊断面板。范围限定为 Gateway、Message/Group、Federation 和 Service Plane 可观察事实，不采集 SDK 本地状态。文档给出发送端、接收端、消息 ID、Group ID 和任意方向过滤语义，并定义服务端 Trace、投递路径、Pull/ACK/GAP、E2EE、Federation、Service Plane 六个子标签，其中服务端自主 Trace 是默认关闭的运行时开关，`message.ack` 需区分 RPC 与同名事件的设备字段语义。
 
 ### 远程 agent.md 缓存与 ETag 透传方案
 

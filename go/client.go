@@ -74,6 +74,12 @@ type pendingOrderedMessage struct {
 	payload any
 }
 
+// orderedReadyEntry 有序投递队列中一条已就绪（seq <= contiguous）的待发布消息。
+type orderedReadyEntry struct {
+	seq  int
+	item pendingOrderedMessage
+}
+
 // pullGateState Pull Gate 状态：序列化同一 key 的 pull 操作
 type pullGateState struct {
 	inflight  atomic.Bool
@@ -410,55 +416,6 @@ var internalOnlyMethods = map[string]bool{
 	"initialize":         true,
 }
 
-// 需要客户端签名的关键方法
-var signedMethods = map[string]bool{
-	"message.send":                    true,
-	"message.v2.put_peer_pk":          true,
-	"message.v2.bootstrap":            true,
-	"message.v2.group_bootstrap":      true,
-	"message.v2.pull":                 true,
-	"message.v2.ack":                  true,
-	"group.send":                      true,
-	"group.v2.put_group_pk":           true,
-	"group.v2.bootstrap":              true,
-	"group.v2.send":                   true,
-	"group.v2.pull":                   true,
-	"group.v2.ack":                    true,
-	"group.v2.propose_state":          true,
-	"group.v2.confirm_state":          true,
-	"group.v2.get_proposal":           true,
-	"group.kick":                      true,
-	"group.add_member":                true,
-	"group.leave":                     true,
-	"group.remove_member":             true,
-	"group.update_rules":              true,
-	"group.update":                    true,
-	"group.update_announcement":       true,
-	"group.update_join_requirements":  true,
-	"group.set_role":                  true,
-	"group.transfer_owner":            true,
-	"group.review_join_request":       true,
-	"group.batch_review_join_request": true,
-	"group.request_join":              true,
-	"group.use_invite_code":           true,
-	"group.thought.put":               true,
-	"message.thought.put":             true,
-	"group.set_settings":              true,
-	"group.resources.put":             true,
-	"group.resources.update":          true,
-	"group.resources.delete":          true,
-	"group.resources.request_add":     true,
-	"group.resources.direct_add":      true,
-	"group.resources.approve_request": true,
-	"group.resources.reject_request":  true,
-	"group.commit_state":              true,
-	"group.ban":                       true,
-	"group.unban":                     true,
-	"group.dissolve":                  true,
-	"group.suspend":                   true,
-	"group.resume":                    true,
-}
-
 // 对端证书缓存 TTL（秒）
 const peerCertCacheTTL = 3600
 
@@ -533,13 +490,21 @@ type AUNClient struct {
 	lastDisconnectInfo map[string]any
 
 	// 组件
-	crypto     *CryptoProvider
-	tokenStore keystore.TokenStore
-	auth       *AuthFlow
-	transport  *RPCTransport
-	events     *EventDispatcher
-	discovery  *GatewayDiscovery
-	dnsNet     *DnsResilientNet
+	clientRuntime   *clientRuntime
+	identityRuntime *identityRuntimeManager
+	peerDirectory   *peerDirectory
+	lifecycle       *lifecycleController
+	rpcPipeline     *rpcPipeline
+	deliveryEngine  *messageDeliveryEngine
+	v2E2EE          *v2E2EECoordinator
+	groupState      *groupStateCoordinator
+	crypto          *CryptoProvider
+	tokenStore      keystore.TokenStore
+	auth            *AuthFlow
+	transport       *RPCTransport
+	events          *EventDispatcher
+	discovery       *GatewayDiscovery
+	dnsNet          *DnsResilientNet
 
 	// 会话参数
 	sessionParams  map[string]any
@@ -574,6 +539,13 @@ type AUNClient struct {
 	groupSynced   map[string]bool
 	groupSyncedMu sync.Mutex
 
+	// 在线未读 hint 队列：同一 group 只保留最后一条，延迟 drain 降低登录瞬时拉取压力
+	onlineUnreadHintQueue        map[string]map[string]any
+	onlineUnreadHintMu           sync.Mutex
+	onlineUnreadHintDraining     bool
+	onlineUnreadHintInitialDelay time.Duration
+	onlineUnreadHintInterval     time.Duration
+
 	// P2P 惰性同步标志：首次发送/收到 P2P 消息后标记 — 已废弃，由 fillP2pGap 在 connect 后异步触发，字段删除
 
 	// 后台任务上下文
@@ -604,12 +576,6 @@ type AUNClient struct {
 	// V2 push 通知 → auto-pull 串行化（only-one-in-flight + drain pending）
 	v2PushPullInflight atomic.Bool
 	v2PushPullPending  atomic.Bool
-
-	// V2 P2P / Group push 通知 only-one-in-flight 序列化（gap fill 拉取）
-	// 与 v2PushPullInflight 区分：那个是 _raw.peer.v2.message_received 触发；
-	// 这个用于一般 V2 拉取去重。
-	v2PullInflight atomic.Bool
-	v2PullPending  atomic.Bool
 
 	// 同一 group 的 V2 自动提案串行化，避免建群初始化 state 与后续成员变更抢同一 state_version。
 	v2AutoProposeLocksMu      sync.Mutex
@@ -681,33 +647,36 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 	namespace.SetLogger(aunLogger.For("aun_core.auth"))
 
 	c := &AUNClient{
-		config:                     rawConfig,
-		configModel:                cfg,
-		state:                      StateIdle,
-		deviceID:                   deviceID,
-		slotID:                     slotID,
-		aid:                        initAid,
-		crypto:                     crypto,
-		tokenStore:                 ks,
-		auth:                       authFlow,
-		events:                     events,
-		dnsNet:                     dnsNet,
-		discovery:                  NewGatewayDiscovery(cfg.VerifySSL, dnsNet),
-		certCache:                  make(map[string]*cachedPeerCert),
-		peerCache:                  make(map[string]*AID),
-		connectDeliveryMode:        copyMapShallow(connectDeliveryMode),
-		defaultConnectDeliveryMode: copyMapShallow(connectDeliveryMode),
-		seqTracker:                 NewSeqTracker(),
-		gapFillDone:                make(map[string]bool),
-		pushedSeqs:                 make(map[string]map[int]bool),
-		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
-		groupSynced:                make(map[string]bool),
-		v2AutoProposeLocks:         make(map[string]*sync.Mutex),
-		v2AutoProposeLastSnapshot:  make(map[string]string),
-		v2SenderIKPending:          make(map[string]v2SenderIKPendingEntry),
-		v2SenderIKFetching:         make(map[string]bool),
-		heartbeatNudge:             make(chan struct{}, 1),
-		pullGateStaleMs:            30000,
+		config:                       rawConfig,
+		configModel:                  cfg,
+		state:                        StateIdle,
+		deviceID:                     deviceID,
+		slotID:                       slotID,
+		aid:                          initAid,
+		crypto:                       crypto,
+		tokenStore:                   ks,
+		auth:                         authFlow,
+		events:                       events,
+		dnsNet:                       dnsNet,
+		discovery:                    NewGatewayDiscovery(cfg.VerifySSL, dnsNet),
+		certCache:                    make(map[string]*cachedPeerCert),
+		peerCache:                    make(map[string]*AID),
+		connectDeliveryMode:          copyMapShallow(connectDeliveryMode),
+		defaultConnectDeliveryMode:   copyMapShallow(connectDeliveryMode),
+		seqTracker:                   NewSeqTracker(),
+		gapFillDone:                  make(map[string]bool),
+		pushedSeqs:                   make(map[string]map[int]bool),
+		pendingOrderedMsgs:           make(map[string]map[int]pendingOrderedMessage),
+		groupSynced:                  make(map[string]bool),
+		onlineUnreadHintQueue:        make(map[string]map[string]any),
+		onlineUnreadHintInitialDelay: 750 * time.Millisecond,
+		onlineUnreadHintInterval:     50 * time.Millisecond,
+		v2AutoProposeLocks:           make(map[string]*sync.Mutex),
+		v2AutoProposeLastSnapshot:    make(map[string]string),
+		v2SenderIKPending:            make(map[string]v2SenderIKPendingEntry),
+		v2SenderIKFetching:           make(map[string]bool),
+		heartbeatNudge:               make(chan struct{}, 1),
+		pullGateStaleMs:              30000,
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
 			"heartbeat_interval":   30.0,
@@ -728,6 +697,14 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		logEG:  aunLogger.For("aun_core.e2ee-group"),
 		logAuS: aunLogger.For("aun_core.auth"),
 	}
+	c.clientRuntime = newClientRuntime(c)
+	c.identityRuntime = newIdentityRuntimeManager(c.clientRuntime)
+	c.peerDirectory = newPeerDirectory(c.clientRuntime)
+	c.lifecycle = newLifecycleController(c.clientRuntime)
+	c.rpcPipeline = newRpcPipeline(c.clientRuntime)
+	c.deliveryEngine = newMessageDeliveryEngine(c.clientRuntime)
+	c.v2E2EE = newV2E2EECoordinator(c.clientRuntime)
+	c.groupState = newGroupStateCoordinator(c.clientRuntime)
 	c.agentMDManager = newAgentMdManager(c, filepath.Join(cfg.AUNPath, "AIDs"))
 
 	// 创建 RPCTransport（使用断线回调）
@@ -1011,23 +988,7 @@ func (c *AUNClient) GetIdentity() map[string]any {
 // 若未 authenticate，内部自动调用 Authenticate()。
 // opts 为可选的连接行为配置（超时、重连退避等）；gateway URL 和 token 来自 Authenticate 缓存。
 func (c *AUNClient) Connect(ctx context.Context, opts ...ConnectionOptions) error {
-	c.mu.RLock()
-	current := c.currentAIDObj
-	authenticated := c.authenticated
-	c.mu.RUnlock()
-	if current == nil || !current.IsPrivateKeyValid() {
-		return NewStateError("Connect requires a loaded AID with a valid private key")
-	}
-	if !authenticated {
-		if _, err := c.Authenticate(ctx); err != nil {
-			return fmt.Errorf("connect: authenticate failed: %w", err)
-		}
-	}
-	var connOpt *ConnectionOptions
-	if len(opts) > 0 {
-		connOpt = &opts[0]
-	}
-	return c.connectWithLoadedIdentity(ctx, connectionOptionsToConnectOptions(connOpt, c))
+	return c.getLifecycleController().connect(ctx, opts...)
 }
 
 // connectionOptionsToConnectOptions 将 ConnectionOptions 转换为内部 ConnectOptions。
@@ -1076,204 +1037,17 @@ func connectionOptionsToConnectOptions(opt *ConnectionOptions, c *AUNClient) *Co
 }
 
 func (c *AUNClient) connectWithLoadedIdentity(ctx context.Context, opts *ConnectOptions) error {
-	c.mu.RLock()
-	current := c.currentAIDObj
-	gatewayURL := c.gatewayURL
-	c.mu.RUnlock()
-	if current == nil || !current.IsPrivateKeyValid() {
-		return NewStateError("Connect requires a loaded AID with a valid private key")
-	}
-	if gatewayURL == "" {
-		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
-		if err != nil {
-			return fmt.Errorf("connect gateway discovery failed: %w", err)
-		}
-		gatewayURL = resolved
-	}
-	params := map[string]any{
-		"gateway": gatewayURL,
-	}
-	return c.connectWithParams(ctx, params, opts, true, false)
+	return c.getLifecycleController().connectWithLoadedIdentity(ctx, opts)
 }
 
 // Authenticate 使用当前加载的 AID 完成两阶段认证并缓存 token，不建立长连接。
 // 只允许在 standby 状态下调用。
 func (c *AUNClient) Authenticate(ctx context.Context, opts ...ConnectOptions) (map[string]any, error) {
-	if len(opts) > 1 {
-		return nil, NewValidationError("Authenticate accepts at most one options object")
-	}
-	pubState := c.State()
-	if pubState != ConnStateStandby {
-		return nil, NewStateError(fmt.Sprintf("authenticate not allowed in state %s", pubState))
-	}
-	c.mu.RLock()
-	current := c.currentAIDObj
-	gatewayURL := c.gatewayURL
-	c.mu.RUnlock()
-	if current == nil || !current.IsPrivateKeyValid() {
-		return nil, NewStateError("Authenticate requires a loaded AID with a valid private key")
-	}
-	if gatewayURL == "" {
-		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
-		if err != nil {
-			return nil, fmt.Errorf("authenticate gateway discovery failed: %w", err)
-		}
-		gatewayURL = resolved
-	}
-	result, err := c.auth.Authenticate(ctx, gatewayURL, current.Aid)
-	if err != nil {
-		c.mu.Lock()
-		c.lastConnectError = err
-		c.authenticated = false
-		c.mu.Unlock()
-		return nil, err
-	}
-	c.mu.Lock()
-	c.identity = c.auth.LoadIdentityOrNil(current.Aid)
-	c.aid = current.Aid
-	c.gatewayURL = gatewayURL
-	c.authenticated = true
-	if c.state == StateIdle {
-		c.state = StateDisconnected
-	}
-	c.lastConnectError = nil
-	c.mu.Unlock()
-	return result, nil
+	return c.getLifecycleController().authenticate(ctx, opts...)
 }
 
 func (c *AUNClient) connectWithParams(ctx context.Context, params map[string]any, opts *ConnectOptions, allowReauth bool, requireAccessToken bool) (err error) {
-	tStart := time.Now()
-	gatewayURL := ""
-	if params != nil {
-		gatewayURL, _ = params["gateway"].(string)
-		if gatewayURL == "" {
-			gatewayURL, _ = params["gateway_url"].(string)
-		}
-	}
-	c.log.Debug("Connect enter: gateway=%s", gatewayURL)
-	defer func() {
-		if err != nil {
-			c.log.Debug("Connect exit (error): gateway=%s elapsed=%dms err=%v", gatewayURL, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.log.Debug("Connect exit: gateway=%s elapsed=%dms", gatewayURL, time.Since(tStart).Milliseconds())
-		}
-	}()
-
-	// 原子检查+状态转换，避免 TOCTOU 竞态
-	// ISSUE-SDK-GO-009: 允许从 disconnected 状态重新连接
-	// Fix-04: 同时放行 reconnecting(retry_backoff) 与 terminal_failed(connection_failed)，
-	// 与 Python SDK connect() 守卫对齐。从 reconnecting 恢复时需先停止旧重连 loop。
-	c.mu.Lock()
-	switch c.state {
-	case StateIdle, StateClosed, StateDisconnected, StateReconnecting, StateTerminalFailed:
-		// 放行
-	default:
-		st := c.state
-		c.mu.Unlock()
-		return NewStateError(fmt.Sprintf("connect 不允许在状态 %s 下调用", st))
-	}
-	// 从 reconnecting 状态进入：取消正在运行的重连 loop，避免与本次手动 connect 抢占
-	if c.state == StateReconnecting && c.reconnectCancel != nil {
-		cancel := c.reconnectCancel
-		c.reconnectCancel = nil
-		c.mu.Unlock()
-		cancel()
-		// 等待旧 loop 让出 reconnecting 标志（loop 收到 ctx.Done 后会 Store(false)）
-		for i := 0; i < 200 && c.reconnecting.Load(); i++ {
-			time.Sleep(5 * time.Millisecond)
-		}
-		c.mu.Lock()
-	}
-	// 从 terminal_failed 恢复：复位重试计数与错误状态
-	if c.state == StateTerminalFailed {
-		c.retryAttempt = 0
-		c.lastConnectError = nil
-	}
-	c.nextRetryAt = time.Time{}
-	c.state = StateConnecting
-	c.mu.Unlock()
-
-	// 合并参数：只放传给 gateway 的字段
-	merged := make(map[string]any)
-	for k, v := range params {
-		merged[k] = v
-	}
-	if opts != nil {
-		if opts.ConnectionKind != "" {
-			merged["connection_kind"] = opts.ConnectionKind
-		}
-		if opts.ShortTtlMs > 0 {
-			merged["short_ttl_ms"] = opts.ShortTtlMs
-		}
-		if len(opts.ExtraInfo) > 0 {
-			merged["extra_info"] = opts.ExtraInfo
-		}
-		if len(opts.DeliveryMode) > 0 {
-			merged["delivery_mode"] = copyMapShallow(opts.DeliveryMode)
-		}
-	}
-
-	// 规范化参数
-	normalized, normErr := c.normalizeConnectParamsWithTokenPolicy(merged, requireAccessToken)
-	if normErr != nil {
-		c.mu.Lock()
-		c.state = StateDisconnected
-		c.mu.Unlock()
-		err = normErr
-		return err
-	}
-
-	c.mu.Lock()
-	c.sessionParams = normalized
-	c.sessionOptions = c.buildSessionOptions(normalized, opts)
-	c.closing.Store(false)
-	c.mu.Unlock()
-
-	// 设置传输层超时
-	c.mu.RLock()
-	if timeouts, ok := c.sessionOptions["timeouts"].(map[string]any); ok {
-		if callTimeout, ok := timeouts["call"].(float64); ok {
-			c.transport.SetTimeout(time.Duration(callTimeout * float64(time.Second)))
-		}
-	}
-	c.mu.RUnlock()
-
-	gateways := c.resolveGateways(normalized)
-	var lastErr error
-	for _, gw := range gateways {
-		gwParams := make(map[string]any)
-		for k, v := range normalized {
-			gwParams[k] = v
-		}
-		gwParams["gateway"] = gw
-		lastErr = c.connectOnce(ctx, gwParams, allowReauth)
-		if lastErr == nil {
-			c.mu.Lock()
-			c.authenticated = true
-			c.lastConnectError = nil
-			c.mu.Unlock()
-			return nil
-		}
-		if len(gateways) > 1 {
-			c.log.Warn("Connect: gateway %s failed, trying next: %v", gw, lastErr)
-		}
-		c.mu.Lock()
-		if c.state == StateConnecting || c.state == StateAuthenticating {
-			c.state = StateConnecting
-		}
-		c.mu.Unlock()
-	}
-	err = lastErr
-	if err != nil {
-		c.log.Error("Connect failed: err=%v", err)
-		c.mu.Lock()
-		c.lastConnectError = err
-		if c.state == StateConnecting || c.state == StateAuthenticating {
-			c.state = StateDisconnected
-		}
-		c.mu.Unlock()
-	}
-	return err
+	return c.getLifecycleController().connectWithParams(ctx, params, opts, allowReauth, requireAccessToken)
 }
 
 // listIdentities 列出本地所有具有有效私钥的身份摘要。
@@ -1458,64 +1232,21 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		}
 	}()
 
-	c.mu.RLock()
-	state := c.state
-	c.mu.RUnlock()
-
-	if state != StateConnected {
-		return nil, NewConnectionError("客户端未连接")
-	}
-	if internalOnlyMethods[method] {
-		return nil, NewPermissionError(fmt.Sprintf("方法 %s 为内部专用", method))
-	}
-
-	if params == nil {
-		params = make(map[string]any)
-	} else {
-		// 浅拷贝，避免修改调用方的 params
-		copied := make(map[string]any, len(params))
-		for k, v := range params {
-			copied[k] = v
-		}
-		params = copied
-	}
-
-	// Fix-03: 对 message.send/group.send/message.thought.put/group.thought.put 自动合并实例级 protected_headers。
-	// 调用方在 params["protected_headers"] 显式传的键优先，实例级仅补充缺失键。
-	c.mergeInstanceProtectedHeaders(method, params)
-
-	if method == "message.send" || method == "group.send" {
-		c.normalizeOutboundMessagePayload(params, method)
-	}
-	if err := c.validateOutboundCall(method, params); err != nil {
+	preflight, err := c.getRpcPipeline().preflight(method, params)
+	if err != nil {
 		return nil, err
 	}
-	if err := c.injectMessageCursorContext(method, params); err != nil {
-		return nil, err
+	params = preflight.params
+	pullGateLocked := truthyBool(params["_pull_gate_locked"])
+	delete(params, "_pull_gate_locked")
+	pullGateKey := c.getRpcPipeline().pullGateKeyForCall(method, params)
+	if pullGateKey != "" && !pullGateLocked {
+		lockedParams := copyRpcParams(params)
+		lockedParams["_pull_gate_locked"] = true
+		return c.getRpcPipeline().runPullSerialized(ctx, pullGateKey, func() (any, error) {
+			return c.Call(ctx, method, lockedParams)
+		})
 	}
-
-	// group.* 方法的 group_id 归一化为 canonical 格式（兼容老/污染数据）
-	if strings.HasPrefix(method, "group.") {
-		if rawGid, ok := params["group_id"]; ok {
-			if s, ok2 := rawGid.(string); ok2 && s != "" {
-				params["group_id"] = NormalizeGroupID(s, "")
-			}
-		}
-	}
-
-	// group.* 方法注入 device_id（服务端用于多设备消息路由）
-	if strings.HasPrefix(method, "group.") {
-		if _, exists := params["device_id"]; !exists {
-			params["device_id"] = c.deviceID
-		}
-	}
-	if strings.HasPrefix(method, "group.") {
-		if _, exists := params["slot_id"]; !exists {
-			params["slot_id"] = c.slotID
-		}
-	}
-
-	c.clampAckParams(method, params)
 
 	// 自动加密：message.send 默认加密
 	if method == "message.send" {
@@ -1621,12 +1352,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	}
 
 	// 关键操作自动附加客户端签名
-	if signedMethods[method] {
-		if c.shouldSkipClientSignature(method, params) {
-			delete(params, "client_signature")
-		} else {
-			c.signClientOperation(method, params)
-		}
+	if err := c.getRpcPipeline().applyClientSignature(method, params); err != nil {
+		return nil, err
 	}
 
 	// P1-23: 非幂等方法使用更长超时
@@ -1642,9 +1369,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	}
 
 	// Pull Gate：序列化同一 key 的 pull 操作
-	pullGateKey := c.pullGateKeyForCall(method, params)
-	if pullGateKey != "" {
-		gatedResult, gatedErr := c.runPullSerialized(callCtx, pullGateKey, func() (any, error) {
+	if pullGateKey != "" && !pullGateLocked {
+		gatedResult, gatedErr := c.getRpcPipeline().runPullSerialized(callCtx, pullGateKey, func() (any, error) {
 			return c.transport.Call(callCtx, method, params)
 		})
 		if gatedErr != nil {
@@ -1658,218 +1384,12 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		}
 	}
 
-	// V2-only thought.get：服务端只存 envelope，SDK 读取时按当前设备解密。
-	if method == "message.thought.get" && c.v2GetState() != nil {
-		if m, ok := result.(map[string]any); ok {
-			c.log.Debug("message.thought.get transport result: found=%v raw_count=%d", m["found"], len(anySlice(m["thoughts"])))
-		}
-		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
-		c.decryptV2ThoughtGetResult(ctx, result, fromAID, false)
-	}
-	if method == "group.thought.get" && c.v2GetState() != nil {
-		if m, ok := result.(map[string]any); ok {
-			c.log.Debug("group.thought.get transport result: found=%v raw_count=%d", m["found"], len(anySlice(m["thoughts"])))
-		}
-		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
-		c.decryptV2ThoughtGetResult(ctx, result, fromAID, true)
-	}
-
-	// 自动解密：message.pull 返回的消息（V2-only：V1 解密已移除，仅做 seq 跟踪）
-	if method == "message.pull" {
-		if resultMap, ok := result.(map[string]any); ok {
-			messages, _ := resultMap["messages"].([]any)
-			c.log.Debug("message.pull returned %d messages", len(messages))
-			// 更新 SeqTracker；server_ack_seq 即使空 pull 也必须生效。
-			c.mu.RLock()
-			myAID := c.aid
-			c.mu.RUnlock()
-			if myAID != "" {
-				ns := "p2p:" + myAID
-				contigBefore := c.seqTracker.GetContiguousSeq(ns)
-				var pullMsgs []map[string]any
-				for _, raw := range messages {
-					if m, ok := raw.(map[string]any); ok {
-						pullMsgs = append(pullMsgs, m)
-					}
-				}
-				if len(pullMsgs) > 0 {
-					pullAfterSeq := int(toInt64(params["after_seq"]))
-					c.seqTracker.OnPullResult(ns, pullMsgs, pullAfterSeq)
-				}
-				// ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
-				// 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
-				// retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
-				// 永远悬挂触发无限 pull。临时消息淘汰走 ephemeral_earliest_available_seq（仅提示），与此互斥。
-				serverAck := int(toInt64(resultMap["server_ack_seq"]))
-				if serverAck > 0 {
-					contig := c.seqTracker.GetContiguousSeq(ns)
-					if contig < serverAck {
-						c.log.Info("message.pull retention-floor advanced: ns=%s contiguous=%d -> server_ack_seq=%d", ns, contig, serverAck)
-						c.seqTracker.ForceContiguousSeq(ns, serverAck)
-					}
-				}
-				c.saveSeqTrackerState()
-				// auto-ack 延迟到 publish 完成后（由 fillP2pGap 负责）
-				resultMap["_contig_before"] = contigBefore
-			}
-		}
-	}
-
-	// 自动解密：group.pull 返回的群消息（V2-only：V1 解密已移除，仅做 seq 跟踪）
-	if method == "group.pull" {
-		if resultMap, ok := result.(map[string]any); ok {
-			messages, _ := resultMap["messages"].([]any)
-			gid, _ := params["group_id"].(string)
-			c.logEG.Debug("group.pull returned %d messages: group=%s", len(messages), gid)
-			// 更新 SeqTracker；cursor.current_seq 即使空 pull 也必须生效。
-			if gid != "" {
-				ns := "group:" + gid
-				contigBefore := c.seqTracker.GetContiguousSeq(ns)
-				var pullMsgs []map[string]any
-				for _, raw := range messages {
-					if m, ok := raw.(map[string]any); ok {
-						pullMsgs = append(pullMsgs, m)
-					}
-				}
-				if len(pullMsgs) > 0 {
-					pullAfterSeq := int(toInt64(params["after_seq"]))
-					if pullAfterSeq == 0 {
-						pullAfterSeq = int(toInt64(params["after_message_seq"]))
-					}
-					c.seqTracker.OnPullResult(ns, pullMsgs, pullAfterSeq)
-				}
-				// ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
-				// 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
-				// 与 S2 [1,seq-1] 历史 gap 配合使用，ForceContiguousSeq 是跳过空洞的唯一手段。
-				serverAck := 0
-				if cursor, ok := resultMap["cursor"].(map[string]any); ok {
-					serverAck = int(toInt64(cursor["current_seq"]))
-					if serverAck > 0 {
-						contig := c.seqTracker.GetContiguousSeq(ns)
-						if contig < serverAck {
-							c.logEG.Info("group.pull retention-floor advanced: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contig, serverAck)
-							c.seqTracker.ForceContiguousSeq(ns, serverAck)
-						}
-					}
-				}
-				c.saveSeqTrackerState()
-				// auto-ack 延迟到 publish 完成后（由 fillGroupGap 负责）
-				resultMap["_contig_before"] = contigBefore
-			}
-		}
-	}
-	// V2-only: thought 解密通过 V2 push 路径处理，RPC 结果直接透传
-
-	// V2-only 群状态编排：建群/成员变更后同步 propose+confirm state。
-	if isV2StateMembershipMethod(method) && c.v2GetState() != nil {
-		groupID := extractGroupIDFromMutationResult(result, params)
-		if groupID != "" {
-			c.v2AutoProposeState(ctx, groupID)
-		}
-	}
-
-	return result, nil
+	return c.getRpcPipeline().postprocessResult(ctx, method, params, result)
 }
 
-func isV2StateMembershipMethod(method string) bool {
-	switch method {
-	case "group.create", "group.add_member", "group.kick", "group.remove_member", "group.leave",
-		"group.review_join_request", "group.batch_review_join_request",
-		"group.use_invite_code", "group.request_join":
-		return true
-	default:
-		return false
-	}
-}
-
-func extractGroupIDFromMutationResult(result any, params map[string]any) string {
-	if resultMap, ok := result.(map[string]any); ok {
-		if group, ok := resultMap["group"].(map[string]any); ok {
-			if gid := strings.TrimSpace(stringFromAny(group["group_id"])); gid != "" {
-				return NormalizeGroupID(gid, "")
-			}
-		}
-		if gid := strings.TrimSpace(stringFromAny(resultMap["group_id"])); gid != "" {
-			return NormalizeGroupID(gid, "")
-		}
-		if member, ok := resultMap["member"].(map[string]any); ok {
-			if gid := strings.TrimSpace(stringFromAny(member["group_id"])); gid != "" {
-				return NormalizeGroupID(gid, "")
-			}
-		}
-	}
-	if params != nil {
-		if gid := strings.TrimSpace(stringFromAny(params["group_id"])); gid != "" {
-			return NormalizeGroupID(gid, "")
-		}
-	}
-	return ""
-}
-
-// signClientOperation 为关键操作附加客户端 ECDSA 签名
-func (c *AUNClient) signClientOperation(method string, params map[string]any) {
-	c.mu.RLock()
-	currentAID := c.currentAIDObj
-	c.mu.RUnlock()
-	if currentAID == nil || currentAID.PrivateKeyPem == "" {
-		return
-	}
-	privPEM := currentAID.PrivateKeyPem
-	aidStr := currentAID.Aid
-	ts := fmt.Sprintf("%d", time.Now().Unix())
-
-	// 计算 params hash：签名覆盖所有非 _ 前缀且非 client_signature 的业务字段
-	paramsForHash := make(map[string]any)
-	for k, v := range params {
-		if k != "client_signature" && !strings.HasPrefix(k, "_") {
-			paramsForHash[k] = v
-		}
-	}
-	paramsJSON := stableStringify(paramsForHash)
-	// stableStringify 保证递归排序键 + 无空格分隔，与 Python/TS/JS 的 Canonical JSON 一致
-	paramsHash := fmt.Sprintf("%x", sha256.Sum256([]byte(paramsJSON)))
-	signData := []byte(fmt.Sprintf("%s|%s|%s|%s", method, aidStr, ts, paramsHash))
-
-	pk, err := parseECPrivateKeyPEM(privPEM)
-	if err != nil {
-		c.log.Warn("client signature private key parse failed: %v", err)
-		return
-	}
-	hash := sha256.Sum256(signData)
-	sig, err := ecdsa.SignASN1(cryptorand.Reader, pk, hash[:])
-	if err != nil {
-		c.log.Error("client signature failed: %v", err)
-		return
-	}
-
-	// 证书指纹
-	certFingerprint := ""
-	if certPEM := currentAID.CertPem; certPEM != "" {
-		block, _ := pem.Decode([]byte(certPEM))
-		if block != nil {
-			fp := sha256.Sum256(block.Bytes)
-			certFingerprint = "sha256:" + fmt.Sprintf("%x", fp)
-		}
-	}
-
-	params["client_signature"] = map[string]any{
-		"aid":              aidStr,
-		"cert_fingerprint": certFingerprint,
-		"timestamp":        ts,
-		"params_hash":      paramsHash,
-		"signature":        base64.StdEncoding.EncodeToString(sig),
-	}
-}
-
-func (c *AUNClient) shouldSkipClientSignature(method string, params map[string]any) bool {
-	if method != "message.send" && method != "group.send" {
-		return false
-	}
-	if params == nil || truthyBool(params["encrypted"]) || truthyBool(params["encrypt"]) {
-		return false
-	}
-	_, _, ok := c.isEchoPayload(params["payload"])
-	return ok
+// signClientOperation 为关键操作附加客户端 ECDSA 签名。
+func (c *AUNClient) signClientOperation(method string, params map[string]any) error {
+	return c.getRpcPipeline().signClientOperation(method, params)
 }
 
 // ── 便利方法 ──────────────────────────────────────────────
@@ -1894,15 +1414,11 @@ func (c *AUNClient) status(ctx context.Context) (any, error) {
 	return c.Call(ctx, "meta.status", nil)
 }
 
-func (c *AUNClient) trustRoots(ctx context.Context) (any, error) {
-	return c.Call(ctx, "meta.trust_roots", nil)
-}
-
 // ── 事件处理 ──────────────────────────────────────────────
 
 func isInstanceScopedMessageEvent(event string) bool {
 	switch event {
-	case "message.received", "message.undecryptable",
+	case "message.received", "message.recalled", "message.undecryptable",
 		"group.message_created", "group.message_undecryptable":
 		return true
 	default:
@@ -1911,53 +1427,19 @@ func isInstanceScopedMessageEvent(event string) bool {
 }
 
 func (c *AUNClient) attachCurrentInstanceContext(payload any) any {
-	message, ok := payload.(map[string]any)
-	if !ok {
-		return payload
-	}
-	result := copyMapShallow(message)
-	if _, exists := result["device_id"]; !exists {
-		result["device_id"] = c.deviceID
-	}
-	if c.slotID != "" && strings.TrimSpace(stringFromAny(result["slot_id"])) == "" {
-		result["slot_id"] = c.slotID
-	}
-	return result
+	return c.delivery().attachCurrentInstanceContext(payload)
 }
 
 func (c *AUNClient) normalizePublishedMessagePayload(event string, payload any) any {
-	if !isInstanceScopedMessageEvent(event) {
-		return payload
-	}
-	return c.attachCurrentInstanceContext(payload)
+	return c.delivery().normalizePublishedMessagePayload(event, payload)
 }
 
 func (c *AUNClient) publishAppEvent(event string, payload any) {
-	if event == "message.received" || event == "group.message_created" {
-		if msg, ok := payload.(map[string]any); ok {
-			c.maybeAppendEchoTraceReceive(msg)
-		}
-	}
-	if event == "message.received" || event == "message.undecryptable" ||
-		event == "group.message_created" || event == "group.message_undecryptable" {
-		c.logMessageDebug("publish", "direct", event, payload, nil)
-	}
-	c.injectAgentMDEtag(payload)
-	c.events.Publish(event, c.normalizePublishedMessagePayload(event, payload))
+	c.delivery().publishAppEvent(event, payload)
 }
 
 func (c *AUNClient) publishAppEventSync(event string, payload any) {
-	if event == "message.received" || event == "group.message_created" {
-		if msg, ok := payload.(map[string]any); ok {
-			c.maybeAppendEchoTraceReceive(msg)
-		}
-	}
-	if event == "message.received" || event == "message.undecryptable" ||
-		event == "group.message_created" || event == "group.message_undecryptable" {
-		c.logMessageDebug("publish", "sync", event, payload, nil)
-	}
-	c.injectAgentMDEtag(payload)
-	c.events.publishSync(event, c.normalizePublishedMessagePayload(event, payload))
+	c.delivery().publishAppEventSync(event, payload)
 }
 
 // injectAgentMDEtag 在应用层事件 payload 中注入 _agent_md 字段，让应用层判断版本一致性；
@@ -2049,311 +1531,34 @@ func (c *AUNClient) maybeAppendEchoTraceReceive(msg map[string]any) {
 }
 
 func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
-	msg, ok := message.(map[string]any)
-	if !ok {
-		return true
-	}
-	if _, exists := msg["device_id"]; exists {
-		targetDeviceID := strings.TrimSpace(stringFromAny(msg["device_id"]))
-		if targetDeviceID != c.deviceID {
-			return false
-		}
-	}
-	targetSlotID := strings.TrimSpace(stringFromAny(msg["slot_id"]))
-	if targetSlotID != "" && c.slotID != "" && SlotIsolationKey(targetSlotID) != SlotIsolationKey(c.slotID) {
-		return false
-	}
-	return true
-}
-
-func encryptedPushEnvelope(msg map[string]any) (map[string]any, bool) {
-	if msg == nil {
-		return nil, false
-	}
-	if pm, ok := msg["payload"].(map[string]any); ok && isEncryptedEnvelopePayload(pm) {
-		return pm, true
-	}
-	raw := strings.TrimSpace(stringFromAny(msg["envelope_json"]))
-	if raw == "" {
-		return nil, false
-	}
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.UseNumber()
-	var envelope map[string]any
-	if err := dec.Decode(&envelope); err != nil {
-		return nil, false
-	}
-	if !isEncryptedEnvelopePayload(envelope) {
-		return nil, false
-	}
-	return envelope, true
-}
-
-func isEncryptedPushMessage(msg map[string]any) bool {
-	if msg == nil {
-		return false
-	}
-	if truthyBool(msg["encrypted"]) {
-		return true
-	}
-	_, ok := encryptedPushEnvelope(msg)
-	return ok
-}
-
-func isEncryptedEnvelopePayload(payload any) bool {
-	pm, ok := payload.(map[string]any)
-	if !ok || pm == nil {
-		return false
-	}
-	payloadType := strings.TrimSpace(stringFromAny(pm["type"]))
-	if strings.HasPrefix(payloadType, "e2ee.") {
-		return true
-	}
-	if strings.TrimSpace(stringFromAny(pm["ciphertext"])) == "" {
-		return false
-	}
-	return pm["nonce"] != nil || pm["tag"] != nil || pm["recipient"] != nil ||
-		pm["recipients"] != nil || pm["wrapped_key"] != nil || pm["recipients_digest"] != nil
-}
-
-func isV2EncryptedEnvelopePayload(envelope map[string]any) bool {
-	if envelope == nil {
-		return false
-	}
-	payloadType := strings.TrimSpace(stringFromAny(envelope["type"]))
-	if payloadType == "e2ee.p2p_encrypted" || payloadType == "e2ee.group_encrypted" {
-		return true
-	}
-	return strings.EqualFold(strings.TrimSpace(stringFromAny(envelope["version"])), "v2") &&
-		strings.HasPrefix(payloadType, "e2ee.")
-}
-
-func safeUndecryptablePushEvent(msg map[string]any, group bool) map[string]any {
-	event := map[string]any{
-		"message_id":     msg["message_id"],
-		"from":           msg["from"],
-		"seq":            msg["seq"],
-		"timestamp":      msg["timestamp"],
-		"device_id":      msg["device_id"],
-		"slot_id":        msg["slot_id"],
-		"_decrypt_error": "encrypted push payload is not decryptable on raw push path",
-		"_decrypt_stage": "push_envelope",
-	}
-	if event["timestamp"] == nil {
-		event["timestamp"] = msg["t_server"]
-	}
-	if group {
-		event["group_id"] = msg["group_id"]
-	} else {
-		event["to"] = msg["to"]
-	}
-	if envelope, ok := encryptedPushEnvelope(msg); ok {
-		event["_envelope_type"] = stringFromAny(envelope["type"])
-		event["_suite"] = stringFromAny(envelope["suite"])
-		if isV2EncryptedEnvelopePayload(envelope) {
-			attachV2EnvelopeMetadata(event, v2MessageE2EEMetadata(envelope))
-		}
-	}
-	return event
+	return c.delivery().messageTargetsCurrentInstance(message)
 }
 
 func (c *AUNClient) publishEncryptedPushAsUndecryptable(eventName, ns string, seq int, msg map[string]any, group bool) bool {
-	safeEvent := safeUndecryptablePushEvent(msg, group)
-	c.logMessageDebug("decrypt-fail", "push.encrypted", eventName, safeEvent, nil)
-	if ns != "" && seq > 0 {
-		return c.publishOrderedMessage(eventName, ns, seq, safeEvent)
-	}
-	c.publishAppEvent(eventName, safeEvent)
-	return true
+	return c.getV2E2EECoordinator().publishEncryptedPushAsUndecryptable(eventName, ns, seq, msg, group)
 }
 
 func (c *AUNClient) decryptEncryptedPushPayload(msg map[string]any, group bool) map[string]any {
-	envelope, ok := encryptedPushEnvelope(msg)
-	if !ok || !isV2EncryptedEnvelopePayload(envelope) {
-		return nil
-	}
-	fromAID := strings.TrimSpace(stringFromAny(msg["from_aid"]))
-	if fromAID == "" {
-		fromAID = strings.TrimSpace(stringFromAny(msg["from"]))
-	}
-	if fromAID == "" {
-		fromAID = strings.TrimSpace(stringFromAny(msg["sender_aid"]))
-	}
-	if fromAID == "" {
-		if aad, ok := envelope["aad"].(map[string]any); ok {
-			fromAID = strings.TrimSpace(stringFromAny(aad["from"]))
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	plaintext := c.decryptV2EnvelopeForThought(ctx, envelope, fromAID)
-	if plaintext == nil {
-		return nil
-	}
-	meta := v2MessageE2EEMetadata(envelope)
-	result := map[string]any{
-		"message_id": stringFromAny(msg["message_id"]),
-		"from":       fromAID,
-		"seq":        msg["seq"],
-		"timestamp":  msg["timestamp"],
-		"payload":    plaintext,
-		"encrypted":  true,
-		"e2ee":       meta,
-	}
-	direction := strings.TrimSpace(stringFromAny(msg["direction"]))
-	if direction == "" {
-		c.mu.RLock()
-		selfAID := c.aid
-		c.mu.RUnlock()
-		if fromAID != "" && fromAID == selfAID {
-			direction = "outbound_sync"
-		} else {
-			direction = "inbound"
-		}
-	}
-	result["direction"] = direction
-	if msg["t_server"] != nil {
-		result["t_server"] = msg["t_server"]
-		result["timestamp"] = msg["t_server"]
-	}
-	if msg["device_id"] != nil {
-		result["device_id"] = msg["device_id"]
-	}
-	if msg["slot_id"] != nil {
-		result["slot_id"] = msg["slot_id"]
-	}
-	if group {
-		groupID := msg["group_id"]
-		if groupID == nil {
-			if aad, ok := envelope["aad"].(map[string]any); ok {
-				groupID = aad["group_id"]
-			}
-		}
-		if groupID == nil {
-			groupID = envelope["group_id"]
-		}
-		result["group_id"] = groupID
-	} else {
-		to := msg["to"]
-		if to == nil {
-			c.mu.RLock()
-			to = c.aid
-			c.mu.RUnlock()
-		}
-		result["to"] = to
-	}
-	attachV2EnvelopeMetadata(result, meta)
-	c.logMessageDebug("decrypt-ok", "push.encrypted", map[bool]string{true: "group.message_created", false: "message.received"}[group], result, nil)
-	return result
+	return c.getV2E2EECoordinator().decryptEncryptedPushPayload(msg, group)
 }
 
 func (c *AUNClient) publishEncryptedPushMessage(normalEvent, undecryptableEvent, ns string, seq int, msg map[string]any, group bool) bool {
-	decrypted := c.decryptEncryptedPushPayload(msg, group)
-	if decrypted != nil {
-		if ns != "" && seq > 0 {
-			return c.publishOrderedMessage(normalEvent, ns, seq, decrypted)
-		}
-		c.publishAppEvent(normalEvent, decrypted)
-		return true
-	}
-	return c.publishEncryptedPushAsUndecryptable(undecryptableEvent, ns, seq, msg, group)
+	return c.getV2E2EECoordinator().publishEncryptedPushMessage(normalEvent, undecryptableEvent, ns, seq, msg, group)
 }
 
 // onRawMessageReceived 处理 transport 层推送的原始消息
 func (c *AUNClient) onRawMessageReceived(data any) {
-	tStart := time.Now()
-	c.log.Debug("onRawMessageReceived enter")
-	c.logMessageDebug("server-push", "_raw.message.received", "message.received", data, nil)
-	defer func() {
-		c.log.Debug("onRawMessageReceived exit: elapsed=%dms", time.Since(tStart).Milliseconds())
-	}()
-	go c.processAndPublishMessage(data)
+	c.delivery().onRawMessageReceived(data)
 }
 
 // processAndPublishMessage 实际处理推送消息的 goroutine
 func (c *AUNClient) processAndPublishMessage(data any) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.log.Error("processAndPublishMessage panic: %v", r)
-		}
-	}()
-
-	dataMap, ok := data.(map[string]any)
-	if !ok {
-		c.publishAppEvent("message.received", data)
-		return
-	}
-
-	msg := copyMapShallow(dataMap)
-	if !c.messageTargetsCurrentInstance(msg) {
-		c.log.Debug("P2P push filtered by instance: message_id=%s seq=%d target_device=%s target_slot=%s local_device=%s local_slot=%s",
-			stringFromAny(msg["message_id"]), int(toInt64(msg["seq"])), stringFromAny(msg["device_id"]), stringFromAny(msg["slot_id"]), c.deviceID, c.slotID)
-		return
-	}
-
-	// P2P 空洞检测
-	seq := int(toInt64(msg["seq"]))
-	fromAID, _ := msg["from"].(string)
-	c.log.Debug("P2P message push: from=%s seq=%d", fromAID, seq)
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	p2pNS := ""
-	if seq > 0 && myAID != "" {
-		p2pNS = "p2p:" + myAID
-		c.seqTracker.UpdateMaxSeen(p2pNS, seq)
-		needPull := c.seqTracker.OnMessageSeq(p2pNS, seq)
-		if needPull {
-			c.log.Debug("P2P seq gap detected, triggering gap fill: seq=%d", seq)
-			go c.fillP2pGap()
-		}
-		// auto-ack contiguous_seq
-		contig := c.seqTracker.GetContiguousSeq(p2pNS)
-		if contig > 0 {
-			ackSeq := c.clampAckSeq("message.ack", "seq", p2pNS, int64(contig))
-			c.log.Debug("P2P push auto-ack send: ns=%s seq=%d contiguous=%d", p2pNS, ackSeq, contig)
-			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-					"seq":       ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
-				}); ackErr != nil {
-					c.log.Warn("P2P auto-ack failed: %v", ackErr)
-				} else {
-					c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", p2pNS, ackSeq)
-				}
-			}()
-		}
-		// 即时持久化 cursor，异常断连后不回退
-		c.saveSeqTrackerState()
-	}
-
-	if isEncryptedPushMessage(msg) {
-		c.log.Debug("encrypted P2P push attempting inline decrypt: from=%s seq=%d", fromAID, seq)
-		c.publishEncryptedPushMessage("message.received", "message.undecryptable", p2pNS, seq, msg, false)
-		return
-	}
-
-	// V2-only: V2 P2P 消息通过 V2 push 路径解密；明文/兼容消息在此处透传
-	decrypted := msg
-	if seq > 0 && myAID != "" {
-		c.publishOrderedMessage("message.received", "p2p:"+myAID, seq, decrypted)
-	} else {
-		c.publishAppEvent("message.received", decrypted)
-	}
+	c.delivery().processAndPublishMessage(data)
 }
 
 // onRawGroupMessageCreated 处理群组消息推送
 func (c *AUNClient) onRawGroupMessageCreated(data any) {
-	tStart := time.Now()
-	c.logEG.Debug("onRawGroupMessageCreated enter")
-	c.logMessageDebug("server-push", "_raw.group.message_created", "group.message_created", data, nil)
-	defer func() {
-		c.logEG.Debug("onRawGroupMessageCreated exit: elapsed=%dms", time.Since(tStart).Milliseconds())
-	}()
-	go c.processAndPublishGroupMessage(data)
+	c.delivery().onRawGroupMessageCreated(data)
 }
 
 // processAndPublishGroupMessage 处理群组推送消息的 goroutine
@@ -2361,546 +1566,50 @@ func (c *AUNClient) onRawGroupMessageCreated(data any) {
 // 带 payload 的事件（消息推送）：解密后 re-publish。
 // 不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
 func (c *AUNClient) processAndPublishGroupMessage(data any) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logEG.Error("processAndPublishGroupMessage panic: %v", r)
-		}
-	}()
-
-	dataMap, ok := data.(map[string]any)
-	if !ok {
-		c.publishAppEvent("group.message_created", data)
-		return
-	}
-
-	msg := copyMapShallow(dataMap)
-	groupID, _ := msg["group_id"].(string)
-	seq := int(toInt64(msg["seq"]))
-	fromAID, _ := msg["from"].(string)
-	c.logEG.Debug("group message push: group=%s from=%s seq=%d", groupID, fromAID, seq)
-
-	if groupID != "" {
-		c.groupSyncedMu.Lock()
-		c.groupSynced[groupID] = true
-		c.groupSyncedMu.Unlock()
-	}
-
-	// 检查是否带 payload
-	payload := msg["payload"]
-	hasPayload := false
-	if payload != nil {
-		if pm, ok := payload.(map[string]any); ok && len(pm) > 0 {
-			hasPayload = true
-		} else if _, ok := payload.(string); ok {
-			hasPayload = true
-		}
-	}
-
-	if !hasPayload {
-		// 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
-		if groupID != "" && seq > 0 {
-			ns := "group:" + groupID
-			c.seqTracker.UpdateMaxSeen(ns, seq)
-			contigBefore := c.seqTracker.GetContiguousSeq(ns)
-			if contigBefore == seq {
-				c.logEG.Debug("group message notification: push seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
-					seq, contigBefore)
-				return
-			}
-			if contigBefore > seq {
-				c.logEG.Warn("group message notification: contiguous_seq=%d 越界（> push_seq=%d），脏数据修复倒退至 %d",
-					contigBefore, seq, seq-1)
-				c.seqTracker.RepairContiguousSeq(ns, seq-1)
-				c.saveSeqTrackerState()
-			}
-		}
-		c.autoPullGroupMessages(msg)
-		return
-	}
-
-	encryptedPush := isEncryptedPushMessage(msg)
-
-	// V2-only: V2 群组消息通过 V2 push 路径解密；明文/兼容消息在此处透传
-	decrypted := msg
-
-	if decrypted != nil && groupID != "" && seq > 0 {
-		ns := "group:" + groupID
-		c.seqTracker.UpdateMaxSeen(ns, seq)
-		contigBefore := c.seqTracker.GetContiguousSeq(ns)
-		if contigBefore == seq {
-			c.logEG.Debug("group message payload push: seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
-				seq, contigBefore)
-			return
-		}
-		needPull := c.seqTracker.OnMessageSeq(ns, seq)
-		if needPull {
-			c.logEG.Debug("group message seq gap detected, triggering gap fill: group=%s seq=%d", groupID, seq)
-			go c.fillGroupGap(groupID)
-		}
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig > 0 {
-			ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", ns, int64(contig))
-			c.logEG.Debug("group push auto-ack send: group=%s ns=%s seq=%d contiguous=%d", groupID, ns, ackSeq, contig)
-			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-					"group_id":  groupID,
-					"msg_seq":   ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
-				}); ackErr != nil {
-					c.logEG.Warn("group message auto-ack failed: group=%s %v", groupID, ackErr)
-				} else {
-					c.logEG.Debug("group push auto-ack ok: group=%s ns=%s seq=%d", groupID, ns, ackSeq)
-				}
-			}()
-		}
-		c.saveSeqTrackerState()
-	}
-
-	if encryptedPush {
-		c.logEG.Debug("encrypted group push attempting inline decrypt: group=%s seq=%d", groupID, seq)
-		ns := ""
-		if groupID != "" && seq > 0 {
-			ns = "group:" + groupID
-		}
-		c.publishEncryptedPushMessage("group.message_created", "group.message_undecryptable", ns, seq, msg, true)
-		return
-	}
-
-	// V2-only: 不再有 pending decrypt 队列，decrypted 始终非 nil
-	if groupID != "" && seq > 0 {
-		c.publishOrderedMessage("group.message_created", "group:"+groupID, seq, decrypted)
-	} else {
-		c.publishAppEvent("group.message_created", decrypted)
-	}
+	c.delivery().processAndPublishGroupMessage(data)
 }
 
 // autoPullGroupMessages 收到不带 payload 的通知后自动 pull 最新消息
 func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
-	groupID, _ := notification["group_id"].(string)
-	if groupID == "" {
-		c.publishAppEvent("group.message_created", notification)
-		return
-	}
-	ns := "group:" + groupID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// V2-only 模式：走 group.v2.pull（合并 V1 明文 + V2 密文并自动解密）
-	v2State := c.v2GetState()
-	if v2State != nil && v2State.session != nil {
-		_, err := c.pullGroupV2Internal(ctx, map[string]any{
-			"group_id":  groupID,
-			"after_seq": afterSeq,
-			"limit":     50,
-		})
-		if err != nil {
-			c.logEG.Warn("auto pull group messages (v2) failed: %v", err)
-			c.publishAppEvent("group.message_created", notification)
-		}
-		return
-	}
-
-	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": afterSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		c.logEG.Warn("auto pull group messages failed: %v", err)
-		c.publishAppEvent("group.message_created", notification)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		c.publishAppEvent("group.message_created", notification)
-		return
-	}
-	messages, ok := resultMap["messages"].([]any)
-	if !ok || len(messages) == 0 {
-		c.publishAppEvent("group.message_created", notification)
-		return
-	}
-	// 更新 SeqTracker
-	var pullMsgs []map[string]any
-	for _, raw := range messages {
-		if m, ok := raw.(map[string]any); ok {
-			pullMsgs = append(pullMsgs, m)
-		}
-	}
-	c.seqTracker.OnPullResult(ns, pullMsgs, afterSeq)
-	// pushedSeqs 去重：使用 publishGapFillGroupMessages 安全发布，避免锁外读取竞态
-	c.publishGapFillGroupMessages(ns, messages)
+	c.delivery().autoPullGroupMessages(notification)
 }
 
 // fillGroupGap 后台补齐群消息空洞
 func (c *AUNClient) fillGroupGap(groupID string) {
-	ns := "group:" + groupID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	c.logEG.Debug("fillGroupGap triggered: group=%s afterSeq=%d", groupID, afterSeq)
-	// per-namespace 去重：同一 group namespace 只允许 1 个 in-flight pull
-	dedupKey := "group_pull:" + ns
-	c.gapFillDoneMu.Lock()
-	if c.gapFillDone[dedupKey] {
-		c.gapFillDoneMu.Unlock()
-		return
-	}
-	c.gapFillDone[dedupKey] = true
-	c.gapFillDoneMu.Unlock()
-	// S1: 使用 defer 在所有出口（成功/异常/空返）清理 dedup 键，避免"成功但返回 0 条"永久污染。
-	defer func() {
-		c.gapFillDoneMu.Lock()
-		delete(c.gapFillDone, dedupKey)
-		c.gapFillDoneMu.Unlock()
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": afterSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		c.logEG.Warn("background gap fill failed (fillGroupGap group=%s): %v", groupID, err)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return
-	}
-	messages, ok := resultMap["messages"].([]any)
-	if !ok {
-		return
-	}
-	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
-	nsKey := "group:" + groupID
-	contigBefore := afterSeq
-	if rawBefore, ok := resultMap["_contig_before"]; ok {
-		contigBefore = int(toInt64(rawBefore))
-	}
-	c.logEG.Debug("fillGroupGap completed: group=%s recovered %d messages", groupID, len(messages))
-	c.publishGapFillGroupMessages(nsKey, messages)
-	// publish 完成后 auto-ack
-	contig := c.seqTracker.GetContiguousSeq(nsKey)
-	if contig > 0 && contig != contigBefore {
-		ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", nsKey, int64(contig))
-		go func() {
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ackCancel()
-			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-				"group_id":  groupID,
-				"msg_seq":   ackSeq,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
-			}); ackErr != nil {
-				c.logEG.Warn("fillGroupGap auto-ack failed: group=%s %v", groupID, ackErr)
-			}
-		}()
-	}
+	c.delivery().fillGroupGap(groupID)
 }
 
 // lazySyncGroup 惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。
 func (c *AUNClient) lazySyncGroup(groupID string) {
-	c.logEG.Debug("lazySyncGroup entry: group=%s", groupID)
-	c.groupSyncedMu.Lock()
-	c.groupSynced[groupID] = true
-	c.groupSyncedMu.Unlock()
-
-	ns := "group:" + groupID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result, err := c.transport.Call(ctx, "group.pull", map[string]any{
-		"group_id":          groupID,
-		"after_message_seq": afterSeq,
-		"limit":             200,
-	})
-	if err != nil {
-		c.logEG.Warn("lazy sync group %s failed: %v", groupID, err)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return
-	}
-	messages, ok := resultMap["messages"].([]any)
-	if !ok {
-		return
-	}
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if s > 0 {
-				c.seqTracker.UpdateMaxSeen(ns, s)
-				c.seqTracker.OnMessageSeq(ns, s)
-			}
-		}
-	}
-	if len(messages) > 0 {
-		c.saveSeqTrackerState()
-		c.logEG.Warn("lazy sync group %s: pulled %d messages, after_seq=%d", groupID, len(messages), afterSeq)
-	}
+	c.delivery().lazySyncGroup(groupID)
 }
 
 // fillGroupEventGap 后台补齐群事件空洞
 func (c *AUNClient) fillGroupEventGap(groupID string) {
-	ns := "group_event:" + groupID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	c.logEG.Debug("fillGroupEventGap triggered: group=%s afterSeq=%d", groupID, afterSeq)
-	// per-namespace 去重：同一 group_event namespace 只允许 1 个 in-flight pull
-	dedupKey := "group_event_pull:" + ns
-	c.gapFillDoneMu.Lock()
-	if c.gapFillDone[dedupKey] {
-		c.gapFillDoneMu.Unlock()
-		return
-	}
-	c.gapFillDone[dedupKey] = true
-	c.gapFillDoneMu.Unlock()
-	// S1: defer 清理 dedup 键
-	defer func() {
-		c.gapFillDoneMu.Lock()
-		delete(c.gapFillDone, dedupKey)
-		c.gapFillDoneMu.Unlock()
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	nextAfterSeq := afterSeq
-	const maxPages = 100
-	pageCount := 0
-	totalEvents := 0
-	for pageCount < maxPages {
-		pageCount++
-		result, err := c.Call(ctx, "group.pull_events", map[string]any{
-			"group_id":        groupID,
-			"after_event_seq": nextAfterSeq,
-			"device_id":       c.deviceID,
-			"limit":           50,
-		})
-		if err != nil {
-			c.logEG.Warn("background gap fill failed (fillGroupEventGap group=%s): %v", groupID, err)
-			return
-		}
-		resultMap, ok := result.(map[string]any)
-		if !ok {
-			return
-		}
-		events, ok := resultMap["events"].([]any)
-		if !ok {
-			return
-		}
-		var pullEvts []map[string]any
-		maxEventSeq := nextAfterSeq
-		for _, raw := range events {
-			if e, ok := raw.(map[string]any); ok {
-				pullEvts = append(pullEvts, e)
-				if es := int(toInt64(e["event_seq"])); es > maxEventSeq {
-					maxEventSeq = es
-				}
-			}
-		}
-		pageContigBefore := c.seqTracker.GetContiguousSeq(ns)
-		if len(pullEvts) > 0 {
-			c.seqTracker.OnPullResult(ns, pullEvts, nextAfterSeq)
-		}
-		serverAck := 0
-		if cursor, ok := resultMap["cursor"].(map[string]any); ok {
-			serverAck = int(toInt64(cursor["current_seq"]))
-			if serverAck > 0 {
-				contigBeforeFloor := c.seqTracker.GetContiguousSeq(ns)
-				if contigBeforeFloor < serverAck {
-					c.logEG.Info("group.pull_events retention-floor advanced: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contigBeforeFloor, serverAck)
-					c.seqTracker.ForceContiguousSeq(ns, serverAck)
-				}
-			}
-		}
-		for _, evt := range pullEvts {
-			evt["_from_gap_fill"] = true
-			et, _ := evt["event_type"].(string)
-			// 消息事件由 fillGroupGap 负责，事件补洞不重复投递
-			if et == "group.message_created" {
-				continue
-			}
-			// 验签：有 client_signature 就验（与实时事件路径对齐）
-			if cs, ok := evt["client_signature"].(map[string]any); ok {
-				if c.shouldSkipEventSignature(evt) {
-					delete(evt, "client_signature")
-				} else {
-					evt["_verified"] = c.verifyEventSignature(cs)
-				}
-			}
-			// group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
-			c.events.publishSync("group.changed", evt)
-		}
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig != pageContigBefore {
-			c.saveSeqTrackerState()
-		}
-		if len(pullEvts) > 0 && contig > 0 && contig != pageContigBefore {
-			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(contig))
-			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
-					"group_id":  groupID,
-					"event_seq": ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
-				}); ackErr != nil {
-					c.logEG.Warn("group event auto-ack failed: group=%s %v", groupID, ackErr)
-				}
-			}()
-		}
-		totalEvents += len(events)
-		hasMore, _ := resultMap["has_more"].(bool)
-		if len(pullEvts) == 0 || maxEventSeq <= nextAfterSeq || !hasMore {
-			break
-		}
-		nextAfterSeq = maxEventSeq
-	}
-	if pageCount >= maxPages {
-		c.logEG.Warn("fillGroupEventGap reached max_pages=%d group=%s afterSeq=%d", maxPages, groupID, nextAfterSeq)
-	}
-	c.logEG.Debug("fillGroupEventGap completed: group=%s recovered %d events", groupID, totalEvents)
+	c.delivery().fillGroupEventGap(groupID)
 }
 
 // fillP2pGap 后台补齐 P2P 消息空洞
 func (c *AUNClient) fillP2pGap() {
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	if myAID == "" {
-		return
-	}
-	ns := "p2p:" + myAID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	c.log.Debug("fillP2pGap triggered: afterSeq=%d", afterSeq)
-	// per-namespace 去重：同一 namespace 只允许 1 个 in-flight pull
-	dedupKey := "p2p_pull:" + ns
-	c.gapFillDoneMu.Lock()
-	if c.gapFillDone[dedupKey] {
-		c.gapFillDoneMu.Unlock()
-		return
-	}
-	c.gapFillDone[dedupKey] = true
-	c.gapFillDoneMu.Unlock()
-	// S1: defer 清理 dedup 键
-	defer func() {
-		c.gapFillDoneMu.Lock()
-		delete(c.gapFillDone, dedupKey)
-		c.gapFillDoneMu.Unlock()
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result, err := c.Call(ctx, "message.pull", map[string]any{
-		"after_seq": afterSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		c.log.Warn("background gap fill failed (fillP2pGap): %v", err)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return
-	}
-	messages, ok := resultMap["messages"].([]any)
-	if !ok {
-		return
-	}
-	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
-	nsKey := "p2p:" + myAID
-	contigBefore := afterSeq
-	if rawBefore, ok := resultMap["_contig_before"]; ok {
-		contigBefore = int(toInt64(rawBefore))
-	}
-	c.log.Debug("fillP2pGap completed: recovered %d messages", len(messages))
-	c.publishGapFillMessages(nsKey, messages)
-	// publish 完成后 auto-ack
-	contig := c.seqTracker.GetContiguousSeq(nsKey)
-	if contig > 0 && contig != contigBefore {
-		ackSeq := c.clampAckSeq("message.ack", "seq", nsKey, int64(contig))
-		go func() {
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ackCancel()
-			if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-				"seq":       ackSeq,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
-			}); ackErr != nil {
-				c.log.Warn("fillP2pGap auto-ack failed: %v", ackErr)
-			}
-		}()
-	}
+	c.delivery().fillP2pGap()
 }
 
 // prunePushedSeqs 只按硬上限裁剪 published guard。
 // 不能按 contiguousSeq 清理：pull/补洞可能在 cursor 推进后再次拿到旧消息，
 // 去重状态必须保留，否则会重复 publish。
 func (c *AUNClient) prunePushedSeqs(ns string) {
-	c.pushedSeqsMu.Lock()
-	defer c.pushedSeqsMu.Unlock()
-	pushed := c.pushedSeqs[ns]
-	if pushed == nil {
-		return
-	}
-	if len(pushed) > pushedSeqsLimit {
-		seqs := make([]int, 0, len(pushed))
-		for s := range pushed {
-			seqs = append(seqs, s)
-		}
-		sort.Ints(seqs)
-		keepStart := len(seqs) - pushedSeqsLimit
-		next := make(map[int]bool, pushedSeqsLimit)
-		for _, s := range seqs[keepStart:] {
-			next[s] = true
-		}
-		c.pushedSeqs[ns] = next
-	}
+	c.delivery().prunePushedSeqs(ns)
 }
 
 // markPushedSeq 在锁内安全标记指定 ns 的 seq 已发布到应用层。
 func (c *AUNClient) markPushedSeq(ns string, seq int) {
-	if seq <= 0 || ns == "" {
-		return
-	}
-	c.pushedSeqsMu.Lock()
-	if c.pushedSeqs[ns] == nil {
-		c.pushedSeqs[ns] = make(map[int]bool)
-	}
-	c.pushedSeqs[ns][seq] = true
-	if len(c.pushedSeqs[ns]) > pushedSeqsLimit {
-		seqs := make([]int, 0, len(c.pushedSeqs[ns]))
-		for s := range c.pushedSeqs[ns] {
-			seqs = append(seqs, s)
-		}
-		sort.Ints(seqs)
-		keepStart := len(seqs) - pushedSeqsLimit
-		next := make(map[int]bool, pushedSeqsLimit)
-		for _, s := range seqs[keepStart:] {
-			next[s] = true
-		}
-		c.pushedSeqs[ns] = next
-	}
-	c.pushedSeqsMu.Unlock()
+	c.delivery().markPushedSeq(ns, seq)
 }
 
 // isPushedSeq 在锁内安全查询指定 ns 的 seq 是否已通过推送路径分发。
 // 不取出内层 map 引用，避免锁外读写竞态。
 func (c *AUNClient) isPushedSeq(ns string, seq int) bool {
-	if seq <= 0 || ns == "" {
-		return false
-	}
-	c.pushedSeqsMu.Lock()
-	defer c.pushedSeqsMu.Unlock()
-	pushed := c.pushedSeqs[ns]
-	if pushed == nil {
-		return false
-	}
-	return pushed[seq]
+	return c.delivery().isPushedSeq(ns, seq)
 }
 
 // clampAckSeq 在所有 ack 出口前做本地边界保护。
@@ -2908,231 +1617,61 @@ func (c *AUNClient) isPushedSeq(ns string, seq int) bool {
 // 上界来自 push/pull 维护的 maxSeenSeq；这样本地脏 contiguousSeq 不会被回传给服务端。
 // 下界固定为 0，避免负数/恶意值进入 RPC 参数。
 func (c *AUNClient) clampAckSeq(method, field, ns string, seq int64) int64 {
-	original := seq
-	if seq < 0 {
-		seq = 0
-	}
-	if ns != "" {
-		maxSeen := c.seqTracker.GetMaxSeenSeq(ns)
-		if maxSeen > 0 && seq > int64(maxSeen) {
-			if strings.HasPrefix(method, "group.") {
-				c.logEG.Warn("ack clamp: method=%s %s=%d > max_seen=%d, clamp", method, field, original, maxSeen)
-			} else {
-				c.log.Warn("ack clamp: method=%s %s=%d > max_seen=%d, clamp", method, field, original, maxSeen)
-			}
-			seq = int64(maxSeen)
-		}
-	}
-	return seq
+	return c.delivery().clampAckSeq(method, field, ns, seq)
 }
 
 func (c *AUNClient) clampAckParams(method string, params map[string]any) {
-	if params == nil {
-		return
-	}
-	switch method {
-	case "message.ack":
-		c.mu.RLock()
-		myAID := c.aid
-		c.mu.RUnlock()
-		if myAID != "" {
-			params["seq"] = c.clampAckSeq(method, "seq", "p2p:"+myAID, toInt64(params["seq"]))
-		}
-	case "message.v2.ack":
-		c.mu.RLock()
-		myAID := c.aid
-		c.mu.RUnlock()
-		if myAID != "" {
-			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "p2p:"+myAID, toInt64(params["up_to_seq"]))
-		}
-	case "group.ack_messages":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
-		if groupID != "" {
-			params["msg_seq"] = c.clampAckSeq(method, "msg_seq", "group:"+groupID, toInt64(params["msg_seq"]))
-		}
-	case "group.v2.ack":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
-		if groupID != "" {
-			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "group:"+groupID, toInt64(params["up_to_seq"]))
-		}
-	case "group.ack_events":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
-		if groupID != "" {
-			params["event_seq"] = c.clampAckSeq(method, "event_seq", "group_event:"+groupID, toInt64(params["event_seq"]))
-		}
-	}
+	c.getRpcPipeline().clampAckParams(method, params)
 }
 
 func (c *AUNClient) enqueueOrderedMessage(ns, event string, seq int, payload any) {
-	if ns == "" || seq <= 0 {
-		return
-	}
-	c.pendingOrderedMsgsMu.Lock()
-	defer c.pendingOrderedMsgsMu.Unlock()
-	if c.pendingOrderedMsgs == nil {
-		c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
-	}
-	queue := c.pendingOrderedMsgs[ns]
-	if queue == nil {
-		queue = make(map[int]pendingOrderedMessage)
-		c.pendingOrderedMsgs[ns] = queue
-	}
-	queue[seq] = pendingOrderedMessage{event: event, payload: payload}
-	if len(queue) > pendingOrderedLimit {
-		seqs := make([]int, 0, len(queue))
-		for s := range queue {
-			seqs = append(seqs, s)
-		}
-		sort.Ints(seqs)
-		for _, s := range seqs[:len(queue)-pendingOrderedLimit] {
-			delete(queue, s)
-		}
-	}
+	c.delivery().enqueueOrderedMessage(ns, event, seq, payload)
 }
 
 func (c *AUNClient) popReadyOrderedMessages(ns string, beforeSeq int) []struct {
 	seq  int
 	item pendingOrderedMessage
 } {
-	c.pendingOrderedMsgsMu.Lock()
-	defer c.pendingOrderedMsgsMu.Unlock()
-	queue := c.pendingOrderedMsgs[ns]
-	if len(queue) == 0 {
-		return nil
-	}
-	contig := c.seqTracker.GetContiguousSeq(ns)
-	seqs := make([]int, 0, len(queue))
-	for seq := range queue {
-		if seq <= contig && (beforeSeq <= 0 || seq < beforeSeq) {
-			seqs = append(seqs, seq)
-		}
-	}
-	sort.Ints(seqs)
 	ready := make([]struct {
 		seq  int
 		item pendingOrderedMessage
-	}, 0, len(seqs))
-	for _, seq := range seqs {
+	}, 0)
+	for _, entry := range c.delivery().popReadyOrderedMessages(ns, beforeSeq) {
 		ready = append(ready, struct {
 			seq  int
 			item pendingOrderedMessage
-		}{seq: seq, item: queue[seq]})
-		delete(queue, seq)
-	}
-	if len(queue) == 0 {
-		delete(c.pendingOrderedMsgs, ns)
+		}{seq: entry.seq, item: entry.item})
 	}
 	return ready
 }
 
 func (c *AUNClient) removePendingOrderedSeq(ns string, seq int) {
-	c.pendingOrderedMsgsMu.Lock()
-	defer c.pendingOrderedMsgsMu.Unlock()
-	queue := c.pendingOrderedMsgs[ns]
-	if queue == nil {
-		return
-	}
-	delete(queue, seq)
-	if len(queue) == 0 {
-		delete(c.pendingOrderedMsgs, ns)
-	}
+	c.delivery().removePendingOrderedSeq(ns, seq)
 }
 
 func (c *AUNClient) drainOrderedMessages(ns string, beforeSeq ...int) {
-	limit := 0
-	if len(beforeSeq) > 0 {
-		limit = beforeSeq[0]
-	}
-	for _, ready := range c.popReadyOrderedMessages(ns, limit) {
-		if c.isPushedSeq(ns, ready.seq) {
-			c.log.Debug("publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
-			continue
-		}
-		c.publishAppEventSync(ready.item.event, ready.item.payload)
-		c.markPushedSeq(ns, ready.seq)
-		c.log.Debug("publish ordered drain delivered: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
-	}
+	c.delivery().drainOrderedMessages(ns, beforeSeq...)
 }
 
 func (c *AUNClient) publishOrderedMessage(event, ns string, seq int, payload any) bool {
-	if ns == "" || seq <= 0 {
-		c.log.Debug("publish ordered direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
-		c.publishAppEvent(event, payload)
-		return true
-	}
-	if c.isPushedSeq(ns, seq) {
-		c.log.Debug("publish ordered skipped duplicate: event=%s ns=%s seq=%d", event, ns, seq)
-		c.removePendingOrderedSeq(ns, seq)
-		return false
-	}
-	contig := c.seqTracker.GetContiguousSeq(ns)
-	if seq > contig {
-		c.log.Debug("publish ordered enqueue(gap): event=%s ns=%s seq=%d contiguous=%d", event, ns, seq, contig)
-		c.enqueueOrderedMessage(ns, event, seq, payload)
-		return false
-	}
-	c.drainOrderedMessages(ns, seq)
-	if c.isPushedSeq(ns, seq) {
-		c.log.Debug("publish ordered skipped after-drain duplicate: event=%s ns=%s seq=%d", event, ns, seq)
-		return false
-	}
-	c.removePendingOrderedSeq(ns, seq)
-	c.publishAppEventSync(event, payload)
-	c.markPushedSeq(ns, seq)
-	c.log.Debug("publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq)
-	c.drainOrderedMessages(ns)
-	return true
+	return c.delivery().publishOrderedMessage(event, ns, seq, payload)
 }
 
 // publishPulledMessage 发布 pull 批中的消息，只做 seq 级去重，不受 contiguous gate 限制。
 // pull 返回的批内部空洞可能是永久空洞，不能因此阻塞批内后续消息投递。
 func (c *AUNClient) publishPulledMessage(event, ns string, seq int, payload any) bool {
-	if ns == "" || seq <= 0 {
-		c.log.Debug("publish pulled direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
-		c.publishAppEventSync(event, payload)
-		return true
-	}
-	if c.isPushedSeq(ns, seq) {
-		c.log.Debug("publish pulled skipped duplicate: event=%s ns=%s seq=%d", event, ns, seq)
-		c.removePendingOrderedSeq(ns, seq)
-		return false
-	}
-	c.removePendingOrderedSeq(ns, seq)
-	c.publishAppEventSync(event, payload)
-	c.markPushedSeq(ns, seq)
-	c.log.Debug("publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq)
-	return true
+	return c.delivery().publishPulledMessage(event, ns, seq, payload)
 }
 
 // publishGapFillMessages 补洞路径发布 P2P 消息，跳过已发布到应用层的 seq。
 // 使用 isPushedSeq 逐条检查，避免取出内层 map 引用后在锁外读取的竞态。
 func (c *AUNClient) publishGapFillMessages(ns string, messages []any) {
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if s > 0 {
-				c.publishPulledMessage("message.received", ns, s, msg)
-			} else {
-				c.publishPulledMessage("message.received", ns, s, msg)
-			}
-		}
-	}
-	c.prunePushedSeqs(ns)
+	c.delivery().publishGapFillMessages(ns, messages)
 }
 
 // publishGapFillGroupMessages 补洞路径发布群消息，跳过已发布到应用层的 seq。
 func (c *AUNClient) publishGapFillGroupMessages(ns string, messages []any) {
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if s > 0 {
-				c.publishPulledMessage("group.message_created", ns, s, msg)
-			} else {
-				c.publishPulledMessage("group.message_created", ns, s, msg)
-			}
-		}
-	}
-	c.prunePushedSeqs(ns)
+	c.delivery().publishGapFillGroupMessages(ns, messages)
 }
 
 func stringFromAny(value any) string {
@@ -3180,21 +1719,7 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 	// V2 bootstrap 缓存失效 + auto_propose 触发
 	c.onRawGroupChangedV2(groupID, action, dataMap)
 
-	// event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
-	needPull := false
-	if rawES, ok := dataMap["event_seq"]; ok && groupID != "" {
-		if es := toInt64(rawES); es > 0 {
-			ns := "group_event:" + groupID
-			c.seqTracker.UpdateMaxSeen(ns, int(es))
-			needPull = c.seqTracker.OnMessageSeq(ns, int(es))
-		}
-	}
-
-	// 仅在检测到 event gap 时才触发补洞（补洞回来的事件不再触发新补洞）
-	if needPull && groupID != "" && dataMap["_from_gap_fill"] == nil {
-		c.logEG.Debug("group.changed event_seq gap detected, triggering gap fill: group=%s", groupID)
-		go c.fillGroupEventGap(groupID)
-	}
+	c.delivery().handleGroupChangedEventSeq(dataMap, groupID)
 
 	// V2-only: epoch 轮换由 V2 session 层处理，此处不再触发 V1 轮换逻辑
 
@@ -3209,132 +1734,14 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 		c.pendingOrderedMsgsMu.Lock()
 		delete(c.pendingOrderedMsgs, "group:"+groupID)
 		c.pendingOrderedMsgsMu.Unlock()
-		if state := c.v2GetState(); state != nil {
-			state.bootstrapCacheM.Lock()
-			delete(state.groupBootstrapCache, groupID)
-			state.bootstrapCacheM.Unlock()
-		}
+		c.getV2E2EECoordinator().deleteGroupBootstrapCache(groupID)
 		c.logEG.Info("group %s dissolved, cleaned up local V2 group runtime state and seq tracker", groupID)
 	}
 }
 
 // onRawGroupStateCommitted 处理 event/group.state_committed：验证 state_hash 链并更新本地存储
 func (c *AUNClient) onRawGroupStateCommitted(data any) {
-	tStart := time.Now()
-	c.logEG.Debug("onRawGroupStateCommitted enter")
-	defer func() {
-		c.logEG.Debug("onRawGroupStateCommitted exit: elapsed=%dms", time.Since(tStart).Milliseconds())
-	}()
-	dataMap, ok := data.(map[string]any)
-	if !ok {
-		return
-	}
-	groupID := strings.TrimSpace(stringFromAny(dataMap["group_id"]))
-	if groupID == "" {
-		return
-	}
-
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	if myAID == "" {
-		return
-	}
-
-	// 提交者签名验证（兼容旧版：无签名时跳过）
-	if cs, ok := dataMap["client_signature"].(map[string]any); ok {
-		if c.shouldSkipEventSignature(dataMap) {
-			delete(dataMap, "client_signature")
-		} else {
-			verified := c.verifyEventSignature(cs)
-			if verified == false {
-				c.logEG.Error("state_committed actor signature verification failed group=%s actor=%s",
-					groupID, stringFromAny(dataMap["actor_aid"]))
-				return
-			}
-		}
-	}
-
-	structured, ok := c.tokenStore.(keystore.StructuredKeyStore)
-	if !ok {
-		c.logEG.Warn("keystore does not support StructuredKeyStore, skipping group state committed handling group=%s", groupID)
-		return
-	}
-
-	stateVersion := toInt64(dataMap["state_version"])
-	stateHash := strings.TrimSpace(stringFromAny(dataMap["state_hash"]))
-	prevStateHash := strings.TrimSpace(stringFromAny(dataMap["prev_state_hash"]))
-	keyEpoch := toInt64(dataMap["key_epoch"])
-	membershipSnapshot := strings.TrimSpace(stringFromAny(dataMap["membership_snapshot"]))
-	policySnapshot := strings.TrimSpace(stringFromAny(dataMap["policy_snapshot"]))
-
-	// 1. 验证 prev_state_hash 连续性
-	localState, err := structured.LoadGroupState(myAID, groupID)
-	if err != nil {
-		c.logEG.Warn("failed to load group %s local state: %v", groupID, err)
-	}
-	if localState != nil && localState.StateHash != "" && localState.StateHash != prevStateHash {
-		c.logEG.Error("state_hash chain discontinuous group=%s local_sv=%d event_sv=%d",
-			groupID, localState.StateVersion, stateVersion)
-		// 回源同步
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		serverResult, callErr := c.transport.Call(ctx, "group.get_state", map[string]any{"group_id": groupID})
-		if callErr != nil {
-			c.logEG.Warn("state fetch from source failed group=%s: %v", groupID, callErr)
-			return
-		}
-		serverState, _ := serverResult.(map[string]any)
-		if serverState == nil || serverState["state_version"] == nil {
-			c.logEG.Warn("state fetch from source returned empty group=%s", groupID)
-			return
-		}
-		sv := toInt64(serverState["state_version"])
-		sHash := strings.TrimSpace(stringFromAny(serverState["state_hash"]))
-		sEpoch := toInt64(serverState["key_epoch"])
-		sMembersJSON := strings.TrimSpace(stringFromAny(serverState["membership_snapshot"]))
-		sPolicyJSON := strings.TrimSpace(stringFromAny(serverState["policy_snapshot"]))
-		sPrev := strings.TrimSpace(stringFromAny(serverState["prev_state_hash"]))
-
-		// 回源也做 hash 验证
-		if sMembersJSON != "" && sHash != "" {
-			sMembers := parseMemberRolesJSON(sMembersJSON)
-			sPolicy := parseJSONObject(sPolicyJSON)
-			computed := ComputeStateHash(groupID, sv, sEpoch, sMembers, sPolicy, sPrev)
-			if computed != sHash {
-				c.logEG.Error("fetched state_hash verification failed group=%s sv=%d expected=%s got=%s",
-					groupID, sv, sHash, computed)
-				return
-			}
-		}
-		saveMembershipJSON := sMembersJSON
-		if saveMembershipJSON == "" {
-			saveMembershipJSON = membershipSnapshot
-		}
-		savePolicyJSON := sPolicyJSON
-		if savePolicyJSON == "" {
-			savePolicyJSON = policySnapshot
-		}
-		if saveErr := structured.SaveGroupState(myAID, groupID, sv, sHash, sEpoch, saveMembershipJSON, savePolicyJSON); saveErr != nil {
-			c.logEG.Warn("failed to save group state after fetch group=%s: %v", groupID, saveErr)
-		}
-		return
-	}
-
-	// 2. 本地重算验证
-	members := parseMemberRolesJSON(membershipSnapshot)
-	policy := parseJSONObject(policySnapshot)
-	computed := ComputeStateHash(groupID, stateVersion, keyEpoch, members, policy, prevStateHash)
-	if computed != stateHash {
-		c.logEG.Error("state_hash recomputation mismatch group=%s sv=%d expected=%s got=%s",
-			groupID, stateVersion, stateHash, computed)
-		return
-	}
-
-	// 3. 更新本地存储
-	if saveErr := structured.SaveGroupState(myAID, groupID, stateVersion, stateHash, keyEpoch, membershipSnapshot, policySnapshot); saveErr != nil {
-		c.logEG.Warn("failed to save group state group=%s: %v", groupID, saveErr)
-	}
+	c.getGroupStateCoordinator().onRawGroupStateCommitted(data)
 }
 
 // parseMemberRolesJSON 解析 membership_snapshot JSON 为 []MemberRole
@@ -3395,8 +1802,7 @@ func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
 	}
 	// cert_fingerprint 校验
 	if expectedFP != "" {
-		actualFP := "sha256:" + fmt.Sprintf("%x", sha256.Sum256(block.Bytes))
-		if actualFP != expectedFP {
+		if !matchCertFingerprint(cached.certBytes, expectedFP) {
 			c.log.Error("signature verification failed: cert fingerprint mismatch aid=%s", sigAID)
 			return false
 		}
@@ -3464,6 +1870,18 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	if cached != nil && float64(time.Now().Unix()) < cached.refreshAfter {
 		return cached.certBytes, nil
 	}
+	normalizedFingerprint := strings.TrimSpace(certFingerprint)
+	if normalizedFingerprint != "" {
+		bareKey := certCacheKey(aid, "")
+		c.certCacheMu.RLock()
+		bareCached := c.certCache[bareKey]
+		c.certCacheMu.RUnlock()
+		if bareCached != nil &&
+			float64(time.Now().Unix()) < bareCached.refreshAfter &&
+			matchCertFingerprint(bareCached.certBytes, normalizedFingerprint) {
+			return bareCached.certBytes, nil
+		}
+	}
 
 	c.mu.RLock()
 	gatewayURL := c.gatewayURL
@@ -3480,16 +1898,8 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	}
 	cb, fetchErr := c.fetchCertHTTP(ctx, buildCertURL(peerGatewayURL, aid, certFingerprint), aid)
 	if fetchErr != nil {
-		if strings.TrimSpace(certFingerprint) == "" {
-			err = fetchErr
-			return nil, err
-		}
-		fallbackCert, fallbackErr := c.fetchCertHTTP(ctx, buildCertURL(peerGatewayURL, aid, ""), aid)
-		if fallbackErr != nil {
-			err = fetchErr
-			return nil, err
-		}
-		cb = fallbackCert
+		err = fetchErr
+		return nil, err
 	}
 	certBytes = cb
 
@@ -3513,15 +1923,12 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	}
 	c.certCacheMu.Lock()
 	c.certCache[cacheKey] = entry
-	// 同时缓存不带 fingerprint 的 key，确保无论有无 fingerprint 都能命中
-	bareKey := certCacheKey(aid, "")
-	if bareKey != cacheKey {
-		c.certCache[bareKey] = entry
-	}
 	// 如果请求时没带 fingerprint，计算实际 fingerprint 也缓存一份
 	if strings.TrimSpace(certFingerprint) == "" {
+		bareKey := certCacheKey(aid, "")
+		c.certCache[bareKey] = entry
 		if actualFP, fpErr := certSHA256Fingerprint(certBytes); fpErr == nil && actualFP != "" {
-			fpKey := certCacheKey(aid, "sha256:"+actualFP)
+			fpKey := certCacheKey(aid, actualFP)
 			c.certCache[fpKey] = entry
 		}
 	}
@@ -3539,86 +1946,6 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	}
 
 	return certBytes, nil
-}
-
-// ensureSenderCertCached 确保发送方证书在本地 keystore 中可用
-func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, certFingerprint ...string) bool {
-	requestedFingerprint := ""
-	if len(certFingerprint) > 0 {
-		requestedFingerprint = certFingerprint[0]
-	}
-	cacheKey := certCacheKey(aid, requestedFingerprint)
-	c.certCacheMu.RLock()
-	cached := c.certCache[cacheKey]
-	c.certCacheMu.RUnlock()
-
-	if cached != nil && float64(time.Now().Unix()) < cached.refreshAfter {
-		return true
-	}
-
-	if versioned, ok := c.tokenStore.(keystore.VersionedCertKeyStore); ok && strings.TrimSpace(requestedFingerprint) != "" {
-		if certPEM, err := versioned.LoadCertVersion(aid, requestedFingerprint); err == nil && certPEM != "" {
-			now := float64(time.Now().Unix())
-			c.certCacheMu.Lock()
-			c.certCache[cacheKey] = &cachedPeerCert{certBytes: []byte(certPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
-			c.certCacheMu.Unlock()
-			return true
-		}
-	}
-	if certPEM, err := c.tokenStore.LoadCert(aid); err == nil && certPEM != "" {
-		if strings.TrimSpace(requestedFingerprint) == "" {
-			now := float64(time.Now().Unix())
-			c.certCacheMu.Lock()
-			c.certCache[cacheKey] = &cachedPeerCert{certBytes: []byte(certPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
-			c.certCacheMu.Unlock()
-			return true
-		}
-		actualFingerprint, fpErr := certSHA256Fingerprint([]byte(certPEM))
-		if fpErr == nil && actualFingerprint == strings.TrimSpace(strings.ToLower(requestedFingerprint)) {
-			now := float64(time.Now().Unix())
-			c.certCacheMu.Lock()
-			c.certCache[cacheKey] = &cachedPeerCert{certBytes: []byte(certPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
-			c.certCacheMu.Unlock()
-			return true
-		}
-	}
-
-	certBytes, err := c.fetchPeerCert(ctx, aid, requestedFingerprint)
-	if err != nil {
-		// 刷新失败时：若内存缓存有 PKI 验证过的证书则继续用
-		if cached != nil && float64(time.Now().Unix()) < cached.validatedAt+peerCertCacheTTL*2 {
-			c.log.Warn("failed to refresh sender %s cert, continuing with verified memory cache: %v", aid, err)
-			return true
-		}
-		c.log.Error("failed to get sender %s cert and no verified cache available, refusing trust: %v", aid, err)
-		return false
-	}
-	certPEM := string(certBytes)
-	if versioned, ok := c.tokenStore.(keystore.VersionedCertKeyStore); ok {
-		// peer 证书只存版本目录，不覆盖 cert.pem
-		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, false); err != nil {
-			c.log.Warn("failed to save versioned cert (aid=%s): %v", aid, err)
-		}
-	} else if err := c.tokenStore.SaveCert(aid, certPEM); err != nil {
-		c.log.Warn("failed to save cert (aid=%s): %v", aid, err)
-	}
-	return true
-}
-
-// getVerifiedPeerCert 获取经过 PKI 验证的 peer 证书（零信任：仅信任内存缓存中已验证的证书）
-func (c *AUNClient) getVerifiedPeerCert(aid string, certFingerprint string) string {
-	now := float64(time.Now().Unix())
-	c.certCacheMu.RLock()
-	cached := c.certCache[certCacheKey(aid, certFingerprint)]
-	// 带 fingerprint 查不到时，降级用 aid 再查一次
-	if cached == nil && strings.TrimSpace(certFingerprint) != "" {
-		cached = c.certCache[certCacheKey(aid, "")]
-	}
-	c.certCacheMu.RUnlock()
-	if cached != nil && now < cached.validatedAt+peerCertCacheTTL*2 {
-		return string(cached.certBytes)
-	}
-	return ""
 }
 
 func normalizeGroupDispatchMode(value any) string {
@@ -3777,18 +2104,16 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 
 	// V2 E2EE 必须先初始化，再触发 post-connect 补拉；否则 message.pull 会走旧路径，
 	// 对 V2 设备副本提前 ack，导致后续 message.v2.pull 跳过尚未解密发布的消息。
-	if v2Err := c.initV2Session(ctx); v2Err != nil {
-		c.logE2.Warn("V2 session init failed (non-fatal): %v", v2Err)
+	bgSync := true
+	if v, ok := c.sessionOptions["background_sync"].(bool); ok {
+		bgSync = v
 	}
+	c.getV2E2EECoordinator().onConnected(ctx, bgSync)
 
 	// connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
 	// 群消息按惰性触发，不在此处主动 pull
 	// connect/reconnect 成功后自动触发一次 P2P gap fill，补齐离线期间积压
 	// background_sync=false 时跳过（CLI 等短命令场景）
-	bgSync := true
-	if v, ok := c.sessionOptions["background_sync"].(bool); ok {
-		bgSync = v
-	}
 	if bgSync {
 		go func() {
 			defer func() {
@@ -3798,17 +2123,6 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 			}()
 			c.fillP2pGap()
 		}()
-	}
-
-	// V2: 上线后自动确认 pending state proposals（后台执行）
-	c.mu.RLock()
-	bgCtx := c.ctx
-	c.mu.RUnlock()
-	if bgCtx == nil {
-		bgCtx = context.Background()
-	}
-	if c.v2GetState() != nil {
-		go c.v2AutoConfirmPendingProposals(bgCtx)
 	}
 
 	return nil
@@ -3857,6 +2171,10 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
+	c.onlineUnreadHintMu.Lock()
+	c.onlineUnreadHintQueue = make(map[string]map[string]any)
+	c.onlineUnreadHintDraining = false
+	c.onlineUnreadHintMu.Unlock()
 	c.v2SenderIKMu.Lock()
 	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
 	c.v2SenderIKFetching = make(map[string]bool)
@@ -3882,6 +2200,10 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
+	c.onlineUnreadHintMu.Lock()
+	c.onlineUnreadHintQueue = make(map[string]map[string]any)
+	c.onlineUnreadHintDraining = false
+	c.onlineUnreadHintMu.Unlock()
 	c.v2SenderIKMu.Lock()
 	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
 	c.v2SenderIKFetching = make(map[string]bool)
@@ -4263,120 +2585,18 @@ func (c *AUNClient) cacheCleanupLoop(ctx context.Context, interval float64) {
 
 // restoreSeqTrackerState 从 keystore seq_tracker 表恢复 SeqTracker 状态
 func (c *AUNClient) restoreSeqTrackerState() {
-	c.mu.RLock()
-	aid := c.aid
-	deviceID := c.deviceID
-	slotID := c.slotID
-	c.mu.RUnlock()
-	if aid == "" {
-		return
-	}
-	if store, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
-		seqs, err := store.LoadAllSeqs(aid, deviceID, slotID)
-		if err != nil || len(seqs) == 0 {
-			return
-		}
-		seqs = c.migrateSeqStateGroupIDs(aid, deviceID, slotID, seqs)
-		c.seqTracker.RestoreState(seqs)
-		return
-	}
-	// 降级：从 instance_state JSON 读取（兼容旧数据）
-	if store, ok := c.tokenStore.(keystore.InstanceStateStore); ok {
-		holder, _ := store.LoadInstanceState(aid, deviceID, slotID)
-		if holder == nil {
-			return
-		}
-		state, ok := holder["seq_tracker_state"].(map[string]any)
-		if !ok {
-			return
-		}
-		intState := make(map[string]int)
-		for ns, v := range state {
-			if seq, ok := v.(float64); ok && int(seq) > 0 {
-				intState[ns] = int(seq)
-			}
-		}
-		if len(intState) > 0 {
-			intState = c.migrateSeqStateGroupIDs(aid, deviceID, slotID, intState)
-			c.seqTracker.RestoreState(intState)
-		}
-	}
+	c.delivery().restoreSeqTrackerState()
 }
 
 // migrateSeqStateGroupIDs 把 state 里 group_event:/group_msg: 前缀的老/污染 group_id 归一化。
 // 冲突取 max；落盘删老 ns、写新 ns，避免下次启动重复迁移。
 func (c *AUNClient) migrateSeqStateGroupIDs(aid, deviceID, slotID string, state map[string]int) map[string]int {
-	if len(state) == 0 {
-		return state
-	}
-	rename := make(map[string]string)
-	for ns := range state {
-		for _, prefix := range []string{"group_event:", "group_msg:"} {
-			if strings.HasPrefix(ns, prefix) {
-				oldGid := ns[len(prefix):]
-				newGid := NormalizeGroupID(oldGid, "")
-				if newGid != "" && newGid != oldGid {
-					rename[ns] = prefix + newGid
-				}
-				break
-			}
-		}
-	}
-	if len(rename) == 0 {
-		return state
-	}
-	newState := make(map[string]int, len(state))
-	for k, v := range state {
-		newState[k] = v
-	}
-	for oldNs, newNs := range rename {
-		oldVal := newState[oldNs]
-		curVal := newState[newNs]
-		delete(newState, oldNs)
-		if oldVal > curVal {
-			newState[newNs] = oldVal
-		} else {
-			newState[newNs] = curVal
-		}
-	}
-	c.logEG.Warn("SeqTracker group_id migration: %d namespaces rewritten", len(rename))
-	if saver, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
-		deleter, _ := c.tokenStore.(keystore.SeqTrackerDeleter)
-		for oldNs, newNs := range rename {
-			if deleter != nil {
-				if err := deleter.DeleteSeq(aid, deviceID, slotID, oldNs); err != nil {
-					c.log.Warn("failed to delete old seq ns: ns=%s err=%v", oldNs, err)
-				}
-			}
-			if err := saver.SaveSeq(aid, deviceID, slotID, newNs, newState[newNs]); err != nil {
-				c.log.Warn("failed to write new seq ns: ns=%s err=%v", newNs, err)
-			}
-		}
-	}
-	return newState
+	return c.delivery().migrateSeqStateGroupIDs(aid, deviceID, slotID, state)
 }
 
 // saveSeqTrackerState 将 SeqTracker 状态保存到 keystore seq_tracker 表（每 namespace 一行）
 func (c *AUNClient) saveSeqTrackerState() {
-	c.mu.RLock()
-	aid := c.aid
-	deviceID := c.deviceID
-	slotID := c.slotID
-	c.mu.RUnlock()
-	if aid == "" {
-		return
-	}
-	state := c.seqTracker.ExportState()
-	if len(state) == 0 {
-		return
-	}
-	if store, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
-		for ns, seq := range state {
-			_ = store.SaveSeq(aid, deviceID, slotID, ns, seq)
-		}
-		return
-	}
-	c.log.Warn("keystore does not support SeqTrackerStore, seq_tracker_state not persisted")
+	c.delivery().saveSeqTrackerState()
 }
 
 // logE2EEError 记录 E2EE 自动编排错误
@@ -4932,117 +3152,14 @@ func stringFieldFromObject(value any, key string) string {
 }
 
 func (c *AUNClient) normalizeOutboundMessagePayload(params map[string]any, method string) {
-	if _, hasPayload := params["payload"]; !hasPayload {
-		if content, hasContent := params["content"]; hasContent {
-			params["payload"] = content
-			delete(params, "content")
-		}
-	}
-	payload, _ := params["payload"].(map[string]any)
-	if payload != nil {
-		if _, hasType := payload["type"]; !hasType {
-			if _, ok := payload["text"].(string); ok {
-				normalized := make(map[string]any, len(payload)+1)
-				normalized["type"] = "text"
-				for k, v := range payload {
-					normalized[k] = v
-				}
-				params["payload"] = normalized
-			}
-		}
-	}
+	c.getRpcPipeline().normalizeOutboundMessagePayload(params, method)
 }
 func (c *AUNClient) validateOutboundCall(method string, params map[string]any) error {
-	if method == "message.send" {
-		if err := validateMessageRecipient(params["to"]); err != nil {
-			return err
-		}
-		if _, ok := params["persist"]; ok {
-			return NewValidationError("message.send no longer accepts 'persist'; configure delivery_mode during connect")
-		}
-		if _, ok := params["delivery_mode"]; ok {
-			return NewValidationError("message.send does not accept delivery_mode; configure delivery_mode during connect")
-		}
-		if _, ok := params["queue_routing"]; ok {
-			return NewValidationError("message.send does not accept delivery_mode; configure delivery_mode during connect")
-		}
-		if _, ok := params["affinity_ttl_ms"]; ok {
-			return NewValidationError("message.send does not accept delivery_mode; configure delivery_mode during connect")
-		}
-		return nil
-	}
-	if method == "group.send" {
-		if _, ok := params["persist"]; ok {
-			return NewValidationError("group.send does not accept 'persist'; group messages are always fanout")
-		}
-		if _, ok := params["delivery_mode"]; ok {
-			return NewValidationError("group.send does not accept delivery_mode; group messages are always fanout")
-		}
-		if _, ok := params["queue_routing"]; ok {
-			return NewValidationError("group.send does not accept delivery_mode; group messages are always fanout")
-		}
-		if _, ok := params["affinity_ttl_ms"]; ok {
-			return NewValidationError("group.send does not accept delivery_mode; group messages are always fanout")
-		}
-	}
-	if method == "group.thought.put" || method == "group.thought.get" || method == "message.thought.put" || method == "message.thought.get" {
-		contextType := stringFieldFromObject(params["context"], "type")
-		contextID := stringFieldFromObject(params["context"], "id")
-		hasContext := contextType != "" && contextID != ""
-		if !hasContext {
-			return NewValidationError(method + " requires context.type + context.id")
-		}
-	}
-	if method == "group.thought.get" {
-		senderAID, _ := params["sender_aid"].(string)
-		if strings.TrimSpace(senderAID) == "" {
-			return NewValidationError("group.thought.get requires sender_aid")
-		}
-	}
-	if method == "message.thought.put" {
-		if err := validateMessageRecipient(params["to"]); err != nil {
-			return err
-		}
-		if strings.TrimSpace(fmt.Sprint(params["to"])) == "" {
-			return NewValidationError("message.thought.put requires to")
-		}
-	}
-	if method == "message.thought.get" {
-		senderAID, _ := params["sender_aid"].(string)
-		if strings.TrimSpace(senderAID) == "" {
-			return NewValidationError("message.thought.get requires sender_aid")
-		}
-	}
-	return nil
-}
-
-func (c *AUNClient) currentMessageDeliveryMode() map[string]any {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return copyMapShallow(c.connectDeliveryMode)
+	return c.getRpcPipeline().validateOutboundCall(method, params)
 }
 
 func (c *AUNClient) injectMessageCursorContext(method string, params map[string]any) error {
-	if method != "message.pull" && method != "message.ack" {
-		return nil
-	}
-	if existing, ok := params["device_id"]; ok && strings.TrimSpace(fmt.Sprint(existing)) != c.deviceID {
-		return NewValidationError("message.pull/message.ack device_id must match the current client instance")
-	}
-	slotSource := any(c.slotID)
-	if existing, ok := params["slot_id"]; ok {
-		slotSource = existing
-	}
-	slotID, err := NormalizeSlotID(slotSource, c.slotID)
-	if err != nil {
-		return NewValidationError(err.Error())
-	}
-	if SlotIsolationKey(slotID) != SlotIsolationKey(c.slotID) {
-		return NewValidationError("message.pull/message.ack slot_id must match the current client instance")
-	}
-	params["device_id"] = c.deviceID
-	params["slot_id"] = c.slotID
-	return nil
+	return c.getRpcPipeline().injectMessageCursorContext(method, params)
 }
 
 // buildCertURL 构建证书下载 URL
@@ -5148,22 +3265,58 @@ func spkiSHA256Fingerprint(certPEM []byte) (string, error) {
 	return "sha256:" + fmt.Sprintf("%x", fp[:]), nil
 }
 
-// matchCertFingerprint 检查证书指纹是否匹配（DER 或 SPKI 任一即可）
-func matchCertFingerprint(certPEM []byte, expectedFP string) bool {
+func normalizeFingerprintHex(expectedFP string) string {
 	expected := strings.TrimSpace(strings.ToLower(expectedFP))
 	if expected == "" {
-		return true
+		return ""
 	}
-	if !strings.HasPrefix(expected, "sha256:") {
+	if strings.HasPrefix(expected, "sha256:") {
+		expected = strings.TrimPrefix(expected, "sha256:")
+	}
+	expected = strings.ReplaceAll(expected, ":", "")
+	if len(expected) != 16 && len(expected) != 64 {
+		return ""
+	}
+	if !regexp.MustCompile(`^[0-9a-f]+$`).MatchString(expected) {
+		return ""
+	}
+	return expected
+}
+
+// matchCertFingerprint 检查证书指纹是否匹配（DER 或 SPKI，完整或 16 位短格式任一即可）
+func matchCertFingerprint(certPEM []byte, expectedFP string) bool {
+	expectedHex := normalizeFingerprintHex(expectedFP)
+	if expectedHex == "" {
 		return false
 	}
-	if derFP, err := certSHA256Fingerprint(certPEM); err == nil && derFP == expected {
-		return true
+	derHex := ""
+	if derFP, err := certSHA256Fingerprint(certPEM); err == nil {
+		derHex = strings.TrimPrefix(derFP, "sha256:")
 	}
-	if spkiFP, err := spkiSHA256Fingerprint(certPEM); err == nil && spkiFP == expected {
-		return true
+	spkiHex := ""
+	if spkiFP, err := spkiSHA256Fingerprint(certPEM); err == nil {
+		spkiHex = strings.TrimPrefix(spkiFP, "sha256:")
 	}
-	return false
+	if len(expectedHex) == 16 {
+		return (len(derHex) >= 16 && derHex[:16] == expectedHex) ||
+			(len(spkiHex) >= 16 && spkiHex[:16] == expectedHex)
+	}
+	return derHex == expectedHex || spkiHex == expectedHex
+}
+
+func matchPublicKeyFingerprint(certPEM []byte, expectedFP string) bool {
+	expectedHex := normalizeFingerprintHex(expectedFP)
+	if expectedHex == "" {
+		return false
+	}
+	spkiHex := ""
+	if spkiFP, err := spkiSHA256Fingerprint(certPEM); err == nil {
+		spkiHex = strings.TrimPrefix(spkiFP, "sha256:")
+	}
+	if len(expectedHex) == 16 {
+		return len(spkiHex) >= 16 && spkiHex[:16] == expectedHex
+	}
+	return spkiHex == expectedHex
 }
 
 // sleepWithCancel 可取消的 sleep
@@ -5174,153 +3327,6 @@ func sleepWithCancel(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
-}
-
-func (c *AUNClient) saveGroupIdentityToV2(groupAID string, identity map[string]any) error {
-	groupAID = strings.TrimSpace(groupAID)
-	privateKeyPEM := strings.TrimSpace(stringFromAny(identity["private_key_pem"]))
-	publicKeyB64 := strings.TrimSpace(stringFromAny(identity["public_key_der_b64"]))
-	if groupAID == "" || privateKeyPEM == "" || publicKeyB64 == "" {
-		return NewStateError("group identity is incomplete")
-	}
-	publicKeyDER, err := base64.StdEncoding.DecodeString(publicKeyB64)
-	if err != nil || len(publicKeyDER) == 0 {
-		return NewStateError(fmt.Sprintf("group identity public key is invalid: %v", err))
-	}
-
-	c.mu.RLock()
-	ownerAID := c.aid
-	deviceID := c.deviceID
-	aunPath := ""
-	if c.configModel != nil {
-		aunPath = c.configModel.AUNPath
-	}
-	if c.currentAIDObj != nil {
-		if ownerAID == "" {
-			ownerAID = c.currentAIDObj.Aid
-		}
-		if deviceID == "" {
-			deviceID = c.currentAIDObj.DeviceID
-		}
-		if aunPath == "" {
-			aunPath = c.currentAIDObj.AunPath
-		}
-	}
-	c.mu.RUnlock()
-
-	if ownerAID == "" {
-		return NewStateError("group identity storage requires a loaded owner AID")
-	}
-	if deviceID == "" {
-		return NewStateError("group identity storage requires a device_id")
-	}
-	store, err := openV2Keystore(aunPath, ownerAID)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	return store.store.SaveGroupIdentity(deviceID, groupAID, privateKeyPEM, publicKeyDER)
-}
-
-// createNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key。
-// 群身份私钥不是 AID 身份私钥，写入 V2 设备密钥库，不写入 AID KeyStore。
-func (c *AUNClient) createNamedGroup(ctx context.Context, groupName string, opts map[string]any) (result map[string]any, err error) {
-	tStart := time.Now()
-	c.logEG.Debug("createNamedGroup enter: name=%s", groupName)
-	defer func() {
-		if err != nil {
-			c.logEG.Debug("createNamedGroup exit (error): name=%s elapsed=%dms err=%v", groupName, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.logEG.Debug("createNamedGroup exit: name=%s elapsed=%dms", groupName, time.Since(tStart).Milliseconds())
-		}
-	}()
-	identity, err := c.crypto.GenerateIdentity()
-	if err != nil {
-		return nil, fmt.Errorf("生成群密钥对失败: %w", err)
-	}
-
-	params := make(map[string]any)
-	for k, v := range opts {
-		params[k] = v
-	}
-	params["group_name"] = groupName
-	params["public_key"] = identity["public_key_der_b64"]
-	params["curve"] = "P-256"
-
-	raw, err := c.Call(ctx, "group.create", params)
-	if err != nil {
-		return nil, err
-	}
-	result, _ = raw.(map[string]any)
-	if result == nil {
-		err = fmt.Errorf("group.create 返回非 object")
-		return nil, err
-	}
-
-	// 存储群 AID 证书和群身份私钥；群身份私钥走 V2 库，不走 AID KeyStore。
-	groupInfo, _ := result["group"].(map[string]any)
-	aidCert, _ := result["aid_cert"].(map[string]any)
-	groupAid := stringFromAny(groupInfo["group_aid"])
-	if groupAid != "" && aidCert != nil {
-		if saveErr := c.saveGroupIdentityToV2(groupAid, identity); saveErr != nil {
-			return nil, saveErr
-		}
-		certPEM := stringFromAny(aidCert["cert"])
-		if certPEM != "" {
-			_ = c.tokenStore.SaveCert(groupAid, certPEM)
-		}
-	}
-
-	return result, nil
-}
-
-// bindGroupAid 为已有普通群绑定命名 AID（升级为命名群）。
-func (c *AUNClient) bindGroupAid(ctx context.Context, groupID string, groupName string) (result map[string]any, err error) {
-	tStart := time.Now()
-	c.logEG.Debug("bindGroupAid enter: group=%s name=%s", groupID, groupName)
-	defer func() {
-		if err != nil {
-			c.logEG.Debug("bindGroupAid exit (error): group=%s elapsed=%dms err=%v", groupID, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.logEG.Debug("bindGroupAid exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
-		}
-	}()
-	identity, err := c.crypto.GenerateIdentity()
-	if err != nil {
-		return nil, fmt.Errorf("生成群密钥对失败: %w", err)
-	}
-
-	params := map[string]any{
-		"group_id":   groupID,
-		"group_name": groupName,
-		"public_key": identity["public_key_der_b64"],
-		"curve":      "P-256",
-	}
-
-	raw, err := c.Call(ctx, "group.bind_aid", params)
-	if err != nil {
-		return nil, err
-	}
-	result, _ = raw.(map[string]any)
-	if result == nil {
-		err = fmt.Errorf("group.bind_aid 返回非 object")
-		return nil, err
-	}
-
-	groupInfo, _ := result["group"].(map[string]any)
-	aidCert, _ := result["aid_cert"].(map[string]any)
-	groupAid := stringFromAny(groupInfo["group_aid"])
-	if groupAid != "" && aidCert != nil {
-		if saveErr := c.saveGroupIdentityToV2(groupAid, identity); saveErr != nil {
-			return nil, saveErr
-		}
-		certPEM := stringFromAny(aidCert["cert"])
-		if certPEM != "" {
-			_ = c.tokenStore.SaveCert(groupAid, certPEM)
-		}
-	}
-
-	return result, nil
 }
 
 // ── 新版 AUNClient 构造函数（重构 API）────────────────────────
@@ -5567,107 +3573,22 @@ func (c *AUNClient) SetProtectedHeaders(headers map[string]string) {
 
 // CachePeer 缓存对端 AID（要求证书有效）。
 func (c *AUNClient) CachePeer(aid *AID) (*AID, error) {
-	if !c.HasIdentity() {
-		return nil, NewStateError("CachePeer requires a loaded identity")
-	}
-	if aid == nil || !aid.IsCertValid() {
-		return nil, NewValidationError("CachePeer requires an AID with a valid certificate")
-	}
-	c.peerCacheMu.Lock()
-	c.peerCache[aid.Aid] = aid
-	c.peerCacheMu.Unlock()
-	return aid, nil
+	return c.getPeerDirectory().cachePeer(aid)
 }
 
 // GetPeer 从缓存读取对端 AID。
 func (c *AUNClient) GetPeer(aid string) *AID {
-	if !c.HasIdentity() {
-		return nil
-	}
-	c.peerCacheMu.RLock()
-	defer c.peerCacheMu.RUnlock()
-	return c.peerCache[strings.TrimSpace(aid)]
+	return c.getPeerDirectory().getPeer(aid)
 }
 
 // LookupPeer 先查缓存，未命中则通过当前客户端的 TokenStore/AuthFlow 解析。
 func (c *AUNClient) LookupPeer(ctx context.Context, aid string) (*AID, error) {
-	if !c.HasIdentity() {
-		return nil, NewStateError("LookupPeer requires a loaded identity")
-	}
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		return nil, NewValidationError("LookupPeer requires non-empty aid")
-	}
-	if cached := c.GetPeer(target); cached != nil {
-		return cached, nil
-	}
-	var certPEM string
-	if localCert, loadErr := c.tokenStore.LoadCert(target); loadErr == nil {
-		certPEM = strings.TrimSpace(localCert)
-	}
-	if certPEM == "" {
-		certBytes, fetchErr := c.fetchPeerCert(ctx, target, "")
-		if fetchErr != nil {
-			return nil, fetchErr
-		}
-		certPEM = string(certBytes)
-	}
-	peer, err := c.publicAIDFromCert(target, certPEM)
-	if err != nil {
-		return nil, err
-	}
-	if !peer.IsCertValid() {
-		return nil, NewAUNError(fmt.Sprintf("resolved peer certificate is invalid: %s", target))
-	}
-	c.peerCacheMu.Lock()
-	c.peerCache[peer.Aid] = peer
-	c.peerCacheMu.Unlock()
-	return peer, nil
-}
-
-func (c *AUNClient) publicAIDFromCert(aid, certPEM string) (*AID, error) {
-	target := strings.TrimSpace(aid)
-	cert, err := parsePEMCertificate(certPEM)
-	if err != nil {
-		return nil, NewAUNError(fmt.Sprintf("peer certificate parse failed: %s", target))
-	}
-	if tErr := certTimeError(cert); tErr != "" {
-		return nil, NewAUNError(fmt.Sprintf("peer certificate is %s: %s", tErr, target))
-	}
-	if cn := strings.TrimSpace(cert.Subject.CommonName); cn != "" && cn != target {
-		return nil, NewAUNError(fmt.Sprintf("peer certificate CN mismatch: expected %s, got %s", target, cn))
-	}
-	debug := false
-	if c.logger != nil {
-		debug = c.logger.Debug()
-	}
-	return newAID(
-		target,
-		c.configModel.AUNPath,
-		certPEM,
-		cert,
-		nil,
-		true,
-		false,
-		c.deviceID,
-		c.slotID,
-		c.configModel.VerifySSL,
-		c.configModel.RootCAPath,
-		debug,
-		"",
-	), nil
+	return c.getPeerDirectory().lookupPeer(ctx, aid)
 }
 
 // Peers 返回所有缓存的对端 AID（按 aid 排序）。
 func (c *AUNClient) Peers() []*AID {
-	c.peerCacheMu.RLock()
-	defer c.peerCacheMu.RUnlock()
-	result := make([]*AID, 0, len(c.peerCache))
-	for _, v := range c.peerCache {
-		result = append(result, v)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Aid < result[j].Aid })
-	return result
+	return c.getPeerDirectory().peers()
 }
 
 // GetProtectedHeaders 返回实例级 protected_headers 的副本
@@ -5695,80 +3616,12 @@ var protectedHeadersMergeMethods = map[string]bool{
 // mergeInstanceProtectedHeaders 将实例级 protected_headers 合并到 params["protected_headers"]。
 // 仅对指定方法生效；调用方显式传入的同名 key 优先保留。
 func (c *AUNClient) mergeInstanceProtectedHeaders(method string, params map[string]any) {
-	if !protectedHeadersMergeMethods[method] {
-		return
-	}
-	c.mu.RLock()
-	instance := c.instanceProtectedHeaders
-	c.mu.RUnlock()
-	if len(instance) == 0 {
-		return
-	}
-
-	// 读取调用方已有的 protected_headers（支持 map[string]any / map[string]string）
-	merged := make(map[string]any)
-	switch existing := params["protected_headers"].(type) {
-	case map[string]any:
-		for k, v := range existing {
-			merged[k] = v
-		}
-	case map[string]string:
-		for k, v := range existing {
-			merged[k] = v
-		}
-	}
-
-	// 实例级仅补充缺失键，不覆盖调用方显式传入的值
-	for k, v := range instance {
-		if _, exists := merged[k]; !exists {
-			merged[k] = v
-		}
-	}
-	params["protected_headers"] = merged
+	c.getRpcPipeline().mergeInstanceProtectedHeaders(method, params)
 }
 
 // loadIdentityFromAID 是 LoadIdentity 的内部实现（仅允许在 idle/closed 状态调用）。
 func (c *AUNClient) loadIdentityFromAID(aid *AID) error {
-	if aid == nil || !aid.IsPrivateKeyValid() {
-		return NewStateError("LoadIdentity requires an AID with a valid private key")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state != StateIdle && c.state != StateClosed {
-		return NewStateError(fmt.Sprintf("LoadIdentity not allowed in state %s", c.state))
-	}
-	// 让无身份客户端加载 AID 后切到该身份所属的 aun_path（对齐 Python _rebuild_runtime_for_identity）。
-	c.rebuildRuntimeForIdentity(aid)
-	c.currentAIDObj = aid
-	c.aid = aid.Aid
-	if aid.DeviceID != "" {
-		c.deviceID = aid.DeviceID
-	}
-	if aid.SlotID != "" {
-		c.slotID = aid.SlotID
-	}
-	if c.auth != nil {
-		c.auth.aid = aid.Aid
-		c.auth.SetInstanceContext(c.deviceID, c.slotID)
-		// 注入内存私钥到 AuthFlow，禁止 AuthFlow 内部再走 keystore 解密
-		c.auth.SetIdentity(map[string]any{
-			"aid":                aid.Aid,
-			"private_key_pem":    aid.PrivateKeyPem,
-			"public_key_der_b64": aid.PublicKey,
-			"cert":               aid.CertPem,
-		})
-	}
-	c.identity = map[string]any{
-		"aid":                aid.Aid,
-		"private_key_pem":    aid.PrivateKeyPem,
-		"public_key_der_b64": aid.PublicKey,
-		"cert":               aid.CertPem,
-	}
-	c.lastConnectError = nil
-	c.retryAttempt = 0
-	// Fix-05: 复位 state 到 idle，使 HasIdentity/ConnectionState 正确反映 standby
-	c.state = StateIdle
-	return nil
+	return c.getIdentityRuntime().loadIdentity(aid)
 }
 
 // rebuildRuntimeForIdentity 当 AID 携带的 aun_path/verify_ssl 与当前 client 不一致时，

@@ -5,8 +5,10 @@ import { GatewayDiscovery } from '../../src/discovery.js';
 describe('GatewayDiscovery', () => {
   let server: http.Server | null = null;
   let baseUrl = '';
+  let flakyRequestCount = 0;
 
   beforeEach(async () => {
+    flakyRequestCount = 0;
     server = http.createServer((req, res) => {
       if (req.url === '/ok') {
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
@@ -14,6 +16,20 @@ describe('GatewayDiscovery', () => {
           gateways: [
             { url: 'ws://gw2', priority: 5 },
             { url: 'ws://gw1', priority: 1 },
+          ],
+        }));
+        return;
+      }
+      if (req.url === '/flaky') {
+        flakyRequestCount += 1;
+        if (flakyRequestCount === 1) {
+          res.destroy(new Error('socket hang up'));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          gateways: [
+            { url: 'ws://gw-flaky', priority: 1 },
           ],
         }));
         return;
@@ -65,6 +81,13 @@ describe('GatewayDiscovery', () => {
     const discovery = new GatewayDiscovery({ verifySsl: true });
     await expect(discovery.discover(`${baseUrl}/unavailable`))
       .rejects.toThrow(`gateway discovery failed for ${baseUrl}/unavailable: HTTP 503`);
+  });
+
+  it('发现端点瞬时断连时应短重试后成功', async () => {
+    const discovery = new GatewayDiscovery({ verifySsl: true });
+    await expect(discovery.discover(`${baseUrl}/flaky`, 1000))
+      .resolves.toBe('ws://gw-flaky');
+    expect(flakyRequestCount).toBe(2);
   });
 
   it('空 gateways 应抛出 ValidationError', async () => {

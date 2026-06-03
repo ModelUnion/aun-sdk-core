@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 
 from .aid import AID
+from ._cert_utils import cert_matches_fingerprint, parse_agent_md_tail_signature
 from .errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
 from .logger import AUNLogger, NullLogger
 
@@ -299,13 +300,19 @@ class AgentMdManager:
             return ""
         return str(await self._maybe_await(self._gateway_resolver(aid)))
 
-    async def _resolve_peer(self, aid: str) -> AID:
+    async def _resolve_peer(self, aid: str, cert_fingerprint: str | None = None) -> AID:
         current = self._current_aid()
+        expected_fp = str(cert_fingerprint or "").strip().lower()
         if current is not None and current.aid == aid:
-            return current
+            if not expected_fp or cert_matches_fingerprint(current._cert_obj, expected_fp):
+                return current
+            raise StateError(f"current AID certificate fingerprint mismatch for {aid}")
         if self._peer_resolver is None:
             raise StateError("agent.md peer resolver is not configured")
-        peer = await self._maybe_await(self._peer_resolver(aid))
+        try:
+            peer = await self._maybe_await(self._peer_resolver(aid, expected_fp or None))
+        except TypeError:
+            peer = await self._maybe_await(self._peer_resolver(aid))
         if not isinstance(peer, AID):
             raise StateError(f"agent.md peer resolver did not return AID for {aid}")
         return peer
@@ -518,7 +525,9 @@ class AgentMdManager:
         if (status < 200 or status >= 300) and not reused_cached_not_modified:
             raise AUNError(f"download agent.md failed: HTTP {status}")
 
-        peer = await self._resolve_peer(target)
+        _, sig_fields, _ = parse_agent_md_tail_signature(content)
+        expected_fp = (sig_fields.get("cert_fingerprint") or sig_fields.get("public_key_fingerprint")) if sig_fields else None
+        peer = await self._resolve_peer(target, expected_fp)
         verified = peer.verify_agent_md(content)
         if not verified.ok or verified.data is None:
             message = verified.error.message if verified.error else "agent.md verification failed"

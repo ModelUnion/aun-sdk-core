@@ -97,11 +97,12 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	}
 	for _, m := range msgs {
 		seq := toInt64(m["seq"])
+		event, payload := p2pAppEventForMessage(m)
 		if seq <= 0 || ns == "" {
-			c.publishAppEvent("message.received", m)
+			c.publishAppEvent(event, payload)
 			continue
 		}
-		c.publishPulledMessage("message.received", ns, int(seq), m)
+		c.publishPulledMessage(event, ns, int(seq), payload)
 	}
 	if ns != "" {
 		contig := c.seqTracker.GetContiguousSeq(ns)

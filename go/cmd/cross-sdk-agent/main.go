@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -245,7 +246,7 @@ func (a *CrossSdkGoAgent) identity() map[string]any {
 		"device_id":              "",
 		"slot_id":                a.slotID,
 		"issuer":                 a.issuer,
-		"public_key_fingerprint": certFingerprint(firstNonEmpty(stringValue(identity["cert"]), stringValue(identity["cert_pem"]))),
+		"public_key_fingerprint": publicKeyFingerprint(firstNonEmpty(stringValue(identity["cert"]), stringValue(identity["cert_pem"]))),
 	}
 }
 
@@ -864,12 +865,16 @@ func sha256JSON(value any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func certFingerprint(certPEM string) string {
+func publicKeyFingerprint(certPEM string) string {
 	block, _ := pem.Decode([]byte(strings.TrimSpace(certPEM)))
 	if block == nil {
 		return ""
 	}
-	sum := sha256.Sum256(block.Bytes)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || len(cert.RawSubjectPublicKeyInfo) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 

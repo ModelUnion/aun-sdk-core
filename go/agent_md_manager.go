@@ -604,6 +604,9 @@ func verifyAgentMDResultToMap(result *VerifyAgentMdResult, certPEM string) map[s
 	if result.CertFingerprint != "" {
 		out["cert_fingerprint"] = result.CertFingerprint
 	}
+	if result.PublicKeyFingerprint != "" {
+		out["public_key_fingerprint"] = result.PublicKeyFingerprint
+	}
 	if result.Timestamp > 0 {
 		out["timestamp"] = result.Timestamp
 	}
@@ -663,8 +666,29 @@ func (m *AgentMdManager) verifyAgentMD(ctx context.Context, content string, aid 
 	current := m.client.currentAIDObj
 	m.client.mu.RUnlock()
 	var peer *AID
+	_, fields, _ := aidParseAgentMdTailSignature(content)
+	expectedFP := ""
+	if fields != nil {
+		expectedFP = strings.TrimSpace(strings.ToLower(fields["cert_fingerprint"]))
+		if expectedFP == "" {
+			expectedFP = strings.TrimSpace(strings.ToLower(fields["public_key_fingerprint"]))
+		}
+	}
 	if current != nil && current.Aid == target {
+		if expectedFP != "" && !matchCertFingerprint([]byte(current.CertPem), expectedFP) {
+			return nil, fmt.Errorf("current AID certificate fingerprint mismatch for %s", target)
+		}
 		peer = current
+	} else if expectedFP != "" {
+		certBytes, err := m.client.fetchPeerCert(ctx, target, expectedFP)
+		if err != nil {
+			return nil, err
+		}
+		resolved, err := m.client.getPeerDirectory().publicAIDFromCert(target, string(certBytes))
+		if err != nil {
+			return nil, err
+		}
+		peer = resolved
 	} else {
 		resolved, err := m.client.LookupPeer(ctx, target)
 		if err != nil {

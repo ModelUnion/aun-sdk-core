@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
   "main": "dist/index.js",
@@ -27,9 +27,9 @@
     "prepack": "python ../scripts/sync_packed_docs.py ts",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration/federation-v2-thought.test.ts tests/integration/group-e2ee.test.ts",
+    "test:integration": "vitest run tests/integration/group-e2ee.test.ts",
     "test:e2e": "vitest run tests/e2e/v2-p2p.test.ts tests/e2e/v2-group.test.ts tests/e2e/v2-thought.test.ts",
-    "test:federation": "vitest run tests/integration/federation.test.ts tests/integration/federation-storage.test.ts",
+    "test:federation": "vitest run tests/integration/federation.test.ts tests/integration/federation-storage.test.ts tests/integration/federation-v2-thought.test.ts",
     "test:watch": "vitest"
   },
   "dependencies": {

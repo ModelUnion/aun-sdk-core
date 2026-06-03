@@ -6,6 +6,38 @@
 
 ---
 
+## 0.4.8 — 2026-06-03
+
+### 新功能
+- `cert-utils.ts` 新增 `normalizeFingerprintHex`、`publicKeyFingerprint`、`certMatchesFingerprint`、`publicKeyMatchesFingerprint` 工具函数，支持 DER/SPKI 双格式及 16/64 位短格式（四语言对齐）
+- `buildAgentMdSignatureBlock` 新增可选 `public_key_fingerprint` 字段输出（四语言对齐）
+- `AID.signAgentMd` 签名块中写入 `public_key_fingerprint`；`verifyAgentMd` 同时校验证书指纹和公钥指纹，`VerifyResult` 新增 `public_key_fingerprint` 字段（四语言对齐）
+- `AgentMdManager.download()` 从签名块提取指纹传入 `_resolvePeer`，实现验证时精确锁定证书（四语言对齐）
+- `peerResolver` 接口新增 `certFingerprint` 参数（四语言对齐）
+- `AIDStore.peerResolver` 支持按指纹从 keystore 查缓存或从 PKI 精确拉取证书（四语言对齐）
+- `pkiCertUrl` 新增 `certFingerprint` 参数，生成带 `cert_fingerprint` 查询参数的 URL（四语言对齐）
+- `_getV2SenderPubDer()` 新增 `certFingerprint` 参数，解密时精确匹配发送方证书（四语言对齐）
+- 新增在线未读 hint 队列（`_onlineUnreadHintQueue` + 定时 drain）（四语言对齐）
+- 新增 `_resetV2IdentityRuntime` / `_v2SessionMatchesIdentity`，V2 session 校验升级为身份匹配（四语言对齐）
+
+### 修复
+- `_resolvePeer()` 当 self AID 与期望指纹不匹配时抛 `StateError`，修复旧版直接返回 self 的安全漏洞（四语言对齐）
+- `_fetchPeerCert()` 移除带指纹失败后的无指纹降级请求（四语言对齐）
+- 指纹验证统一改用 `certMatchesFingerprint`，`_verifyEventSignature` 同步更新（四语言对齐）
+- cert 缓存只在无 `certFingerprint` 时写裸 key，避免缓存污染（四语言对齐）
+- `disconnect()` 允许状态范围扩大（增加 AUTHENTICATED/CONNECTING/RETRY_BACKOFF/CONNECTION_FAILED），修复原来只允许 connected/reconnecting 的限制
+- `_connectOnce()` / `disconnect()` / `_handleTransportDisconnect()` 断连后状态统一改为 `standby`，与 Python 对齐
+- `_applyAidRuntimeContext()` 新增旧 transport 清理，防止切换身份时旧连接泄漏（四语言对齐）
+- `parseAgentMdTailSignature` 改用 `normalizeFingerprintHex` 替换旧正则，支持更宽松指纹格式（四语言对齐）
+- SPK hash 计算改用 `exactArrayBuffer()` 防止 TypedArray offset 错误
+
+### 优化
+- `AUNClient` 大规模拆分重构：拆分出 `ClientRuntime`、`LifecycleController`、`RpcPipeline`、`MessageDeliveryEngine`、`V2E2EECoordinator`、`GroupStateCoordinator`、`PeerDirectory`、`IdentityRuntimeManager` 子模块（四语言对齐）
+- `AIDStore` 构造函数移除 `deviceId` 入参，统一使用 `getDeviceId()` 自动生成（四语言对齐）
+- `_decryptV2Message()` 透传 `proximity`/`same_device`/`same_network`/`same_egress_ip` 字段到解密后事件
+
+---
+
 ## 0.4.7 — 2026-06-01
 
 ### Added

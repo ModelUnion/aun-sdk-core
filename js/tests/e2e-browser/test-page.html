@@ -31,12 +31,14 @@ window.AUN_TEST_HELPERS = {
 
   createStore(source = {}) {
     const opts = this.storeOptions(source);
+    if (opts.deviceId) {
+      localStorage.setItem('aun_device_id', opts.deviceId);
+    }
     return new AUN.AIDStore({
       aunPath: opts.aunPath,
       encryptionSeed: opts.encryptionSeed,
       rootCaPem: opts.rootCaPem,
       verifySsl: opts.verifySsl,
-      ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
       ...(opts.slotId ? { slotId: opts.slotId } : {}),
     });
   },

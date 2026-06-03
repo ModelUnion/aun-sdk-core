@@ -5,6 +5,63 @@ import type { ModuleLogger } from './logger.js';
 import { isJsonObject, type GatewayDiscoveryDocument, type GatewayEntry, type JsonValue } from './types.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+const _DISCOVERY_RETRY_DELAYS_MS = [50, 100];
+
+function _sleep(ms: number): Promise<void> {
+  return new Promise(resolve => globalThis.setTimeout(resolve, ms));
+}
+
+function _errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function _errorForDisplay(err: unknown): string {
+  return err instanceof Error ? String(err) : String(err);
+}
+
+function _isTransientDiscoveryError(err: unknown): boolean {
+  if (err instanceof ValidationError) return false;
+
+  const maybeError = err as { name?: unknown; code?: unknown };
+  const name = typeof maybeError?.name === 'string' ? maybeError.name.toLowerCase() : '';
+  const code = typeof maybeError?.code === 'string' ? maybeError.code.toUpperCase() : '';
+  if (name === 'aborterror') return true;
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) {
+    return true;
+  }
+
+  const message = _errorMessage(err).toLowerCase();
+  if (/^http\s+\d+/.test(message)) return false;
+  return (
+    message.includes('socket hang up') ||
+    message.includes('connection reset') ||
+    message.includes('econnreset') ||
+    message.includes('econnrefused') ||
+    message.includes('etimedout') ||
+    message.includes('epipe') ||
+    message.includes('timeout') ||
+    message.includes('fetch failed') ||
+    message.includes('network error') ||
+    message.includes('getaddrinfo')
+  );
+}
+
+async function _fetchJsonWithTimeout(url: string, timeout: number): Promise<JsonValue> {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json() as JsonValue;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Gateway 发现服务 — 通过 .well-known 端点发现 Gateway WebSocket URL。
@@ -64,18 +121,23 @@ export class GatewayDiscovery {
     this._log.debug(`discoverAll enter: url=${wellKnownUrl}`);
     let payload: GatewayDiscoveryDocument;
     try {
-      const controller = new AbortController();
-      const timer = globalThis.setTimeout(() => controller.abort(), timeout);
-
-      const response = await fetch(wellKnownUrl, {
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      let rawPayload: JsonValue = null;
+      const maxAttempts = _DISCOVERY_RETRY_DELAYS_MS.length + 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        try {
+          rawPayload = await _fetchJsonWithTimeout(wellKnownUrl, timeout);
+          break;
+        } catch (err) {
+          const isLastAttempt = attempt >= maxAttempts - 1;
+          if (isLastAttempt || !_isTransientDiscoveryError(err)) {
+            throw err;
+          }
+          this._log.warn(
+            `gateway discover transient failure, retrying: url=${wellKnownUrl}, attempt=${attempt + 1}/${maxAttempts}, error=${_errorMessage(err)}`,
+          );
+          await _sleep(_DISCOVERY_RETRY_DELAYS_MS[attempt]);
+        }
       }
-      const rawPayload = await response.json() as JsonValue;
       if (!isJsonObject(rawPayload)) {
         throw new ValidationError('well-known returned invalid payload');
       }
@@ -83,7 +145,7 @@ export class GatewayDiscovery {
     } catch (exc) {
       this._log.debug(`discoverAll exit (error): elapsed=${Date.now() - tStart}ms err=${exc instanceof Error ? exc.message : String(exc)}`);
       throw new ConnectionError(
-        `gateway discovery failed for ${wellKnownUrl}: ${exc}`,
+        `gateway discovery failed for ${wellKnownUrl}: ${_errorForDisplay(exc)}`,
         { retryable: true },
       );
     }

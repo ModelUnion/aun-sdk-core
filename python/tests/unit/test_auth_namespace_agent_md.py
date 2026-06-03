@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from cryptography import x509
@@ -8,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from aun_core import AIDStore, result_ok
+from aun_core._cert_utils import parse_agent_md_tail_signature
 
 
 def _make_identity(aid: str) -> dict[str, str]:
@@ -82,6 +84,17 @@ def test_aid_sign_agent_md_appends_tail_signature(tmp_path):
     assert text.startswith("---\n")
     assert text.count("<!-- AUN-SIGNATURE") == 1
     assert text.rstrip().endswith("-->")
+    _, fields, _ = parse_agent_md_tail_signature(text)
+    assert fields is not None
+    cert = x509.load_pem_x509_certificate(identity["cert"].encode("utf-8"))
+    cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+    spki = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_key_fp = "sha256:" + hashlib.sha256(spki).hexdigest()
+    assert fields["cert_fingerprint"] == cert_fp
+    assert fields["public_key_fingerprint"] == public_key_fp
     store.close()
 
 

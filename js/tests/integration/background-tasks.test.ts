@@ -39,7 +39,9 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   await client.connect({
     auto_reconnect: true,
     heartbeat_interval: 5,
-    retry: { max_attempts: 10, initial_delay: 1.0, max_delay: 10.0 },
+    retry_max_attempts: 10,
+    retry_initial_delay: 1.0,
+    retry_max_delay: 10.0,
   });
 }
 

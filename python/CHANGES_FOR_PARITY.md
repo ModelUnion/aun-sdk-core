@@ -1,12 +1,383 @@
-# Python SDK 变更清单（v0.3.3 → v0.3.6）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.8）— 跨 SDK 对齐参考
 
-本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出从 v0.3.3
-到 v0.3.6 期间 Python SDK 的实际变更，定位到具体类、函数与代码行。按重要程度
-（Breaking → 安全/认证 → API 公开面 → 内部机制 → CLI/工具 → Bug 修复）排序。
-
-涉及提交：`af5c6ed7` (v0.3.3) → `5b75e33e` (v0.3.4) → `74d4fb7a` (OCSP/CRL fail-open + check_agent_md) → `33344726` (旧 SPK 私钥内存缓存) → `fef5a6ee` (v0.3.5) → 工作区 (v0.3.6)。
+本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
+
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → 工作区 (v0.4.8)。
+
+---
+
+## v0.4.8 — 相对于 v0.4.7 的变更
+
+### `_cert_utils.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| — | 删除 | `_AGENT_MD_FINGERPRINT_RE` | 删除严格 sha256: 前缀正则，由 `normalize_fingerprint_hex` 替代 |
+| +23 | 新增 | `_FINGERPRINT_HEX_RE` | 纯 hex 字符校验正则（取代原正则） |
+| +26 | 新增 | `def normalize_fingerprint_hex(value)` | 将 `sha256:xxx`、`xx:xx:xx`（冒号分隔）、裸 hex 统一为小写 hex，支持 16/64 位 |
+| +34 | 新增 | `def cert_fingerprint_hexes(cert)` | 同时返回证书指纹 hex 和 SPKI（公钥 DER）指纹 hex |
+| +39 | 新增 | `def cert_matches_fingerprint(cert, fingerprint)` | 将证书指纹（cert/SPKI）与 fingerprint 比对，支持 16 位短前缀匹配 |
+| +47 | 新增 | `def public_key_matches_fingerprint(cert, fingerprint)` | 仅比对 SPKI 指纹，支持短前缀 |
+| +87 | 修改 | `parse_agent_md_tail_signature()` | 使用 `normalize_fingerprint_hex` 校验 `cert_fingerprint`；新增 `public_key_fingerprint` 字段可选校验 |
+| +115 | 修改 | `def build_agent_md_signature_block(...)` | 新增可选参数 `public_key_fingerprint: str = ""`，若非空则在签名块中写入该字段 |
+| +182 | 新增 | `def public_key_fingerprint(cert)` | 返回 `sha256:` + SPKI DER SHA-256 hex |
+
+### `aid.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +14 | 新增 import | `cert_matches_fingerprint` | 引入新的指纹比对函数 |
+| +18 | 新增 import | `public_key_fingerprint`, `public_key_matches_fingerprint` | 引入公钥指纹函数 |
+| +145 | 修改 | `AID.sign_agent_md()` | 签名块中新增 `public_key_fingerprint` 字段 |
+| +171 | 修改 | `AID.verify_agent_md()` | cert_fingerprint 比对改用 `cert_matches_fingerprint()`（支持多格式/短前缀） |
+| +180 | 新增 | `AID.verify_agent_md()` | 新增对 `public_key_fingerprint` 字段的可选校验（`public_key_matches_fingerprint`） |
+| +205 | 修改 | `AID.verify_agent_md()` 返回值 | 验证结果中新增 `public_key_fingerprint` 字段 |
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| — | 删除 import | `normalize_device_id` | 改用 `get_device_id` |
+| +106 | 删除 | `AIDStore.__init__` 参数 `device_id` | 移除外部传入 device_id 的能力，改为始终调用 `get_device_id(aun_path)` |
+| +114 | 修改 | `AIDStore.__init__` | `self.device_id` 赋值从 `normalize_device_id(device_id, ...)` 改为 `get_device_id(self.aun_path)` |
+| +149 | 修改 | `resolve_peer()` 闭包签名 | 新增参数 `cert_fingerprint: str \| None = None` |
+| +152 | 修改 | `resolve_peer()` 闭包实现 | 重写：先查本地 keystore 证书，若指纹匹配则直接构造公钥 AID；否则按指纹走 PKI HTTP 接口或 `fetch_peer_cert` |
+
+### `agent_md.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +18 | 新增 import | `cert_matches_fingerprint`, `parse_agent_md_tail_signature` | 引入指纹比对与签名块解析 |
+| +302 | 修改 | `AgentMdManager._resolve_peer()` 签名 | 新增参数 `cert_fingerprint: str \| None = None` |
+| +305 | 修改 | `AgentMdManager._resolve_peer()` | 当前 AID 匹配时，额外校验 `cert_fingerprint`；调用 `_peer_resolver` 时透传 fingerprint，并用 `try/except TypeError` 兼容旧签名 |
+| +525 | 修改 | `AgentMdManager.download_and_verify()` | 下载后先解析签名块提取 `cert_fingerprint`/`public_key_fingerprint`，再将其传入 `_resolve_peer()` 做锁定解析 |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +9 | 新增 import | `_client` 模块中的 8 个子类 | `ClientRuntime`, `GroupStateCoordinator`, `IdentityRuntimeManager`, `LifecycleController`, `MessageDeliveryEngine`, `PeerDirectory`, `RpcPipeline`, `V2E2EECoordinator` |
+| +21 | 修改 import | `cert_matches_fingerprint`, `normalize_fingerprint_hex` | 替换原 `cert_common_name`, `cert_time_error` |
+| +368 | 修改 | `resolve_peer()` 闭包签名 | 新增 `cert_fingerprint` 参数，透传给 `_resolve_peer_aid` |
+| +468 | 修改 | `AUNClient.__init__` | `raw_config` 初始化时额外传入 `verify_ssl`、`debug`、`root_ca_path`（来自 initial_aid_obj） |
+| +651 | 新增 | `AUNClient.__init__` | 初始化 8 个子组件实例（`_client_runtime`、`_identity_runtime`、`_peer_directory` 等） |
+| +374 | 新增 | `AUNClient._lifecycle()` | lazy 获取 `LifecycleController` 的访问器 |
+| +381 | 新增 | `AUNClient._rpc()` | lazy 获取 `RpcPipeline` |
+| +388 | 新增 | `AUNClient._delivery()` | lazy 获取 `MessageDeliveryEngine` |
+| +395 | 新增 | `AUNClient._v2_e2ee_coordinator()` | lazy 获取 `V2E2EECoordinator` |
+| +402 | 新增 | `AUNClient._group_state()` | lazy 获取 `GroupStateCoordinator` |
+| +409 | 修改 | `AUNClient.authenticate()` / `connect()` / `disconnect()` / `close()` | 实现委托给 `_lifecycle()` 对应方法 |
+| +699~977 | 修改 | RPC/ACK 相关方法群 | `_sign_client_operation`, `_pull_gate_key_for_call`, `_try_acquire_pull_gate`, `_release_pull_gate`, `_run_pull_serialized`, `call`, `_merge_instance_protected_headers`, `_fire_ack`, `_await_ack`, `_clamp_ack_params` 均委托给 `_rpc()` / `_delivery()` |
+| +793 | 新增 | `AUNClient._call_after_pipeline()` | pull gate 锁定检测 + 结果后处理的新入口（由 `RpcPipeline.call` 回调） |
+| +795 | 修改 | `AUNClient.load_identity()` | 委托给 `_identity_runtime.load_identity(aid)` |
+| +100~134 | 修改 | peer 管理方法群 | `_require_peer_management_state`, `cache_peer`, `get_peer`, `lookup_peer`, `peers`, `_rebuild_runtime_for_identity` 均委托给 `_peer_directory` / `_identity_runtime` |
+| +224~338 | 修改 | gateway 发现/持久化方法群 | `_discover_gateway_for_aid`, `_issuer_domain_for_aid`, `_discover_gateway_for_peer_aid`, `_discover_gateway_url`, `_load_cached_gateway_url`, `_persist_gateway_url`, `_resolve_peer_aid`, `_public_aid_from_cert` 均委托给 `_peer_directory` |
+
+### `config.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +78 | 修改 | `get_device_id()` | `mkdir` 移入 try 块内；文件不可写时 fallback 从静默返回旧 device_id 改为返回 `"default"` |
+
+### `version.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1 | 修改 | `__version__` | `"0.4.7"` → `"0.4.8"` |
+
+---
+
+## v0.4.7 — 相对于 v0.4.6 的变更
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L22 | 新增 import | `AuthFlow` | 新增对 `AuthFlow` 的导入 |
+| L29 | 修改 import | `errors` | 新增导入 `ClientSignatureError`, `StateError` |
+| L31 | 新增 import | `LocalTokenStore` | 新增对 `LocalTokenStore` 的导入 |
+| L56–L62 | 新增 | `class UploadAgentMdResult` | upload_agent_md 的返回类型定义（TypedDict，含 aid/etag/last_modified/agent_md_url） |
+| L128–L131 | 新增 | `AIDStore.__init__` 中 `_token_store` | 初始化 `LocalTokenStore` 实例 |
+| L179 | 新增 | `AIDStore.close()` | 关闭时同步调用 `self._token_store.close()` |
+| L434–L439 | 新增 | `AIDStore._auth_identity_from_aid()` | 从 AID 对象构造 auth identity dict 的私有辅助方法 |
+| L441–L458 | 新增 | `AIDStore._upload_agent_md_token()` | 通过 AuthFlow 获取上传 agent.md 所需 token 的私有异步方法 |
+| L460–L510 | 新增 | `AIDStore.upload_agent_md()` | 公开异步方法，签名并上传指定 AID 的 agent.md，返回 `Result[UploadAgentMdResult]` |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1062 | 删除 | `AUNClient.upload_agent_md()` | 从 AUNClient 移除该方法（职责迁移到 AIDStore） |
+
+### `keystore/sqlite_db.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L308–L313 | 修改 | `AIDDatabase._migrate_schema()` v1→v2 分支 | 用 `_add_column_if_missing` 替代直接 `ALTER TABLE`，防止重复迁移报错 |
+| L321–L322 | 新增 | `AIDDatabase._migrate_schema()` 末尾 | 补充幂等的 `slot_id_full` 列添加，修复 pending 升级场景 |
+| L384–L390 | 新增 | `AIDDatabase._add_column_if_missing()` | 静态方法，检查列是否存在后再执行 ADD COLUMN，实现幂等迁移 |
+
+### `version.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1 | 修改 | `__version__` | `"0.4.6"` → `"0.4.7"` |
+
+## v0.4.6 — 相对于 v0.4.5 的变更
+
+### `agent_md.py`（新文件，相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L24 | 新增 | `class AgentMdManager` | agent.md 本地持久化、远端同步、观察元数据管理器，从 AUNClient/AIDStore 中拆出，通过回调注入能力 |
+| L27 | 新增 | `AgentMdManager.__init__` | 构造器接收 aun_path + 一组可选回调（owner_aid_getter, gateway_resolver, peer_resolver, token_provider, authenticator 等） |
+| L70 | 新增 | `AgentMdManager.content_etag` | 静态方法，计算内容 SHA-256 ETag |
+| L77 | 新增 | `AgentMdManager.root` | property，返回 AIDs 根目录 Path |
+| L83 | 新增 | `AgentMdManager.safe_aid` | 静态方法，校验 AID 不含路径分隔符 |
+| L88 | 新增 | `AgentMdManager.file_path` / `meta_path` | 返回 agent.md 内容文件 / agentmd.json 元数据文件路径 |
+| L104 | 新增 | `AgentMdManager._record_lock` | contextmanager，跨进程文件锁（msvcrt / fcntl 双平台） |
+| L132 | 新增 | `AgentMdManager._atomic_write_text` | 原子写文本文件（tmp → replace + fsync） |
+| L154 | 新增 | `AgentMdManager._write_record_unlocked` / `_normalize_record` / `_read_record_unlocked` | 元数据 JSON 读写内部方法 |
+| — | 新增 | `download` / `upload` / `check` / `observe_rpc_meta` / `observe_envelope` / `event_snapshot` | 对外公开的核心业务方法（下载/上传/检查/观察/etag 快照） |
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L21 | 修改 import | `AuthFlow` → `AgentMdManager` | 删除 `from .auth import AuthFlow`，改为 `from .agent_md import AgentMdManager` |
+| L28 | 修改 import | `FileKeyStore` → `LocalIdentityStore` | 新增 `AUNError`, `NotFoundError` |
+| L38 | 修改 | `FetchAgentMdResult` → `DownloadAgentMdResult` | TypedDict 重命名 |
+| L44 | 删除 | `HeadAgentMdResult` | TypedDict 整体删除 |
+| L112 | 删除 | `AIDStore._agent_md_cache` | 内存 cache dict 删除，移入 AgentMdManager |
+| L115 | 修改 | `AIDStore.__init__` | `FileKeyStore` → `LocalIdentityStore` |
+| L129 | 修改 | `AIDStore.__init__` | 删除 `self._auth = AuthFlow(...)`，改为直接创建 `self._register_flow = RegisterFlow(...)` |
+| L155 | 新增 | `AIDStore.__init__` | 初始化 `self._agent_md_manager = AgentMdManager(...)` 并注入 peer_resolver / http 回调 |
+| L293 | 修改 | `AIDStore.register` | `self._auth._validate_aid_name` → `self._register_flow.validate_aid_name`；注册成功后调用 `_persist_gateway_url` |
+| L355 | 修改 | `AIDStore.resolve` | `fetch_peer_cert` 改用 register_flow；resolve 后增加 `_persist_gateway_url`；`fetch_agent_md` → `download_agent_md` |
+| L389 | 修改 | `fetch_agent_md` → `download_agent_md` | 方法重命名；委托给 `self._agent_md_manager.download()`，删除内联 HTTP + 验签逻辑 |
+| L418 | 修改 | `head_agent_md` → `check_agent_md` | 重命名；委托给 `self._agent_md_manager.check()`；旧 check_agent_md 逻辑并入 |
+| L501 | 修改 | `AIDStore.renew_cert` / `rekey` / `_begin_aid_operation` | `_validate_aid_name` / `_short_rpc` / `_verify_phase1_response` / `generate_identity` 全部改用 register_flow 公开方法 |
+| L775 | 修改 | `import_trust_roots` / `update_issuer_root_cert` | `self._auth.reload_trusted_roots()` → `self._register_flow.reload_trusted_roots()` |
+| L1104 | 修改 | `_load_cached_gateway_url` / `_persist_gateway_url` | 内联 db.get/set_metadata 改用 `_keystore.get/set_metadata_value`；新增 `_has_local_aid_material` 前置校验 |
+| L1123 | 新增 | `AIDStore._has_local_aid_material` | 判断本地是否存有证书或密钥对（防止向无身份的 peer 写元数据） |
+| L1133 | 删除 | `AIDStore._agent_md_url` | URL 拼接逻辑移入 AgentMdManager |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L29 | 修改 import | `AIDStore` → `AgentMdManager` | 删除 `from .aid_store import AIDStore`，改为 `from .agent_md import AgentMdManager` |
+| L38 | 修改 import | `FileKeyStore` → `LocalTokenStore` | — |
+| L342 | 新增 | `_build_client_runtime_manager(client)` | 模块级工厂函数，构造绑定 AUNClient 回调的 AgentMdManager 实例 |
+| L524 | 修改 | `AUNClient.__init__` | 删除 `_agent_md_path` / `_local_agent_md_etag` / `_remote_agent_md_etag` / `_agent_md_cache` 字段；改为 `self._agent_md_manager = _build_client_runtime_manager(self)`；`FileKeyStore` → `LocalTokenStore` |
+| L867 | 修改 | `AUNClient._reconnect_setup` | `FileKeyStore` → `LocalTokenStore`；重建 `_agent_md_manager` |
+| L174 | 修改 | `AUNClient._discover_gateway_for_aid` | 删除 `_make_aid_store` 调用；改为先查 `_load_cached_gateway_url`，再调 `_discover_gateway_url`，并持久化 |
+| L369 | 新增 | `AUNClient._discover_gateway_url` | 抽出 gateway 发现逻辑（DNS .well-known 双 URL fallback） |
+| L423 | 新增 | `AUNClient._load_cached_gateway_url` | 从 LocalTokenStore 读取持久化 gateway_url |
+| L460 | 新增 | `AUNClient._persist_gateway_url` | 写 gateway_url 到 LocalTokenStore |
+| L486 | 新增 | `AUNClient._resolve_peer_aid` | 替代 `_get_peer` 内的 AIDStore.resolve；先查本地缓存 cert，再 fetch，构造只含公钥的 AID 对象 |
+| L719 | 新增 | `AUNClient._public_aid_from_cert` | 从 cert PEM 构造公钥 AID 对象（校验时效 / CN 一致性） |
+| L854 | 修改 | `AUNClient.upload_agent_md` | 重写为委托 `self._agent_md_manager.upload(content)` |
+| L880 | 修改 | `AUNClient._observe_rpc_meta` | 内联逻辑 → `self._agent_md_manager.observe_rpc_meta(meta, ...)` |
+| L2981 | 修改 | `AUNClient._inject_agent_md_etag` | 内联 local/remote etag 注入 → `self._agent_md_manager.event_snapshot()` |
+| L4395 | 修改 | `_validate_slot_id`（message.pull/ack） | `slot_id != self._slot_id` → `slot_isolation_key(...)` 比较 |
+| L6280 / L6443 / L7418 | 修改 | V2 解密路径 × 3 | `_observe_agent_md_from_envelope` → `self._agent_md_manager.observe_envelope` |
+| — | 删除 | agent.md 内联方法群 | `_agent_md_content_etag` / `_agent_md_owner_aid` / `_agent_md_root` / `_make_aid_store` / `_agent_md_url` / `_agent_md_safe_aid` / `_agent_md_file_path` / `_agent_md_meta_path` / `_agent_md_record_lock` / `_atomic_write_text` / `_write_agent_md_record_unlocked` / `_normalize_agent_md_record` / `_read_agent_md_record_unlocked` / `_read_agent_md_content` / `_write_agent_md_content` / `_load_agent_md_record` / `_save_agent_md_record` / `_agent_md_has_local_content` / `_agent_md_checked_at_fresh` / `_schedule_agent_md_fetch_if_missing` / `_observe_agent_md_meta` / `_observe_agent_md_etag` / `_observe_agent_md_from_envelope` / `_check_agent_md` / `publish_agent_md` 全部移入 AgentMdManager 或合并 |
+
+### `register_flow.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L17 | 新增 import | `GatewayCertificateVerifier` | — |
+| L20 | 修改 import | `FileKeyStore` → `KeyStore` | 抽象基类 |
+| L29 | 修改 | `RegisterFlow.__init__` | keystore 类型 `FileKeyStore` → `KeyStore`；新增 `root_ca_path` 参数；初始化 `self._certs = GatewayCertificateVerifier(...)` |
+| L43~61 | 新增 | 公开代理方法群 | `validate_aid_name` / `fetch_peer_cert` / `short_rpc` / `generate_identity` / `new_client_nonce` / `verify_phase1_response` / `reload_trusted_roots` |
+
+### `keystore/local_identity_store.py`（新文件，相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L35 | 新增 | `class LocalIdentityStore` | 原 FileKeyStore "含私钥"部分的独立实现，持有 encryption_seed，供 AIDStore 使用 |
+| L78~150 | 新增 | 身份/私钥/证书/元数据读写 | `load_identity` / `save_identity` / `list_identities` / `load_any_identity` / `load_key_pair` / `save_key_pair` / `load_cert` / `save_cert` / `get_metadata_value` / `set_metadata_value` |
+| L170 | 新增 | 信任根管理 | `trust_root_dir` / `trust_root_bundle_path` / `save_trust_roots` / `save_issuer_root_cert` |
+| L212 | 新增 | pending 目录原子注册全流程 | `pending_identity_dir` / `list_pending_identity_dirs` / `save_pending_key_pair` / `load_pending_key_pair` / `save_pending_cert` / `promote_pending_identity` / `discard_pending_identity` / `cleanup_pending_dirs` |
+| L268 | 新增 | `change_seed` / `ChangeSeed` | seed 迁移（委托 seed_migration 模块） |
+
+### `keystore/local_token_store.py`（新文件，相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L28 | 新增 | `class LocalTokenStore` | 原 FileKeyStore "无私钥"部分的独立实现，供 AuthFlow / AUNClient 使用 |
+| L80 | 新增 | `load_cert` / `save_cert` | 证书读写（含 fingerprint 版本化存储） |
+| L116 | 新增 | `load_metadata` / `get_metadata_value` / `set_metadata_value` | 元数据读写 |
+| L154 | 新增 | prekey 存取 | `load_e2ee_prekeys` / `load_e2ee_prekey_by_id` / `save_e2ee_prekey` |
+
+## v0.4.5 — 相对于 v0.4.3 的变更
+
+### `keystore/base.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L7 | 新增 | `class TokenStore` | 新增不含私钥操作的存储接口，AuthFlow/AUNClient 持有此类型 |
+| L93 | 修改 | `class KeyStore` | 移除 load/save_key_pair、load/save_identity、list_identities，改为纯私钥接口；新增 pending 目录相关方法群 |
+| L122~134 | 新增 | KeyStore pending 协议方法 | `pending_identity_dir` / `list_pending_identity_dirs` / `save_pending_key_pair` / `load_pending_key_pair` / `save_pending_cert` / `promote_pending_identity` / `discard_pending_identity` |
+| L127 | 新增 | `class FullKeyStore` | 组合协议类，物理 keystore 同时实现 TokenStore + KeyStore |
+
+### `register_flow.py`（新文件，相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L4 | 新增 | `class RegisterFlow` | 独立注册流模块，持有 FileKeyStore（含私钥操作），从 auth.py 剥离 |
+| L20 | 新增 | `async def register_aid()` | 注册主流程，返回含私钥字段的 dict（私钥由 AIDStore 写入）；新增 pending 目录原子注册 |
+| L122 | 新增 | `def _persist_identity()` | 只持久化 cert，私钥由 pending promote 或 AIDStore 管理 |
+| L131 | 新增 | `async def _try_recover_pending_registration()` | pending 残留崩溃恢复逻辑 |
+| L182 | 新增 | `async def _download_registered_cert()` | HTTP GET /pki/cert/{aid} 查服务端已注册证书 |
+| L204~258 | 新增 | 注册辅助方法群 | `_create_aid` / `_short_rpc` / `_connect` / `_gateway_http_url` / `_validate_aid_name` |
+
+### `auth.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L12 | 修改 import | — | 移除 `IdentityConflictError`、`FileKeyStore`；改导入 `TokenStore` |
+| L21 | 修改 | `AuthFlow.__init__` 参数 | `keystore: FileKeyStore` → `token_store: TokenStore`（`_keystore` 重命名 `_token_store`） |
+| L48 | 新增 | `AuthFlow._mem_identity` | 内存 identity 字段，存放 AUNClient 注入的明文私钥 |
+| L50 | 新增 | `def set_identity()` | 由 AUNClient.load_identity 调用，注入内存私钥，不再走 token_store 解密 |
+| L77 | 删除 | `async def register_aid()`（原实现） | 完整注册逻辑迁移至 RegisterFlow |
+| L221 | 修改 | `_assert_cert_matches_local_keypair()` | 行为弱化：cert 或 pub_b64 任一缺失则直接 return，不再 raise |
+| L233 | 新增 | `async def register_aid()`（stub） | 保留方法但直接 raise StateError，提示用 AIDStore.register |
+| L1278 | 修改 | `_load_identity_or_raise()` | 移除 keystore 读取路径；优先从 `_mem_identity` 读取 |
+| L1318 | 修改 | `_persist_identity()`（token_store 分支） | 只写 cert，不再写私钥字段 |
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L20 | 新增 import | `RegisterFlow` | 引入新的注册流模块 |
+| L141 | 修改 | `AIDStore._auth` 构造 | `keystore=` 参数改名为 `token_store=` |
+| L148 | 新增 | `AIDStore._register_flow` | 新增 RegisterFlow 实例，由 AIDStore 独占持有（含私钥 keystore） |
+| L285 | 修改 | `AIDStore.register()` 实现 | 从 `self._auth.register_aid()` 改为 `self._register_flow.register_aid()`；cert 和 key_pair 由 AIDStore 写入 keystore |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L356 | 修改 | `AUNClient._keystore` | 重命名为 `_token_store`（20+ 处引用同步替换） |
+| L375 | 新增 | `AUNClient.__init__` identity 注入 | 若传入 `initial_aid_obj`，立即构建内存 identity dict 并调用 `_auth.set_identity()` |
+| L391 | 修改 | `AUNClient.load_identity()` | `self._identity = None` 改为构建完整内存 identity dict 并调用 `_auth.set_identity()` |
+| L431 | 修改 | `_post_authenticate()` | identity 改为直接用 `self._identity`；新增持久化 `refresh_token`、`access_token_expires_at` |
+| L621 | 修改 | `_sync_identity_after_connect()` | 不再调用 `_auth.load_identity_or_none()` / `_persist_identity()`；直接操作 `_identity` dict 并通过 `_token_store.update_instance_state()` 持久化 access_token |
+| L655 / L4708 | 修改 | `_invoke_reconnect_connect_once()` / `_token_refresh_loop()` | fresh_identity 改为直接读 `self._identity` |
+| L4522~4542 | 修改 | 调试事件名 | `ensure_sender_cert_keystore_*` → `ensure_sender_cert_token_store_*` |
+
+## v0.4.3 — 相对于 v0.4.2 的变更
+
+> 0.4.3 含两次提交：`2d1bce76`（slot_id 校验与隔离键，标记 0.4.3a）与 `dc380c86`（AID 持明文私钥 + pending 原子注册，标记 0.4.3b）。
+
+### 0.4.3a（`2d1bce76`）— slot_id 隔离键 + ConnectionOptions 扩展
+
+#### `config.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L13 | 新增 | `_SLOT_ID_PATTERN` | slot_id 正则，允许 `/` `:` 空格作分隔符（但不得出现在首字符） |
+| L57 | 修改 | `normalize_slot_id()` | 重写：不再复用 `normalize_instance_id`，改用 `_SLOT_ID_PATTERN` 校验，非法字符抛 `ValueError` |
+| L67 | 新增 | `slot_isolation_key()` | 提取 slot_id 第一个分隔符之前的部分作为隔离键 |
+
+#### `client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L27 | 修改 import | — | 新增导入 `slot_isolation_key` |
+| L1625~1633 | 新增 | `_build_connect_params()` 内 | 透传 `connection_kind` / `short_ttl_ms` / `extra_info` / `delivery_mode` / `background_sync` |
+| L3452 | 修改 | `_is_message_for_me()` | slot_id 比较改用 `slot_isolation_key()` 对比隔离键，不再全字符串匹配 |
+
+#### `types.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L69~73 | 新增 | `ConnectionOptions` 新字段 | `connection_kind`（'long'/'short'）、`short_ttl_ms`、`extra_info`、`delivery_mode`、`background_sync`（默认 True） |
+
+#### `keystore/sqlite_db.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L26 | 修改 | `_SCHEMA_VERSION` | `1` → `2` |
+| L132 / L140 | 新增 | `instance_state.slot_id_full` / `seq_tracker.slot_id_full` | 表新增列，存储完整 slot_id（原 slot_id 列改存隔离键） |
+| L370 | 修改 | `AIDDatabase._init_schema()` | 新增 schema 版本检测分支，旧版本调用 `_migrate_schema()` 升级 |
+| L380 | 新增 | `AIDDatabase._migrate_schema()` | 静态方法：v1→v2 为两张表各 ALTER ADD COLUMN slot_id_full |
+| L1380~1413 | 修改 | `save_instance_state()` / `load_instance_state()` / `save_seq()` | slot 存储/查询键改用 `slot_isolation_key()`，写入时同时保存 `slot_id_full` 原始值 |
+
+### 0.4.3b（`dc380c86`）— AID 持明文私钥 + pending 原子注册
+
+#### `aid.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L41 | 新增 | `AID.private_key_pem: str` | 新增字段，AIDStore 加载时注入明文私钥 PEM |
+| L61 | 新增 | `AID._create(private_key_pem)` | `_create` 工厂方法新增 `private_key_pem` 参数，构造时写入实例 |
+
+#### `aid_store.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L234 | 新增 | `AIDStore.load`（内部构造 AID） | 调用 `AID._create` 时传入 `private_key_pem`，将 key_pair 明文私钥注入 AID 对象 |
+
+#### `auth.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1422 | 新增 | `AuthFlow._persist_identity` | 持久化前过滤 `private_key_pem`、`public_key_der_b64`、`curve`，防止私钥写入 key.json |
+
+#### `client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L228 | 新增 | `_PUBLIC_CONNECTION_OPTION_KEYS` | 模块级常量，列出 connect() opts 允许的公开字段白名单 |
+| L504 / L837 | 删除 | `connect` / `reconnect`（内部） | 构造 `FileKeyStore` 时移除 `encryption_seed` 参数 |
+| L1617 | 修改 | `connect` opts 校验 | 改为白名单校验：传入非公开字段抛 `ValidationError` |
+| L1847 / L1873 | 修改 | `_sign_client_operation` | 私钥来源从 `_identity` dict 改为 `_current_aid.private_key_pem`；cert 改为 `current_aid.cert_pem` |
+| L2038 | 修改 | `_route_call`（group.ack_messages） | V2 ack 路由前增加 `_group_cursor_targets_current_instance` 检查 |
+| L2363 | 新增 | `AUNClient._await_ack` | 异步方法，await ack RPC 完成（替代 fire-and-forget，用于 pull 返回前收敛游标） |
+| L4874 | 新增 | `_group_cursor_targets_current_instance` | 判断 params 中 device_id/slot_id 是否指向当前实例 |
+| L5492 | 修改 | `_init_v2_session` | 移除 identity 缓存自愈逻辑，直接从 `_current_aid.private_key_pem` 读私钥 |
+| L5885 | 修改 | `_pull_v2_p2p`（auto-ack） | `_fire_ack` → `await _await_ack`；ack 触发增加 `has_page_server_ack and contig > page_server_ack` 分支 |
+| L6991~7163 | 修改 | `_pull_v2_group` | 新增 `has_explicit_after_seq` 标志；pull/ack 携带 device_id/slot_id/device_name/device_type 支持外部 cursor；`owns_cursor` 判断；补充 `has_more` 字段计算 |
+| L7572 | 修改 | `_auto_propose_v2_group_state` | 签名私钥来源改为 `_current_aid.private_key_pem` |
+
+## v0.4.2 — 相对于 v0.4.0 的变更
+
+### `__init__.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L7 / L43 | 新增 | `ConnectionOptions` | 从 `.types` 导入并加入 `__all__` 导出列表 |
+
+### `aid.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L39~41 | 新增 | `AID.verify_ssl` / `root_ca_path` / `debug` | 新增三个连接配置字段（默认 True / None / False） |
+| L56 | 修改 | `AID._create()` | 新增 `verify_ssl`、`root_ca_path`、`debug` 三个参数 |
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L37~91 | 新增 | 9 个 TypedDict 返回类型 | `FetchAgentMdResult` / `HeadAgentMdResult` / `CheckAgentMdResult` / `DiagnoseResult` / `RenewCertResult` / `RekeyResult` / `ChangeSeedResult` / `ResolveResult` / `ListResult` |
+| L107 | 删除 | `AIDStore.__init__` 参数 `discovery_port` | 移除 `discovery_port: int \| None` 参数 |
+| L190 / L228 | 修改 | `AIDStore.load()` / `register()` | `_create` 调用时透传 `verify_ssl`、`root_ca_path`、`debug` |
+| L233~633 | 修改 | 各方法返回类型收窄 | `list` / `change_seed` / `resolve` / `fetch_agent_md` / `head_agent_md` / `check_agent_md` / `diagnose` / `renew_cert` / `rekey` 均收窄为对应 `Result[XxxResult]`；`resolve` 新增 `timeout`/`timeoutMs`，`fetch_agent_md` 新增 `timeout_s` 并删除 signature/certPem/status 等冗余返回字段 |
+| L974 / L1175 / L1226 | 修改 | `_pki_authority()` / `_resolve_gateway_url()` / `_agent_md_url()` | 移除 `discovery_port` 端口拼接逻辑 |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L403 | 修改 | `AUNClient.__init__()` | 删除参数 `debug: bool`、`protected_headers`；`debug` 改为从 `aid.debug` 读取；删除 `set_protected_headers()` 调用 |
+| L889 | 修改 | `AUNClient._make_aid_store()` | 移除 `discovery_port` 传参 |
+| L1594 | 修改 | `AUNClient.connect()` | 参数由 `options: dict` 改为 `opts: ConnectionOptions \| None`；移除 `access_token` 外部传入；`slot_id` 改从 AID 对象读取；`NO_IDENTITY` 状态直接 raise |
+| L1733~5216 | 修改 | 多处事件名 | `connection.state` → `state_change`（`disconnect` / `close` / `_on_auth_complete` / `_on_disconnected` / `_reconnect_loop`） |
+
+### `types.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L59 | 新增 | `class ConnectionOptions(TypedDict, total=False)` | 新增连接选项类型，含 7 个可选字段：`auto_reconnect`、`connect_timeout`、`retry_initial_delay`、`retry_max_delay`、`retry_max_attempts`、`heartbeat_interval`、`call_timeout` |
+
+---
+
+## v0.4.0 — 相对于 v0.3.7 的变更
+
+### `aid.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L37 / L38 | 新增 | `AID.device_id` / `AID.slot_id` | 新增字段，默认 `""` / `"default"` |
+| L51 | 修改 | `AID._create()` | 签名新增 `device_id` 和 `slot_id` 参数，构造时赋值（`slot_id` 空值归一化为 `"default"`） |
+
+### `aid_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L128 / L163 | 修改 | `_load_cert_only()` / `_load_full()` | 调用 `AID._create()` 时透传 `device_id` / `slot_id` |
+
+### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L10 | 新增 import | `re` | 用于 key 校验 |
+| L418 / L499 / L804 | 修改 | `__init__()` / `switch_aid()` | `_device_id` 优先用 `initial_aid_obj.device_id`，回退 `get_device_id()`；`_slot_id` 优先用 `aid.slot_id`，回退 `normalize_slot_id(None)` |
+| L444 | 修改 | `__init__()` | `_instance_protected_headers` 初始化改为先置 `None` 再调 `set_protected_headers()` |
+| L857 | 修改 | `set_protected_headers()` | 新增 key 合规校验：限 `[a-z0-9_-]`，过滤 `_auth` 保留键，非法 key 静默跳过，值强转 `str` |
+
+### `__init__.py` / `version.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L31 | 修改 | `__version__` | 从硬编码字符串改为从 `version.py` 导入；版本号升至 `"0.4.0"` |
 
 ---
 

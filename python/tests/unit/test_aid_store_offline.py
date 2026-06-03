@@ -58,15 +58,15 @@ def test_store_load_local_identity_with_private_key(tmp_path):
     assert loaded.is_private_key_valid()
 
 
-def test_store_normalizes_empty_instance_context_to_defaults(tmp_path):
-    store = AIDStore(str(tmp_path), "", device_id="", slot_id="")
+def test_store_uses_device_id_file_and_normalizes_empty_slot_to_default(tmp_path):
+    store = AIDStore(str(tmp_path), "", slot_id="")
     try:
         assert store.device_id == get_device_id(tmp_path)
         assert store.slot_id == "default"
     finally:
         store.close()
 
-    store = AIDStore(str(tmp_path), "", device_id="  ", slot_id="  ")
+    store = AIDStore(str(tmp_path), "", slot_id="  ")
     try:
         assert store.device_id == get_device_id(tmp_path)
         assert store.slot_id == "default"

@@ -7,11 +7,14 @@ import { X509Certificate } from 'node:crypto';
 import * as codes from './error-codes.js';
 import {
   buildAgentMdSignatureBlock,
+  certMatchesFingerprint,
   certCommonName,
   certFingerprint as _certFingerprint,
   extractAgentMdAid,
   normalizeAgentMdPayload,
   parseAgentMdTailSignature,
+  publicKeyFingerprint,
+  publicKeyMatchesFingerprint,
   publicKeyDerB64,
   signBytes,
   verifySignatureWithCert,
@@ -23,6 +26,7 @@ export interface VerifyResult {
   payload: string;
   aid?: string;
   cert_fingerprint?: string;
+  public_key_fingerprint?: string;
   timestamp?: number;
   reason?: string;
 }
@@ -154,6 +158,7 @@ export class AID {
         this.certFingerprint,
         Math.trunc(Date.now() / 1000),
         sig.toString('base64'),
+        publicKeyFingerprint(this.certPem),
       );
       return resultOk({ signed: payload + block });
     } catch (exc) {
@@ -178,8 +183,12 @@ export class AID {
       if (payloadAid && payloadAid !== this.aid) {
         return resultOk({ status: 'invalid', payload, aid: payloadAid, reason: 'aid mismatch' });
       }
-      if (fields.cert_fingerprint.toLowerCase() !== this.certFingerprint.toLowerCase()) {
+      if (!certMatchesFingerprint(this.certPem, fields.cert_fingerprint)) {
         return resultOk({ status: 'invalid', payload, aid: this.aid, reason: 'certificate fingerprint mismatch' });
+      }
+      const publicKeyFp = String(fields.public_key_fingerprint ?? '').trim();
+      if (publicKeyFp && !publicKeyMatchesFingerprint(this.certPem, publicKeyFp)) {
+        return resultOk({ status: 'invalid', payload, aid: this.aid, reason: 'public key fingerprint mismatch' });
       }
 
       const sigBuf = Buffer.from(fields.signature, 'base64');
@@ -200,6 +209,7 @@ export class AID {
         payload,
         aid: this.aid,
         cert_fingerprint: fields.cert_fingerprint,
+        public_key_fingerprint: publicKeyFp,
         timestamp: Number(fields.timestamp),
       });
     } catch (exc) {

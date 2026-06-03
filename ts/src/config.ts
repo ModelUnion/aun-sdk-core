@@ -58,20 +58,20 @@ export function slotIsolationKey(slotId: string): string {
  */
 export function getDeviceId(aunRoot?: string): string {
   const root = aunRoot ?? join(homedir(), '.aun');
-  mkdirSync(root, { recursive: true });
   const deviceIdPath = join(root, '.device_id');
 
-  if (existsSync(deviceIdPath)) {
-    try {
+  try {
+    mkdirSync(root, { recursive: true });
+    if (existsSync(deviceIdPath)) {
       const stored = readFileSync(deviceIdPath, 'utf-8').trim();
       if (stored) return normalizeInstanceId(stored, 'device_id');
-    } catch {
-      // 平台兼容 fallback
     }
+  } catch {
+    // 平台兼容 fallback
   }
 
-  const newId = normalizeInstanceId(randomUUID(), 'device_id');
   try {
+    const newId = normalizeInstanceId(randomUUID(), 'device_id');
     writeFileSync(deviceIdPath, newId, 'utf-8');
     if (process.platform !== 'win32') {
       try {
@@ -80,10 +80,11 @@ export function getDeviceId(aunRoot?: string): string {
         // 平台兼容 fallback
       }
     }
+    return newId;
   } catch {
     // 平台兼容 fallback
   }
-  return newId;
+  return 'default';
 }
 
 // ── 配置接口 ─────────────────────────────────────────────────

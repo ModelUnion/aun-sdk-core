@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -88,6 +89,23 @@ def test_client_construct_with_aid_enters_standby(tmp_path: Path):
     store.close()
 
 
+def test_client_construct_inherits_aid_runtime_context(tmp_path: Path):
+    store, aid = _load_local_aid(tmp_path)
+    root_ca_path = str(tmp_path / "root-ca.pem")
+    Path(root_ca_path).write_text(aid.cert_pem, encoding="utf-8")
+    aid = replace(aid, slot_id="slot-x", verify_ssl=False, root_ca_path=root_ca_path)
+
+    client = AUNClient(aid)
+
+    assert client.slot_id == "slot-x"
+    assert client._config_model.verify_ssl is False
+    assert client._config_model.root_ca_path == root_ca_path
+    assert client._auth._slot_id == "slot-x"
+    assert client._auth._verify_ssl is False
+
+    store.close()
+
+
 def test_client_construct_with_peer_only_aid_enters_no_identity(tmp_path: Path):
     """传入无私钥的 AID 应抛出 StateError（不允许静默降级）。"""
     store, _aid = _load_local_aid(tmp_path)
@@ -125,6 +143,24 @@ def test_client_load_identity_only_accepts_private_aid(tmp_path: Path):
     store.close()
 
 
+def test_client_load_identity_inherits_aid_runtime_context(tmp_path: Path):
+    store, aid = _load_local_aid(tmp_path)
+    root_ca_path = str(tmp_path / "root-ca.pem")
+    Path(root_ca_path).write_text(aid.cert_pem, encoding="utf-8")
+    aid = replace(aid, slot_id="slot-y", verify_ssl=False, root_ca_path=root_ca_path)
+    client = AUNClient()
+
+    client.load_identity(aid)
+
+    assert client.slot_id == "slot-y"
+    assert client._config_model.verify_ssl is False
+    assert client._config_model.root_ca_path == root_ca_path
+    assert client._auth._slot_id == "slot-y"
+    assert client._auth._verify_ssl is False
+
+    store.close()
+
+
 def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkeypatch):
     store, aid = _load_local_aid(tmp_path)
     peer_name = "peer.agentid.pub"
@@ -141,6 +177,12 @@ def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkey
 
     assert asyncio.run(client.lookup_peer(peer_name)) is peer
     resolver_client = AUNClient(aid)
+    async def fake_fetch_peer_cert(aid: str, cert_fingerprint: str | None = None) -> bytes:
+        assert aid == bob_name
+        assert cert_fingerprint is None
+        return _identity(bob_name)["cert"].encode("utf-8")
+
+    monkeypatch.setattr(resolver_client, "_fetch_peer_cert", fake_fetch_peer_cert)
     resolved_bob = asyncio.run(resolver_client.lookup_peer(bob_name))
     assert resolved_bob.aid == bob_name
     assert resolver_client.get_peer(bob_name) is resolved_bob

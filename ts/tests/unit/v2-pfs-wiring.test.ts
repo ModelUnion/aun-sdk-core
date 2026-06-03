@@ -57,6 +57,7 @@ function makeClientWithSession(): ClientFixture {
   // 设置已连接 + 已注入 V2 session
   (client as any)._state = 'connected';
   (client as any)._aid = 'alice.aid';
+  (client as any)._deviceId = 'dev-1';
   (client as any)._v2Session = session;
   return { client, session, store };
 }

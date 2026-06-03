@@ -14,6 +14,7 @@ package aun
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
@@ -205,75 +206,7 @@ func openV2Keystore(aunPath, aid string) (*V2SQLiteStore, error) {
 //   - IK = AID 长期密钥，从 identity["private_key_pem"] 解析为 raw scalar (32B P-256) + DER 公钥。
 //   - 调用 V2Session.EnsureKeys 加载或生成 SPK；EnsureRegistered 上传 message.v2.put_peer_pk。
 func (c *AUNClient) initV2Session(ctx context.Context) error {
-	c.mu.RLock()
-	aid := c.aid
-	currentAID := c.currentAIDObj
-	deviceID := c.deviceID
-	aunPath := ""
-	if c.configModel != nil {
-		aunPath = c.configModel.AUNPath
-	}
-	c.mu.RUnlock()
-
-	if aid == "" {
-		return nil
-	}
-	// 私钥由 AIDStore 管理，直接从 currentAID 读取明文私钥
-	privPEM := ""
-	if currentAID != nil {
-		privPEM = currentAID.PrivateKeyPem
-	}
-	if privPEM == "" {
-		c.logE2.Warn("V2 session init skipped: no AID private key")
-		return nil
-	}
-
-	ecKey, err := parseECPrivateKeyPEM(privPEM)
-	if err != nil {
-		return fmt.Errorf("V2 session init: 解析 AID 私钥失败: %w", err)
-	}
-	if ecKey.Curve.Params().BitSize != 256 {
-		return fmt.Errorf("V2 session init: AID 私钥必须为 P-256 曲线")
-	}
-	aidPriv := ecKey.D.FillBytes(make([]byte, 32))
-	aidPubDER, err := x509.MarshalPKIXPublicKey(&ecKey.PublicKey)
-	if err != nil {
-		return fmt.Errorf("V2 session init: 编码 AID 公钥失败: %w", err)
-	}
-
-	// 关闭已有 V2 keystore（处理重连或 AID 切换场景）
-	c.releaseV2State()
-
-	store, err := openV2Keystore(aunPath, aid)
-	if err != nil {
-		return err
-	}
-
-	v2 := session.NewV2Session(store.store, deviceID, aid, aidPriv, aidPubDER)
-	if err := v2.EnsureKeys(); err != nil {
-		_ = store.Close()
-		return fmt.Errorf("V2 session init: EnsureKeys 失败: %w", err)
-	}
-
-	state := &v2P2PState{
-		session:             v2,
-		keystore:            store,
-		bootstrapCache:      make(map[string]v2BootstrapEntry),
-		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
-	}
-	c.mu.Lock()
-	c.v2State = state
-	c.mu.Unlock()
-
-	if err := v2.EnsureRegistered(ctx, c.v2CallFn()); err != nil {
-		// 注册失败时仍保留 session 状态：消费方面（pull/decrypt）依旧可用，
-		// 发送方在 send_v2 调用时会自然透传错误。这里仅日志告警。
-		c.logE2.Warn("V2 session init: EnsureRegistered 失败（保留 session 状态）: %v", err)
-	} else {
-		c.logE2.Debug("V2 session initialized: aid=%s device=%s", aid, deviceID)
-	}
-
-	return nil
+	return c.getV2E2EECoordinator().initV2Session(ctx)
 }
 
 func (c *AUNClient) releaseV2State() {
@@ -445,12 +378,39 @@ func v2DecodeBase64Field(m map[string]any, key string) []byte {
 	return out
 }
 
-func (c *AUNClient) getV2SenderPubDER(ctx context.Context, state *v2P2PState, fromAID, senderDeviceID string) []byte {
+func v2PubDERMatchesFingerprint(pubDER []byte, certFingerprint string) bool {
+	expected := strings.TrimSpace(strings.ToLower(certFingerprint))
+	if expected == "" {
+		return true
+	}
+	if !strings.HasPrefix(expected, "sha256:") {
+		return false
+	}
+	expectedHex := strings.TrimPrefix(expected, "sha256:")
+	if len(expectedHex) != 16 && len(expectedHex) != 64 {
+		return false
+	}
+	for _, ch := range expectedHex {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	sum := sha256.Sum256(pubDER)
+	spkiHex := fmt.Sprintf("%x", sum[:])
+	if len(expectedHex) == 16 {
+		return spkiHex[:16] == expectedHex
+	}
+	return spkiHex == expectedHex
+}
+
+func (c *AUNClient) getV2SenderPubDER(ctx context.Context, state *v2P2PState, fromAID, senderDeviceID, certFingerprint string) []byte {
 	if state == nil || state.session == nil || strings.TrimSpace(fromAID) == "" {
 		return nil
 	}
 	if senderPubDER := state.session.GetPeerIK(fromAID, senderDeviceID); len(senderPubDER) > 0 {
-		return senderPubDER
+		if v2PubDERMatchesFingerprint(senderPubDER, certFingerprint) {
+			return senderPubDER
+		}
 	}
 
 	fetchCtx := ctx
@@ -464,7 +424,7 @@ func (c *AUNClient) getV2SenderPubDER(ctx context.Context, state *v2P2PState, fr
 	}
 	defer cancel()
 
-	certBytes, certErr := c.fetchPeerCert(fetchCtx, fromAID, "")
+	certBytes, certErr := c.fetchPeerCert(fetchCtx, fromAID, certFingerprint)
 	if certErr != nil {
 		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: %v", fromAID, certErr)
 		return nil
@@ -482,6 +442,10 @@ func (c *AUNClient) getV2SenderPubDER(ctx context.Context, state *v2P2PState, fr
 	der, marshalErr := x509.MarshalPKIXPublicKey(cert.PublicKey)
 	if marshalErr != nil {
 		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: %v", fromAID, marshalErr)
+		return nil
+	}
+	if !v2PubDERMatchesFingerprint(der, certFingerprint) {
+		c.logE2.Warn("V2 decrypt: PKI cert sender IK fingerprint mismatch for %s", fromAID)
 		return nil
 	}
 	state.session.CachePeerIK(fromAID, senderDeviceID, der)
@@ -505,7 +469,8 @@ func (c *AUNClient) cacheV2PeerIKFromDevice(state *v2P2PState, dev map[string]an
 	state.session.CachePeerIK(aid, devID, ikDER)
 }
 
-func (c *AUNClient) v2PendingSenderIKMessageKey(msg map[string]any, groupID string) string {
+func (v *v2E2EECoordinator) v2PendingSenderIKMessageKey(msg map[string]any, groupID string) string {
+	c := v.runtime.client
 	messageID := strings.TrimSpace(v2AsString(msg["message_id"]))
 	seqText := strings.TrimSpace(fmt.Sprint(msg["seq"]))
 	prefix := "p2p:" + c.AID()
@@ -525,13 +490,14 @@ func v2PendingSenderIKFetchKey(fromAID, senderDeviceID, groupID string) string {
 	return strings.TrimSpace(fromAID) + "#" + senderDeviceID + "#" + strings.TrimSpace(groupID)
 }
 
-func (c *AUNClient) scheduleV2SenderIKPending(msg map[string]any, fromAID, senderDeviceID, groupID string) {
+func (v *v2E2EECoordinator) scheduleV2SenderIKPending(msg map[string]any, fromAID, senderDeviceID, groupID string) {
+	c := v.runtime.client
 	fromAID = strings.TrimSpace(fromAID)
 	if fromAID == "" {
 		return
 	}
 	groupID = strings.TrimSpace(groupID)
-	messageKey := c.v2PendingSenderIKMessageKey(msg, groupID)
+	messageKey := v.v2PendingSenderIKMessageKey(msg, groupID)
 	fetchKey := v2PendingSenderIKFetchKey(fromAID, senderDeviceID, groupID)
 	shouldFetch := false
 	c.v2SenderIKMu.Lock()
@@ -551,11 +517,12 @@ func (c *AUNClient) scheduleV2SenderIKPending(msg map[string]any, fromAID, sende
 	c.logE2.Debug("V2 decrypt pending sender IK: key=%s from=%s device=%s group=%s pending=%d",
 		messageKey, fromAID, valueOrDefault(senderDeviceID, "-"), valueOrDefault(groupID, "<p2p>"), pendingCount)
 	if shouldFetch {
-		go c.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
+		go v.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
 	}
 }
 
-func (c *AUNClient) scheduleV2SenderIKFetch(fromAID, senderDeviceID, groupID string) {
+func (v *v2E2EECoordinator) scheduleV2SenderIKFetch(fromAID, senderDeviceID, groupID string) {
+	c := v.runtime.client
 	fromAID = strings.TrimSpace(fromAID)
 	if fromAID == "" {
 		return
@@ -569,10 +536,11 @@ func (c *AUNClient) scheduleV2SenderIKFetch(fromAID, senderDeviceID, groupID str
 	}
 	c.v2SenderIKFetching[fetchKey] = true
 	c.v2SenderIKMu.Unlock()
-	go c.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
+	go v.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
 }
 
-func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey string) {
+func (v *v2E2EECoordinator) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey string) {
+	c := v.runtime.client
 	defer func() {
 		if r := recover(); r != nil {
 			c.logE2.Warn("V2 sender IK pending resolver panic: from=%s device=%s group=%s panic=%v", fromAID, senderDeviceID, groupID, r)
@@ -620,7 +588,7 @@ func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, f
 	}
 	if len(state.session.GetPeerIK(fromAID, senderDeviceID)) == 0 {
 		shortCtx, shortCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = c.getV2SenderPubDER(shortCtx, state, fromAID, senderDeviceID)
+		_ = c.getV2SenderPubDER(shortCtx, state, fromAID, senderDeviceID, "")
 		shortCancel()
 	}
 
@@ -660,12 +628,13 @@ func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, f
 //   - 优先使用 bootstrap 缓存（TTL = v2BootstrapTTL）。
 //   - 缓存命中则直接发送；命中失败时刷新缓存重试 1 次。
 //   - 同时携带 audit_recipients（监管方）和 self_sync（本 AID 其它设备）。
-func (c *AUNClient) sendV2(ctx context.Context, to string, payload map[string]any) (map[string]any, error) {
-	return c.SendV2WithOpts(ctx, to, payload, e2ee.EncryptOptions{})
+func (v *v2E2EECoordinator) sendV2(ctx context.Context, to string, payload map[string]any) (map[string]any, error) {
+	return v.SendV2WithOpts(ctx, to, payload, e2ee.EncryptOptions{})
 }
 
 // SendV2WithOpts 与 SendV2 相同，但允许传入 EncryptOptions（含 ProtectedHeaders / Context）。
-func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+func (v *v2E2EECoordinator) SendV2WithOpts(ctx context.Context, to string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c := v.runtime.client
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
 		return nil, errors.New("V2 session not initialized (not connected?)")
@@ -678,24 +647,23 @@ func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[s
 		"payload": payload,
 	}, payload, nil)
 
-	resp, err := c.v2SendOnce(ctx, state, to, payload, true, opts)
+	resp, err := v.v2SendOnce(ctx, state, to, payload, true, opts)
 	if err == nil {
 		return resp, nil
 	}
 
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 P2P speculative send rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
-		state.bootstrapCacheM.Lock()
-		delete(state.bootstrapCache, to)
-		state.bootstrapCacheM.Unlock()
-		return c.v2SendOnce(ctx, state, to, payload, false, opts)
+		v.deletePeerBootstrapCache(to)
+		return v.v2SendOnce(ctx, state, to, payload, false, opts)
 	}
 	return nil, err
 }
 
-func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+func (v *v2E2EECoordinator) v2SendOnce(ctx context.Context, state *v2P2PState, to string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c := v.runtime.client
 	c.logE2.Debug("message.v2.send attempt: to=%s use_cache=%v", to, useCache)
-	peerDevices, auditRaw, wrapPolicy, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
+	peerDevices, auditRaw, wrapPolicy, err := v.v2ResolveBootstrap(ctx, state, to, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -732,7 +700,7 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 	myDeviceID := c.deviceID
 	c.mu.RUnlock()
 	if myAID != "" && myAID != to {
-		selfDevices := c.v2FetchSelfDevices(ctx, state, myAID)
+		selfDevices := v.v2FetchSelfDevices(ctx, state, myAID)
 		for _, dev := range selfDevices {
 			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
 			if !hasDeviceID || devID == myDeviceID {
@@ -798,11 +766,10 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 }
 
 // v2ResolveBootstrap 根据 useCache 决定是否使用缓存，未命中则调 message.v2.bootstrap。
-func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, peerAID string, useCache bool) ([]map[string]any, []map[string]any, *v2WrapPolicy, error) {
+func (v *v2E2EECoordinator) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, peerAID string, useCache bool) ([]map[string]any, []map[string]any, *v2WrapPolicy, error) {
+	c := v.runtime.client
 	if useCache {
-		state.bootstrapCacheM.Lock()
-		entry, ok := state.bootstrapCache[peerAID]
-		state.bootstrapCacheM.Unlock()
+		entry, ok := v.getPeerBootstrapCache(state, peerAID)
 		if ok && time.Since(entry.CachedAt) < v2BootstrapTTL {
 			c.logE2.Debug("message.v2.bootstrap cache hit: peer=%s devices=%d audit=%d", peerAID, len(entry.Devices), len(entry.AuditRecipients))
 			return entry.Devices, entry.AuditRecipients, entry.WrapPolicy, nil
@@ -821,23 +788,20 @@ func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, p
 	wrapPolicy := v2NormalizeWrapPolicy(bs["e2ee_wrap_policy"])
 	c.logE2.Debug("message.v2.bootstrap fetched: peer=%s devices=%d audit=%d", peerAID, len(devices), len(audit))
 	if len(devices) > 0 {
-		state.bootstrapCacheM.Lock()
-		state.bootstrapCache[peerAID] = v2BootstrapEntry{
+		v.setPeerBootstrapCache(state, peerAID, v2BootstrapEntry{
 			Devices:         devices,
 			AuditRecipients: audit,
 			CachedAt:        time.Now(),
 			WrapPolicy:      wrapPolicy,
-		}
-		state.bootstrapCacheM.Unlock()
+		})
 	}
 	return devices, audit, wrapPolicy, nil
 }
 
 // v2FetchSelfDevices 缓存优先获取本 AID 其它设备列表（best-effort，错误吞掉返回空）。
-func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, myAID string) []map[string]any {
-	state.bootstrapCacheM.Lock()
-	entry, ok := state.bootstrapCache[myAID]
-	state.bootstrapCacheM.Unlock()
+func (v *v2E2EECoordinator) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, myAID string) []map[string]any {
+	c := v.runtime.client
+	entry, ok := v.getPeerBootstrapCache(state, myAID)
 	if ok && time.Since(entry.CachedAt) < v2BootstrapTTL {
 		return entry.Devices
 	}
@@ -852,12 +816,10 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 	bs, _ := raw.(map[string]any)
 	devices := v2ToMapList(bs["peer_devices"])
 	if len(devices) > 0 {
-		state.bootstrapCacheM.Lock()
-		state.bootstrapCache[myAID] = v2BootstrapEntry{
+		v.setPeerBootstrapCache(state, myAID, v2BootstrapEntry{
 			Devices:  devices,
 			CachedAt: time.Now(),
-		}
-		state.bootstrapCacheM.Unlock()
+		})
 	}
 	return devices
 }
@@ -866,12 +828,13 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 //
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（对齐 Python pull_v2）。
 // limit=0 时默认 50。
-func (c *AUNClient) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
-	msgs, _, err := c.pullV2WithForce(ctx, afterSeq, limit, false)
+func (v *v2E2EECoordinator) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
+	msgs, _, err := v.pullV2WithForce(ctx, afterSeq, limit, false)
 	return msgs, err
 }
 
-func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
+func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
+	c := v.runtime.client
 	meta := v2PullPageMeta{}
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
@@ -902,7 +865,10 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 	if force {
 		pullParams["force"] = true
 	}
-	raw, err := c.Call(ctx, "message.v2.pull", pullParams)
+	if err := c.signClientOperation("message.v2.pull", pullParams); err != nil {
+		return nil, meta, err
+	}
+	raw, err := c.transport.Call(ctx, "message.v2.pull", pullParams)
 	if err != nil {
 		return nil, meta, err
 	}
@@ -996,7 +962,8 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 // AckV2 确认 V2 消息已消费 + 自检销毁旧 SPK。
 //
 // upToSeq=0 时使用本地 SeqTracker 的 contiguous_seq。返回 {"acked": int64} 兜底。
-func (c *AUNClient) ackV2(ctx context.Context, upToSeq int64) (map[string]any, error) {
+func (v *v2E2EECoordinator) ackV2(ctx context.Context, upToSeq int64) (map[string]any, error) {
+	c := v.runtime.client
 	state := c.v2GetState()
 
 	c.mu.RLock()
@@ -1064,6 +1031,31 @@ func (c *AUNClient) ackV2(ctx context.Context, upToSeq int64) (map[string]any, e
 	}
 	c.logE2.Debug("message.v2.ack ok: ns=%s requested=%d effective=%d result=%v", ns, seq, actualAckSeq, result)
 	return result, nil
+}
+
+// AUNClient 兼容门面：V2 P2P 主体逻辑由 V2E2EECoordinator 承接。
+func (c *AUNClient) scheduleV2SenderIKPending(msg map[string]any, fromAID, senderDeviceID, groupID string) {
+	c.getV2E2EECoordinator().scheduleV2SenderIKPending(msg, fromAID, senderDeviceID, groupID)
+}
+
+func (c *AUNClient) sendV2(ctx context.Context, to string, payload map[string]any) (map[string]any, error) {
+	return c.getV2E2EECoordinator().sendV2(ctx, to, payload)
+}
+
+func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[string]any, opts e2ee.EncryptOptions) (map[string]any, error) {
+	return c.getV2E2EECoordinator().SendV2WithOpts(ctx, to, payload, opts)
+}
+
+func (c *AUNClient) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
+	return c.getV2E2EECoordinator().pullV2(ctx, afterSeq, limit)
+}
+
+func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
+	return c.getV2E2EECoordinator().pullV2WithForce(ctx, afterSeq, limit, force)
+}
+
+func (c *AUNClient) ackV2(ctx context.Context, upToSeq int64) (map[string]any, error) {
+	return c.getV2E2EECoordinator().ackV2(ctx, upToSeq)
 }
 
 // decryptV2Message 解密单条 V2 P2P 消息（pull 内部使用）。
@@ -1169,7 +1161,8 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 	if aad, ok := envelope["aad"].(map[string]any); ok {
 		senderDeviceID = v2AsString(aad["from_device"])
 	}
-	senderPubDER := c.getV2SenderPubDER(ctx, state, fromAID, senderDeviceID)
+	senderCertFingerprint := strings.TrimSpace(stringFromAny(envelope["sender_cert_fingerprint"]))
+	senderPubDER := c.getV2SenderPubDER(ctx, state, fromAID, senderDeviceID, senderCertFingerprint)
 	if len(senderPubDER) == 0 {
 		c.logE2.Warn("V2 decrypt: no sender IK for %s device=%s", fromAID, senderDeviceID)
 		if allowPending {
@@ -1177,18 +1170,17 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 			return nil
 		}
 		event := map[string]any{
-			"message_id":        v2AsString(msg["message_id"]),
-			"from":              fromAID,
-			"to":                v2AsString(msg["to"]),
-			"seq":               msg["seq"],
-			"timestamp":         msg["t_server"],
-			"device_id":         v2AsString(msg["device_id"]),
-			"slot_id":           v2AsString(msg["slot_id"]),
-			"_decrypt_error":    "sender_ik_not_found",
-			"_decrypt_stage":    "sender_ik",
-			"_envelope_type":    v2AsString(envelope["type"]),
-			"_suite":            v2AsString(envelope["suite"]),
-			"_sender_device_id": senderDeviceID,
+			"message_id":     v2AsString(msg["message_id"]),
+			"from":           fromAID,
+			"to":             v2AsString(msg["to"]),
+			"seq":            msg["seq"],
+			"timestamp":      msg["t_server"],
+			"device_id":      v2AsString(msg["device_id"]),
+			"slot_id":        v2AsString(msg["slot_id"]),
+			"_decrypt_error": "sender_ik_not_found",
+			"_decrypt_stage": "sender_ik",
+			"_envelope_type": v2AsString(envelope["type"]),
+			"_suite":         v2AsString(envelope["suite"]),
 		}
 		attachV2EnvelopeMetadata(event, e2eeMeta)
 		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
@@ -1205,18 +1197,17 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 	if err != nil {
 		c.logE2.Warn("V2 decrypt failed for msg seq=%v: %v", msg["seq"], err)
 		event := map[string]any{
-			"message_id":        v2AsString(msg["message_id"]),
-			"from":              fromAID,
-			"to":                v2AsString(msg["to"]),
-			"seq":               msg["seq"],
-			"timestamp":         msg["t_server"],
-			"device_id":         v2AsString(msg["device_id"]),
-			"slot_id":           v2AsString(msg["slot_id"]),
-			"_decrypt_error":    err.Error(),
-			"_decrypt_stage":    "decrypt",
-			"_envelope_type":    v2AsString(envelope["type"]),
-			"_suite":            v2AsString(envelope["suite"]),
-			"_sender_device_id": senderDeviceID,
+			"message_id":     v2AsString(msg["message_id"]),
+			"from":           fromAID,
+			"to":             v2AsString(msg["to"]),
+			"seq":            msg["seq"],
+			"timestamp":      msg["t_server"],
+			"device_id":      v2AsString(msg["device_id"]),
+			"slot_id":        v2AsString(msg["slot_id"]),
+			"_decrypt_error": err.Error(),
+			"_decrypt_stage": "decrypt",
+			"_envelope_type": v2AsString(envelope["type"]),
+			"_suite":         v2AsString(envelope["suite"]),
 		}
 		attachV2EnvelopeMetadata(event, e2eeMeta)
 		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
@@ -1230,37 +1221,9 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 
 	// SPK 轮换：当前活跃 SPK 被消费后立即轮换（后台执行，不阻塞）
 	if groupIDForKeys != "" && recipientKeySource == "group_device_prekey" && state.session.IsLastUploadedGroupSPK(groupIDForKeys, spkID) {
-		// Group SPK 消费触发轮换
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					c.logE2.Warn("V2 group SPK rotation panic: %v", r)
-				}
-			}()
-			rotateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := state.session.RotateGroupSPK(rotateCtx, groupIDForKeys, c.v2CallFn()); err != nil {
-				c.logE2.Warn("V2 group SPK rotation failed (non-fatal): group=%s %v", groupIDForKeys, err)
-			} else {
-				c.logE2.Debug("V2 group SPK rotated after consumption: group=%s aid=%s", groupIDForKeys, selfAID)
-			}
-		}()
+		c.getV2E2EECoordinator().scheduleGroupSpkRotation(groupIDForKeys, "group_spk_consumed")
 	} else if groupIDForKeys != "" && recipientKeySource == "peer_device_prekey" {
-		// peer_device_prekey fallback：补注册 group SPK
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					c.logE2.Warn("V2 group SPK registration panic: %v", r)
-				}
-			}()
-			regCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := state.session.EnsureGroupRegistered(regCtx, groupIDForKeys, c.v2CallFn()); err != nil {
-				c.logE2.Debug("V2 group SPK registration after peer fallback failed (non-fatal): group=%s %v", groupIDForKeys, err)
-			} else {
-				c.logE2.Debug("V2 group SPK registered after peer fallback: group=%s", groupIDForKeys)
-			}
-		}()
+		c.getV2E2EECoordinator().scheduleGroupSpkRegistrationAfterPeerFallback(groupIDForKeys)
 	} else if groupIDForKeys == "" && state.session.IsLastUploadedSPK(spkID) {
 		// P2P SPK 消费触发轮换
 		go func() {
@@ -1305,6 +1268,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 	if v, ok := msg["slot_id"]; ok {
 		result["slot_id"] = v
 	}
+	attachGatewayProximity(result, msg)
 	attachV2EnvelopeMetadata(result, e2ee)
 	if groupIDForKeys != "" {
 		c.logMessageDebug("decrypt-ok", "v2.decrypt", "group.message_created", result, nil)

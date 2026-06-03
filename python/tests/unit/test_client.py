@@ -1578,6 +1578,55 @@ async def test_v2_p2p_pull_force_true_passthrough_keeps_explicit_after_zero():
 
 
 @pytest.mark.asyncio
+async def test_v2_p2p_public_pull_gate_serializes_full_pipeline():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                await asyncio.sleep(0.02)
+                if int(params.get("after_seq", 0) or 0) == 0:
+                    return {
+                        "has_more": False,
+                        "messages": [{
+                            "version": "v1",
+                            "seq": 1,
+                            "message_id": "m-1",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": 1,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": "m-1"},
+                            },
+                        }],
+                    }
+                return {"has_more": False, "messages": []}
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    first, second = await asyncio.gather(
+        client.call("message.pull", {"after_seq": 0, "limit": 10}),
+        client.call("message.pull", {"after_seq": 0, "limit": 10}),
+    )
+
+    pull_calls = [(method, params) for method, params in calls if method == "message.v2.pull"]
+    assert [params["after_seq"] for _, params in pull_calls] == [0, 1]
+    assert [msg["seq"] for msg in first["messages"]] == [1]
+    assert second["messages"] == []
+
+
+@pytest.mark.asyncio
 async def test_v2_group_pull_batches_auto_ack_once_with_final_contiguous_seq():
     client = AUNClient()
     client._state = "connected"

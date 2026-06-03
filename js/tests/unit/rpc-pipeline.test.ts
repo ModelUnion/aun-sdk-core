@@ -1,0 +1,99 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { ConnectionError, PermissionError, ValidationError } from '../../src/errors.js';
+import { RpcPipeline } from '../../src/client/rpc-pipeline.js';
+import { ClientRuntime } from '../../src/client/runtime.js';
+
+function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: RpcPipeline; client: Record<string, any> } {
+  const client: Record<string, any> = {
+    _state: 'connected',
+    _aid: 'alice.agentid.pub',
+    _deviceId: 'device-a',
+    _slotId: 'slot-a',
+    _instanceProtectedHeaders: { trace_id: 'instance-trace', priority: 'normal' },
+    _pullGates: new Map(),
+    _clientLog: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+    _clampAckParams: vi.fn((_method: string, params: Record<string, unknown>) => params),
+    _isEchoPayload: vi.fn((payload: unknown) => Boolean((payload as Record<string, unknown> | null)?.text?.toString().toLowerCase().includes('echo'))),
+    _signClientOperation: vi.fn(async (_method: string, params: Record<string, unknown>) => {
+      params.client_signature = { signed: true };
+    }),
+    ...overrides,
+  };
+  return { client, pipeline: new RpcPipeline(new ClientRuntime(client)) };
+}
+
+describe('RpcPipeline 组件边界', () => {
+  it('preflight 拒绝未连接和 internal-only 方法', () => {
+    const disconnected = createPipeline({ _state: 'disconnected' }).pipeline;
+    expect(() => disconnected.preflight('message.send', { to: 'bob.agentid.pub' })).toThrow(ConnectionError);
+
+    const { pipeline } = createPipeline();
+    expect(() => pipeline.preflight('auth.connect', {})).toThrow(PermissionError);
+  });
+
+  it('preflight 合并 protected_headers 并规范化 outbound payload，且不修改调用方 params', () => {
+    const { pipeline } = createPipeline();
+    const original = {
+      to: 'bob.agentid.pub',
+      content: { text: 'hello' },
+      protected_headers: { priority: 'urgent' },
+    };
+
+    const result = pipeline.preflight('message.send', original);
+
+    expect(result.params.payload).toEqual({ type: 'text', text: 'hello' });
+    expect(result.params).not.toHaveProperty('content');
+    expect(result.params.protected_headers).toEqual({ trace_id: 'instance-trace', priority: 'urgent' });
+    expect(original).toHaveProperty('content');
+  });
+
+  it('preflight 为 message cursor 注入当前实例上下文，并拒绝跨实例 cursor', () => {
+    const { pipeline } = createPipeline();
+
+    expect(pipeline.preflight('message.pull', { after_seq: 7 }).params).toMatchObject({
+      after_seq: 7,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+    });
+    expect(() => pipeline.preflight('message.ack', { device_id: 'other-device' })).toThrow(ValidationError);
+  });
+
+  it('preflight 归一化 group_id、保留显式 cursor 参数，并注入默认实例上下文', () => {
+    const { pipeline } = createPipeline();
+
+    const explicit = pipeline.preflight('group.pull', {
+      group_id: 'g-room.agentid.pub',
+      device_id: 'device-x',
+      slot_id: 'slot-x',
+      device_name: 'laptop',
+    }).params;
+    expect(explicit.group_id).toBe('group.agentid.pub/g-room');
+    expect(explicit._group_cursor_params).toEqual({
+      device_id: 'device-x',
+      slot_id: 'slot-x',
+      device_name: 'laptop',
+    });
+
+    const injected = pipeline.preflight('group.send', { group_id: 'room.agentid.pub', payload: { text: 'hi' } }).params;
+    expect(injected).toMatchObject({
+      group_id: 'group.agentid.pub/room',
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+    });
+  });
+
+  it('applyClientSignature 对明文 echo send 跳过签名，对普通关键方法调用签名函数', async () => {
+    const { client, pipeline } = createPipeline();
+    const echoParams = { payload: { text: 'echo ping' }, client_signature: { stale: true } };
+
+    await pipeline.applyClientSignature('message.send', echoParams);
+    expect(echoParams).not.toHaveProperty('client_signature');
+    expect(client._signClientOperation).not.toHaveBeenCalled();
+
+    const normalParams = { to: 'bob.agentid.pub', payload: { text: 'hello' } };
+    await pipeline.applyClientSignature('message.send', normalParams);
+    expect(client._signClientOperation).toHaveBeenCalledWith('message.send', normalParams);
+    expect(normalParams.client_signature).toEqual({ signed: true });
+  });
+});

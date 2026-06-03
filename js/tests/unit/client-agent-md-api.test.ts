@@ -80,7 +80,7 @@ function installStoreAid(store: AIDStore, aid = 'alice.agentid.pub'): void {
       signAgentMd: vi.fn(async (c: string) => ({
         ok: true,
         data: {
-          signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
+          signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:${'0'.repeat(64)}\ntimestamp: 1\nsignature: x\n-->\n`,
         },
       })),
     },

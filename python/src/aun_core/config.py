@@ -78,25 +78,26 @@ def get_device_id(aun_root: Path | str | None = None) -> str:
     首次调用时自动生成并持久化，后续调用返回同一值。
     """
     root = Path(aun_root) if aun_root else Path.home() / ".aun"
-    root.mkdir(parents=True, exist_ok=True)
     device_id_path = root / ".device_id"
 
-    if device_id_path.exists():
-        try:
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if device_id_path.exists():
             stored = device_id_path.read_text(encoding="utf-8").strip()
             if stored:
                 return normalize_instance_id(stored, "device_id")
-        except (OSError, ValueError):
-            pass
+    except (OSError, ValueError):
+        pass
 
-    device_id = normalize_instance_id(str(uuid.uuid4()), "device_id")
     try:
+        device_id = normalize_instance_id(str(uuid.uuid4()), "device_id")
         device_id_path.write_text(device_id, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(device_id_path, 0o600)
+        return device_id
     except OSError:
         pass
-    return device_id
+    return "default"
 
 
 def resolve_verify_ssl_from_env() -> bool:

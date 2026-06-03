@@ -71,13 +71,14 @@ export function getDeviceId(): string {
     // localStorage 不可用（隐私模式等）
   }
 
-  const newId = normalizeInstanceId(crypto.randomUUID(), 'device_id');
   try {
+    const newId = normalizeInstanceId(crypto.randomUUID(), 'device_id');
     localStorage.setItem(STORAGE_KEY, newId);
+    return newId;
   } catch {
-    // 写入失败时仍返回生成的 ID（本次会话内有效）
+    // 平台兼容 fallback
   }
-  return newId;
+  return 'default';
 }
 
 /** AUN SDK 配置接口 */

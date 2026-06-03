@@ -1,4 +1,5 @@
 import { AID } from './aid.js';
+import { certMatchesFingerprint, parseAgentMdTailSignature } from './cert-utils.js';
 import { AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError } from './errors.js';
 import type { TokenStore } from './keystore/index.js';
 import type { ModuleLogger } from './logger.js';
@@ -69,7 +70,7 @@ export interface AgentMdManagerOptions {
   ownerAidGetter?: () => string | null | undefined;
   currentAidGetter?: () => AID | null | undefined;
   gatewayResolver?: (aid: string) => Promise<string> | string;
-  peerResolver?: (aid: string) => Promise<AID> | AID;
+  peerResolver?: (aid: string, certFingerprint?: string | null) => Promise<AID> | AID;
   accessTokenResolver?: (aid: string, gatewayUrl: string) => Promise<string> | string;
   aidValidator?: (aid: string) => void;
 }
@@ -109,7 +110,7 @@ export class AgentMdManager {
   private _ownerAidGetter?: () => string | null | undefined;
   private _currentAidGetter?: () => AID | null | undefined;
   private _gatewayResolver?: (aid: string) => Promise<string> | string;
-  private _peerResolver?: (aid: string) => Promise<AID> | AID;
+  private _peerResolver?: (aid: string, certFingerprint?: string | null) => Promise<AID> | AID;
   private _accessTokenResolver?: (aid: string, gatewayUrl: string) => Promise<string> | string;
   private _aidValidator?: (aid: string) => void;
   private _cache: Map<string, Record<string, unknown>> = new Map();
@@ -200,7 +201,9 @@ export class AgentMdManager {
   async download(aid?: string | null, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS): Promise<AgentMdDownloadResult> {
     const target = this._safeAid(String(aid ?? this._ownerAid() ?? '').trim());
     const contentResult = await this._downloadHttp(target, timeoutMs);
-    const peer = await this._resolvePeer(target);
+    const parsed = parseAgentMdTailSignature(contentResult.content);
+    const expectedFp = parsed.fields?.cert_fingerprint || parsed.fields?.public_key_fingerprint || null;
+    const peer = await this._resolvePeer(target, expectedFp);
     const verified = await peer.verifyAgentMd(contentResult.content);
     if (!verified.ok) throw new AUNError(verified.error.message);
 
@@ -513,10 +516,14 @@ export class AgentMdManager {
     return String(await this._gatewayResolver?.(aid) ?? '');
   }
 
-  private async _resolvePeer(aid: string): Promise<AID> {
+  private async _resolvePeer(aid: string, certFingerprint?: string | null): Promise<AID> {
+    const expectedFp = String(certFingerprint ?? '').trim().toLowerCase();
     const current = this._currentAid();
-    if (current?.aid === aid) return current;
-    const peer = await this._peerResolver?.(aid);
+    if (current?.aid === aid) {
+      if (!expectedFp || await certMatchesFingerprint(current.certPem, expectedFp)) return current;
+      throw new StateError(`current AID certificate fingerprint mismatch for ${aid}`);
+    }
+    const peer = await this._peerResolver?.(aid, expectedFp || null);
     if (!(peer instanceof AID)) {
       throw new StateError(`agent.md peer resolver did not return AID for ${aid}`);
     }
