@@ -7,7 +7,7 @@
 export { VERSION } from './version.js';
 
 // ── 主客户端 ─────────────────────────────────────────────────
-export { AUNClient, type ConnectionOptions } from './client.js';
+export { AUNClient, type ConnectionOptions, type NotifyOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
 export { AIDStore, type AIDInfo, type ResolveOpts } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
@@ -82,6 +82,16 @@ export { FileSecretStore, SeedMigrationError, type SeedChangeResult } from './se
 
 // ── 传输层 ───────────────────────────────────────────────────
 export { RPCTransport } from './transport.js';
+
+// ── Service Proxy ───────────────────────────────────────────
+export {
+  EmbeddedServiceRegistry,
+  EndpointPolicy,
+  ServiceProxyClient,
+  ServiceRecord,
+  type ServiceProxyClientOptions,
+  type ServiceSummary,
+} from './service-proxy.js';
 
 // ── Gateway 发现 ─────────────────────────────────────────────
 export { GatewayDiscovery } from './discovery.js';

@@ -9,14 +9,15 @@ class MockWebSocket {
 }
 
 function createReadyTransport(timeout = 10) {
+  const dispatcher = new EventDispatcher();
   const transport = new RPCTransport({
-    eventDispatcher: new EventDispatcher(),
+    eventDispatcher: dispatcher,
     timeout,
   });
   const ws = new MockWebSocket();
   (transport as any)._ws = ws;
   (transport as any)._closed = false;
-  return { transport, ws };
+  return { transport, ws, dispatcher };
 }
 
 function parseSent(ws: MockWebSocket): Array<{ id: string; method: string; params?: Record<string, unknown> }> {
@@ -122,5 +123,36 @@ describe('RPCTransport 后台 RPC 调度', () => {
     expect((transport as any)._pendingBackground.size).toBe(0);
     expect((transport as any)._rpcQueue).toHaveLength(0);
     expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
+  });
+});
+
+describe('RPCTransport notify', () => {
+  it('发送 JSON-RPC Notification 时不应包含 id', async () => {
+    const { transport, ws } = createReadyTransport();
+
+    await transport.notify('notification/client.activity', { state: 'idle' });
+
+    const sent = JSON.parse(ws.sent[0]);
+    expect(sent).toEqual({
+      jsonrpc: '2.0',
+      method: 'notification/client.activity',
+      params: { state: 'idle' },
+    });
+    expect(sent.id).toBeUndefined();
+  });
+
+  it('event/app.* 应直接发布为应用事件', async () => {
+    const { transport, dispatcher } = createReadyTransport();
+    const received: unknown[] = [];
+    dispatcher.subscribe('app.typing', (payload) => { received.push(payload); });
+
+    (transport as any)._routeMessage({
+      jsonrpc: '2.0',
+      method: 'event/app.typing',
+      params: { thread_id: 't1' },
+    });
+    await Promise.resolve();
+
+    expect(received).toEqual([{ thread_id: 't1' }]);
   });
 });

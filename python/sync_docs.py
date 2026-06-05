@@ -7,7 +7,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+KITE_ROOT = REPO_ROOT.parent
 SDK_DOCS = REPO_ROOT / "docs" / "sdk"
+PROTOCOL_SOURCE = KITE_ROOT / "docs" / "AUN文档" / "AUN协议"
+PROTOCOL_TARGET = REPO_ROOT / "docs" / "protocol"
+PACKED_PROTOCOL_TARGET = REPO_ROOT / "python" / "src" / "aun_core" / "_packed_docs" / "protocol"
 SKILL_ROOT = REPO_ROOT / "python" / "src" / "aun_core" / "docs" / "skill"
 SKILL_SDK_CORE = SKILL_ROOT / "sdk-core"
 
@@ -17,7 +21,12 @@ RPC_ALIASES = {
     "09-storage-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "storage" / "04-RPC-Manual.md",
     "09-stream-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "stream" / "04-RPC-Manual.md",
     "09-meta-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "meta" / "01-RPC-Manual.md",
+    "09-proxy-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "proxy" / "04-RPC-Manual.md",
 }
+
+PROTOCOL_FILES = [
+    "06-服务协议.md",
+]
 
 COMPAT_ALIASES = {
     "09-payload-reference.md": SKILL_SDK_CORE / "消息Payload参考约定.md",
@@ -44,6 +53,12 @@ def main() -> int:
         if alias is not None:
             copy_file(src, alias)
             copied += 1
+
+    for name in PROTOCOL_FILES:
+        copy_file(PROTOCOL_SOURCE / name, PROTOCOL_TARGET / name)
+        copy_file(PROTOCOL_SOURCE / name, PACKED_PROTOCOL_TARGET / name)
+        copied += 1
+        copied += 1
 
     print(f"[sync_docs] copied {copied} SDK doc files/aliases to {SKILL_ROOT}")
     return 0

@@ -23,7 +23,10 @@ class MockWebSocket extends EventEmitter {
   sent: string[] = [];
   close(): void { this.emit('close', 1000); }
   terminate(): void { /* noop */ }
-  send(data: string): void { this.sent.push(data); }
+  send(data: string, cb?: (err?: Error) => void): void {
+    this.sent.push(data);
+    cb?.();
+  }
 }
 
 // ── 辅助函数 ────────────────────────────────────────────────
@@ -161,7 +164,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
     const ws = new MockWebSocket();
     (transport as any)._ws = ws;
     (transport as any)._closed = false;
-    return { transport, ws };
+    return { transport, ws, dispatcher };
   }
 
   function createReadyTransportWithListeners(timeout = 10_000) {
@@ -272,5 +275,41 @@ describe('RPCTransport 后台 RPC 调度', () => {
     ws.emit('close', 4013);
 
     await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
+  });
+});
+
+describe('RPCTransport notify', () => {
+  it('发送 JSON-RPC Notification 时不应包含 id', async () => {
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({ eventDispatcher: dispatcher, verifySsl: false });
+    const ws = new MockWebSocket();
+    (transport as any)._ws = ws;
+    (transport as any)._closed = false;
+
+    await transport.notify('notification/client.activity', { state: 'idle' });
+
+    const sent = JSON.parse(ws.sent[0]);
+    expect(sent).toEqual({
+      jsonrpc: '2.0',
+      method: 'notification/client.activity',
+      params: { state: 'idle' },
+    });
+    expect(sent.id).toBeUndefined();
+  });
+
+  it('event/app.* 应直接发布为应用事件', async () => {
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({ eventDispatcher: dispatcher, verifySsl: false });
+    const received: unknown[] = [];
+    dispatcher.subscribe('app.typing', (payload) => { received.push(payload); });
+
+    (transport as any)._routeMessage({
+      jsonrpc: '2.0',
+      method: 'event/app.typing',
+      params: { thread_id: 't1' },
+    });
+    await Promise.resolve();
+
+    expect(received).toEqual([{ thread_id: 't1' }]);
   });
 });

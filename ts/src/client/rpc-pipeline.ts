@@ -74,7 +74,7 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
   'group.update_name', 'group.update_avatar', 'group.update_announcement',
   'group.update_settings',
-  'storage.upload', 'storage.complete_upload', 'storage.delete',
+  'storage.create_upload_session', 'storage.complete_upload', 'storage.delete_object',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member',

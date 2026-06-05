@@ -3,7 +3,7 @@
 export { VERSION as __version__ } from './version.js';
 
 // 客户端
-export { AUNClient, type ConnectionOptions } from './client.js';
+export { AUNClient, type ConnectionOptions, type NotifyOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
 export { AIDStore, type AIDInfo } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
@@ -75,6 +75,19 @@ export { CryptoProvider } from './crypto.js';
 
 // 传输层
 export { RPCTransport } from './transport.js';
+
+// Service Proxy
+export {
+  EmbeddedServiceRegistry,
+  EndpointPolicy,
+  ServiceProxyClient,
+  ServiceRecord,
+  type ServiceProxyClientOptions,
+  type ServiceSummary,
+  type WebSocketFactory,
+  type WebSocketFactoryOptions,
+  type WebSocketLike,
+} from './service-proxy.js';
 
 // 发现
 export { GatewayDiscovery } from './discovery.js';

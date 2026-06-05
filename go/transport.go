@@ -615,6 +615,55 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	}
 }
 
+// Notify 发送 JSON-RPC 2.0 Notification，不分配 id，也不等待响应。
+func (t *RPCTransport) Notify(ctx context.Context, method string, params map[string]any) error {
+	method = strings.TrimSpace(method)
+	if !strings.HasPrefix(method, "notification/") && !strings.HasPrefix(method, "event/") {
+		return NewValidationError("notify method must start with notification/ or event/")
+	}
+
+	t.closedMu.RLock()
+	ws := t.ws
+	if t.closed || ws == nil {
+		err := t.lastDisconnectErrorLocked()
+		t.closedMu.RUnlock()
+		pkgLogTransport().Error("notification send failed, transport not connected: method=%s", method)
+		return err
+	}
+	t.closedMu.RUnlock()
+
+	sendParams := make(map[string]any)
+	for k, v := range params {
+		sendParams[k] = v
+	}
+	request := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  sendParams,
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		pkgLogTransport().Error("failed to serialize notification: method=%s err=%v", method, err)
+		return NewSerializationError(fmt.Sprintf("failed to serialize notification: %v", err))
+	}
+	if len(data) > MaxWSPayloadSize {
+		return NewValidationError("payload is too large")
+	}
+
+	writeTimeout := t.getTimeout()
+	if writeTimeout <= 0 || writeTimeout > 30*time.Second {
+		writeTimeout = 30 * time.Second
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	if err := ws.Write(writeCtx, websocket.MessageText, data); err != nil {
+		pkgLogTransport().Error("failed to send notification: method=%s err=%v", method, err)
+		return NewConnectionError(fmt.Sprintf("failed to send notification %s: %v", method, err))
+	}
+	pkgLogTransport().Debug("notification sent: method=%s size=%d", method, len(data))
+	return nil
+}
+
 // recvInitialMessage 接收初始消息（通常为 challenge）
 // GO-015: 循环等待 challenge 消息，非 challenge 消息路由后继续等待，直到超时
 func (t *RPCTransport) recvInitialMessage(ctx context.Context) (map[string]any, error) {
@@ -786,6 +835,10 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 			}
 		}
 		pkgLogTransport().Debug("event recv: event=%s %s", sdkEvent, summarizeDict(params, diagResultFields))
+		if strings.HasPrefix(sdkEvent, "app.") {
+			go t.dispatcher.Publish(sdkEvent, params)
+			return
+		}
 		go t.dispatcher.Publish("_raw."+sdkEvent, params)
 		return
 	}

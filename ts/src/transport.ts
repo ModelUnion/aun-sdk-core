@@ -687,6 +687,47 @@ export class RPCTransport {
     });
   }
 
+  /** 发送 JSON-RPC 2.0 Notification，不分配 id，也不等待响应。 */
+  async notify(method: string, params?: RpcParams | null): Promise<void> {
+    if (this._closed || !this._ws) {
+      const suffix = this._lastCloseCode !== null ? `: close code ${this._lastCloseCode}` : '';
+      throw new ConnectionError(`transport not connected${suffix}`, {
+        ...(this._lastCloseCode !== null ? { code: this._lastCloseCode } : {}),
+      });
+    }
+    const normalizedMethod = String(method ?? '').trim();
+    if (!normalizedMethod.startsWith('notification/') && !normalizedMethod.startsWith('event/')) {
+      throw new ValidationError('notify method must start with notification/ or event/');
+    }
+    if (params !== undefined && params !== null && !isJsonObject(params)) {
+      throw new ValidationError('notify params must be an object');
+    }
+    const payload = JSON.stringify({
+      jsonrpc: '2.0',
+      method: normalizedMethod,
+      params: params ?? {},
+    });
+    const payloadSize = new TextEncoder().encode(payload).length;
+    if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
+      throw new ValidationError('payload is too large');
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      try {
+        this._ws!.send(payload, (err) => {
+          if (err) {
+            reject(new ConnectionError(`failed to send notification ${normalizedMethod}: ${err.message}`));
+            return;
+          }
+          this._logger.debug(`notification sent: method=${normalizedMethod}, size=${payloadSize}`);
+          resolve();
+        });
+      } catch (err) {
+        reject(new ConnectionError(`failed to send notification ${normalizedMethod}: ${err instanceof Error ? err.message : String(err)}`));
+      }
+    });
+  }
+
   private _removeRpc(rpcId: string, pending?: PendingRpc): void {
     const current = this._pending.get(rpcId);
     if (current && (!pending || current === pending)) {
@@ -887,6 +928,10 @@ export class RPCTransport {
         }
       }
       // 发布为 _raw.{event}，由 AUNClient 处理后再发布用户可见的事件
+      if (sdkEvent.startsWith('app.')) {
+        this._dispatcher.publish(sdkEvent, params as unknown as import('./types.js').JsonValue);
+        return;
+      }
       this._dispatcher.publish(`_raw.${sdkEvent}`, params as unknown as import('./types.js').JsonValue);
       return;
     }

@@ -9,8 +9,9 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - `AIDStore`：注册、加载、列举、解析和证书运维。
 - `AID`：不可变身份值对象，负责签名、验签和 agent.md 签验。
 - `AUNClient`：认证、连接、状态机、事件和 RPC。
+- `ServiceProxyClient`：Python SDK 的 Service Proxy provider 侧客户端，负责 Gateway 控制面注册和 proxy-server 数据面隧道注册。
 
-业务操作统一通过 `client.call(method, params)` 调用；消息、群组、存储、meta、stream 的参数见 `09-*-rpc-manual.md`。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。
+业务操作统一通过 `client.call(method, params)` 调用；消息、群组、存储、meta、stream、proxy 的参数见 `09-*-rpc-manual.md`。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。在线轻量通知和跨域 federation notify 方案见 `Notify通知方案.md`。
 
 ## 渐进式查阅流程
 
@@ -25,7 +26,8 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - 身份与认证：AIDStore / AID / 注册 / 加载 / 证书
 - 连接与状态：AUNClient / 九态状态机 / Gateway / 重连
 - E2EE：默认加密、ProtectedHeaders、P2P / Group V2
-- RPC 与事件：`client.call()`、`client.on()`、RPC 手册
+- RPC 与事件：`client.call()`、`client.on()`、`client.notify()`、RPC 手册
+- Service Proxy：`ServiceProxyClient`、`proxy.register_services`、proxy-server `register_services`
 - agent.md：`AIDStore.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
 - 错误处理：Result、异常、错误码、重试
 
@@ -42,10 +44,11 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 | 03 | [核心概念](03-核心概念.md) | AID、状态机、认证、E2EE |
 | 04 | [连接与认证](04-连接与认证.md) | AIDStore、连接、网关发现、事件 |
 | 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE、ProtectedHeaders、密钥管理 |
-| 06 | [API手册](06-API手册.md) | AIDStore / AID / AUNClient / 事件 / RPC |
+| 06 | [API手册](06-API手册.md) | AIDStore / AID / AUNClient / ServiceProxyClient / 事件 / RPC |
 | 07 | [错误处理](07-错误处理.md) | Result、异常、错误码、重试 |
 | 08 | [最佳实践](08-最佳实践.md) | 幂等、多 AID、资源清理、测试数据 |
 | 09 | `09-*-rpc-manual.md` | 各服务 RPC 参数和响应 |
+| 09 | [Service Proxy RPC手册](09-proxy-rpc-manual.md) | `proxy.*` 控制面和 proxy-server 数据面注册 |
 | 09 | [AID托管API手册](09-custody-api-manual.md) | 可选 custody HTTP 服务 |
 
 ## 常见查阅场景
@@ -59,6 +62,8 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 | 状态机和重连 | [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md) |
 | 查方法签名 | [06-API手册](06-API手册.md) |
 | 查消息或群组 RPC | 对应 `09-*-rpc-manual.md` |
+| 查 notify 在线轻量通知 / 跨域 federation | [Notify通知方案.md](Notify通知方案.md) |
+| 查 Service Proxy 服务注册和路由 | [06-API手册](06-API手册.md)、[09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) |
 | 查 payload 格式 | [09-payload-reference.md](09-payload-reference.md) |
 | 排查错误 | [07-错误处理](07-错误处理.md) |
 | 写测试或 demo | [08-最佳实践](08-最佳实践.md) |

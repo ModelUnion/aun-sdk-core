@@ -392,6 +392,15 @@ type ConnectionOptions struct {
 	BackgroundSync    bool           // 连接后是否启动后台同步
 }
 
+// NotifyOptions 控制轻量在线通知的路由目标。
+type NotifyOptions struct {
+	To       string // 目标 AID；为空且 GroupID 为空时表示直发 Gateway notification/*
+	GroupID  string // 群 ID；只通知当前在线成员设备
+	DeviceID string // 可选：限制到目标 AID 的某个设备
+	SlotID   string // 可选：限制到目标设备的某个 slot，必须同时提供 DeviceID
+	TTLMS    int    // 可选：0..60000ms；仅用于路由通知
+}
+
 // RetryConfig 重试配置
 type RetryConfig struct {
 	InitialDelay float64 // 初始延迟（秒）
@@ -421,30 +430,31 @@ const peerCertCacheTTL = 3600
 
 // P1-23: 非幂等方法使用更长超时（35s），避免 SDK 10s 超时 < gateway 30s 处理时间
 const nonIdempotentTimeout = 35 * time.Second
+const maxNotifyPayloadSize = 64 * 1024
 
 var nonIdempotentMethods = map[string]bool{
-	"message.send":              true,
-	"group.send":                true,
-	"group.create":              true,
-	"group.invite":              true,
-	"group.kick":                true,
-	"group.remove_member":       true,
-	"group.leave":               true,
-	"group.dissolve":            true,
-	"group.update_name":         true,
-	"group.update_avatar":       true,
-	"group.update_announcement": true,
-	"group.update_settings":     true,
-	"group.rotate_epoch":        true,
-	"storage.upload":            true,
-	"storage.complete_upload":   true,
-	"storage.delete":            true,
-	"auth.create_aid":           true,
-	"auth.renew_cert":           true,
-	"auth.rekey":                true,
-	"message.thought.put":       true,
-	"group.thought.put":         true,
-	"group.add_member":          true,
+	"message.send":                  true,
+	"group.send":                    true,
+	"group.create":                  true,
+	"group.invite":                  true,
+	"group.kick":                    true,
+	"group.remove_member":           true,
+	"group.leave":                   true,
+	"group.dissolve":                true,
+	"group.update_name":             true,
+	"group.update_avatar":           true,
+	"group.update_announcement":     true,
+	"group.update_settings":         true,
+	"group.rotate_epoch":            true,
+	"storage.create_upload_session": true,
+	"storage.complete_upload":       true,
+	"storage.delete_object":         true,
+	"auth.create_aid":               true,
+	"auth.renew_cert":               true,
+	"auth.rekey":                    true,
+	"message.thought.put":           true,
+	"group.thought.put":             true,
+	"group.add_member":              true,
 }
 
 // cachedPeerCert 缓存的对端证书条目
@@ -1130,6 +1140,110 @@ func (c *AUNClient) Close() (err error) {
 // Call 发送 RPC 调用（自动 E2EE 加解密）
 func (c *AUNClient) Call(ctx context.Context, method string, params map[string]any) (result any, err error) {
 	return c.getRpcPipeline().call(ctx, method, params)
+}
+
+func notifyParamsSizeOK(params map[string]any) bool {
+	data, err := jsonMarshalNoHTMLEscape(params)
+	return err == nil && len(data) <= maxNotifyPayloadSize
+}
+
+func validateNotifyEventMethod(method string) (string, error) {
+	method = strings.TrimSpace(method)
+	if !strings.HasPrefix(method, "event/app.") || len(method) <= len("event/app.") {
+		return "", NewValidationError("routed notify method must be event/app.*")
+	}
+	return method, nil
+}
+
+func normalizeNotifyTTL(ttl int) (int, error) {
+	if ttl < 0 || ttl > 60000 {
+		return 0, NewValidationError("ttl_ms must be between 0 and 60000")
+	}
+	return ttl, nil
+}
+
+// Notify 发送轻量在线通知，不走离线存储、seq/pull 或 ack。
+func (c *AUNClient) Notify(ctx context.Context, method string, params map[string]any, opts ...NotifyOptions) error {
+	if len(opts) > 1 {
+		return NewValidationError("Notify accepts at most one options value")
+	}
+	opt := NotifyOptions{}
+	if len(opts) == 1 {
+		opt = opts[0]
+	}
+	payload := copyRpcParams(params)
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if !notifyParamsSizeOK(payload) {
+		return NewValidationError("notify payload is too large")
+	}
+
+	targetAID := strings.TrimSpace(opt.To)
+	targetGroupID := strings.TrimSpace(opt.GroupID)
+	targetDeviceID := strings.TrimSpace(opt.DeviceID)
+	targetSlotID := strings.TrimSpace(opt.SlotID)
+	ttl, err := normalizeNotifyTTL(opt.TTLMS)
+	if err != nil {
+		return err
+	}
+
+	if targetAID != "" && targetGroupID != "" {
+		return NewValidationError("notify() cannot set both To and GroupID")
+	}
+	if targetSlotID != "" && targetDeviceID == "" {
+		return NewValidationError("SlotID requires DeviceID for notify target")
+	}
+
+	if targetAID != "" {
+		eventMethod, err := validateNotifyEventMethod(method)
+		if err != nil {
+			return err
+		}
+		target := map[string]any{"type": "aid", "aid": targetAID}
+		if targetDeviceID != "" {
+			target["device_id"] = targetDeviceID
+		}
+		if targetSlotID != "" {
+			target["slot_id"] = targetSlotID
+		}
+		routeParams := map[string]any{
+			"target":  target,
+			"deliver": map[string]any{"method": eventMethod, "params": payload},
+		}
+		if ttl > 0 {
+			routeParams["ttl_ms"] = ttl
+		}
+		return c.transport.Notify(ctx, "notification/route", routeParams)
+	}
+
+	if targetGroupID != "" {
+		eventMethod, err := validateNotifyEventMethod(method)
+		if err != nil {
+			return err
+		}
+		normalizedGroupID := NormalizeGroupID(targetGroupID, "")
+		if normalizedGroupID == "" {
+			return NewValidationError("group_id is required for group notify")
+		}
+		routeParams := map[string]any{
+			"group_id": normalizedGroupID,
+			"deliver":  map[string]any{"method": eventMethod, "params": payload},
+		}
+		if ttl > 0 {
+			routeParams["ttl_ms"] = ttl
+		}
+		return c.transport.Notify(ctx, "notification/group.route", routeParams)
+	}
+
+	if targetDeviceID != "" || targetSlotID != "" {
+		return NewValidationError("DeviceID and SlotID require To")
+	}
+	directMethod := strings.TrimSpace(method)
+	if !strings.HasPrefix(directMethod, "notification/") {
+		return NewValidationError("direct notify method must start with notification/")
+	}
+	return c.transport.Notify(ctx, directMethod, payload)
 }
 
 // signClientOperation 为关键操作附加客户端 ECDSA 签名。

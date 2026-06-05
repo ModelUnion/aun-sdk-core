@@ -96,6 +96,7 @@ _HEARTBEAT_MIN_INTERVAL = 10.0
 _HEARTBEAT_MAX_INTERVAL = 600.0
 _ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
 _ONLINE_UNREAD_HINT_INTERVAL = 0.05
+_MAX_NOTIFY_PAYLOAD_SIZE = 64 * 1024
 
 
 def _clamp_heartbeat_interval(value: Any) -> float:
@@ -207,7 +208,7 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "group.kick", "group.remove_member", "group.leave", "group.dissolve",
     "group.update_name", "group.update_avatar", "group.update_announcement",
     "group.update_settings", "group.rotate_epoch",
-    "storage.upload", "storage.complete_upload", "storage.delete",
+    "storage.create_upload_session", "storage.complete_upload", "storage.delete_object",
     "auth.create_aid", "auth.renew_cert", "auth.rekey",
     "message.thought.put", "group.thought.put",
     "group.add_member",
@@ -958,6 +959,96 @@ class AUNClient:
 
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         return await self._rpc().call(method, params, trace=trace)
+
+    @staticmethod
+    def _notify_params_size_ok(params: dict[str, Any]) -> bool:
+        try:
+            return len(json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= _MAX_NOTIFY_PAYLOAD_SIZE
+        except Exception:
+            return False
+
+    @staticmethod
+    def _validate_notify_event_method(method: str) -> str:
+        method = str(method or "").strip()
+        if not method.startswith("event/app.") or len(method) <= len("event/app."):
+            raise ValidationError("routed notify method must be event/app.*")
+        return method
+
+    @staticmethod
+    def _normalize_notify_ttl(ttl_ms: int | None) -> int | None:
+        if ttl_ms is None:
+            return None
+        try:
+            ttl = int(ttl_ms)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("ttl_ms must be an integer") from exc
+        if ttl < 0 or ttl > 60000:
+            raise ValidationError("ttl_ms must be between 0 and 60000")
+        return ttl
+
+    async def notify(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        to: str | None = None,
+        group_id: str | None = None,
+        device_id: str | None = None,
+        slot_id: str | None = None,
+        ttl_ms: int | None = None,
+    ) -> None:
+        if params is not None and not isinstance(params, dict):
+            raise ValidationError("notify params must be a dict")
+        payload = dict(params or {})
+        if not self._notify_params_size_ok(payload):
+            raise ValidationError("notify payload is too large")
+        target_aid = str(to or "").strip()
+        target_group_id = str(group_id or "").strip()
+        target_device_id = str(device_id or "").strip()
+        target_slot_id = str(slot_id or "").strip()
+        ttl = self._normalize_notify_ttl(ttl_ms)
+
+        if target_aid and target_group_id:
+            raise ValidationError("notify() cannot set both to and group_id")
+        if target_slot_id and not target_device_id:
+            raise ValidationError("slot_id requires device_id for notify target")
+
+        if target_aid:
+            event_method = self._validate_notify_event_method(method)
+            target: dict[str, Any] = {"type": "aid", "aid": target_aid}
+            if target_device_id:
+                target["device_id"] = target_device_id
+            if target_slot_id:
+                target["slot_id"] = target_slot_id
+            route_params: dict[str, Any] = {
+                "target": target,
+                "deliver": {"method": event_method, "params": payload},
+            }
+            if ttl is not None:
+                route_params["ttl_ms"] = ttl
+            await self._transport.notify("notification/route", route_params)
+            return
+
+        if target_group_id:
+            event_method = self._validate_notify_event_method(method)
+            normalized_group_id = _normalize_group_id(target_group_id)
+            if not normalized_group_id:
+                raise ValidationError("group_id is required for group notify")
+            route_params = {
+                "group_id": normalized_group_id,
+                "deliver": {"method": event_method, "params": payload},
+            }
+            if ttl is not None:
+                route_params["ttl_ms"] = ttl
+            await self._transport.notify("notification/group.route", route_params)
+            return
+
+        if target_device_id or target_slot_id:
+            raise ValidationError("device_id and slot_id require to")
+        direct_method = str(method or "").strip()
+        if not direct_method.startswith("notification/"):
+            raise ValidationError("direct notify method must start with notification/")
+        await self._transport.notify(direct_method, payload)
 
     @staticmethod
     def _protected_headers_from_params(params: dict[str, Any]) -> dict[str, Any] | ProtectedHeaders | None:

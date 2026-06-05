@@ -767,6 +767,91 @@ async def test_storage_validation_ttl_and_upload_conflicts():
         await alice.close()
 
 
+async def test_storage_cas_dedup_and_instant_upload_download():
+    """覆盖 CAS 去重与秒传：多个对象共享同一内容时，每个对象都必须能真实下载。
+
+    复现并验证 folder-path/CAS-path 映射 bug 的修复：
+    - 对象1 首传同内容
+    - 对象2 同内容（不同 owner_aid + object_key），走 check_upload 秒传
+    - 两个对象的下载 URL 经签名→302→后端，都必须下到正确内容（非 404）
+    """
+    rid = uuid.uuid4().hex[:10]
+    alice = _make_client()
+    bob = _make_client()
+    bucket = f"storage-dedup-{rid}"
+    key1 = f"dedup/{rid}/file1.bin"
+    key2 = f"dedup/{rid}/file2.bin"
+    payload = (b"AUN-CAS-DEDUP-" + rid.encode("ascii")) * 4096  # 大于 inline 上限
+    sha256 = hashlib.sha256(payload).hexdigest()
+
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+
+        # ---- 对象1（alice）：首传，真实 PUT 上传 ----
+        s1 = await alice.call("storage.create_upload_session", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key1,
+            "size_bytes": len(payload), "expire_in_seconds": 300,
+        })
+        status, _ = await _http_request(
+            str(s1.get("upload_url") or ""), method="PUT", payload=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if status < 200 or status >= 300:
+            raise AssertionError(f"对象1 HTTP PUT 上传失败: status={status}")
+        await alice.call("storage.complete_upload", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key1,
+            "is_private": False, "sha256": sha256, "size_bytes": len(payload),
+            "expire_in_seconds": 300,
+        })
+
+        # ---- 对象1 下载验证（首传内容必须可下载）----
+        t1 = await bob.call("storage.create_download_ticket", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key1,
+            "expire_in_seconds": 300,
+        })
+        _, body1 = await _http_request(str(t1.get("download_url") or ""))
+        if body1 != payload:
+            raise AssertionError("对象1 下载内容与上传不一致（首传对象悬空）")
+
+        # ---- 对象2（bob）：同内容，check_upload 命中应秒传 ----
+        chk = await bob.call("storage.check_upload", {
+            "sha256": sha256, "size_bytes": len(payload),
+        })
+        if chk.get("exists") is not True or chk.get("skip_upload") is not True:
+            raise AssertionError(f"check_upload 未命中去重: {chk}")
+
+        await bob.call("storage.create_upload_session", {
+            "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
+            "size_bytes": len(payload), "expire_in_seconds": 300,
+        })
+        completed2 = await bob.call("storage.complete_upload", {
+            "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
+            "is_private": False, "sha256": sha256, "size_bytes": len(payload),
+            "skip_blob": True, "expire_in_seconds": 300,
+        })
+        if completed2.get("sha256") != sha256:
+            raise AssertionError(f"秒传 complete_upload sha256 异常: {completed2}")
+
+        # ---- 对象2 下载验证（秒传对象必须可下载，这是 bug 的核心症状）----
+        t2 = await bob.call("storage.create_download_ticket", {
+            "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
+            "expire_in_seconds": 300,
+        })
+        download_url2 = str(t2.get("download_url") or "")
+        _assert_non_loopback_url(download_url2, "对象2 download_url")
+        status2, body2 = await _http_request(download_url2)
+        if status2 != 200:
+            raise AssertionError(f"对象2（秒传）下载失败 status={status2}（CAS 路径悬空 404）")
+        if body2 != payload:
+            raise AssertionError("对象2（秒传）下载内容与上传不一致")
+
+        _ok("storage_cas_dedup_and_instant_upload_download")
+    finally:
+        await bob.close()
+        await alice.close()
+
+
 async def test_storage_share_links_and_short_urls():
     """覆盖分享链接 RPC、短链接 HTTP 下载、授权名单、次数限制和撤销。"""
     rid = uuid.uuid4().hex[:10]
@@ -898,6 +983,107 @@ async def test_storage_share_links_and_short_urls():
         await alice.close()
 
 
+async def _http_status(url: str, *, headers: dict | None = None) -> tuple[int, bytes]:
+    """GET 并返回 (status, body)，4xx/5xx 不抛异常（用于断言鉴权码）。"""
+    import urllib.error
+
+    def _run():
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, method="GET")
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        try:
+            with opener.open(req, timeout=20) as resp:
+                return int(resp.status), resp.read()
+        except urllib.error.HTTPError as e:
+            return int(e.code), e.read()
+
+    return await asyncio.to_thread(_run)
+
+
+async def test_storage_logical_url_public_and_private():
+    """逻辑 URL（无签名）：公开文件免鉴权可访问，私有文件需 AID bearer token。"""
+    rid = uuid.uuid4().hex[:10]
+    alice = _make_client()
+    bob = _make_client()
+    bucket = "default"  # 逻辑 URL 仅支持 default bucket
+    pub_key = f"logical/{rid}/pub.bin"
+    priv_key = f"logical/{rid}/priv.bin"
+    pub_body = (b"LOGICAL-PUB-" + rid.encode()) * 4096
+    priv_body = (b"LOGICAL-PRIV-" + rid.encode()) * 4096
+
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+
+        # 上传公开 + 私有大文件
+        for okey, body, is_priv in [(pub_key, pub_body, False), (priv_key, priv_body, True)]:
+            s = await alice.call("storage.create_upload_session", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": okey,
+                "size_bytes": len(body), "expire_in_seconds": 300,
+            })
+            st, _ = await _http_request(str(s.get("upload_url") or ""), method="PUT",
+                                        payload=body, headers={"Content-Type": "application/octet-stream"})
+            if st < 200 or st >= 300:
+                raise AssertionError(f"上传失败 {okey}: status={st}")
+            await alice.call("storage.complete_upload", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": okey,
+                "is_private": is_priv, "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body), "expire_in_seconds": 300,
+            })
+
+        # ticket 必须返回干净 logical_url（无 cas、无签名）
+        ticket = await alice.call("storage.create_download_ticket", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": pub_key,
+        })
+        logical_url = str(ticket.get("logical_url") or "")
+        if not logical_url:
+            raise AssertionError(f"ticket 未返回 logical_url: {ticket}")
+        if "cas/" in logical_url or "expire=" in logical_url or "sig=" in logical_url:
+            raise AssertionError(f"logical_url 不干净: {logical_url}")
+        _assert_non_loopback_url(logical_url, "logical_url")
+        if "/alice/" not in logical_url:
+            raise AssertionError(f"logical_url 用户段不符: {logical_url}")
+
+        # 公开文件：无 token 直接访问
+        st, body = await _http_status(logical_url)
+        if st != 200 or body != pub_body:
+            raise AssertionError(f"公开 logical_url 访问失败: status={st} len={len(body)}")
+
+        # 私有文件逻辑 URL
+        priv_logical = logical_url.replace(pub_key, priv_key)
+        # 无 token → 403
+        st_no, _ = await _http_status(priv_logical)
+        if st_no != 403:
+            raise AssertionError(f"私有文件无 token 应 403，实际 {st_no}")
+        # 带 owner 的 AID token → 200
+        token = alice.access_token
+        if not token:
+            raise AssertionError("alice.access_token 为空，无法测私有鉴权")
+        st_ok, body_ok = await _http_status(priv_logical, headers={"Authorization": f"Bearer {token}"})
+        if st_ok != 200 or body_ok != priv_body:
+            raise AssertionError(f"私有文件带 token 访问失败: status={st_ok} len={len(body_ok)}")
+        # 非 owner（bob）的 token → 403
+        bob_token = bob.access_token
+        st_bob, _ = await _http_status(priv_logical, headers={"Authorization": f"Bearer {bob_token}"})
+        if st_bob != 403:
+            raise AssertionError(f"非 owner token 应 403，实际 {st_bob}")
+
+        _ok("storage_logical_url_public_and_private")
+    finally:
+        for okey in (pub_key, priv_key):
+            try:
+                await alice.call("storage.delete_object", {
+                    "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": okey})
+            except Exception:
+                pass
+        await bob.close()
+        await alice.close()
+
+
 async def main():
     global _failed
 
@@ -910,9 +1096,11 @@ async def main():
     tests = [
         test_storage_inline_permissions_events_and_quota,
         test_storage_upload_session_roundtrip_and_download_ticket,
+        test_storage_cas_dedup_and_instant_upload_download,
         test_storage_prefix_pagination_and_version_conflict,
         test_storage_validation_ttl_and_upload_conflicts,
         test_storage_share_links_and_short_urls,
+        test_storage_logical_url_public_and_private,
     ]
 
     for fn in tests:

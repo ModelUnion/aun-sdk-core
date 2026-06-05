@@ -171,6 +171,18 @@ export interface ConnectionOptions {
   background_sync?: boolean;
 }
 
+export interface NotifyOptions {
+  to?: string;
+  group_id?: string;
+  groupId?: string;
+  device_id?: string;
+  deviceId?: string;
+  slot_id?: string;
+  slotId?: string;
+  ttl_ms?: number;
+  ttlMs?: number;
+}
+
 interface ConnectParams extends RpcParams {
   access_token?: string;
   gateway?: string;
@@ -216,6 +228,7 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
 const RECONNECT_MIN_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_BASE_DELAY_MS = 64_000;
 const TOKEN_REFRESH_CHECK_INTERVAL_MS = 30_000;
+const MAX_NOTIFY_PAYLOAD_SIZE = 64 * 1024;
 
 // 心跳间隔下/上限（秒）。0 = 关闭心跳；负值视为 0；其余值 clamp 到 [10, 600]。
 // 服务端通过 hello.heartbeat_interval 与 meta.ping pong 中的同名字段下发。
@@ -237,7 +250,7 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
   'group.update_name', 'group.update_avatar', 'group.update_announcement',
   'group.update_settings',
-  'storage.upload', 'storage.complete_upload', 'storage.delete',
+  'storage.create_upload_session', 'storage.complete_upload', 'storage.delete_object',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member',
@@ -1090,6 +1103,94 @@ export class AUNClient {
    */
   async call(method: string, params?: RpcParams): Promise<RpcResult> {
     return await this._rpcPipeline.call(method, params);
+  }
+
+  private static _notifyParamsSizeOk(params: RpcParams): boolean {
+    return new TextEncoder().encode(JSON.stringify(params)).length <= MAX_NOTIFY_PAYLOAD_SIZE;
+  }
+
+  private static _validateNotifyEventMethod(method: string): string {
+    const normalized = String(method ?? '').trim();
+    if (!normalized.startsWith('event/app.') || normalized.length <= 'event/app.'.length) {
+      throw new ValidationError('routed notify method must be event/app.*');
+    }
+    return normalized;
+  }
+
+  private static _normalizeNotifyTtl(value: unknown): number | undefined {
+    if (value === undefined || value === null) return undefined;
+    const ttl = Number(value);
+    if (!Number.isInteger(ttl)) {
+      throw new ValidationError('ttl_ms must be an integer');
+    }
+    if (ttl < 0 || ttl > 60000) {
+      throw new ValidationError('ttl_ms must be between 0 and 60000');
+    }
+    return ttl;
+  }
+
+  /**
+   * 发送轻量在线通知，不走离线存储、seq/pull 或 ack。
+   */
+  async notify(method: string, params?: RpcParams, options: NotifyOptions = {}): Promise<void> {
+    if (params !== undefined && params !== null && !isJsonObject(params)) {
+      throw new ValidationError('notify params must be an object');
+    }
+    const payload: RpcParams = { ...(params ?? {}) };
+    if (!AUNClient._notifyParamsSizeOk(payload)) {
+      throw new ValidationError('notify payload is too large');
+    }
+
+    const targetAid = String(options.to ?? '').trim();
+    const targetGroupId = String(options.group_id ?? options.groupId ?? '').trim();
+    const targetDeviceId = String(options.device_id ?? options.deviceId ?? '').trim();
+    const targetSlotId = String(options.slot_id ?? options.slotId ?? '').trim();
+    const ttl = AUNClient._normalizeNotifyTtl(options.ttl_ms ?? options.ttlMs);
+
+    if (targetAid && targetGroupId) {
+      throw new ValidationError('notify() cannot set both to and group_id');
+    }
+    if (targetSlotId && !targetDeviceId) {
+      throw new ValidationError('slot_id requires device_id for notify target');
+    }
+
+    if (targetAid) {
+      const eventMethod = AUNClient._validateNotifyEventMethod(method);
+      const target: JsonObject = { type: 'aid', aid: targetAid };
+      if (targetDeviceId) target.device_id = targetDeviceId;
+      if (targetSlotId) target.slot_id = targetSlotId;
+      const routeParams: RpcParams = {
+        target,
+        deliver: { method: eventMethod, params: payload },
+      };
+      if (ttl !== undefined) routeParams.ttl_ms = ttl;
+      await this._transport.notify('notification/route', routeParams);
+      return;
+    }
+
+    if (targetGroupId) {
+      const eventMethod = AUNClient._validateNotifyEventMethod(method);
+      const normalizedGroupId = normalizeGroupId(targetGroupId);
+      if (!normalizedGroupId) {
+        throw new ValidationError('group_id is required for group notify');
+      }
+      const routeParams: RpcParams = {
+        group_id: normalizedGroupId,
+        deliver: { method: eventMethod, params: payload },
+      };
+      if (ttl !== undefined) routeParams.ttl_ms = ttl;
+      await this._transport.notify('notification/group.route', routeParams);
+      return;
+    }
+
+    if (targetDeviceId || targetSlotId) {
+      throw new ValidationError('device_id and slot_id require to');
+    }
+    const directMethod = String(method ?? '').trim();
+    if (!directMethod.startsWith('notification/')) {
+      throw new ValidationError('direct notify method must start with notification/');
+    }
+    await this._transport.notify(directMethod, payload);
   }
 
   // ── 事件 ──────────────────────────────────────────────────

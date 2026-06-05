@@ -23,7 +23,9 @@
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
+| [09-proxy-rpc-manual](09-proxy-rpc-manual.md) | Service Proxy 控制面 RPC 和数据面隧道注册 |
 | [09-custody-api-manual](09-custody-api-manual.md) | 可选 AID 托管 HTTP API |
+| [Notify通知方案](Notify通知方案.md) | `client.notify()` 在线轻量通知、跨域 federation 和可靠消息分工 |
 
 ---
 
@@ -55,11 +57,13 @@
 ### RPC 与事件
 
 - `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
+- `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
 - Group RPC → [09-group-rpc-manual](09-group-rpc-manual.md)
 - Storage RPC → [09-storage-rpc-manual](09-storage-rpc-manual.md)
 - Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)
+- Service Proxy RPC 和隧道注册 → [09-proxy-rpc-manual](09-proxy-rpc-manual.md)
 - Payload 格式 → [09-payload-reference](09-payload-reference.md)
 
 ### 错误与测试
@@ -95,7 +99,7 @@
 
 ### 06-API手册
 
-列出 AIDStore、AID、AUNClient、事件、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
+列出 AIDStore、AID、AUNClient、事件、ServiceProxyClient、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
 
 ### 07-错误处理
 
@@ -108,3 +112,11 @@
 ### 09-*-rpc-manual
 
 各业务服务的 RPC 参数、响应和错误语义。SDK 不为每个 RPC 提供一层业务 wrapper，应用直接通过 `client.call()` 调用。
+
+### 09-proxy-rpc-manual
+
+定义 Service Proxy 的 Gateway 控制面 `proxy.register_services` / `proxy.unregister_services` / `proxy.list_services`，以及 proxy-server 数据面 `register_services` 隧道消息、双注册顺序、服务列表一致性和 wakeup 路由语义。
+
+### Notify通知方案
+
+定义 `client.notify()` 的在线轻量通知语义、服务端/AID/群路由方式、跨域 federation 在线转发、无离线存储边界、安全约束，以及与 `message.send` / `group.send` 可靠应用事件的分工。

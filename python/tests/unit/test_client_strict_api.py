@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from aun_core import AIDStore, AUNClient
+from aun_core import AIDStore, AUNClient, ConnectionState
 from aun_core.errors import ValidationError
 
 from test_client_state_machine import _load_local_aid
@@ -343,6 +344,37 @@ def test_client_does_not_expose_removed_namespaces():
     assert not hasattr(client, "auth")
     assert not hasattr(client, "meta")
     assert not hasattr(client, "custody")
+
+
+def test_client_does_not_expose_proxy_control_surface_by_default():
+    client = AUNClient()
+
+    for name in (
+        "proxy",
+        "proxy_client",
+        "start_proxy",
+        "stop_proxy",
+        "connect_proxy",
+        "register_proxy_service",
+        "unregister_proxy_service",
+        "list_proxy_services",
+    ):
+        assert not hasattr(client, name)
+
+
+@pytest.mark.asyncio
+async def test_client_constructor_does_not_start_proxy_background_tasks():
+    before = set()
+    current = asyncio.current_task()
+    for task in asyncio.all_tasks():
+        if task is not current:
+            before.add(task)
+
+    client = AUNClient()
+    assert client.state == ConnectionState.NO_IDENTITY
+
+    after = {task for task in asyncio.all_tasks() if task is not current}
+    assert after - before == set()
 
 
 @pytest.mark.asyncio

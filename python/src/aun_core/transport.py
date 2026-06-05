@@ -396,6 +396,32 @@ class RPCTransport:
         finally:
             sem.release()
 
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        if self._closed or self._ws is None:
+            self._log.warn("transport", "notification send failed (not connected): method=%s", method)
+            raise ConnectionError("transport not connected")
+        method = str(method or "").strip()
+        if not method.startswith(("notification/", "event/")):
+            raise ValidationError("notify method must start with notification/ or event/")
+        if params is not None and not isinstance(params, dict):
+            raise ValidationError("notify params must be a dict")
+
+        envelope = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": dict(params or {}),
+        }
+        payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        payload_bytes = payload.encode("utf-8")
+        if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
+            raise ValidationError("payload is too large")
+        try:
+            await self._ws.send(payload)
+        except Exception as exc:
+            self._log.warn("transport", "notification send failed: method=%s err=%s", method, exc)
+            raise ConnectionError(f"failed to send notification {method}: {exc}") from exc
+        self._log.debug("transport", "notification sent: method=%s size=%d", method, len(payload_bytes))
+
     async def _call_inner(self, method: str, params: dict[str, Any] | None = None, *, effective_timeout: float, trace: str | None = None, t0: float) -> Any:
         import time as _diag_time
         _t0 = t0
@@ -626,6 +652,9 @@ class RPCTransport:
                                    event_trace.get("trace_id", ""), sdk_event)
             if "v2" in sdk_event:
                 self._log.debug("transport", "V2 event arrived at transport: %s params_keys=%s", sdk_event, list(params.keys()) if isinstance(params, dict) else "?")
+            if sdk_event.startswith("app."):
+                await self._dispatcher.publish(sdk_event, params)
+                return
             asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))
             return
 

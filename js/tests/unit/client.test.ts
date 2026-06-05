@@ -130,6 +130,54 @@ describe('AUNClient.call 状态检查', () => {
   });
 });
 
+describe('AUNClient.notify', () => {
+  it('to 目标应包装为 notification/route', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.notify = vi.fn().mockResolvedValue(undefined);
+
+    await client.notify(
+      'event/app.typing',
+      { thread_id: 't1' },
+      { to: 'bob.agentid.pub', device_id: 'dev-1', slot_id: 'slot-1', ttl_ms: 5000 },
+    );
+
+    expect((client as any)._transport.notify).toHaveBeenCalledWith(
+      'notification/route',
+      {
+        target: {
+          type: 'aid',
+          aid: 'bob.agentid.pub',
+          device_id: 'dev-1',
+          slot_id: 'slot-1',
+        },
+        deliver: {
+          method: 'event/app.typing',
+          params: { thread_id: 't1' },
+        },
+        ttl_ms: 5000,
+      },
+    );
+  });
+
+  it('group_id 目标应包装为 notification/group.route', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.notify = vi.fn().mockResolvedValue(undefined);
+
+    await client.notify('event/app.presence', { state: 'active' }, { group_id: 'g-room.agentid.pub' });
+
+    expect((client as any)._transport.notify).toHaveBeenCalledWith(
+      'notification/group.route',
+      {
+        group_id: 'group.agentid.pub/g-room',
+        deliver: {
+          method: 'event/app.presence',
+          params: { state: 'active' },
+        },
+      },
+    );
+  });
+});
+
 describe('AUNClient.close', () => {
   it('idle 状态关闭应安全', async () => {
     const client = new AUNClient();

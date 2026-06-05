@@ -439,13 +439,17 @@ async def test_reconnect_flow_refreshes_stale_access_token(tmp_path, local_gatew
         for ws in list(local_gateway.state.websockets):
             await ws.close()
 
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=3)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=5)
         while datetime.now(timezone.utc) < deadline:
-            if local_gateway.state.refresh_calls:
+            refreshed_connect_seen = any(token != stale_token for token in local_gateway.state.connect_tokens)
+            if local_gateway.state.refresh_calls and refreshed_connect_seen and client.state.value == "ready":
                 break
             await asyncio.sleep(0.05)
 
-        assert client.state.value == "ready"
+        assert client.state.value == "ready", {
+            "refresh_calls": list(local_gateway.state.refresh_calls),
+            "connect_tokens": list(local_gateway.state.connect_tokens),
+        }
         assert local_gateway.state.refresh_calls == [auth["refresh_token"]]
         assert local_gateway.state.connect_tokens.count(stale_token) >= 2
         assert any(token != stale_token for token in local_gateway.state.connect_tokens)

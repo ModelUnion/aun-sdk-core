@@ -8,6 +8,7 @@
 - [AID](#aid)
 - [AUNClient](#aunclient)
 - [事件](#事件)
+- [ServiceProxyClient](#serviceproxyclient)
 - [E2EE 高级 API](#e2ee-高级-api)
 - [RPC 方法参考](#rpc-方法参考)
 - [Stream 使用指南](#stream-使用指南)
@@ -246,6 +247,41 @@ await client.call("meta.status", {})
 await client.call("meta.trust_roots", {})
 ```
 
+### Notify
+
+`notify()` 发送轻量在线通知，底层是 JSON-RPC Notification，无 `id`，不进入离线存储、seq、pull 或 ack。
+
+| Python | TS/JS | Go | 说明 |
+|--------|-------|----|------|
+| `notify(method, params=None, *, to=None, group_id=None, device_id=None, slot_id=None, ttl_ms=None)` | `notify(method, params?, options?)` | `Notify(ctx, method, params, NotifyOptions{...})` | 发送在线轻量通知 |
+
+常见用法：
+
+```python
+await client.notify("notification/client.activity", {"state": "idle"})
+await client.notify("event/app.typing", {"thread_id": "t1"}, to="bob.agentid.pub", ttl_ms=5000)
+await client.notify("event/app.presence", {"state": "active"}, group_id="group.agentid.pub/123")
+```
+
+路由选项：
+
+| 选项 | 说明 |
+|------|------|
+| `to` / `To` | 目标 AID；可同域或跨域 |
+| `group_id` / `groupId` / `GroupID` | 目标群；与 `to` 互斥 |
+| `device_id` / `deviceId` / `DeviceID` | 限定目标 AID 的在线设备；必须配合 `to` |
+| `slot_id` / `slotId` / `SlotID` | 限定目标设备的在线 slot；必须配合 `device_id` |
+| `ttl_ms` / `ttlMs` / `TTLMS` | `0..60000`，只控制在线投递过期，不表示离线缓存 |
+
+约束：
+
+- 未指定 `to` / `group_id` 时，`method` 必须以 `notification/` 开头，表示直发 Gateway 的协议级通知。
+- 指定 `to` 或 `group_id` 时，`method` 必须是 `event/app.*`，接收端通过 `client.on("app.xxx", handler)` 订阅。
+- 跨域 AID notify 已支持 federation 在线转发，但仍是 best-effort；目标离线或 federation 不可用时丢弃。
+- 可靠、敏感或需要审计的业务事件应继续使用 `message.send` / `group.send`。
+
+详细语义见 [Notify通知方案.md](Notify通知方案.md)。
+
 ### protected_headers
 
 ```python
@@ -275,6 +311,55 @@ headers = client.get_protected_headers()
 - 上传要求目标 AID 已在本地加载且私钥有效；SDK 会对正文签名，并通过 `AuthFlow` 获取或复用该 AID 的 access_token。
 - SDK 发起 GET 时只发送 `Accept: text/markdown`，不主动发送 `If-None-Match` / `If-Modified-Since`。如果服务端异常返回 304，本地有内容则复用；无内容时再发一次无条件 GET。
 - `Accept: text/markdown` 与 agent.md 的 YAML frontmatter + Markdown 格式兼容；agent.md 仍是 Markdown 媒体类型上的结构化约定。
+
+---
+
+## ServiceProxyClient
+
+Service Proxy 用于 provider 通过 AUN 身份暴露本地 HTTP / WebSocket 服务。当前公开封装在 Python SDK 的 `ServiceProxyClient` 中；其它语言可以按 [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) 直接实现同等控制面和隧道消息。
+
+```python
+from aun_core.service_proxy import ServiceProxyClient
+
+proxy_client = ServiceProxyClient(
+    provider_aid="alice.agentid.pub",
+    aun_client=client,
+)
+proxy_client.register_service(
+    "fileshare",
+    "http://127.0.0.1:8080",
+    visibility="public",
+)
+await proxy_client.serve_forever()
+```
+
+proxy-server 连接地址不能由应用外部传入或配置。`ServiceProxyClient` 会先读取 provider AID 本地 SQLite metadata 中 1 小时 TTL 的 `service_proxy_discovery` 缓存；缓存缺失或过期时，按协议查询 `https://{provider_aid}/.well-known/aun-proxy`，失败后回退 `https://proxy.{issuer}/.well-known/aun-proxy`，并使用返回的 `ws_url` 建立隧道。
+
+关键 API：
+
+| Python | 说明 |
+|--------|------|
+| `register_service(service_name, endpoint, service_type="http", visibility="private", metadata=None)` | 注册本地 embedded endpoint |
+| `unregister_service(service_name)` | 注销本地服务 |
+| `list_service_summaries()` | 获取可上报到 Gateway 和 proxy-server 的服务摘要 |
+| `register_services_with_gateway()` | 显式调用 Gateway `proxy.register_services` |
+| `unregister_services_from_gateway(service_names=None)` | 显式调用 Gateway `proxy.unregister_services` |
+| `list_gateway_services()` | 显式调用 Gateway `proxy.list_services` |
+| `register_services_with_proxy_server(ws)` | 通过已认证 proxy-server 隧道发送 `register_services` |
+| `discover_proxy_server(force_refresh=False)` | 通过缓存 / well-known 发现 proxy-server |
+| `connect_once()` | 建立一次 proxy-server 隧道并完成认证、数据面注册和可选心跳 |
+| `serve_once()` | 处理有限数量的 proxy-server 转发请求 |
+| `serve_forever(connection_mode="persistent")` | 持续提供 Service Proxy 服务；支持 persistent / on_demand |
+
+自动注册顺序：
+
+- `connect_once()`、`serve_once()`、`serve_forever()` 在存在 `aun_client.call()` 时，会先向 Gateway 调用 `proxy.register_services`。
+- 建立 proxy-server 隧道前，SDK 必须通过缓存 / `/.well-known/aun-proxy` 发现得到 `ws_url`；不得由应用传入或配置 proxy-server 地址。
+- proxy-server 隧道使用 `Authorization: Bearer <access_token>` 鉴权；SDK 优先复用 cached token，缺失或过期时通过 `aun_client.authenticate()` 向 Gateway 完成登录刷新。
+- 每次 proxy-server 隧道认证成功后，都会立即向 proxy-server 发送 `register_services` 隧道消息。
+- 服务列表与连接绑定；断开 Gateway 长连接或 proxy-server 隧道后，相应注册立即失效。
+
+详细控制面 RPC、隧道消息和路由语义见 [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md)。
 
 ---
 
@@ -328,6 +413,7 @@ sub.unsubscribe()
 | 存储 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | `storage.upload` / `storage.download` / `storage.share` |
 | 元信息 | [09-meta-rpc-manual.md](09-meta-rpc-manual.md) | `meta.ping` / `meta.status` / `meta.trust_roots` |
 | Stream | [09-stream-rpc-manual.md](09-stream-rpc-manual.md) | `stream.create` / `stream.close` / `stream.list_active` |
+| Service Proxy | [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) | `proxy.register_services` / `proxy.unregister_services` / `proxy.list_services` |
 
 ---
 
