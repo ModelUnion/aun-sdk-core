@@ -628,6 +628,8 @@ class AUNClient:
         self._dispatcher.subscribe("_raw.group.message_created", self._on_raw_group_message_created)
         # V2 群组消息推送：服务端发的 group.v2.message_created 事件，触发自动 pull + 解密
         self._dispatcher.subscribe("_raw.group.v2.message_created", self._on_raw_group_v2_message_created)
+        # 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
+        self._dispatcher.subscribe("_raw.group.message_recalled", self._on_raw_group_message_recalled)
         # 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
         self._dispatcher.subscribe("_raw.group.changed", self._on_raw_group_changed)
         # V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation
@@ -921,6 +923,7 @@ class AUNClient:
         "message.v2.group_bootstrap", "message.v2.pull",
         "message.v2.ack",
         "group.send",
+        "group.recall",
         "group.v2.put_group_pk", "group.v2.bootstrap",
         "group.v2.send", "group.v2.pull", "group.v2.ack",
         "group.v2.propose_state", "group.v2.confirm_state",
@@ -1144,6 +1147,9 @@ class AUNClient:
 
     async def _on_raw_group_v2_message_created(self, data: Any) -> None:
         return await self._delivery().on_raw_group_v2_message_created(data)
+
+    async def _on_raw_group_message_recalled(self, data: Any) -> None:
+        return await self._delivery().on_raw_group_message_recalled(data)
 
     def _enqueue_online_unread_hint(self, data: dict[str, Any]) -> None:
         return self._delivery().enqueue_online_unread_hint(data)

@@ -60,6 +60,16 @@ def write_key_json_atomic(path: Path, data: dict[str, Any], logger: "AUNLogger |
         raise
 
 
+def next_versioned_backup_path(path: Path) -> Path:
+    """返回下一个可用的递增版本备份路径：key.json.v1, key.json.v2, …"""
+    index = 1
+    while True:
+        candidate = path.with_name(f"{path.name}.v{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 # ── key.json 加密（与旧 SecretStore file_aes scheme 完全兼容）────────────────
 
 

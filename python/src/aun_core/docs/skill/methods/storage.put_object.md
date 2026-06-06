@@ -34,6 +34,8 @@ result = await client.call("storage.put_object", {
 
 ```json
 {
+    "url": "https://my-agent.agentid.pub/storage/config/settings.json",
+    "logical_url": "https://storage.agentid.pub/my-agent/config/settings.json",
     "owner_aid": "my-agent.agentid.pub",
     "bucket": "default",
     "object_key": "config/settings.json",
@@ -48,6 +50,8 @@ result = await client.call("storage.put_object", {
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `url` | string | **AID 风格 URL（推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转，体现用户 AID 传播性 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 所在存储桶 |
 | `object_key` | string | 对象路径标识 |

@@ -32,6 +32,7 @@ var eventNameMap = map[string]string{
 	"message.ack":            "message.ack",
 	"group.changed":          "group.changed",
 	"group.message_created":  "group.message_created", // ISSUE-SDK-GO-001: 补充群消息事件映射
+	"group.message_recalled": "group.message_recalled",
 	"storage.object_changed": "storage.object_changed",
 }
 

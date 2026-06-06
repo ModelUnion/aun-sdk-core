@@ -226,7 +226,15 @@ func (f *LocalIdentityStore) saveKeyPairAtPath(aid, path string, keyPair map[str
 		protected["private_key_protection"] = rec
 	}
 	data, _ := json.MarshalIndent(protected, "", "  ")
-	tmpPath := path + ".tmp"
+	// 覆盖已有 key.json 前备份（.v1/.v2 递增）
+	if _, err := os.Stat(path); err == nil {
+		existing, readErr := os.ReadFile(path)
+		if readErr == nil {
+			bakPath := nextVersionedBackupPath(path)
+			_ = os.WriteFile(bakPath, existing, 0o600)
+		}
+	}
+	tmpPath := path + fmt.Sprintf(".tmp-%d", time.Now().UnixNano())
 	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return err
 	}

@@ -164,6 +164,223 @@ func p2pAppEventForMessage(message any) (string, any) {
 	return "message.received", message
 }
 
+// recallEventFromGroupMessage 把 pull / push 收到的群撤回 tombstone 归一化为
+// group.message_recalled payload。占位 tombstone（原 seq）与通知 tombstone（新 seq）
+// 都满足识别条件，统一归一化，由 publishGroupRecallTombstone 负责去重。
+func recallEventFromGroupMessage(message any) (map[string]any, bool) {
+	msg, ok := message.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	payloadMap := map[string]any{}
+	if rawPayload, ok := msg["payload"].(map[string]any); ok {
+		payloadMap = rawPayload
+	}
+	msgType := strings.TrimSpace(getStr(msg, "type", ""))
+	if msgType == "" {
+		msgType = strings.TrimSpace(getStr(msg, "kind", ""))
+	}
+	if msgType == "" {
+		msgType = strings.TrimSpace(getStr(msg, "message_type", ""))
+	}
+	payloadType := strings.TrimSpace(getStr(payloadMap, "type", ""))
+	if payloadType == "" {
+		payloadType = strings.TrimSpace(getStr(payloadMap, "kind", ""))
+	}
+	if msgType != "group.message_recalled" && payloadType != "group.message_recalled" {
+		return nil, false
+	}
+	event := make(map[string]any, len(payloadMap)+6)
+	for k, v := range payloadMap {
+		event[k] = v
+	}
+	messageIDs := []any{}
+	if rawIDs, ok := event["message_ids"].([]any); ok {
+		for _, item := range rawIDs {
+			value := strings.TrimSpace(stringFromAny(item))
+			if value != "" {
+				messageIDs = append(messageIDs, value)
+			}
+		}
+	}
+	if len(messageIDs) == 0 {
+		for _, key := range []string{"recalled_message_id", "target_message_id", "original_message_id"} {
+			value := strings.TrimSpace(getStr(event, key, ""))
+			if value != "" {
+				messageIDs = append(messageIDs, value)
+				break
+			}
+		}
+	}
+	event["type"] = "group.message_recalled"
+	event["kind"] = "group.message_recalled"
+	event["message_ids"] = messageIDs
+	if _, ok := event["group_id"]; !ok {
+		event["group_id"] = getStr(msg, "group_id", "")
+	}
+	if _, ok := event["timestamp"]; !ok {
+		ts := msg["timestamp"]
+		if ts == nil {
+			ts = msg["t_server"]
+		}
+		if ts == nil {
+			ts = event["recalled_at"]
+		}
+		if ts == nil {
+			ts = int64(0)
+		}
+		event["timestamp"] = ts
+	}
+	if seq, exists := msg["seq"]; exists {
+		event["seq"] = seq
+	}
+	if _, ok := event["tombstone_message_id"]; !ok {
+		if mid, exists := msg["message_id"]; exists {
+			event["tombstone_message_id"] = mid
+		}
+	}
+	return event, true
+}
+
+// groupRecallDedupKey 群撤回去重键：group_id|sorted(message_ids)。
+//
+// 一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
+// (group_id, sorted message_ids) 已能唯一标识一次撤回。
+// 去重键不含 recalled_at：占位/通知 tombstone（pull）与在线 push 三条通道对同一次撤回
+// 可能携带不同来源的时间戳（push 在事务后重取），纳入 recalled_at 会使去重失效、回调多次。
+// 注意 Go map 无序，message_ids 拼接前必须 sort.Strings 保证键稳定。
+func groupRecallDedupKey(groupID string, payload map[string]any) string {
+	idParts := []string{}
+	if rawIDs, ok := payload["message_ids"].([]any); ok {
+		for _, item := range rawIDs {
+			v := strings.TrimSpace(stringFromAny(item))
+			if v != "" {
+				idParts = append(idParts, v)
+			}
+		}
+	}
+	sort.Strings(idParts)
+	return groupID + "|" + strings.Join(idParts, ",")
+}
+
+// publishGroupRecallTombstone 归一化并按去重键发布一次 group.message_recalled。
+// 返回 true 表示本次实际发布；false 表示被去重抑制或不是撤回 tombstone。
+func (d *messageDeliveryEngine) publishGroupRecallTombstone(groupID string, seq int, message any) bool {
+	c := d.runtime.client
+	eventPayload, ok := recallEventFromGroupMessage(message)
+	if !ok {
+		return false
+	}
+	dedupKey := groupRecallDedupKey(groupID, eventPayload)
+	c.groupRecallSeenMu.Lock()
+	if c.groupRecallSeen == nil {
+		c.groupRecallSeen = make(map[string]int64)
+	}
+	if _, seen := c.groupRecallSeen[dedupKey]; seen {
+		c.groupRecallSeenMu.Unlock()
+		c.logEG.Debug("group.message_recalled dedup suppressed: group=%s seq=%d key=%s", groupID, seq, dedupKey)
+		return false
+	}
+	c.groupRecallSeen[dedupKey] = time.Now().UnixMilli()
+	if len(c.groupRecallSeen) > groupRecallSeenLimit {
+		type kv struct {
+			k string
+			v int64
+		}
+		entries := make([]kv, 0, len(c.groupRecallSeen))
+		for k, v := range c.groupRecallSeen {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].v < entries[j].v })
+		for i := 0; i < len(entries)-groupRecallSeenLimit; i++ {
+			delete(c.groupRecallSeen, entries[i].k)
+		}
+	}
+	c.groupRecallSeenMu.Unlock()
+	c.publishAppEventSync("group.message_recalled", eventPayload)
+	c.logEG.Debug("group.message_recalled published: group=%s seq=%d", groupID, seq)
+	return true
+}
+
+// onRawGroupMessageRecalled 处理 group.message_recalled 在线推送（与 pull 双 tombstone 兜底互补，去重）。
+//
+// 在线 push 是实时通道，与 pull 兜底的双 tombstone 互补。push 携带的 seq 是通知 tombstone 的
+// notice_seq；必须像普通群消息 push 一样推进 seqTracker + markPushedSeq + auto-ack，否则该 seq
+// 在本地 contiguous 序列留洞，后续 pull/reconnect 会重复拉到并重复处理。publishGroupRecallTombstone
+// 内部再按 (group_id, message_ids) 去重，确保应用层只回调一次。
+//
+// 对齐 Python _apply_group_recall_push；Go 无 ns lock（单 goroutine 处理 + seqTracker 各方法自带
+// mutex），且用 RepairContiguousSeq + saveSeqTrackerState 取代 Python 的 repair_push_contiguous_bound +
+// persist_seq，与同文件普通群消息 push 的 recall 分支保持一致。
+func (c *AUNClient) onRawGroupMessageRecalled(data any) {
+	dataMap, ok := data.(map[string]any)
+	if !ok {
+		return
+	}
+	groupID := getStr(dataMap, "group_id", "")
+	wrapped := copyMapShallow(dataMap)
+	if _, ok := wrapped["type"]; !ok {
+		wrapped["type"] = "group.message_recalled"
+	}
+	if _, ok := wrapped["payload"]; !ok {
+		wrapped["payload"] = map[string]any{
+			"type":                "group.message_recalled",
+			"message_ids":         dataMap["message_ids"],
+			"target_message_seqs": dataMap["target_message_seqs"],
+			"sender_aid":          dataMap["sender_aid"],
+			"recalled_by":         dataMap["recalled_by"],
+			"recalled_at":         dataMap["recalled_at"],
+			"reason":              dataMap["reason"],
+			"group_id":            groupID,
+		}
+	}
+	seq := int(toInt64(dataMap["seq"]))
+	// 无 group_id 或无 seq：无法推进序列，仅走去重发布兜底。
+	if groupID == "" || seq <= 0 {
+		c.delivery().publishGroupRecallTombstone(groupID, seq, wrapped)
+		return
+	}
+
+	ns := "group:" + groupID
+	c.seqTracker.UpdateMaxSeen(ns, seq)
+	if c.seqTracker.GetContiguousSeq(ns) == seq {
+		// 已被 pull 覆盖（pull 先到并推进过），仅走去重发布兜底，不重复推进 seq。
+		c.delivery().publishGroupRecallTombstone(groupID, seq, wrapped)
+		return
+	}
+	if c.seqTracker.GetContiguousSeq(ns) > seq {
+		// contiguous 越界（脏数据）：倒退修复至 seq-1，与普通 push 路径一致。
+		c.logEG.Warn("group recall push: contiguous_seq 越界（> push_seq=%d），脏数据修复倒退至 %d", seq, seq-1)
+		c.seqTracker.RepairContiguousSeq(ns, seq-1)
+		c.saveSeqTrackerState()
+	}
+	if c.isPushedSeq(ns, seq) || c.delivery().isPendingOrderedSeq(ns, seq) {
+		// 该 notice_seq 已由 pull 路径处理过，去重发布兜底后返回。
+		c.delivery().publishGroupRecallTombstone(groupID, seq, wrapped)
+		return
+	}
+	c.seqTracker.OnMessageSeq(ns, seq)
+	c.saveSeqTrackerState()
+	c.delivery().publishGroupRecallTombstone(groupID, seq, wrapped)
+	c.markPushedSeq(ns, seq)
+	contig := c.seqTracker.GetContiguousSeq(ns)
+	if contig > 0 {
+		ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", ns, int64(contig))
+		go func() {
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ackCancel()
+			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+				"group_id":  groupID,
+				"msg_seq":   ackSeq,
+				"device_id": c.deviceID,
+				"slot_id":   c.slotID,
+			}); ackErr != nil {
+				c.logEG.Warn("group recall push auto-ack failed: group=%s %v", groupID, ackErr)
+			}
+		}()
+	}
+}
+
 func (d *messageDeliveryEngine) publishAppEvent(event string, payload any) {
 	c := d.runtime.client
 	if event == "message.received" || event == "group.message_created" {
@@ -374,6 +591,44 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 	}
 
 	encryptedPush := isEncryptedPushMessage(msg)
+
+	// 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled，仍占 seq 推进 contiguous/ack。
+	if !encryptedPush {
+		if _, isRecall := recallEventFromGroupMessage(msg); isRecall {
+			if groupID != "" && seq > 0 {
+				ns := "group:" + groupID
+				c.seqTracker.UpdateMaxSeen(ns, seq)
+				contigBefore := c.seqTracker.GetContiguousSeq(ns)
+				if contigBefore == seq {
+					c.logEG.Debug("group recall tombstone: push seq=%d already covered, ignore duplicate", seq)
+					return
+				}
+				c.seqTracker.OnMessageSeq(ns, seq)
+				c.delivery().publishGroupRecallTombstone(groupID, seq, msg)
+				c.markPushedSeq(ns, seq)
+				contig := c.seqTracker.GetContiguousSeq(ns)
+				if contig > 0 {
+					ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", ns, int64(contig))
+					go func() {
+						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer ackCancel()
+						if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+							"group_id":  groupID,
+							"msg_seq":   ackSeq,
+							"device_id": c.deviceID,
+							"slot_id":   c.slotID,
+						}); ackErr != nil {
+							c.logEG.Warn("group recall auto-ack failed: group=%s %v", groupID, ackErr)
+						}
+					}()
+				}
+				c.saveSeqTrackerState()
+			} else {
+				c.delivery().publishGroupRecallTombstone(groupID, seq, msg)
+			}
+			return
+		}
+	}
 
 	// V2-only: V2 群组消息通过 V2 push 路径解密；明文/兼容消息在此处透传
 	decrypted := msg
@@ -1268,6 +1523,23 @@ func (d *messageDeliveryEngine) removePendingOrderedSeq(ns string, seq int) {
 	}
 }
 
+// isPendingOrderedSeq 查询 seq 是否已解密并挂在有序队列里等待放行
+// （对齐 Python is_pending_ordered_seq）。撤回 push 用它判定 pull 是否已处理过该 seq。
+func (d *messageDeliveryEngine) isPendingOrderedSeq(ns string, seq int) bool {
+	c := d.runtime.client
+	if ns == "" || seq <= 0 {
+		return false
+	}
+	c.pendingOrderedMsgsMu.Lock()
+	defer c.pendingOrderedMsgsMu.Unlock()
+	queue := c.pendingOrderedMsgs[ns]
+	if queue == nil {
+		return false
+	}
+	_, ok := queue[seq]
+	return ok
+}
+
 func (d *messageDeliveryEngine) drainOrderedMessages(ns string, beforeSeq ...int) {
 	c := d.runtime.client
 	limit := 0
@@ -1356,16 +1628,25 @@ func (d *messageDeliveryEngine) publishGapFillMessages(ns string, messages []any
 }
 
 // publishGapFillGroupMessages 补洞路径发布群消息，跳过已发布到应用层的 seq。
+//
+// legacy / 明文 pull 回退路径也可能拉回群撤回 tombstone（占位 / 通知）；发布前先用
+// recallEventFromGroupMessage 识别，命中则走 publishGroupRecallTombstone（归一化为
+// group.message_recalled 并去重 + markPushedSeq 占 seq），而非当作 group.message_created
+// 泄漏给应用层。对齐 v2_routing pull 路径与 Python。
 func (d *messageDeliveryEngine) publishGapFillGroupMessages(ns string, messages []any) {
 	c := d.runtime.client
 	for _, raw := range messages {
 		if msg, ok := raw.(map[string]any); ok {
 			s := int(toInt64(msg["seq"]))
-			if s > 0 {
-				c.publishPulledMessage("group.message_created", ns, s, msg)
-			} else {
-				c.publishPulledMessage("group.message_created", ns, s, msg)
+			if _, isRecall := recallEventFromGroupMessage(msg); isRecall {
+				groupID := strings.TrimPrefix(ns, "group:")
+				c.delivery().publishGroupRecallTombstone(groupID, s, msg)
+				if s > 0 {
+					c.markPushedSeq(ns, s)
+				}
+				continue
 			}
+			c.publishPulledMessage("group.message_created", ns, s, msg)
 		}
 	}
 	c.prunePushedSeqs(ns)

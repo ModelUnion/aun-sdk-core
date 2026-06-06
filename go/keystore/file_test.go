@@ -652,3 +652,51 @@ func TestPromotePendingIdentityPreservesPreexistingMetadataDB(t *testing.T) {
 		t.Fatalf("gateway_url metadata lost: %q", got)
 	}
 }
+
+func TestChangeSeedCreatesVersionedBackup(t *testing.T) {
+	dir := t.TempDir()
+	aid := "backup-test.agentid.pub"
+	writeSeedProtectedKeyJSON(t, dir, aid, "old-seed", "BACKUP_PRIVATE")
+
+	if _, err := ChangeSeed(dir, "old-seed", "new-seed"); err != nil {
+		t.Fatalf("ChangeSeed failed: %v", err)
+	}
+
+	keyPath := filepath.Join(dir, "AIDs", aid, "private", "key.json")
+	bakPath := keyPath + ".v1"
+	if _, err := os.Stat(bakPath); os.IsNotExist(err) {
+		t.Fatal("key.json.v1 backup not created after ChangeSeed")
+	}
+	// .v1 内容应可用旧 seed 解密
+	raw, _ := os.ReadFile(bakPath)
+	var bakData map[string]any
+	if err := json.Unmarshal(raw, &bakData); err != nil {
+		t.Fatalf("backup JSON parse failed: %v", err)
+	}
+	rec, _ := bakData["private_key_protection"].(map[string]any)
+	if rec == nil {
+		t.Fatal("backup missing private_key_protection")
+	}
+	oldMaster := deriveSeedMasterKey([]byte("old-seed"))
+	plain, ok := decryptSeedRecord(oldMaster, aid, "identity/private_key", rec)
+	if !ok || string(plain) != "BACKUP_PRIVATE" {
+		t.Fatal("backup not decryptable with old seed")
+	}
+}
+
+func TestSaveKeyPairCreatesVersionedBackupOnOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	aid := "overwrite-backup.agentid.pub"
+	ks, err := NewLocalIdentityStore(dir, nil, "seed1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ks.Close()
+	ks.SaveKeyPair(aid, map[string]any{"private_key_pem": "FIRST", "public_key_der_b64": "pub", "curve": "P-256"})
+	ks.SaveKeyPair(aid, map[string]any{"private_key_pem": "SECOND", "public_key_der_b64": "pub", "curve": "P-256"})
+
+	bakPath := filepath.Join(dir, "AIDs", aid, "private", "key.json.v1")
+	if _, err := os.Stat(bakPath); os.IsNotExist(err) {
+		t.Fatal("key.json.v1 backup not created on overwrite")
+	}
+}

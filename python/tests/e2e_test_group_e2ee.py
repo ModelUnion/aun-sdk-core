@@ -1868,6 +1868,92 @@ async def test_v2_client_joins_v2_group_and_exchanges_messages():
         await alice.close(); await bob.close()
 
 
+async def test_group_recall():
+    """Test 28: 群消息撤回 E2E — alice 发加密消息，撤回，bob 收到 group.message_recalled 回调恰好一次。"""
+    print("\n=== Test 28: Group message recall ===")
+    rid = _run_id()
+    alice = _make_client("a-recall", rid)
+    bob = _make_client("b-recall", rid)
+    recall_events_bob: list[dict] = []
+    bob.on("group.message_recalled", lambda d: recall_events_bob.append(d))
+    try:
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+
+        group_id = await _create_group(alice, f"recall-e2e-{rid}")
+        await _add_member(alice, group_id, b_aid)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
+
+        # Alice 发加密消息
+        text = f"recall-target-{rid}"
+        send_result = await alice.call("group.send", {
+            "group_id": group_id,
+            "payload": {"type": "text", "text": text},
+            "encrypt": True,
+        })
+        # V2 send 返回顶层 message_id/seq；明文 send 返回 message.{...}
+        nested = send_result.get("message") if isinstance(send_result, dict) else None
+        if isinstance(nested, dict) and nested.get("message_id"):
+            msg_id = str(nested.get("message_id"))
+            orig_seq = int(nested.get("seq") or 0)
+        else:
+            msg_id = str(send_result.get("message_id") or "")
+            orig_seq = int(send_result.get("seq") or 0)
+        assert msg_id, f"send returned no message_id: {send_result}"
+        print(f"  sent: msg_id={msg_id} seq={orig_seq}")
+
+        # Bob 先收一次原消息（成为"已读客户端"）
+        await asyncio.sleep(0.5)
+        await bob.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 50, "force": True})
+        await asyncio.sleep(0.3)
+
+        # Alice 撤回
+        recall_result = await alice.call("group.recall", {
+            "group_id": group_id,
+            "message_ids": [msg_id],
+        })
+        recalled = recall_result.get("recalled") or []
+        assert msg_id in recalled, f"recall failed: {recall_result}"
+        print(f"  recalled: {recalled}")
+
+        # 等待推送到达 + bob 再 pull 兜底
+        await asyncio.sleep(1.5)
+        await bob.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 50, "force": True})
+        await asyncio.sleep(0.5)
+
+        # SDK 把 tombstone 归一化为 group.message_recalled 事件（不在 pull 消息列表里）。
+        # 验证：bob 收到该事件恰好一次（双 tombstone 去重）。
+        assert len(recall_events_bob) == 1, \
+            f"expected exactly 1 group.message_recalled callback, got {len(recall_events_bob)}: {recall_events_bob}"
+        assert msg_id in (recall_events_bob[0].get("message_ids") or []), \
+            f"recall event missing original message_id: {recall_events_bob[0]}"
+
+        # 服务端 raw 校验：双 tombstone 落库，原始密文已删
+        raw = await bob._rpc().raw_call("group.v2.pull", {
+            "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
+        })
+        raw_msgs = raw.get("messages", []) if isinstance(raw, dict) else []
+        tombstones = [m for m in raw_msgs if str(m.get("type") or m.get("message_type") or "") == "group.message_recalled"]
+        assert len(tombstones) >= 2, f"expected >=2 server tombstones, got {len(tombstones)}: {[m.get('seq') for m in raw_msgs]}"
+        assert any(int(m.get("seq") or 0) == orig_seq for m in tombstones), \
+            f"no placeholder tombstone at orig_seq={orig_seq}"
+        ciphertext_present = any(
+            str(m.get("message_id") or "") == msg_id and m.get("envelope_json")
+            for m in raw_msgs
+        )
+        assert not ciphertext_present, "original ciphertext still retrievable after recall"
+
+        print("[PASS] Test 28")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 28: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        await alice.close(); await bob.close()
+
+
 async def main():
     print("=" * 60)
     print("Group E2EE E2E Tests")
@@ -1902,6 +1988,7 @@ async def main():
         ("25. open group: pending allows recv/send",  test_open_pending_allows_recv_send),
         ("26. V2 group rejects legacy encrypted envelope", test_v2_group_rejects_legacy_encrypted_envelope),
         ("27. V2 client joins V2 group and exchanges messages", test_v2_client_joins_v2_group_and_exchanges_messages),
+        ("28. Group message recall", test_group_recall),
     ]
 
     results = []

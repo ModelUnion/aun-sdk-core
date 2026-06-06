@@ -163,7 +163,36 @@ func rewriteKeyJSONPrivateKey(path, aid string, plaintext []byte, newSeed, newMa
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, encoded, 0o600)
+	// 覆盖前先备份（.v1/.v2 递增）
+	bakPath := nextVersionedBackupPath(path)
+	if err := os.WriteFile(bakPath, data, 0o600); err != nil {
+		return fmt.Errorf("backup key.json failed (aid=%s): %w", aid, err)
+	}
+	// 原子写
+	return writeFileAtomic(path, encoded)
+}
+
+// nextVersionedBackupPath 返回下一个可用的递增版本备份路径：key.json.v1, key.json.v2, …
+func nextVersionedBackupPath(path string) string {
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s.v%d", path, i)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+}
+
+// writeFileAtomic 原子写：先写 .tmp 再 rename
+func writeFileAtomic(path string, data []byte) error {
+	tmp := fmt.Sprintf("%s.tmp-%d", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func migrateAIDDBEncryptedFields(root string, oldMaster, newSeed []byte) (int, int, int) {

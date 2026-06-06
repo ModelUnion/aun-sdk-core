@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from ._utils import safe_aid, prepare_root, protect_field, reveal_field, write_key_json_atomic
+from ._utils import safe_aid, prepare_root, protect_field, reveal_field, write_key_json_atomic, next_versioned_backup_path
 from .sqlite_db import AIDDatabase
 
 if TYPE_CHECKING:
@@ -356,6 +356,13 @@ class LocalIdentityStore:
             protected["private_key_protection"] = protect_field(
                 self._seed_bytes, safe_aid(aid), "identity/private_key", private_key_pem.encode("utf-8")
             )
+        # 覆盖已有 key.json 前备份（.v1/.v2 递增）
+        if path.exists():
+            bak = next_versioned_backup_path(path)
+            try:
+                bak.write_bytes(path.read_bytes())
+            except OSError as exc:
+                self._log.warn("keystore", "key.json backup failed (path=%s): %s", path, exc)
         write_key_json_atomic(path, protected, self._log)
 
     def _restore_key_pair(self, aid: str, key_pair: dict, persist_path: Path | None = None) -> dict:

@@ -15,6 +15,7 @@ from .runtime import ClientRuntime
 
 _PUSHED_SEQS_LIMIT = 50000
 _PENDING_ORDERED_LIMIT = 50000
+_GROUP_RECALL_SEEN_LIMIT = 10000
 _ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
 _ONLINE_UNREAD_HINT_INTERVAL = 0.05
 
@@ -120,6 +121,7 @@ class MessageDeliveryEngine:
             "message.recalled",
             "message.undecryptable",
             "group.message_created",
+            "group.message_recalled",
             "group.message_undecryptable",
         }
 
@@ -194,6 +196,101 @@ class MessageDeliveryEngine:
         if recall is not None:
             return "message.recalled", recall
         return "message.received", message
+
+    @staticmethod
+    def recall_event_from_group_message(message: Any) -> dict[str, Any] | None:
+        """把 pull / push 收到的群撤回 tombstone 归一化为 group.message_recalled payload。
+
+        识别条件：顶层 type / kind 或 payload.type / payload.kind == "group.message_recalled"。
+        占位 tombstone（原 seq）与通知 tombstone（新 seq）都满足此条件，统一归一化，
+        由 publish_group_recall_tombstone 负责按 (group_id, original_message_id) 去重。
+        """
+        if not isinstance(message, dict):
+            return None
+        payload = message.get("payload")
+        payload_dict = payload if isinstance(payload, dict) else {}
+        msg_type = str(message.get("type") or message.get("kind") or message.get("message_type") or "").strip()
+        payload_type = str(payload_dict.get("type") or payload_dict.get("kind") or "").strip()
+        if msg_type != "group.message_recalled" and payload_type != "group.message_recalled":
+            return None
+        event = dict(payload_dict)
+        raw_ids = event.get("message_ids")
+        if isinstance(raw_ids, list):
+            message_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
+        else:
+            message_ids = []
+        if not message_ids:
+            for key in ("recalled_message_id", "target_message_id", "original_message_id"):
+                value = str(event.get(key) or "").strip()
+                if value:
+                    message_ids = [value]
+                    break
+        event["type"] = "group.message_recalled"
+        event["kind"] = "group.message_recalled"
+        event["message_ids"] = message_ids
+        event.setdefault("group_id", message.get("group_id") or "")
+        event.setdefault(
+            "timestamp",
+            message.get("timestamp") or message.get("t_server") or event.get("recalled_at") or 0,
+        )
+        if "seq" in message:
+            event["seq"] = message.get("seq")
+        if "message_id" in message:
+            event.setdefault("tombstone_message_id", message.get("message_id"))
+        return event
+
+    @staticmethod
+    def group_recall_dedup_key(group_id: str, payload: dict[str, Any]) -> str:
+        """群撤回去重键：group_id + 排序后的 message_ids。
+
+        一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
+        (group_id, sorted message_ids) 已能唯一标识一次撤回。
+        去重键不含 recalled_at：占位/通知 tombstone（pull）与在线 push 三条通道对同一次撤回
+        可能携带不同来源的时间戳（push 在事务后重取），纳入 recalled_at 会使去重失效、回调多次。
+        """
+        ids = payload.get("message_ids")
+        if isinstance(ids, list):
+            id_part = ",".join(sorted(str(i or "").strip() for i in ids if str(i or "").strip()))
+        else:
+            id_part = str(ids or "")
+        return f"{group_id}|{id_part}"
+
+    async def publish_group_recall_tombstone(self, group_id: str, seq: Any, message: Any) -> bool:
+        """把群撤回 tombstone 归一化并按去重键发布一次 group.message_recalled。
+
+        返回 True 表示本次实际发布了事件；False 表示被去重抑制或不是撤回 tombstone。
+        """
+        client = self.client
+        event_payload = self.recall_event_from_group_message(message)
+        if event_payload is None:
+            return False
+        dedup_key = self.group_recall_dedup_key(group_id, event_payload)
+        seen = getattr(client, "_group_recall_seen", None)
+        if seen is None:
+            seen = {}
+            try:
+                client._group_recall_seen = seen
+            except Exception:
+                seen = {}
+        if dedup_key in seen:
+            client._log.debug(
+                "client",
+                "group.message_recalled 去重抑制: group=%s seq=%s key=%s",
+                group_id, seq, dedup_key,
+            )
+            return False
+        seen[dedup_key] = time.time()
+        # 限制去重表大小，避免长期运行无限增长。
+        if len(seen) > _GROUP_RECALL_SEEN_LIMIT:
+            for old_key in sorted(seen, key=lambda k: seen[k])[: len(seen) - _GROUP_RECALL_SEEN_LIMIT]:
+                seen.pop(old_key, None)
+        await client._publish_app_event("group.message_recalled", event_payload, source="group-recall")
+        client._log.debug(
+            "client",
+            "group.message_recalled 发布: group=%s seq=%s message_ids=%s",
+            group_id, seq, event_payload.get("message_ids"),
+        )
+        return True
 
     @staticmethod
     def debug_json_default(value: Any) -> Any:
@@ -638,6 +735,73 @@ class MessageDeliveryEngine:
         else:
             await client._on_raw_group_message_created_inner(data)
 
+    async def on_raw_group_message_recalled(self, data: Any) -> None:
+        """处理 group.message_recalled 在线推送。
+
+        在线 push 是实时通道，与 pull 兜底的双 tombstone 互补。push 携带的 seq 是通知
+        tombstone 的 notice_seq；必须像普通群消息 push 一样推进 seq_tracker + mark_published +
+        auto-ack，否则该 seq 在本地 contiguous 序列留洞，后续 pull/reconnect 会重复拉到并
+        重复处理。publish_group_recall_tombstone 内部再按 (group_id, message_ids) 去重，
+        确保应用层只回调一次。
+        """
+        client = self.client
+        if not isinstance(data, dict):
+            return
+        group_id = str(data.get("group_id") or "").strip()
+        # push 事件 data 本身是 recall payload；包成 recall_event_from_group_message 可识别的形状。
+        wrapped = dict(data)
+        wrapped.setdefault("type", "group.message_recalled")
+        if "payload" not in wrapped:
+            wrapped["payload"] = {
+                "type": "group.message_recalled",
+                "message_ids": data.get("message_ids") or [],
+                "target_message_seqs": data.get("target_message_seqs") or [],
+                "sender_aid": data.get("sender_aid") or "",
+                "recalled_by": data.get("recalled_by") or "",
+                "recalled_at": data.get("recalled_at") or data.get("timestamp") or 0,
+                "reason": data.get("reason") or "",
+                "group_id": group_id,
+            }
+        seq = data.get("seq")
+        if not group_id:
+            await self.publish_group_recall_tombstone(group_id, seq, wrapped)
+            return
+        async with client._get_ns_lock(f"group:{group_id}"):
+            await self._apply_group_recall_push(group_id, seq, wrapped)
+
+    async def _apply_group_recall_push(self, group_id: str, seq: Any, wrapped: dict) -> None:
+        """在 ns lock 内推进 notice_seq 的 seq/ack 并发布撤回（与普通群消息 push 对齐）。"""
+        client = self.client
+        ns = f"group:{group_id}"
+        if seq is not None:
+            seq_i = int(seq)
+            if seq_i > 0:
+                client._seq_tracker.update_max_seen(ns, seq_i)
+                if client._seq_tracker.get_contiguous_seq(ns) == seq_i:
+                    # 已覆盖（pull 先到并推进过），仍走去重发布兜底，不重复推进 seq。
+                    await self.publish_group_recall_tombstone(group_id, seq, wrapped)
+                    return
+                client._repair_push_contiguous_bound(
+                    ns, seq_i, has_payload=True, label="_raw.group.message_recalled",
+                )
+            if client._is_published_seq(ns, seq_i) or client._is_pending_ordered_seq(ns, seq_i):
+                # 该 notice_seq 已由 pull 路径处理过，去重发布兜底后返回。
+                await self.publish_group_recall_tombstone(group_id, seq, wrapped)
+                return
+            client._seq_tracker.on_message_seq(ns, seq_i)
+            client._persist_seq(ns)
+            await self.publish_group_recall_tombstone(group_id, seq, wrapped)
+            client._mark_published_seq(ns, seq_i)
+            contig = client._seq_tracker.get_contiguous_seq(ns)
+            if contig > 0:
+                client._fire_ack("group.ack_messages", {
+                    "group_id": group_id, "msg_seq": contig,
+                    "device_id": client._device_id,
+                    "slot_id": client._slot_id,
+                }, f"群撤回 auto-ack group={group_id}")
+        else:
+            await self.publish_group_recall_tombstone(group_id, seq, wrapped)
+
     async def on_raw_group_message_created_inner(self, data: Any) -> None:
         """群消息 push 内部实现（在 ns lock 保护下调用）。"""
         client = self.client
@@ -745,7 +909,12 @@ class MessageDeliveryEngine:
                 return
             client._seq_tracker.on_message_seq(ns, seq_i)
             client._persist_seq(ns)
-            await client._publish_ordered_message("group.message_created", ns, seq, data)
+            # 群撤回 tombstone（占位 / 通知）经普通明文推送路径到达时，归一化为 group.message_recalled。
+            if self.recall_event_from_group_message(data) is not None:
+                await self.publish_group_recall_tombstone(group_id, seq, data)
+                client._mark_published_seq(ns, seq_i)
+            else:
+                await client._publish_ordered_message("group.message_created", ns, seq, data)
             contig = client._seq_tracker.get_contiguous_seq(ns)
             if contig > 0:
                 client._fire_ack("group.ack_messages", {

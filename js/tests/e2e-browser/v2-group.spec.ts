@@ -298,4 +298,82 @@ test.describe('V2 Group E2EE 端到端测试', () => {
     expect(result.bobMsgText).toContain('bob-group-');
   });
 
+  // ── 4. 群消息撤回 ──
+
+  test('群消息撤回 — Bob 收到 group.message_recalled 恰好一次', async ({ page }) => {
+    const rid = Math.random().toString(36).slice(2, 8);
+    const result = await page.evaluate(async (rid) => {
+      const { makeAndConnect, createGroupWithMembers, collectGroupMessages, waitForGroupText, sleep, ISSUER } = (window as any).__v2grp;
+      const aliceAid = `v2g-ra-${rid}.${ISSUER}`;
+      const bobAid = `v2g-rb-${rid}.${ISSUER}`;
+
+      const alice = await makeAndConnect(aliceAid);
+      const bob = await makeAndConnect(bobAid);
+      const bobPush = collectGroupMessages(bob);
+
+      // Bob 订阅撤回事件
+      const recallEvents: any[] = [];
+      bob.on('group.message_recalled', (d: any) => {
+        if (d && d.group_id) recallEvents.push(d);
+      });
+
+      const groupId = await createGroupWithMembers(
+        alice, [bob], [bobAid], `v2g-recall-${rid}`,
+      );
+
+      // Alice 发加密群消息
+      const testText = `v2-recall-target-${Date.now()}`;
+      const sendResult = await (alice as any)._sendGroupV2(groupId, { text: testText });
+      const msgId = (sendResult as any)?.message_id ?? '';
+      const origSeq = Number((sendResult as any)?.seq ?? 0);
+
+      // Bob 先收一次原消息（成为"已读客户端"）
+      await waitForGroupText(bob, groupId, bobPush, testText);
+      await (bob as any)._ackGroupV2(groupId);
+
+      // Alice 撤回
+      const recallResult = await alice.call('group.recall', {
+        group_id: groupId,
+        message_ids: [msgId],
+      });
+      const recalled = (recallResult as any)?.recalled ?? [];
+
+      // 等待 push + Bob pull 兜底（触发归一化）
+      await sleep(1500);
+      await (bob as any)._pullGroupV2(groupId);
+      await sleep(600);
+
+      // 服务端 raw 校验：双 tombstone 落库，密文已删
+      const raw = await (bob as any)._callRawV2Rpc('group.v2.pull', {
+        group_id: groupId, after_seq: 0, limit: 50, force: true,
+      });
+      const rawMsgs = (raw?.messages ?? []) as any[];
+      const tombstones = rawMsgs.filter((m: any) =>
+        String(m?.type ?? m?.message_type ?? '') === 'group.message_recalled');
+      const placeholderAtOrig = tombstones.some((m: any) => Number(m?.seq ?? 0) === origSeq);
+      const ciphertextPresent = rawMsgs.some((m: any) =>
+        String(m?.message_id ?? '') === msgId && m?.envelope_json);
+
+      await alice.close();
+      await bob.close();
+
+      return {
+        recalledOk: Array.isArray(recalled) && recalled.includes(msgId),
+        recallCallbacks: recallEvents.length,
+        recallIds: recallEvents[0]?.message_ids ?? [],
+        tombstoneCount: tombstones.length,
+        placeholderAtOrig,
+        ciphertextPresent,
+        msgId,
+      };
+    }, rid);
+
+    expect(result.recalledOk, `recall 应成功 (msgId=${result.msgId})`).toBe(true);
+    expect(result.recallCallbacks, 'group.message_recalled 应恰好回调一次').toBe(1);
+    expect(result.recallIds).toContain(result.msgId);
+    expect(result.tombstoneCount, '服务端应有 >=2 个 tombstone').toBeGreaterThanOrEqual(2);
+    expect(result.placeholderAtOrig, '占位 tombstone 应在原 seq').toBe(true);
+    expect(result.ciphertextPresent, '原始密文应已删除').toBe(false);
+  });
+
 });

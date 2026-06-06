@@ -6,6 +6,7 @@ import type { ClientRuntime } from './runtime.js';
 
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
+const GROUP_RECALL_SEEN_LIMIT = 10_000;
 
 function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
   return Boolean(value && typeof (value as { then?: unknown }).then === 'function');
@@ -65,6 +66,7 @@ export class MessageDeliveryEngine {
       || event === 'message.recalled'
       || event === 'message.undecryptable'
       || event === 'group.message_created'
+      || event === 'group.message_recalled'
       || event === 'group.message_undecryptable';
   }
 
@@ -135,6 +137,141 @@ export class MessageDeliveryEngine {
     const recall = this.recallEventFromMessage(message);
     if (recall) return { event: 'message.recalled', payload: recall as EventPayload };
     return { event: 'message.received', payload: message };
+  }
+
+  recallEventFromGroupMessage(message: EventPayload): JsonObject | null {
+    if (!isJsonObject(message as JsonValue | object | null | undefined)) return null;
+    const msg = message as JsonObject;
+    const rawPayload = msg.payload;
+    const payload = isJsonObject(rawPayload as JsonValue | object | null | undefined) ? rawPayload as JsonObject : {};
+    const msgType = String(msg.type ?? msg.kind ?? msg.message_type ?? '').trim();
+    const payloadType = String(payload.type ?? payload.kind ?? '').trim();
+    if (msgType !== 'group.message_recalled' && payloadType !== 'group.message_recalled') return null;
+    const event: JsonObject = { ...payload };
+    const rawIds = event.message_ids;
+    let messageIds = Array.isArray(rawIds)
+      ? rawIds.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : [];
+    if (messageIds.length === 0) {
+      for (const key of ['recalled_message_id', 'target_message_id', 'original_message_id']) {
+        const value = String(event[key] ?? '').trim();
+        if (value) {
+          messageIds = [value];
+          break;
+        }
+      }
+    }
+    event.type = 'group.message_recalled';
+    event.kind = 'group.message_recalled';
+    event.message_ids = messageIds;
+    if (!('group_id' in event)) event.group_id = msg.group_id ?? '';
+    if (!('timestamp' in event)) event.timestamp = msg.timestamp ?? msg.t_server ?? event.recalled_at ?? 0;
+    if ('seq' in msg) event.seq = msg.seq;
+    if ('message_id' in msg && !('tombstone_message_id' in event)) event.tombstone_message_id = msg.message_id;
+    return event;
+  }
+
+  groupRecallDedupKey(groupId: string, payload: JsonObject): string {
+    // 群撤回去重键：group_id + 排序后的 message_ids。
+    // 一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
+    // (group_id, sorted message_ids) 已能唯一标识一次撤回。
+    // 去重键不含 recalled_at：占位/通知 tombstone（pull，事务内时间）与在线 push（事务后重取时间）
+    // 三条通道对同一次撤回可能携带不同来源的时间戳，纳入 recalled_at 会使去重失效、回调多次。
+    // group_id 归一化一次，使去重键与来源无关（pull 用 normalizeGroupId，push 可能是原始值）。
+    const normalizedGroupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    const ids = payload.message_ids;
+    const idPart = Array.isArray(ids)
+      ? ids.map((i) => String(i ?? '').trim()).filter(Boolean).sort().join(',')
+      : String(ids ?? '');
+    return `${normalizedGroupId}|${idPart}`;
+  }
+
+  async publishGroupRecallTombstone(groupId: string, seq: unknown, message: EventPayload): Promise<boolean> {
+    const client = this.runtime.client;
+    const eventPayload = this.recallEventFromGroupMessage(message);
+    if (!eventPayload) return false;
+    const dedupKey = this.groupRecallDedupKey(groupId, eventPayload);
+    let seen = client._groupRecallSeen;
+    if (!seen) {
+      seen = new Map<string, number>();
+      client._groupRecallSeen = seen;
+    }
+    if (seen.has(dedupKey)) {
+      client._clientLog.debug(`group.message_recalled dedup suppressed: group=${groupId} seq=${String(seq)} key=${dedupKey}`);
+      return false;
+    }
+    seen.set(dedupKey, Date.now());
+    if (seen.size > GROUP_RECALL_SEEN_LIMIT) {
+      const drop = [...seen.entries()].sort((a, b) => a[1] - b[1]).slice(0, seen.size - GROUP_RECALL_SEEN_LIMIT);
+      for (const [oldKey] of drop) seen.delete(oldKey);
+    }
+    await client._publishAppEvent('group.message_recalled', eventPayload as EventPayload, 'group-recall');
+    client._clientLog.debug(`group.message_recalled published: group=${groupId} seq=${String(seq)} ids=${JSON.stringify(eventPayload.message_ids)}`);
+    return true;
+  }
+
+  async onRawGroupMessageRecalled(data: EventPayload): Promise<void> {
+    // 在线 push 是实时通道，与 pull 兜底的双 tombstone 互补。push 携带的 seq 是通知
+    // tombstone 的 notice_seq；必须像普通群消息 push 一样推进 seqTracker + markPublished +
+    // auto-ack，否则该 seq 在本地 contiguous 序列留洞，后续 pull/reconnect 会重复拉到并
+    // 重复处理。publishGroupRecallTombstone 内部再按 (group_id, message_ids) 去重，
+    // 确保应用层只回调一次。
+    const client = this.runtime.client;
+    if (!isJsonObject(data as JsonValue | object | null | undefined)) return;
+    const src = data as JsonObject;
+    const groupId = String(src.group_id ?? '').trim();
+    // push 事件 data 本身是 recall payload；包成 recallEventFromGroupMessage 可识别的形状。
+    const wrapped: JsonObject = { ...src };
+    if (!('type' in wrapped)) wrapped.type = 'group.message_recalled';
+    if (!('payload' in wrapped)) {
+      wrapped.payload = {
+        type: 'group.message_recalled',
+        message_ids: src.message_ids ?? [],
+        target_message_seqs: src.target_message_seqs ?? [],
+        sender_aid: src.sender_aid ?? '',
+        recalled_by: src.recalled_by ?? '',
+        recalled_at: src.recalled_at ?? src.timestamp ?? 0,
+        reason: src.reason ?? '',
+        group_id: groupId,
+      };
+    }
+    const seq = src.seq;
+    const seqNum = Number(seq);
+    // 无 group_id 或无可用 seq 时无法推进 contiguous 序列，仅做去重发布兜底。
+    // TS/JS 为单线程事件循环，无需 Python 侧的 ns lock 串行保护。
+    if (!groupId || seq === undefined || seq === null || !Number.isFinite(seqNum) || !Number.isInteger(seqNum)) {
+      await this.publishGroupRecallTombstone(groupId, seq, wrapped as EventPayload);
+      return;
+    }
+    const ns = `group:${groupId}`;
+    if (seqNum > 0) {
+      client._seqTracker.updateMaxSeen(ns, seqNum);
+      if (client._seqTracker.getContiguousSeq(ns) === seqNum) {
+        // 已覆盖（pull 先到并推进过），仍走去重发布兜底，不重复推进 seq。
+        await this.publishGroupRecallTombstone(groupId, seq, wrapped as EventPayload);
+        return;
+      }
+      client._repairPushContiguousBound(ns, seqNum, true, '_raw.group.message_recalled');
+    }
+    // 该 notice_seq 已由 pull 路径处理过（已发布或挂起待发布）时，去重发布兜底后返回。
+    const pushed = client._pushedSeqs.get(ns) as Set<number> | undefined;
+    const pending = client._pendingOrderedMsgs.get(ns) as Map<number, unknown> | undefined;
+    if (pushed?.has(seqNum) || pending?.has(seqNum)) {
+      await this.publishGroupRecallTombstone(groupId, seq, wrapped as EventPayload);
+      return;
+    }
+    const contigBefore = client._seqTracker.getContiguousSeq(ns);
+    client._seqTracker.onMessageSeq(ns, seqNum);
+    await this.publishGroupRecallTombstone(groupId, seq, wrapped as EventPayload);
+    this.markPublishedSeq(ns, seqNum);
+    client._markOrderedSeqDelivered?.(ns, seqNum);
+    const contig = client._seqTracker.getContiguousSeq(ns);
+    if (contig > 0) {
+      const ackSeq = this.clampAckSeq('group.ack_messages', 'msg_seq', ns, contig);
+      client._withBackgroundRpc(() => client._ackGroupV2(groupId, ackSeq))
+        .catch((e: unknown) => { client._clientLog.debug(`group recall auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`); });
+    }
+    if (contig !== contigBefore) this.saveSeqTrackerState();
   }
 
   publishAppEvent(event: string, payload: EventPayload, source = 'direct'): void | Promise<void> {
@@ -374,6 +511,20 @@ export class MessageDeliveryEngine {
       const ns = `group:${groupId}`;
       if (seq > 0) client._seqTracker.updateMaxSeen(ns, seq);
       const contigBefore = client._seqTracker.getContiguousSeq(ns);
+      // 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled，仍占 seq 推进 contiguous/ack。
+      if (!encryptedPush && this.recallEventFromGroupMessage(msg)) {
+        const published = await this.publishOrderedGroupRecall(ns, seq, msg);
+        const contigAfter = client._seqTracker.getContiguousSeq(ns);
+        const contig = client._seqTracker.getContiguousSeq(ns);
+        if (contig > 0) {
+          const ackSeq = this.clampAckSeq('group.ack_messages', 'msg_seq', ns, contig);
+          client._withBackgroundRpc(() => client._ackGroupV2(groupId, ackSeq))
+            .catch((e: unknown) => { client._clientLog.debug(`group recall auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`); });
+        }
+        if (contigAfter !== contigBefore) this.saveSeqTrackerState();
+        void published;
+        return;
+      }
       const published = encryptedPush
         ? await client._publishEncryptedPushMessage('group.message_created', 'group.message_undecryptable', ns, seq, msg, true)
         : await this.publishOrderedMessage('group.message_created', ns, seq, msg);
@@ -1103,6 +1254,26 @@ export class MessageDeliveryEngine {
     this.markPublishedSeq(ns, seqNum);
     client._markOrderedSeqDelivered(ns, seqNum);
     client._clientLog.debug(`publish ordered delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
+    await this.drainOrderedMessages(ns);
+    return true;
+  }
+
+  async publishOrderedGroupRecall(ns: string, seq: unknown, message: EventPayload): Promise<boolean> {
+    const client = this.runtime.client;
+    const seqNum = Number(seq);
+    if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0) {
+      await this.publishGroupRecallTombstone(ns.replace(/^group:/, ''), seq, message);
+      return true;
+    }
+    // 撤回 tombstone 也占 seq：推进 contiguous 并标记已发布，确保 ack 正常推进、不留空洞。
+    if (client._pushedSeqs.get(ns)?.has(seqNum)) {
+      await this.publishGroupRecallTombstone(ns.replace(/^group:/, ''), seq, message);
+      return false;
+    }
+    client._seqTracker.onMessageSeq(ns, seqNum);
+    await this.publishGroupRecallTombstone(ns.replace(/^group:/, ''), seq, message);
+    this.markPublishedSeq(ns, seqNum);
+    client._markOrderedSeqDelivered?.(ns, seqNum);
     await this.drainOrderedMessages(ns);
     return true;
   }

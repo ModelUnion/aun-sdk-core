@@ -67,6 +67,7 @@
 | 方法 | 说明 |
 |------|------|
 | [group.send](#groupsend) | 发送群消息 |
+| [group.recall](#grouprecall) | 撤回群消息 |
 | [group.thought.put](#groupthoughtput) | 写入某个群上下文的思考内容 |
 | [group.thought.get](#groupthoughtget) | 获取某个群上下文的思考内容 |
 | [group.pull](#grouppull) | 增量拉取消息 |
@@ -1173,6 +1174,59 @@ result = await client.call("group.thought.get", {
 {"cursor": 42}
 ```
 
+### group.recall
+
+撤回群消息。仅**原发送者**可撤回自己的消息，受时间窗口限制（默认 **120 秒**，由群服务配置 `recall_window_seconds` 控制，`0` 表示不限制）。管理员撤回（`group_admin_recall_enabled`）默认关闭，本期不实现。
+
+**双 tombstone 机制**：群消息使用 per-group 全局 `message_seq`（V1/V2 共享同一空间），直接删除原消息会让"还没拉到原消息"的客户端遇到永久 seq 空洞。因此撤回写入两条 tombstone：
+
+- **原 seq 占位 tombstone**：占住被撤消息原来的 seq。V1 把原 `group_messages` 行 `message_type` 改为 `group.message_recalled` 并清空正文；V2 删除 `v2_group_messages` 密文体与所有 `v2_group_wraps`，再在 `group_messages` 插入同 `original_seq` 的明文 tombstone 顶替。服务对象是**还没读到原消息**的客户端——拉到该 seq 看到 tombstone，而非空洞。
+- **新 seq 通知 tombstone**：分配一个新的 `message_seq`，通知**已经读过原消息**（游标已越过 `original_seq`）的客户端"这条消息被撤回了"。
+
+同时写一条 `group_events`（`event_type = group.message_recalled`）用于事件流审计，并在事务提交后推送 `event/group.message_recalled`（见下）。撤回真相记录在 `group_message_recalls` 表，`(group_id, original_message_id)` 与 `(group_id, original_seq)` 双唯一键防止重复撤回。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `message_ids` | string[] | 是 | 待撤回消息 ID 列表，最多 100 个（`recall_max_batch`）|
+| `reason` | string | 否 | 可选撤回理由，建议短文本（最长 255 字符）|
+
+**响应**：
+
+```json
+{
+    "success": true,
+    "accepted": ["gm-aaa", "gm-bbb"],
+    "recalled": ["gm-aaa"],
+    "errors": [
+        {"message_id": "gm-bbb", "error": "not_sender"}
+    ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `success` | boolean | 整体是否受理 |
+| `accepted` | string[] | 通过时间窗口前置过滤、进入撤回事务的消息 ID |
+| `recalled` | string[] | DB 真实撤回成功的消息 ID（避免并发撤回误通知）|
+| `errors` | array | 逐条错误：`{message_id, error}` |
+
+**逐条错误码**：
+
+| error | 说明 |
+|-------|------|
+| `not_found` | 消息不存在 |
+| `not_sender` | 操作者不是原发送者 |
+| `already_recalled` | 消息已被撤回（命中唯一键 / 占位 tombstone 已存在）|
+| `expired` | 超过撤回时间窗口 |
+| `group_inactive` | 群组非 active 状态（suspended / dissolved）|
+
+**SDK 行为**：SDK 把 pull / push 收到的撤回 tombstone（占位与通知）归一化为 `group.message_recalled` 应用事件，**不**作为普通 `group.message_created` 交付；tombstone 仍占 seq，正常推进 SeqTracker 与 ack。SDK 按 `(group_id, message_ids)` 去重，因此即使同时收到在线 push 事件、占位 tombstone、通知 tombstone，应用层也**只回调一次**。去重键**不含 `recalled_at`**：占位 tombstone、通知 tombstone 与在线 push 三条通道对同一次撤回可能携带不同来源的时间戳（push 在事务提交后重取），若纳入 `recalled_at` 会使去重失效、导致重复回调；一条消息只能被撤回一次（服务端 `group_message_recalls` 唯一键保证），`(group_id, message_ids)` 已能唯一标识一次撤回。
+
+> 所有语言 SDK 统一通过 `client.call("group.recall", {...})` 调用，不提供独立的便捷方法名。
+
 ---
 
 ## 公告与规则
@@ -1873,6 +1927,49 @@ SDK 收到后自动解密 `payload`，解密后的明文消息直接交付用户
 ```
 
 SDK 收到后自动调用 `group.pull` 拉取最新消息并逐条解密后交付用户回调。
+
+### event/group.message_recalled
+
+群消息撤回后推送给所有在线成员（与 pull 双 tombstone 兜底互补）。在线 push 是实时通道，双 tombstone 是离线 / 未读 / push 丢失时的可靠性兜底；两者最终一致，SDK 去重保证应用层只感知一次。
+
+**Payload**：
+
+```json
+{
+    "module_id": "group",
+    "group_id": "g-abc123.agentid.pub",
+    "seq": 43,
+    "message_id": "grm-uuid",
+    "message_ids": ["gm-aaa"],
+    "target_message_seqs": [42],
+    "sender_aid": "alice.agentid.pub",
+    "recalled_by": "alice.agentid.pub",
+    "recalled_at": 1234567890000,
+    "reason": "",
+    "member_aids": ["bob.agentid.pub"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `module_id` | string | 固定 `"group"` |
+| `group_id` | string | 群组 ID |
+| `seq` | integer | 撤回通知 tombstone 的**新群消息 seq** |
+| `message_id` | string | 撤回通知 tombstone 自己的 message_id |
+| `message_ids` | string[] | 被撤回的**原消息 ID 列表** |
+| `target_message_seqs` | integer[] | 被撤回的原消息 seq 列表 |
+| `sender_aid` | string | 原消息发送方 |
+| `recalled_by` | string | 撤回操作者 |
+| `recalled_at` | integer | 撤回时间戳（毫秒）|
+| `reason` | string | 可选撤回理由 |
+
+跨域成员通过 federation forward 转发（`group.message_recalled` 在跨域转发白名单内），路径与 `group.message_created` 一致。
+
+**订阅**：
+
+```python
+client.on("group.message_recalled", lambda ev: print("recalled:", ev["message_ids"]))
+```
 
 ---
 

@@ -1035,7 +1035,7 @@ async def test_storage_logical_url_public_and_private():
                 "size_bytes": len(body), "expire_in_seconds": 300,
             })
 
-        # ticket 必须返回干净 logical_url（无 cas、无签名）
+        # ticket 必须返回干净 logical_url（无 cas、无签名）和 AID 风格 url
         ticket = await alice.call("storage.create_download_ticket", {
             "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": pub_key,
         })
@@ -1047,6 +1047,30 @@ async def test_storage_logical_url_public_and_private():
         _assert_non_loopback_url(logical_url, "logical_url")
         if "/alice/" not in logical_url:
             raise AssertionError(f"logical_url 用户段不符: {logical_url}")
+
+        # 验证新增 url 字段（AID 风格，优先/默认）
+        aid_url = str(ticket.get("url") or "")
+        if not aid_url:
+            raise AssertionError(f"ticket 未返回 url 字段: {ticket}")
+        if f"{_ALICE_AID}/storage/" not in aid_url:
+            raise AssertionError(f"url 不含 AID 路径段: {aid_url}")
+        if pub_key not in aid_url:
+            raise AssertionError(f"url 不含 object_key: {aid_url}")
+        print(f"  url={aid_url}")
+        print(f"  logical_url={logical_url}")
+
+        # 验证 put_object 也返回 url 字段
+        small_key = f"logical/{rid}/small.txt"
+        put_res = await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID, "object_key": small_key,
+            "content": __import__("base64").b64encode(b"hello").decode(),
+            "is_private": False,
+        })
+        if not str(put_res.get("url") or ""):
+            raise AssertionError(f"put_object 未返回 url: {put_res}")
+        if f"{_ALICE_AID}/storage/" not in put_res["url"]:
+            raise AssertionError(f"put_object url 不含 AID 路径段: {put_res['url']}")
+        print(f"  put_object url={put_res['url']}")
 
         # 公开文件：无 token 直接访问
         st, body = await _http_status(logical_url)
@@ -1074,7 +1098,7 @@ async def test_storage_logical_url_public_and_private():
 
         _ok("storage_logical_url_public_and_private")
     finally:
-        for okey in (pub_key, priv_key):
+        for okey in (pub_key, priv_key, small_key):
             try:
                 await alice.call("storage.delete_object", {
                     "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": okey})

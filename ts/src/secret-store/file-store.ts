@@ -112,6 +112,27 @@ function renameSeedFile(seedPath: string): boolean {
   }
 }
 
+function nextVersionedBackupPath(path: string): string {
+  for (let i = 1; ; i++) {
+    const candidate = `${path}.v${i}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+function writeKeyJsonAtomic(path: string, data: object): void {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    try { renameSync(tmp, path); } catch {
+      try { unlinkSync(path); } catch { /* ignore */ }
+      renameSync(tmp, path);
+    }
+  } catch (exc) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw exc;
+  }
+}
+
 function verifyPrivateKeys(root: string, oldMasterKey: Buffer): PrivateKeyMigration[] {
   const aidsRoot = join(root, 'AIDs');
   if (!existsSync(aidsRoot)) throw new SeedMigrationError('seed migration refused: AIDs directory not found');
@@ -188,7 +209,10 @@ function changeSeedBytes(
     const data = JSON.parse(readFileSync(item.path, 'utf-8'));
     data.private_key_protection = record;
     delete data.private_key_pem;
-    writeFileSync(item.path, JSON.stringify(data, null, 2), 'utf-8');
+    // 覆盖前先备份（.v1/.v2 递增）
+    const bakPath = nextVersionedBackupPath(item.path);
+    writeFileSync(bakPath, readFileSync(item.path));
+    writeKeyJsonAtomic(item.path, data);
     result.migrated += 1;
     result.privateKeysMigrated += 1;
   }

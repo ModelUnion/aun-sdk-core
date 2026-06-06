@@ -607,6 +607,9 @@ export class AUNClient {
   /** 惰性群同步：已同步过的 group_id 集合 */
   private _groupSynced: Set<string> = new Set();
 
+  /** 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次 */
+  _groupRecallSeen: Map<string, number> = new Map();
+
   /** 补洞去重：已完成/进行中的 key -> 开始时间戳，防止重复 pull 同一区间 */
   private _gapFillDone: Map<string, number> = new Map();
   /** pull gate：按消费单元串行化 public pull / gap fill / push auto-pull。 */
@@ -796,6 +799,8 @@ export class AUNClient {
     this._dispatcher.subscribe('_raw.group.v2.message_created', (data) => this._safeAsync(this._onRawGroupV2MessageCreated(data)));
     // 群组消息推送：自动解密后 re-publish
     this._dispatcher.subscribe('_raw.group.message_created', (data) => this._onRawGroupMessageCreated(data));
+    // 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
+    this._dispatcher.subscribe('_raw.group.message_recalled', (data) => this._safeAsync(this._onRawGroupMessageRecalled(data)));
     // 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
     this._dispatcher.subscribe('_raw.group.changed', (data) => this._onRawGroupChanged(data));
     // V2 epoch 轮换事件：清 bootstrap 缓存并触发 SPK rotation
@@ -1267,6 +1272,10 @@ export class AUNClient {
   /** 处理群组消息推送：自动解密后 re-publish */
   private async _onRawGroupMessageCreated(data: EventPayload): Promise<void> {
     return this._delivery.onRawGroupMessageCreated(data);
+  }
+
+  private async _onRawGroupMessageRecalled(data: EventPayload): Promise<void> {
+    return this._delivery.onRawGroupMessageRecalled(data);
   }
 
   /** 后台补齐 P2P 消息空洞 */

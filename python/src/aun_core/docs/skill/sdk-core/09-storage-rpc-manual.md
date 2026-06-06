@@ -24,6 +24,14 @@
 | [storage.complete_upload](#storagecomplete_upload) | 确认上传完成 |
 | [storage.create_download_ticket](#storagecreate_download_ticket) | 申请下载 URL |
 
+### 分享方法
+
+| 方法 | 说明 |
+|------|------|
+| [storage.create_share_link](#storagecreate_share_link) | 创建分享链接 |
+| [storage.list_share_links](#storagelist_share_links) | 列举分享链接 |
+| [storage.revoke_share_link](#storagerevoke_share_link) | 撤销分享链接 |
+
 ---
 
 > `object_key` 当前仅支持 ASCII 安全字符集合 `[A-Za-z0-9._/-]`，且不允许空路径段、`..`、反斜杠转义后的非法段。
@@ -51,6 +59,8 @@
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转到直链 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 存储桶 |
 | `object_key` | string | 对象路径 |
@@ -313,12 +323,13 @@ for obj in result["items"]:
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `object_key` | string | 是 | 对象路径 |
-| `sha256` | string | 是 | 文件 SHA-256 哈希 |
+| `sha256` | string | 否 | 文件 SHA-256 哈希；提供则校验完整性，`skip_blob=true` 时必填 |
 | `bucket` | string | 否 | 存储桶，默认 `"default"` |
 | `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
 | `content_type` | string | 否 | MIME 类型，默认 `"application/octet-stream"` |
 | `is_private` | boolean | 否 | 是否私有，默认 `true` |
 | `size_bytes` | integer | 否 | 预期文件大小（用于校验） |
+| `skip_blob` | boolean | 否 | 秒传模式，默认 `false`；为 `true` 时跳过 blob 上传，必须提供 `sha256` 且服务端已存在对应内容 |
 | `expected_version` | integer | 否 | 乐观并发控制版本号 |
 | `expire_in_seconds` | integer | 否 | 过期时间（秒） |
 | `metadata` | object | 否 | 自定义元数据 |
@@ -327,6 +338,8 @@ for obj in result["items"]:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 存储桶 |
 | `object_key` | string | 对象路径 |
@@ -356,8 +369,10 @@ for obj in result["items"]:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `download_url` | string | 下载用 presigned URL |
-| `expire_at` | integer | URL 过期时间戳 |
+| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
+| `download_url` | string | 预签名下载 URL（有时效，签名形式由 BlobStore 后端决定） |
+| `expire_at` | integer | `download_url` 的过期时间戳（Unix 秒） |
 | `file_name` | string | 文件名（从 object_key 提取） |
 | `size_bytes` | integer | 文件大小（字节） |
 | `content_type` | string | MIME 类型 |
@@ -365,7 +380,7 @@ for obj in result["items"]:
 | `version` | integer | 版本号 |
 | `etag` | string | 实体标签 |
 
-客户端获得 `download_url` 后，通过 HTTP GET 下载文件。
+客户端获得 `download_url` 后，通过 HTTP GET 下载文件。`url` 为永久可分享的 AID 风格链接，`logical_url` 为无跳转直链。
 
 > 当前实现会对 BlobStore 返回的 loopback URL 做对外地址规范化：优先使用 `KITE_STORAGE_EXTERNAL_URL`，否则按 `storage.{issuer}` 形式改写。对外地址不可使用 `127.0.0.1` 或 `localhost`。
 
@@ -483,6 +498,104 @@ else:
         "size_bytes": len(data),
     })
 ```
+
+---
+
+## storage.create_share_link
+
+创建分享链接。生成一个短码（share_id），通过短码可访问对象，支持授权 AID 白名单、有效期、使用次数限制。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `object_key` | string | 是 | 被分享对象的路径 |
+| `bucket` | string | 否 | 存储桶，默认 `"default"` |
+| `owner_aid` | string | 否 | 对象所有者 AID，默认当前用户（仅可分享自己的对象） |
+| `allowed_aids` | string[] | 否 | 授权访问的 AID 列表，默认 `["*"]`（任意 AID 可访问）；含 `"*"` 即视为公开 |
+| `expire_in_seconds` | integer | 否 | 有效期（秒），默认 86400（1 天），`0` 表示永不过期 |
+| `max_uses` | integer | 否 | 最大使用次数，默认 `0`（无限制） |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `share_id` | string | 10 位 Base62 分享短码 |
+| `aid_share_url` | string | **AID 风格分享 URL（默认/推荐）**：`https://{owner_aid}/storage/{share_id}`，体现分享者身份 |
+| `share_url` | string | 直链分享 URL：`{base_url}/s/{share_id}`，兼容字段 |
+| `expire_at` | integer | 过期时间戳（Unix 秒），`0` 表示永不过期 |
+| `max_uses` | integer | 最大使用次数，`0` 表示无限制 |
+| `allowed_aids` | string[] | 授权 AID 列表，`["*"]` 表示公开 |
+
+> 访问 `aid_share_url` 时经 NameService 302 跳转到 `share_url`。share_id 是 10 位无斜杠 Base62，与 object_key 路径天然区分（object_key 含 `/` 或非 10 位）。
+> share_id 指向 `(owner_aid, bucket, object_key)` 逻辑引用，非内容快照：对象改名/移动后原 share_id 失效，内容覆盖后下载到新内容。
+
+### 示例
+
+```python
+result = await client.call("storage.create_share_link", {
+    "object_key": "docs/report.pdf",
+    "allowed_aids": ["alice.agentid.pub"],
+    "expire_in_seconds": 3600,
+    "max_uses": 5,
+})
+share_url = result["aid_share_url"]
+```
+
+---
+
+## storage.list_share_links
+
+列举分享链接，可按 bucket / object_key 过滤。仅返回当前用户自己创建的链接。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `bucket` | string | 否 | 按存储桶过滤 |
+| `object_key` | string | 否 | 按对象路径过滤 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `links` | array | 分享链接列表 |
+
+每个 link 包含：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `share_id` | string | 分享短码 |
+| `aid_share_url` | string | AID 风格分享 URL（主字段） |
+| `share_url` | string | 直链分享 URL（兼容） |
+| `object_key` | string | 被分享对象路径 |
+| `bucket` | string | 存储桶 |
+| `allowed_aids` | string[] | 授权 AID 列表，`["*"]` 表示公开 |
+| `expire_at` | integer | 过期时间戳（秒），`0` 表示永不过期 |
+| `max_uses` | integer | 最大使用次数，`0` 表示无限制 |
+| `used_count` | integer | 已使用次数 |
+| `created_at` | integer | 创建时间戳（毫秒） |
+
+---
+
+## storage.revoke_share_link
+
+撤销分享链接。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `share_id` | string | 是 | 待撤销的分享短码 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `revoked` | boolean | 是否成功撤销 |
+| `share_id` | string | 被撤销的分享短码 |
+
+> 链接不存在或已撤销时返回通用错误（`-32000`）。
 
 ---
 

@@ -207,6 +207,7 @@ const EVENT_NAME_MAP: Record<string, string> = {
   'message.ack': 'message.ack',
   'group.changed': 'group.changed',
   'group.message_created': 'group.message_created',
+  'group.message_recalled': 'group.message_recalled',
   'group.state_committed': 'group.state_committed',
   'storage.object_changed': 'storage.object_changed',
 };

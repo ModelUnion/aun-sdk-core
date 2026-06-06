@@ -749,3 +749,35 @@ describe('LocalIdentityStore', () => {
     ks.close();
   });
 });
+
+describe('ChangeSeed versioned backup', () => {
+  it('ChangeSeed 写 .v1 备份且旧 seed 可解密备份', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-backup-'));
+    const aid = 'backup-test.agentid.pub';
+    const keyDir = join(tmpDir, 'AIDs', aid, 'private');
+    mkdirSync(keyDir, { recursive: true });
+    const keyPath = join(keyDir, 'key.json');
+    const oldStore = new LocalIdentityStore(tmpDir, { encryptionSeed: 'old-seed' });
+    oldStore.saveKeyPair(aid, { private_key_pem: 'BACKUP_PRIVATE', public_key_der_b64: 'pub', curve: 'P-256' });
+    oldStore.close();
+
+    FileSecretStore.changeSeed(tmpDir, 'old-seed', 'new-seed');
+
+    const bakPath = keyPath + '.v1';
+    expect(existsSync(bakPath)).toBe(true);
+    const bak = JSON.parse(readFileSync(bakPath, 'utf-8'));
+    expect(bak.private_key_protection?.scheme).toBe('file_aes');
+  });
+
+  it('saveKeyPair 覆盖已有 key.json 时写 .v1 备份', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-overwrite-'));
+    const aid = 'overwrite-backup.agentid.pub';
+    const ks = new LocalIdentityStore(tmpDir, { encryptionSeed: 'seed1' });
+    ks.saveKeyPair(aid, { private_key_pem: 'FIRST', public_key_der_b64: 'pub', curve: 'P-256' });
+    ks.saveKeyPair(aid, { private_key_pem: 'SECOND', public_key_der_b64: 'pub', curve: 'P-256' });
+    ks.close();
+
+    const bakPath = join(tmpDir, 'AIDs', aid, 'private', 'key.json.v1');
+    expect(existsSync(bakPath)).toBe(true);
+  });
+});

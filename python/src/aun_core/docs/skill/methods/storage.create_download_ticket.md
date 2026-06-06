@@ -37,7 +37,9 @@ download_url = result["download_url"]
 
 ```json
 {
-    "download_url": "https://storage.example.com/download?key=...&expire=...&sig=...",
+    "url": "https://alice.agentid.pub/storage/attachments/report.pdf",
+    "logical_url": "https://storage.agentid.pub/alice/attachments/report.pdf",
+    "download_url": "https://storage.example.com/download?key=...&sig=...",
     "expire_at": 1711238167,
     "file_name": "report.pdf",
     "size_bytes": 5242880,
@@ -50,8 +52,10 @@ download_url = result["download_url"]
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `download_url` | string | 下载 URL。签名/鉴权形式由底层 BlobStore 后端决定 |
-| `expire_at` | integer | URL 过期时间戳（Unix 秒） |
+| `url` | string | **AID 风格 URL（推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转，可长期分享 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
+| `download_url` | string | 预签名下载 URL，有时效，签名形式由底层 BlobStore 后端决定 |
+| `expire_at` | integer | `download_url` 的过期时间戳（Unix 秒） |
 | `file_name` | string | 文件名（从 object_key 提取） |
 | `size_bytes` | integer | 文件大小（字节） |
 | `content_type` | string | MIME 类型 |

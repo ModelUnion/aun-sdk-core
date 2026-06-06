@@ -24,12 +24,13 @@ result = await client.call("storage.complete_upload", {
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `object_key` | string | 是 | — | 对象路径标识 |
-| `sha256` | string | 是 | — | 文件 SHA-256 哈希 |
+| `sha256` | string | 否 | — | 文件 SHA-256 哈希；提供则校验完整性，`skip_blob=true` 时必填 |
 | `bucket` | string | 否 | `"default"` | 存储桶名称 |
 | `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
 | `content_type` | string | 否 | `"application/octet-stream"` | MIME 类型 |
 | `is_private` | boolean | 否 | `true` | 是否私有 |
 | `size_bytes` | integer | 否 | — | 预期文件大小（用于校验） |
+| `skip_blob` | boolean | 否 | `false` | 秒传模式；为 `true` 时跳过 blob 上传，必须提供 `sha256` 且服务端已存在对应内容 |
 | `expected_version` | integer | 否 | — | 乐观并发控制版本号 |
 | `expire_in_seconds` | integer | 否 | `0` | 对象过期时间（秒），`0` 表示不过期 |
 | `metadata` | object | 否 | — | 自定义元数据 |
@@ -38,6 +39,8 @@ result = await client.call("storage.complete_upload", {
 
 ```json
 {
+    "url": "https://my-agent.agentid.pub/storage/attachments/report.pdf",
+    "logical_url": "https://storage.agentid.pub/my-agent/attachments/report.pdf",
     "owner_aid": "my-agent.agentid.pub",
     "bucket": "default",
     "object_key": "attachments/report.pdf",
@@ -52,6 +55,8 @@ result = await client.call("storage.complete_upload", {
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `url` | string | **AID 风格 URL（推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转 |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 存储桶名称 |
 | `object_key` | string | 对象路径标识 |

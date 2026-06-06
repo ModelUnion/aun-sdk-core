@@ -1843,6 +1843,13 @@ class V2E2EECoordinator:
                     payload = msg.get("payload")
                     if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
                         continue
+                    # 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled，
+                    # 不当作普通消息投递；仍占 seq，确保 contiguous / ack 正常推进。
+                    if client._delivery().recall_event_from_group_message(msg) is not None:
+                        await client._delivery().publish_group_recall_tombstone(group_id, seq, msg)
+                        client._mark_published_seq(ns, seq)
+                        client._log.debug("client", "group.v2.pull recall tombstone delivered: group=%s seq=%d", group_id, seq)
+                        continue
                     v1_msg = {
                         "message_id": msg.get("message_id", ""),
                         "from": msg.get("from_aid", ""),

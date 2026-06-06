@@ -6,6 +6,25 @@
 
 ---
 
+## 0.4.10 — 2026-06-06
+
+### 新功能
+- **Service Proxy 服务代理**：新增 `service_proxy` 客户端模块（控制面 `proxy.register`/`unregister`/`list_services` + 数据面隧道），含 holder/visitor 工具与协议探测（四语言对齐）
+- **notify() 单向通知**：新增 `notify()` 公开 API，发送无 id 的 JSON-RPC 2.0 Notification，只面向在线长连接、不落库、不分配 seq、无 ack（四语言对齐）
+- **Storage 逻辑下载 URL**：支持干净逻辑下载 URL `storage.{issuer}/{user_name}/{object_key}`，无签名无 CAS，localfs 逻辑解析器 + CAS 物理缺失兜底校验
+
+### 修复
+- **群消息撤回（`group.message_recalled`）端到端打通**：新增在线 push 通道（`_raw.group.message_recalled`），与 pull 双 tombstone（占位 + 通知）兜底互补；push 路径推进 `notice_seq` 的 seq/ack 与普通群消息对齐，避免 seq 留洞导致重复拉取；按 `(group_id, message_ids)` 去重（去重键不含 `recalled_at`），确保应用层只回调一次；V2 pull 路径同样归一化撤回 tombstone（四语言+服务端对齐）
+- `group.recall` 加入 RPC 白名单；`transport` 事件名映射补充 `group.message_recalled`
+
+### 优化
+- **ChangeSeed 健壮性增强**：key.json 重写改用递增版本备份（`.v1`/`.v2`…）替代单一 `.bak`，迁移失败时从版本备份回滚，成功后保留备份供审计；`LocalIdentityStore` 覆盖已有 key.json 前先做版本备份，写入统一走原子 tmp+rename（四语言对齐）
+
+### 测试
+- `e2e_test_group_e2ee.py` 补充群撤回收发端断言；`integration_test_storage.py` 补充逻辑下载 URL 用例
+
+---
+
 ## 0.4.9 — 2026-06-03
 
 ### 修复

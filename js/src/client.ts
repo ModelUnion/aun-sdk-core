@@ -686,6 +686,8 @@ export class AUNClient {
   private _pendingOrderedMsgs: Map<string, Map<number, { event: string; payload: EventPayload }>> = new Map();
   /** Lazy group sync：首次发送群消息前自动拉取历史 */
   private _groupSynced: Set<string> = new Set();
+  /** 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次 */
+  _groupRecallSeen: Map<string, number> = new Map();
   /** 在线未读 hint 队列：同一 group 只保留最后一条，延迟 drain 降低登录瞬时拉取压力。 */
   private _onlineUnreadHintQueue: Map<string, JsonObject> = new Map();
   private _onlineUnreadHintTimer: ReturnType<typeof setTimeout> | null = null;
@@ -843,6 +845,10 @@ export class AUNClient {
     // 群组消息推送：re-publish（V2 加密消息走 V2 push 路径）
     this._dispatcher.subscribe('_raw.group.message_created', (data) => {
       this._onRawGroupMessageCreated(data);
+    });
+    // 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
+    this._dispatcher.subscribe('_raw.group.message_recalled', (data) => {
+      this._safeAsync(this._onRawGroupMessageRecalled(data));
     });
     // 群组变更事件：验签 + 透传 + gap 检测
     this._dispatcher.subscribe('_raw.group.changed', (data) => {
@@ -1309,6 +1315,10 @@ export class AUNClient {
   /** 处理群组消息推送：re-publish（V2 加密消息走 V2 push 路径） */
   private _onRawGroupMessageCreated(data: EventPayload): void {
     return this._delivery.onRawGroupMessageCreated(data);
+  }
+
+  private async _onRawGroupMessageRecalled(data: EventPayload): Promise<void> {
+    return this._delivery.onRawGroupMessageRecalled(data);
   }
 
   /** 处理 V2 群消息通知：主动 pull V2 envelope，由 pullGroupV2 解密并发布。 */

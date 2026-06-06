@@ -262,22 +262,21 @@ def _change_seed_bytes(
         )
 
     # 阶段 2：重写 key.json（带备份回滚保护）
-    written: list[_PrivateKeyMigration] = []
+    written: list[tuple[_PrivateKeyMigration, Path]] = []
     try:
         for item in migrations:
-            _rewrite_key_json(item, new_seed, new_master)
-            written.append(item)
+            bak_path = _rewrite_key_json(item, new_seed, new_master)
+            written.append((item, bak_path))
             result.private_keys_migrated += 1
             result.migrated += 1
     except SeedMigrationError:
-        # key.json 写入失败 → 从 .bak 恢复所有已写入的
+        # key.json 写入失败 → 从 .vN 备份恢复所有已写入的
         _rollback_key_json_from_backups(written, logger=logger, emit=emit)
         # 同时回滚 DB 迁移
         _migrate_all_aun_dbs(root, new_master, old_seed, old_master)
         raise
 
-    # 阶段 3：全部成功，清理备份
-    _cleanup_key_json_backups(written)
+    # 阶段 3：全部成功，版本备份保留供审计
 
     if rename_seed_path is not None:
         result.seed_files_renamed = _rename_seed_file(rename_seed_path)
@@ -400,13 +399,12 @@ def _verify_private_keys(root: Path, old_master: bytes, *, raise_on_empty: bool 
     return migrations
 
 
-def _rewrite_key_json(item: _PrivateKeyMigration, new_seed: bytes, new_master: bytes) -> None:
-    """重写 key.json，使用备份机制保证原子性。
+def _rewrite_key_json(item: _PrivateKeyMigration, new_seed: bytes, new_master: bytes) -> Path:
+    """重写 key.json，使用递增版本号备份保证原子性。
 
-    流程：原文件 → .bak 备份 → 写新内容 → 验证 → 成功
-    调用方负责在全部成功后调用 _cleanup_key_json_backups 删除 .bak。
+    返回备份路径（.vN）。调用方负责在全部成功后决定是否清理。
     """
-    bak_path = item.path.with_name(item.path.name + ".bak")
+    bak_path = _next_versioned_backup_path(item.path)
     try:
         data = json.loads(item.path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -414,11 +412,9 @@ def _rewrite_key_json(item: _PrivateKeyMigration, new_seed: bytes, new_master: b
     if not isinstance(data, dict):
         raise SeedMigrationError(f"key.json changed during migration: aid={item.aid}")
 
-    # 备份原文件
+    # 备份原文件（copy 而非 rename，保留原文件直到新内容写入成功）
     try:
-        if not bak_path.exists():
-            # 用 copy 而非 rename，保留原文件直到新内容写入成功
-            bak_path.write_bytes(item.path.read_bytes())
+        bak_path.write_bytes(item.path.read_bytes())
     except OSError as exc:
         raise SeedMigrationError(
             f"无法备份 key.json (aid={item.aid}): {exc}; 迁移中止，数据未修改"
@@ -440,33 +436,37 @@ def _rewrite_key_json(item: _PrivateKeyMigration, new_seed: bytes, new_master: b
         try:
             os.replace(bak_path, item.path)
         except OSError:
-            pass  # 备份恢复也失败了，但原文件可能还在（_write_json_atomic 用 tmp）
+            pass
         raise
+    return bak_path
 
 
-def _rollback_key_json_from_backups(items: list[_PrivateKeyMigration], logger: Any = None, emit: Callable[[str], None] | None = None) -> None:
-    """从 .bak 文件恢复所有已修改的 key.json。"""
-    for item in items:
-        bak_path = item.path.with_name(item.path.name + ".bak")
+def _next_versioned_backup_path(path: Path) -> Path:
+    """返回下一个可用的递增版本备份路径：key.json.v1, key.json.v2, …"""
+    index = 1
+    while True:
+        candidate = path.with_name(f"{path.name}.v{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _rollback_key_json_from_backups(written: list[tuple[_PrivateKeyMigration, Path]], logger: Any = None, emit: Callable[[str], None] | None = None) -> None:
+    """从版本备份恢复所有已修改的 key.json。"""
+    for item, bak_path in written:
         if bak_path.exists():
             try:
                 os.replace(bak_path, item.path)
-                _emit(logger, emit, "info", "key.json rolled back from backup: aid=%s", item.aid)
+                _emit(logger, emit, "info", "key.json rolled back from backup: aid=%s bak=%s", item.aid, bak_path.name)
             except OSError as exc:
                 _emit(logger, emit, "error",
-                      "CRITICAL: key.json rollback from backup failed for aid=%s: %s — "
-                      "manual recovery: rename %s → %s",
+                      "CRITICAL: key.json rollback failed for aid=%s: %s — manual recovery: rename %s → %s",
                       item.aid, exc, bak_path, item.path)
 
 
-def _cleanup_key_json_backups(items: list[_PrivateKeyMigration]) -> None:
-    """迁移全部成功后，删除 .bak 备份文件。"""
-    for item in items:
-        bak_path = item.path.with_name(item.path.name + ".bak")
-        try:
-            bak_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+def _cleanup_key_json_backups(written: list[tuple[_PrivateKeyMigration, Path]]) -> None:
+    """迁移全部成功后，保留版本备份（.v1/.v2）供用户审计；不自动删除。"""
+    pass  # 版本备份有意保留
 
 
 def _migrate_all_aun_dbs(root: Path, old_master: bytes, new_seed: bytes, new_master: bytes) -> tuple[int, int, int]:

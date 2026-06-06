@@ -201,8 +201,18 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	}
 	out := make([]any, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, m)
 		seq := toInt64(m["seq"])
+		// 群撤回 tombstone（占位 / 通知 / legacy V1）：先识别再决定是否进列表。
+		// 命中则归一化为 group.message_recalled 事件并占 seq，但绝不 append 进返回的 messages
+		// 列表（否则撤回 tombstone 会作为"普通消息"泄漏给应用层）。对齐 Python/TS：识别后直接 continue。
+		if _, isRecall := recallEventFromGroupMessage(m); isRecall {
+			c.delivery().publishGroupRecallTombstone(groupID, int(seq), m)
+			if seq > 0 {
+				c.markPushedSeq(ns, int(seq))
+			}
+			continue
+		}
+		out = append(out, m)
 		if seq <= 0 {
 			c.publishAppEvent("group.message_created", m)
 			continue

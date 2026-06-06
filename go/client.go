@@ -67,6 +67,7 @@ const (
 	reconnectMaxBaseDelaySeconds = 64.0
 	pushedSeqsLimit              = 50000
 	pendingOrderedLimit          = 50000
+	groupRecallSeenLimit         = 10000
 )
 
 type pendingOrderedMessage struct {
@@ -549,6 +550,10 @@ type AUNClient struct {
 	groupSynced   map[string]bool
 	groupSyncedMu sync.Mutex
 
+	// 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次
+	groupRecallSeen   map[string]int64
+	groupRecallSeenMu sync.Mutex
+
 	// 在线未读 hint 队列：同一 group 只保留最后一条，延迟 drain 降低登录瞬时拉取压力
 	onlineUnreadHintQueue        map[string]map[string]any
 	onlineUnreadHintMu           sync.Mutex
@@ -678,6 +683,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                   make(map[string]map[int]bool),
 		pendingOrderedMsgs:           make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                  make(map[string]bool),
+		groupRecallSeen:              make(map[string]int64),
 		onlineUnreadHintQueue:        make(map[string]map[string]any),
 		onlineUnreadHintInitialDelay: 750 * time.Millisecond,
 		onlineUnreadHintInterval:     50 * time.Millisecond,
@@ -733,6 +739,10 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 	// 群组消息推送：自动解密后 re-publish
 	events.Subscribe("_raw.group.message_created", func(payload any) {
 		c.onRawGroupMessageCreated(payload)
+	})
+	// 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
+	events.Subscribe("_raw.group.message_recalled", func(payload any) {
+		c.onRawGroupMessageRecalled(payload)
 	})
 	// 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
 	events.Subscribe("_raw.group.changed", func(payload any) {
@@ -1278,7 +1288,7 @@ func (c *AUNClient) status(ctx context.Context) (any, error) {
 func isInstanceScopedMessageEvent(event string) bool {
 	switch event {
 	case "message.received", "message.recalled", "message.undecryptable",
-		"group.message_created", "group.message_undecryptable":
+		"group.message_created", "group.message_recalled", "group.message_undecryptable":
 		return true
 	default:
 		return false

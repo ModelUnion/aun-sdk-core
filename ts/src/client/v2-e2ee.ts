@@ -12,6 +12,7 @@ import {
 } from '../v2/e2ee/index.js';
 import { V2Session, type V2KeyStore } from '../v2/session/index.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcParams, type RpcResult } from '../types.js';
+import type { EventPayload } from '../events.js';
 import type { ClientHost, ClientRuntime } from './runtime.js';
 
 type BootstrapEntry = Record<string, any> & { cachedAt?: number };
@@ -1100,6 +1101,13 @@ export class V2E2EECoordinator {
         if (version === 'v1') {
           const payload = msg.payload;
           const payloadObj = isJsonObject(payload as JsonValue | object | null | undefined) ? payload as Record<string, unknown> : null;
+          // 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled 事件，仍占 seq。
+          if (client._delivery.recallEventFromGroupMessage(msg as unknown as EventPayload)) {
+            await client._delivery.publishGroupRecallTombstone(gid, seq, msg as unknown as EventPayload);
+            client._markPublishedSeq(ns, seq);
+            client._clientLog.debug(`group.v2.pull recall tombstone delivered: group=${gid}, seq=${seq}`);
+            continue;
+          }
           if (payloadObj) {
             const payloadType = String(payloadObj.type ?? '').trim();
             if (payloadType !== 'e2ee.encrypted' && payloadType !== 'e2ee.group_encrypted') {

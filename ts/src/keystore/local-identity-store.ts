@@ -168,6 +168,12 @@ export class LocalIdentityStore implements KeyStore {
       const rec = this._secretStore.protect(safeAid(aid), 'identity/private_key', Buffer.from(pem, 'utf-8'));
       protected_.private_key_protection = rec;
     }
+    // 覆盖已有 key.json 前备份（.v1/.v2 递增）
+    if (existsSync(path)) {
+      let bakIdx = 1;
+      while (existsSync(`${path}.v${bakIdx}`)) bakIdx++;
+      try { writeFileSync(`${path}.v${bakIdx}`, readFileSync(path)); } catch { /* non-fatal */ }
+    }
     const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
     writeFileSync(tmpPath, JSON.stringify(protected_, null, 2), { mode: 0o600 });
     secureFilePermissions(tmpPath);

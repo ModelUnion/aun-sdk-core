@@ -1,10 +1,148 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.9）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.10）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → 工作区 (v0.4.9)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10)。
+
+---
+
+## v0.4.10 — 相对于 v0.4.9 的变更
+
+> 对齐基准为 git 中首个 v0.4.9 提交 `1d64d186`。v0.4.10 = `b45b9f15`（Service Proxy + notify() + Storage 逻辑下载 URL，版本仍标 0.4.9）+ 工作区未提交改动（群撤回端到端 + ChangeSeed 健壮性 + 版本号升 0.4.10）。
+>
+> 三大变更块：**① Service Proxy 服务代理（新模块）**、**② notify() 单向通知（新公开 API）**、**③ 群消息撤回 `group.message_recalled` 端到端打通（修复）**，外加 **④ ChangeSeed 健壮性增强**。Storage 逻辑下载 URL 主要为服务端 + 文档改动，SDK 侧仅 `_NON_IDEMPOTENT_METHODS` 方法名同步。
+
+### 块① Service Proxy 服务代理（新模块 `service_proxy/`）
+
+#### `service_proxy/__init__.py`（新文件，相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1~9 | 新增 | 模块导出 | 导出 `ServiceProxyClient`、`EmbeddedServiceRegistry`、`EndpointPolicy`、`ServiceRecord` |
+
+#### `service_proxy/registry.py`（新文件，172 行）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L83 | 新增 | `class ServiceRecord` | 服务注册记录（service_name/endpoint/service_type/visibility/metadata）；`summary()`→dict |
+| L100 | 新增 | `class EndpointPolicy` | 后端 endpoint 白名单策略；`is_allowed(endpoint)` 校验目标 host |
+| L123 | 新增 | `class EmbeddedServiceRegistry` | 内嵌服务注册表：`register()` / `unregister()` / `get()` / `list_records()` / `list_summaries()` |
+
+#### `service_proxy/protocol_detection.py`（新文件，237 行）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L23 | 新增 | `class ProtocolDetection` | 协议探测结果（stream_mode/protocol/service_type）；`summary()`→dict |
+| L125 | 新增 | `def detect_request_protocol(message, record)` | 从请求头/路径/body 探测 HTTP/JSON-RPC/SSE/WS 流模式 |
+| L217 | 新增 | `def is_stream_response_headers(headers)` | 判断响应头是否为流式（SSE/chunked） |
+| L230 | 新增 | `def stream_type_from_response(headers, fallback)` | 从响应头推断流类型 |
+
+#### `service_proxy/client.py`（新文件，1716 行）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L58 | 新增 | `class ServiceProxyClient` | 服务代理客户端核心 |
+| L160 | 新增 | `register_service()` / `unregister_service()` / `list_service_summaries()` | 本地服务登记（控制面） |
+| L191 | 新增 | `register_services_with_gateway()` | RPC `proxy.register_services` 向 gateway 注册服务 |
+| L207 | 新增 | `unregister_services_from_gateway()` | RPC `proxy.unregister_services` |
+| L220 | 新增 | `list_gateway_services()` | RPC `proxy.list_services` |
+| L360 | 新增 | `discover_proxy_server()` / `discover_proxy_ws_url()` | 发现 proxy 数据面 WS 地址 |
+| L381 | 新增 | `connect_once()` / `serve_once()` / `serve_forever()` | 数据面隧道：建链、单次/持续处理反代请求 |
+| L936 | 新增 | `handle_request_message()` / `iter_request_messages()` / `stream_request_message()` | 隧道请求→本地后端 HTTP 转发（含流式分块） |
+| L1378 | 新增 | `handle_ws_connect_message()` | WS 反代隧道 |
+| L1658 | 新增 | `create_admin_app()` | holder 侧本地 admin HTTP（带 admin_token） |
+
+#### `service_proxy/tools/`（新文件）
+| 文件 | 说明 |
+|------|------|
+| `tools/common.py`（199 行） | holder/visitor 公共工具 |
+| `tools/test_service_holder.py`（465 行） | holder 端测试工具（暴露本地服务到 proxy） |
+| `tools/visitor_client.py`（307 行） | visitor 端测试工具（经 proxy 访问远端服务） |
+
+**对齐要点**：四语言 service_proxy 客户端 API 一致。Go 见 `go/service_proxy.go`（`NewServiceProxyClient` + `RegisterService`/`ServeForever` 等，含 `cmd/service-proxy-holder`、`cmd/service-proxy-visitor`）；TS 见 `ts/src/service-proxy.ts` + `tools/service-proxy-{holder,visitor}.mjs`；JS 见 `js/src/service-proxy.ts` + `tools/service-proxy-{holder-boundary,visitor}.mjs`。控制面方法名固定为 `proxy.register_services`/`proxy.unregister_services`/`proxy.list_services`。
+
+### 块② notify() 单向通知（新公开 API）
+
+#### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +99 | 新增常量 | `_MAX_NOTIFY_PAYLOAD_SIZE = 64 * 1024` | notify payload 上限 64KB |
+| +967 | 新增 | `AUNClient._notify_params_size_ok(params)` | 校验序列化后字节数 ≤ 上限 |
+| +974 | 新增 | `AUNClient._validate_notify_event_method(method)` | 路由型 notify 的 method 必须为 `event/app.*`，否则抛 `ValidationError` |
+| +981 | 新增 | `AUNClient._normalize_notify_ttl(ttl_ms)` | 校验 ttl_ms 为 0~60000 整数 |
+| +992 | 新增 | `async AUNClient.notify(method, params, *, to, group_id, device_id, slot_id, ttl_ms)` | 三种目标分支：① `to`（AID 单播，可带 device_id/slot_id）→ `notification/route`；② `group_id`（群广播）→ `notification/group.route`；③ 无目标（直发 `notification/*`）。互斥校验：`to` 与 `group_id` 不可同设；`slot_id` 须配 `device_id` |
+
+#### `transport.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +400 | 新增 | `async RPCTransport.notify(method, params)` | 发送无 `id` 的 JSON-RPC 2.0 Notification（method 须以 `notification/` 或 `event/` 开头）；不分配 seq、不等 ack、超 `MAX_WS_PAYLOAD_SIZE` 抛错；未连接抛 `ConnectionError` |
+| +655 | 新增 | `_handle_event()` 内 `app.*` 分支 | 收到 `event/app.*` 事件直接 `publish(sdk_event, params)`（应用层事件，不走 `_raw.` 前缀分发） |
+
+**对齐要点**：所有 SDK 的 `notify()` 三分支语义与互斥校验必须一致。Go：`AUNClient.Notify(ctx, method, params, opts...)` + `type NotifyOptions`（client.go:1176/397），`RPCTransport.Notify`（transport.go:620），辅助函数 `notifyParamsSizeOK`/`validateNotifyEventMethod`/`normalizeNotifyTTL`（client.go:1155~1168）。TS：`notify(method, params?, options)` + `interface NotifyOptions`（client.ts:1140/174）。JS：同 TS（client.ts:1204/146）。
+
+### 块③ 群消息撤回 `group.message_recalled` 端到端打通（修复）
+
+> 服务端发两条 tombstone（pull 路径的占位 tombstone 用原 seq + 通知 tombstone 用新 notice_seq），外加在线 push 通道。SDK 三条通道都归一化为 `group.message_recalled` 事件并按 `(group_id, message_ids)` 去重，确保应用层只回调一次；push/pull 都要正确推进 seq/ack，避免 contiguous 序列留洞导致重复拉取。
+
+#### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +18 | 新增常量 | `_GROUP_RECALL_SEEN_LIMIT = 10000` | 去重表上限 |
+| +124 | 新增 | `_handled_app_event_types` 集合补 `group.message_recalled` | 标记为已处理事件类型 |
+| +201 | 新增 | `MessageDeliveryEngine.recall_event_from_group_message(message)` (静态) | 把 pull/push 收到的撤回 tombstone 归一化为 `group.message_recalled` payload；识别 `type`/`kind` 或 `payload.type/kind == "group.message_recalled"`；提取 `message_ids`（兼容 `recalled_message_id`/`target_message_id`/`original_message_id`） |
+| +243 | 新增 | `MessageDeliveryEngine.group_recall_dedup_key(group_id, payload)` (静态) | 去重键 = `group_id + sorted(message_ids)`；**不含 `recalled_at`**（三通道时间戳来源不同，纳入会使去重失效） |
+| +258 | 新增 | `async MessageDeliveryEngine.publish_group_recall_tombstone(group_id, seq, message)` | 归一化 + 按去重键发布一次 `group.message_recalled`；维护 `client._group_recall_seen` dict 并按上限 LRU 淘汰；返回是否实际发布 |
+| +738 | 新增 | `async MessageDeliveryEngine.on_raw_group_message_recalled(data)` | 处理在线 push：包装 data 为可识别形状，进 ns lock 后调 `_apply_group_recall_push` |
+| +772 | 新增 | `async MessageDeliveryEngine._apply_group_recall_push(group_id, seq, wrapped)` | 在 ns lock 内推进 notice_seq 的 seq/ack（与普通群消息 push 对齐）：`update_max_seen` → contiguous 判断 → `on_message_seq` + `persist_seq` → 发布撤回 → `mark_published_seq` → `group.ack_messages` auto-ack；已覆盖/已发布的 seq 走去重兜底不重复推进 |
+
+#### `_client/v2_e2ee.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1848 | 新增 | `pull_v2_group` 明文路径撤回识别 | pull 到的消息若被 `recall_event_from_group_message` 识别为撤回 tombstone，则 `publish_group_recall_tombstone` + `mark_published_seq` 后 `continue`，绝不当普通消息投递给应用层 |
+
+#### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +208 | 修改 | `_NON_IDEMPOTENT_METHODS` | storage 方法名同步：`storage.upload`/`storage.delete` → `storage.create_upload_session`/`storage.delete_object`（配合块④ Storage 改动） |
+| +632 | 新增 | `__init__` 订阅 | `dispatcher.subscribe("_raw.group.message_recalled", self._on_raw_group_message_recalled)` |
+| +926 | 新增 | RPC 白名单 | `"group.recall"` 加入允许调用的 RPC 方法集 |
+| +1151 | 新增 | `async AUNClient._on_raw_group_message_recalled(data)` | 委托 `_delivery().on_raw_group_message_recalled(data)` |
+
+#### `transport.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +28 | 新增 | `EVENT_NAME_MAP` 补项 | `"group.message_recalled": "group.message_recalled"` |
+
+**对齐要点**：Go 见 `client_delivery.go`（`recallEventFromGroupMessage`:170 / `groupRecallDedupKey`:252 / `publishGroupRecallTombstone`:268 / `onRawGroupMessageRecalled`:315，去重表 `groupRecallSeen`+`groupRecallSeenMu` client.go:554，常量 `groupRecallSeenLimit`:70），订阅 client.go:744，RPC 白名单 client.go:1291，V2 pull 路径 v2_routing.go:201（含 legacy V1 tombstone 归一化）。TS 见 `client/delivery.ts`（`recallEventFromGroupMessage`:142 / `groupRecallDedupKey`:174 / `publishGroupRecallTombstone`:189 / `onRawGroupMessageRecalled`:213，常量 `GROUP_RECALL_SEEN_LIMIT`:9），订阅 client.ts:803。JS 见 `client/delivery.ts`（同名符号 138/170/183/207），订阅 client.ts:850。**去重键统一不含 `recalled_at`** 是四语言一致的关键修复点。
+
+### 块④ ChangeSeed 健壮性增强（优化）
+
+> 原 ChangeSeed 用单一 `.bak` 备份，重复迁移会因 `.bak` 已存在而跳过备份；改为递增版本备份 `.vN`（每次都新建），迁移失败可从对应版本回滚，成功后保留备份供审计。`LocalIdentityStore` 覆盖 key.json 前同样做版本备份。
+
+#### `keystore/_utils.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +63 | 新增 | `def next_versioned_backup_path(path)` | 返回下一个可用的 `path.v1`/`path.v2`… 路径 |
+
+#### `keystore/seed_migration.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +264 | 修改 | `_change_seed_bytes()` 阶段2 | `written` 列表元素从 `_PrivateKeyMigration` 改为 `(migration, bak_path)` 元组；失败时从 `.vN` 备份回滚 |
+| +279 | 删除 | 阶段3 `_cleanup_key_json_backups()` 调用 | 成功后保留版本备份供审计（不再删除） |
+| +402 | 修改 | `_rewrite_key_json()` | 返回值由 `None` 改为 `Path`（备份路径）；备份改用 `_next_versioned_backup_path()`（每次新建，不再复用 `.bak`） |
+| +444 | 新增 | `def _next_versioned_backup_path(path)` | 同 `_utils` 版本（模块内私有） |
+| +454 | 修改 | `_rollback_key_json_from_backups(written, ...)` | 参数改为 `(migration, bak_path)` 元组列表；从版本备份恢复 |
+
+#### `keystore/local_identity_store.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +23 | 修改 import | 增 `next_versioned_backup_path` | 从 `_utils` 引入 |
+| +359 | 新增 | `_save_key_pair_at_path()` 备份逻辑 | 覆盖已有 key.json 前先 `next_versioned_backup_path` 备份（失败仅 WARN，非致命），再 `write_key_json_atomic` |
+
+**对齐要点**：Go 见 `keystore/seed_migration.go`（`nextVersionedBackupPath`:176 / `writeFileAtomic`:186，`rewriteKeyJSONPrivateKey`:144 覆盖前备份）、`keystore/local_identity_store.go`（`saveKeyPairAtPath`:215 覆盖前 `nextVersionedBackupPath` 备份 + 改用带时间戳的 tmp 文件名）。TS 见 `secret-store/file-store.ts`（`nextVersionedBackupPath`:115 / `writeKeyJsonAtomic`:122，`changeSeedBytes` 覆盖前备份:209）、`keystore/local-identity-store.ts`（覆盖前 `.vN` 备份:171）。JS（浏览器 IndexedDB 后端）无文件级 seed 迁移，**不适用本块**。
+
+#### `version.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1 | 修改 | `__version__` | `"0.4.9"` → `"0.4.10"` |
 
 ---
 

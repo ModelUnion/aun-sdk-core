@@ -8,6 +8,25 @@
 
 ---
 
+## 0.4.10 — 2026-06-06
+
+### 新功能
+- **Service Proxy 服务代理**：新增 `service_proxy.go` 客户端（控制面 `proxy.register`/`unregister`/`list_services` + 数据面隧道）及 `cmd/service-proxy-holder`、`cmd/service-proxy-visitor` 工具（四语言对齐）
+- **notify() 单向通知**：新增 `Notify()` 公开 API，发送无 id 的 JSON-RPC 2.0 Notification，只面向在线长连接、不落库、不分配 seq、无 ack（四语言对齐）
+- **Storage 逻辑下载 URL**：支持干净逻辑下载 URL `storage.{issuer}/{user_name}/{object_key}`，无签名无 CAS
+
+### 修复
+- **群消息撤回（`group.message_recalled`）端到端打通**：新增在线 push 通道（`_raw.group.message_recalled`），与 pull 双 tombstone（占位 + 通知）兜底互补；push 路径推进 `notice_seq` 的 seq/ack 与普通群消息对齐，避免 seq 留洞导致重复拉取；按 `(group_id, message_ids)` 去重（去重键不含 `recalled_at`），确保应用层只回调一次（四语言+服务端对齐）
+- `group.recall` 加入 RPC 白名单；`transport` 事件名映射补充 `group.message_recalled`
+
+### 优化
+- **ChangeSeed 健壮性增强**：key.json 重写覆盖前先做递增版本备份（`.v1`/`.v2`…），写入改用 `writeFileAtomic`（tmp+rename）；`LocalIdentityStore.saveKeyPairAtPath` 覆盖已有 key.json 前同样做版本备份并改用带 pid/时间戳的临时文件名（四语言对齐）
+
+### 测试
+- `notify_test.go`/`federation_notify_test.go`/`integration_notify_test.go` 覆盖 notify；`integration_service_proxy_test.go`/`service_proxy_test.go` 覆盖 service proxy；`keystore/file_test.go`/`go_fixes_test.go` 覆盖 ChangeSeed 版本备份
+
+---
+
 ## 0.4.9 — 2026-06-03
 
 ### 修复
