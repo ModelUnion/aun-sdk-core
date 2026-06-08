@@ -1,22 +1,19 @@
 /**
  * Gateway 长连接配额 + 短连接空闲 TTL 集成测试
  *
- * 与 Python tests/unit/test_gateway_disconnect_detail.py +
- *    extensions/services/codex-unit/gateway/test_gateway_quota.py 对齐。
+ * 与 Python tests/integration_test_gateway_quota.py 对齐。
  *
  * 覆盖场景：
  *   Test 1: (aid, device) 下 slot 数超限 → close 4015 +
  *           quota_kind=aid_device_slot_quota_exceeded
  *   Test 2: aid 下 device 数超限 → close 4015 +
  *           quota_kind=aid_devices_quota_exceeded
- *   Test 3: device 下 aid 数超限 → close 4015 +
- *           quota_kind=device_aids_quota_exceeded
+ *   Test 3: device 下 aid 数超过 10 不触发配额踢人
  *   Test 4: 短连接空闲 TTL 滑动窗口 — 不保活则被关闭，持续 RPC 保活则不关闭
  *
  * 服务端：
  *   - GATEWAY_LONG_SLOTS_PER_AID_DEVICE 默认 10
  *   - GATEWAY_LONG_DEVICES_PER_AID       默认 10
- *   - GATEWAY_LONG_AIDS_PER_DEVICE       默认 10
  *
  * 前置条件：
  *   - Docker 单域环境运行中（kite-app + kite-mysql）
@@ -43,7 +40,7 @@ const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
 // 服务端默认配额（与 GATEWAY_LONG_*_PER_* 对齐）
 const SLOTS_PER_AID_DEVICE = Number(process.env.GATEWAY_LONG_SLOTS_PER_AID_DEVICE ?? 10);
 const DEVICES_PER_AID = Number(process.env.GATEWAY_LONG_DEVICES_PER_AID ?? 10);
-const AIDS_PER_DEVICE = Number(process.env.GATEWAY_LONG_AIDS_PER_DEVICE ?? 10);
+const DIAGNOSTIC_AIDS_PER_DEVICE = 10;
 
 function rid(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -317,51 +314,44 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     await newDeviceClient.call('meta.ping');
   }, 60000);
 
-  // ── Test 3: device 下 aid 数超限 ──────────────────────
+  // ── Test 3: device 下 aid 数不触发配额 ──────────────────────
 
-  it('Test 3: device → aid 配额超限 触发 4015 + device_aids_quota_exceeded', async () => {
+  it('Test 3: device → aid 维度不触发配额，第 11 个 aid 不应踢人', async () => {
     if (skip()) return;
 
     const r = rid();
     const sharedDevice = `q-a3-dev-${r}`;
     const sharedPath = makeSharedPath('s3');
 
-    // 占满 AIDS_PER_DEVICE 个 aid（同 device，不同 aid）
+    // 建立 10 个 aid（同 device，不同 aid）。Gateway 当前只做
+    // (aid,device)→slot 和 aid→device 两个维度的长连接配额；
+    // device→aid 仅保留诊断索引，不应触发 4015。
     const filled: AUNClient[] = [];
-    const aids: string[] = [];
-    for (let i = 0; i < AIDS_PER_DEVICE; i++) {
+    const capturedList: Array<ReturnType<typeof captureDisconnect>> = [];
+    for (let i = 0; i < DIAGNOSTIC_AIDS_PER_DEVICE; i++) {
       const aid = `q-a3-${i}-${r}.${ISSUER}`;
-      aids.push(aid);
       const c = makeClient(sharedPath, sharedDevice);
       filled.push(c);
       clients.push(c);
+      capturedList.push(captureDisconnect(c));
       await connectLong(c, aid, 'main');
       await sleep(150);
     }
     await sleep(500);
 
-    // 监听最早 aid 的连接（即将被踢）
-    const oldest = filled[0];
-    const captured = captureDisconnect(oldest);
-
-    // 第 AIDS+1 个新 aid 在同 device 上进入
+    // 第 11 个新 aid 在同 device 上进入，不应踢掉已有连接
     const newAid = `q-a3-new-${r}.${ISSUER}`;
     const newAidClient = makeClient(sharedPath, sharedDevice);
     clients.push(newAidClient);
+    const newCaptured = captureDisconnect(newAidClient);
     await connectLong(newAidClient, newAid, 'main');
 
-    const kicked = await waitFor(() => disconnectedWithCode(captured, 4015), 10000);
-    expect(kicked).toBe(true);
-
-    expect(captured.events.length).toBeGreaterThan(0);
-    const evt = captured.events[0];
-    expect(evt.code).toBe(4015);
-    expect(evt.detail!.quota_kind).toBe('device_aids_quota_exceeded');
-    expect(evt.detail!.aid).toBe(aids[0]);
-    expect(evt.detail!.device_id).toBe(sharedDevice);
-    const evictedBy = evt.detail!.evicted_by as JsonObject | undefined;
-    expect(evictedBy!.aid).toBe(newAid);
-
+    await sleep(1500);
+    for (let i = 0; i < filled.length; i++) {
+      expect(disconnectedWithCode(capturedList[i], 4015)).toBe(false);
+      expect(filled[i].state).toBe('ready');
+    }
+    expect(disconnectedWithCode(newCaptured, 4015)).toBe(false);
     expect(newAidClient.state).toBe('ready');
     await newAidClient.call('meta.ping');
   }, 60000);

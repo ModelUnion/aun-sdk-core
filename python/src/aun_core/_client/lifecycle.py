@@ -818,9 +818,11 @@ class LifecycleController:
             else:
                 client._log.debug(
                     "client",
-                    "_invoke_reconnect_connect_once cached identity has no valid access_token aid=%s",
+                    "_invoke_reconnect_connect_once cached identity has no valid access_token aid=%s, clearing stale token to trigger re-login",
                     client._aid,
                 )
+                # 清空过期 token，让 connect_session 走两阶段登录而不是用旧 token 反复触发 4001
+                client._session_params["access_token"] = ""
         else:
             client._log.debug(
                 "client",

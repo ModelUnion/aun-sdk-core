@@ -8,6 +8,27 @@
 
 ---
 
+## 0.4.12 — 2026-06-08
+
+### 新功能
+- **应用层事件信封（envelope）**：`message.*` 与 `group.changed` 事件发布给应用层时注入 `envelope` 字段，聚合 `message_id`/`seq`/`from`/`to`/`group_id`/`action` 等元数据；顶层别名字段在兼容期保留，计划于 `0.5.*` 移除，请改用 `envelope.*` 访问（四语言对齐）
+- **撤回事件携带 message_id 与自身信封**：`recallEventFromMessage` / `recallEventFromGroupMessage` 补全 `message_id` 字段并继承原消息的信封键（四语言对齐）
+
+### 修复
+- **入群首个事件被旧序号阻塞**：`isSelfJoinGroupChanged` 识别自己入群后，将本地 `group_event` seq 基线对齐到 `event_seq-1`，避免被入群前不可见事件挡住（四语言对齐）
+- **过期 token 重连死循环**：`reconnectLoop` 重连前同步 identity 中的 token 状态到 `sessionParams`，过期或缺失则清空以触发两阶段重新登录，避免反复用旧 token 触发 4001（四语言对齐）
+- **Service Proxy 持久隧道重连**：新增指数退避（上限 60s，成功后重置）；`AuthError` 经 `handlePersistentTunnelError` 触发重新获取 access_token 后再重连（四语言对齐）
+- **protected_headers 参数兼容**：`protectedHeadersFromParams` 同时识别 `protected_headers` 与 `headers` 别名，并兼容 `map[string]any` / `map[string]string` 两种类型；V2 P2P/群组加密路径同步使用
+- **配额语义修正**：移除不存在的 `device_aids` 踢出场景描述，`4015` 仅覆盖 `aid_device_slot` / `aid_devices`
+
+### 测试
+- `TestProtectedHeadersFromParamsSupportsHeadersAlias`：验证 headers 别名与类型兼容
+- `TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline`：验证入群事件基线对齐
+- `TestOrderedGroupEventPullSkipsPermanentHoleAndPublishesReadyEvents`：验证永久空洞不阻塞后续群事件
+- `TestGroupRecallTombstonePublishesNoticeEnvelope`：验证撤回通知携带自身信封
+
+---
+
 ## 0.4.11 — 2026-06-08
 
 ### 新功能

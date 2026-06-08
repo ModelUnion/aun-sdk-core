@@ -3224,6 +3224,8 @@ async def test_group_changed_skips_fill_when_no_gap():
 
     client = AUNClient.__new__(AUNClient)
     from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
     client._seq_tracker = SeqTracker()
@@ -3352,6 +3354,63 @@ async def test_group_changed_first_event_gap_does_not_force_local_cursor():
 
 
 @pytest.mark.asyncio
+async def test_group_changed_self_join_sets_visible_event_baseline():
+    """自己入群前的 group.changed 对新成员不可见，首个自加入事件不应被历史 seq 阻塞。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._aid = "bob.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._dispatcher = MagicMock()
+    published: list[dict] = []
+
+    async def fake_publish(event, payload):
+        if event == "group.changed":
+            published.append(dict(payload))
+
+    client._dispatcher.publish = AsyncMock(side_effect=fake_publish)
+    client._seq_tracker = SeqTracker()
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    client._fill_group_event_gap = AsyncMock()
+    client._group_state_coordinator = MagicMock()
+    client._group_state_coordinator.handle_group_changed_v2_membership = MagicMock()
+    persisted: list[str] = []
+    client._persist_seq = lambda ns: persisted.append(ns)
+    ack_calls: list[tuple[str, dict]] = []
+
+    async def fake_ack(method, params, label=""):
+        ack_calls.append((method, dict(params)))
+
+    client._safe_ack = fake_ack
+    client._transport = object()
+
+    await client._on_raw_group_changed({
+        "group_id": "G1",
+        "event_seq": 5,
+        "action": "member_added",
+        "joined_aid": "bob.agentid.pub",
+    })
+    await asyncio.sleep(0)
+
+    assert [evt["event_seq"] for evt in published] == [5]
+    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 5
+    assert persisted == ["group_event:G1"]
+    assert ack_calls == [("group.ack_events", {
+        "group_id": "G1",
+        "event_seq": 5,
+        "device_id": "device-1",
+        "slot_id": "slot-a",
+    })]
+    client._fill_group_event_gap.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     """group.changed event_seq gap 应真实触发 group.pull_events，并用 contiguous_seq ack。"""
     from unittest.mock import AsyncMock, MagicMock
@@ -3417,8 +3476,8 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
 
 
 @pytest.mark.asyncio
-async def test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app():
-    """高序号 push 先到时，pull 补洞后 SDK 内部消费和应用发布都必须保序去重。"""
+async def test_group_changed_gap_fill_skips_permanent_hole_and_publishes_ordered():
+    """pull 缺失中间 event_seq 时视为永久空洞，不阻塞已拿到的群事件发布。"""
     from unittest.mock import AsyncMock, MagicMock
 
     from aun_core.client import AUNClient
@@ -3460,25 +3519,41 @@ async def test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app():
     async def fake_call(method, params):
         if method == "group.pull_events":
             return {
-                "events": [{
-                    "group_id": "g1",
-                    "event_seq": 2,
-                    "event_type": "group.member_added",
-                    "action": "member_added",
-                }],
-                "count": 1,
-                "cursor": {"current_seq": 2},
+                "events": [
+                    {
+                        "group_id": "g1",
+                        "event_seq": 2,
+                        "event_type": "group.member_added",
+                        "action": "member_added",
+                    },
+                    {
+                        "group_id": "g1",
+                        "event_seq": 4,
+                        "event_type": "group.announcement_updated",
+                        "action": "announcement_updated",
+                    },
+                ],
+                "count": 2,
+                "cursor": {"current_seq": 4},
+                "has_more": False,
             }
         return {"ok": True}
 
     client.call = AsyncMock(side_effect=fake_call)
+    ack_calls: list[dict] = []
+
+    async def fake_ack(method, params):
+        if method == "group.ack_events":
+            ack_calls.append(dict(params))
+        return {"ok": True}
+
     transport = MagicMock()
-    transport.call = AsyncMock(return_value={"ok": True})
+    transport.call = AsyncMock(side_effect=fake_ack)
     client._transport = transport
 
     await client._on_raw_group_changed({
         "group_id": "g1",
-        "event_seq": 3,
+        "event_seq": 5,
         "event_type": "group.member_removed",
         "action": "member_removed",
     })
@@ -3488,18 +3563,19 @@ async def test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app():
 
     await client._delivery().fill_group_event_gap_inner("g1", ns)
 
-    assert internal_consumed == [2, 3]
-    assert app_published == [2, 3]
-    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert internal_consumed == [2, 4, 5]
+    assert app_published == [2, 4, 5]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 5
+    assert ack_calls == [{"group_id": "g1", "event_seq": 5, "device_id": "device-1", "slot_id": "slot-a"}]
 
     await client._on_raw_group_changed({
         "group_id": "g1",
-        "event_seq": 3,
+        "event_seq": 5,
         "event_type": "group.member_removed",
         "action": "member_removed",
     })
-    assert internal_consumed == [2, 3]
-    assert app_published == [2, 3]
+    assert internal_consumed == [2, 4, 5]
+    assert app_published == [2, 4, 5]
 
 
 @pytest.mark.asyncio
@@ -4127,20 +4203,93 @@ async def test_published_message_events_fallback_current_instance_context(tmp_pa
 
     p2p_events: list[dict] = []
     group_events: list[dict] = []
+    group_changed_events: list[dict] = []
     client._dispatcher.subscribe("message.received", lambda data: p2p_events.append(data))
     client._dispatcher.subscribe("group.message_created", lambda data: group_events.append(data))
+    client._dispatcher.subscribe("group.changed", lambda data: group_changed_events.append(data))
 
     assert await client._publish_ordered_message(
-        "message.received", p2p_ns, 1, {"seq": 1, "payload": {"type": "text"}}
+        "message.received",
+        p2p_ns,
+        1,
+        {
+            "message_id": "m-1",
+            "seq": 1,
+            "from": "bob.aid.com",
+            "to": "alice.aid.com",
+            "payload": {"type": "text"},
+            "e2ee": {"payload_type": "text"},
+        },
     )
     assert await client._publish_ordered_message(
-        "group.message_created", group_ns, 1, {"group_id": "g1", "seq": 1, "payload": {"type": "text"}}
+        "group.message_created",
+        group_ns,
+        1,
+        {
+            "group_id": "g1",
+            "message_id": "gm-1",
+            "seq": 1,
+            "sender_aid": "bob.aid.com",
+            "message_type": "group.message",
+            "payload": {"type": "text"},
+        },
     )
 
     assert p2p_events[0]["device_id"] == "dev-1"
     assert p2p_events[0]["slot_id"] == "slot-a"
+    assert p2p_events[0]["message_id"] == "m-1"
+    assert p2p_events[0]["payload"] == {"type": "text"}
+    assert p2p_events[0]["e2ee"] == {"payload_type": "text"}
+    assert p2p_events[0]["envelope"] == {
+        "message_id": "m-1",
+        "seq": 1,
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "device_id": "dev-1",
+        "slot_id": "slot-a",
+    }
     assert group_events[0]["device_id"] == "dev-1"
     assert group_events[0]["slot_id"] == "slot-a"
+    assert group_events[0]["group_id"] == "g1"
+    assert group_events[0]["payload"] == {"type": "text"}
+    assert group_events[0]["envelope"] == {
+        "message_id": "gm-1",
+        "seq": 1,
+        "message_type": "group.message",
+        "sender_aid": "bob.aid.com",
+        "group_id": "g1",
+        "device_id": "dev-1",
+        "slot_id": "slot-a",
+    }
+
+    await client._publish_app_event(
+        "group.changed",
+        {
+            "module_id": "group",
+            "group_id": "g1",
+            "event_seq": 2,
+            "event_type": "group.member_added",
+            "action": "member_added",
+            "actor_aid": "alice.aid.com",
+            "member_aid": "bob.aid.com",
+        },
+    )
+    assert group_changed_events[0]["group_id"] == "g1"
+    assert group_changed_events[0]["event_seq"] == 2
+    assert group_changed_events[0]["action"] == "member_added"
+    assert group_changed_events[0]["device_id"] == "dev-1"
+    assert group_changed_events[0]["slot_id"] == "slot-a"
+    assert group_changed_events[0]["envelope"] == {
+        "module_id": "group",
+        "event_seq": 2,
+        "event_type": "group.member_added",
+        "action": "member_added",
+        "group_id": "g1",
+        "actor_aid": "alice.aid.com",
+        "member_aid": "bob.aid.com",
+        "device_id": "dev-1",
+        "slot_id": "slot-a",
+    }
 
 
 @pytest.mark.asyncio

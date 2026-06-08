@@ -5,7 +5,7 @@
  *   1. (aid, device) → slot 配额超限 — 同 aid+device 起 11 个长连接（不同 slot），
  *      第 11 个进入时第 1 个被服务端 4015 关闭，detail.quota_kind === "aid_device_slot_quota_exceeded"
  *   2. aid → device 配额超限 — 同 aid 占满 10 个 device，第 11 个 device 进入时第 1 个 device 被踢
- *   3. device → aid 配额超限 — 同 device 上挂 10 个 aid，第 11 个 aid 进入时第 1 个 aid 被踢
+ *   3. device → aid 维度不触发配额 — 同 device 上挂 11 个 aid 不应踢人
  *   4. 短连接空闲 TTL 滑动窗口 — short_ttl_ms=2000，每秒 ping 保活 → 不应被踢；
  *      停 ping → ~2s 后被 4014 踢
  *
@@ -351,7 +351,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     }
   }, 180_000);
 
-  it('3. device → aid 配额超限 — 第 11 个 aid 进入踢最早 aid (4015)', async () => {
+  it('3. device → aid 维度不触发配额 — 第 11 个 aid 进入不应踢人', async () => {
     if (shouldSkip()) return;
     const r = rid();
     const sharedPath = makeAunPath('q3');
@@ -382,29 +382,19 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
         expect(longs[i].client.state, `setup aid[${i}] state`).toBe('ready');
       }
 
-      // 第 11 个 aid 进入 — 踢最早 aid（longs[0]）
+      // 第 11 个 aid 进入。Gateway 当前只做 (aid,device)→slot 和 aid→device
+      // 两个维度的长连接配额；device→aid 仅保留诊断索引，不应触发 4015。
       overflow = makeClient(sharedPath);
       const newAid = aids[QUOTA_LIMIT];
       await connectLong(overflow, newAid, { slotId: 'main', registerAid: false });
       expect(overflow.state).toBe('ready');
 
-      const evicted = longs[0];
-      const ok = await waitFor(() => evicted.captured.length > 0, 5000);
-      expect(ok, `aid[0] should be evicted within 5s`).toBe(true);
-      const ev = evicted.captured[0];
-      expect(ev.code).toBe(4015);
-      expect(ev.detail?.quota_kind).toBe('device_aids_quota_exceeded');
-      expect(ev.detail?.aid).toBe(longs[0].aid);
-      const evictedBy = ev.detail?.evicted_by as Record<string, unknown> | undefined;
-      expect(evictedBy?.aid).toBe(newAid);
-
-      await sleep(800);
-      expect(evicted.client.state).not.toBe('ready');
-      expect(evicted.client.state).not.toBe('reconnecting');
-
-      for (let i = 1; i < longs.length; i++) {
+      await sleep(1500);
+      for (let i = 0; i < longs.length; i++) {
+        expect(longs[i].captured.length, `aid[${i}] should not be evicted`).toBe(0);
         expect(longs[i].client.state, `aid[${i}] should remain ready`).toBe('ready');
       }
+      expect(overflow.state, 'overflow aid should remain ready').toBe('ready');
     } finally {
       for (const e of longs) await safeClose(e.client);
       await safeClose(overflow);

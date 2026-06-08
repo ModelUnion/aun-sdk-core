@@ -8,7 +8,7 @@
   Test 2: aid → device 数 — 同 aid、11 个不同 device 各 1 个长连接
           → 第 11 个 device 进入时第 1 个 device 被踢，detail.quota_kind=aid_devices_quota_exceeded
   Test 3: device → aid 数 — 同 device、11 个不同 aid 各 1 个长连接
-          → 第 11 个 aid 进入时第 1 个 aid 被踢，detail.quota_kind=device_aids_quota_exceeded
+          → 重构后不再按 device→aid 维度限流，所有连接应保持在线
   Test 4: 短连接 idle TTL 滑动窗口 — 持续 RPC 保活不被踢，停止 RPC ~2s 后被 4014 踢
 
 使用方法（容器内运行）：
@@ -341,11 +341,11 @@ async def test_aid_devices_quota() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: device → aid 数超限 → 4015 + device_aids_quota_exceeded
+# Test 3: device → aid 数不再限流
 # ---------------------------------------------------------------------------
 
-async def test_device_aids_quota() -> bool:
-    name = f"Test 3: device → aid count > {_QUOTA_LIMIT} → 4015"
+async def test_device_aids_not_quota_limited() -> bool:
+    name = f"Test 3: device → aid count > {_QUOTA_LIMIT} should not evict"
     print(f"\n=== {name} ===")
     rid = _rid()
 
@@ -373,36 +373,28 @@ async def test_device_aids_quota() -> bool:
             await asyncio.sleep(0.15)
         print(f"  [OK] {_QUOTA_LIMIT} aids established on shared device")
 
-        # 第 _QUOTA_LIMIT+1 个 aid 进入
+        # 第 _QUOTA_LIMIT+1 个 aid 进入。Gateway 当前只做 (aid,device)→slot 和 aid→device
+        # 两个维度的长连接配额；device→aid 仅保留诊断索引，不应触发 4015。
         overflow = _make_client(shared_path, is_path=True)
         clients.append(overflow)
         watchers.append(_DisconnectWatcher(overflow, "aid-NEW"))
         await _connect_long(overflow, aids[_QUOTA_LIMIT], slot_id="main")
 
-        try:
-            await asyncio.wait_for(watchers[0].kicked.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            _fail(name, f"aid-0 did not receive disconnect; events={watchers[0].events}")
-            return False
-
-        if watchers[0].last_code != 4015:
-            _fail(name, f"aid-0 close code != 4015, got {watchers[0].last_code}; detail={watchers[0].last_detail}")
-            return False
-        kind = watchers[0].last_quota_kind
-        if kind != "device_aids_quota_exceeded":
-            _fail(name, f"aid-0 quota_kind={kind}, expected device_aids_quota_exceeded; detail={watchers[0].last_detail}")
-            return False
-        print(f"  [OK] aid-0 evicted: code=4015 detail={watchers[0].last_detail}")
-
-        # aid-1 .. aid-(N-1) 仍在线
-        for i in range(1, _QUOTA_LIMIT):
+        await asyncio.sleep(1.0)
+        for i in range(_QUOTA_LIMIT):
+            if watchers[i].events:
+                _fail(name, f"aid-{i} unexpectedly received disconnect: {watchers[i].events}")
+                return False
             if not _is_ready(clients[i]):
-                _fail(name, f"aid-{i} unexpectedly kicked, state={clients[i].state}, events={watchers[i].events}")
+                _fail(name, f"aid-{i} unexpectedly disconnected, state={clients[i].state}, events={watchers[i].events}")
                 return False
         if not _is_ready(overflow):
             _fail(name, f"overflow not connected, state={overflow.state}")
             return False
-        print(f"  [OK] other aids survive, overflow connected")
+        if watchers[-1].events:
+            _fail(name, f"overflow unexpectedly received disconnect: {watchers[-1].events}")
+            return False
+        print(f"  [OK] all {_QUOTA_LIMIT + 1} aids stay connected on shared device")
         _ok(name)
         return True
     except Exception as exc:
@@ -522,7 +514,7 @@ async def main() -> int:
     tests = [
         ("(aid,device) → slot quota → 4015",   test_aid_device_slot_quota),
         ("aid → device quota → 4015",          test_aid_devices_quota),
-        ("device → aid quota → 4015",          test_device_aids_quota),
+        ("device → aid is not quota-limited",  test_device_aids_not_quota_limited),
         ("short idle TTL sliding window 4014", test_short_ttl_sliding_window),
     ]
 

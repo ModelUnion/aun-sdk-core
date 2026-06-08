@@ -148,19 +148,140 @@ function createEngine(): {
 describe('MessageDeliveryEngine 组件边界', () => {
   it('publishAppEvent 为实例级消息注入 device_id / slot_id，并透传 agent_md 快照', async () => {
     const { engine, published } = createEngine();
-    const payload = { text: 'hello' };
+    const payload = {
+      message_id: 'm-1',
+      seq: 7,
+      from: 'bob.agentid.pub',
+      to: 'alice.agentid.pub',
+      payload: { type: 'text', text: 'hello' },
+      e2ee: { payload_type: 'text' },
+    };
 
     await Promise.resolve(engine.publishAppEvent('message.received', payload));
 
     expect(published).toEqual([{
       event: 'message.received',
       payload: {
-        text: 'hello',
+        message_id: 'm-1',
+        seq: 7,
+        from: 'bob.agentid.pub',
+        to: 'alice.agentid.pub',
+        payload: { type: 'text', text: 'hello' },
+        e2ee: { payload_type: 'text' },
         _agent_md: { local_etag: 'local-1', remote_etag: 'remote-1' },
         device_id: 'device-a',
         slot_id: 'slot-a',
+        envelope: {
+          message_id: 'm-1',
+          seq: 7,
+          from: 'bob.agentid.pub',
+          to: 'alice.agentid.pub',
+          device_id: 'device-a',
+          slot_id: 'slot-a',
+        },
       },
     }]);
+  });
+
+  it('publishAppEvent 为群事件注入 envelope 并保留顶层兼容字段', async () => {
+    const { engine, published } = createEngine();
+
+    await Promise.resolve(engine.publishAppEvent('group.changed', {
+      module_id: 'group',
+      group_id: 'group.agentid.pub/g1',
+      event_seq: 8,
+      event_type: 'group.member_added',
+      action: 'member_added',
+      actor_aid: 'alice.agentid.pub',
+      member_aid: 'bob.agentid.pub',
+    }));
+
+    expect(published).toEqual([{
+      event: 'group.changed',
+      payload: {
+        module_id: 'group',
+        group_id: 'group.agentid.pub/g1',
+        event_seq: 8,
+        event_type: 'group.member_added',
+        action: 'member_added',
+        actor_aid: 'alice.agentid.pub',
+        member_aid: 'bob.agentid.pub',
+        _agent_md: { local_etag: 'local-1', remote_etag: 'remote-1' },
+        device_id: 'device-a',
+        slot_id: 'slot-a',
+        envelope: {
+          module_id: 'group',
+          group_id: 'group.agentid.pub/g1',
+          event_seq: 8,
+          event_type: 'group.member_added',
+          action: 'member_added',
+          actor_aid: 'alice.agentid.pub',
+          member_aid: 'bob.agentid.pub',
+          device_id: 'device-a',
+          slot_id: 'slot-a',
+        },
+      },
+    }]);
+  });
+
+  it('撤回事件发布给应用层时带撤回通知自身 envelope', async () => {
+    const { engine, published } = createEngine();
+
+    const p2pRecall = engine.p2pAppEventForMessage({
+      message_id: 'recall-1',
+      from: 'alice.agentid.pub',
+      to: 'bob.agentid.pub',
+      seq: 9,
+      type: 'message.recalled',
+      payload: {
+        kind: 'message.recalled',
+        message_ids: ['m-1'],
+        recalled_at: 123,
+      },
+    });
+    await Promise.resolve(engine.publishAppEvent(p2pRecall.event, p2pRecall.payload));
+
+    const groupRecall = engine.recallEventFromGroupMessage({
+      module_id: 'group',
+      group_id: 'g1',
+      message_id: 'notice-1',
+      seq: 43,
+      type: 'group.message_recalled',
+      payload: {
+        message_ids: ['gm-1'],
+        target_message_seqs: [42],
+        sender_aid: 'alice.agentid.pub',
+        recalled_by: 'owner.agentid.pub',
+      },
+    });
+    expect(groupRecall).not.toBeNull();
+    await Promise.resolve(engine.publishAppEvent('group.message_recalled', groupRecall as any));
+
+    expect(published[0].payload).toEqual(expect.objectContaining({
+      message_id: 'recall-1',
+      tombstone_message_id: 'recall-1',
+      message_ids: ['m-1'],
+      envelope: expect.objectContaining({
+        message_id: 'recall-1',
+        seq: 9,
+        from: 'alice.agentid.pub',
+        to: 'bob.agentid.pub',
+      }),
+    }));
+    expect(published[1].payload).toEqual(expect.objectContaining({
+      module_id: 'group',
+      group_id: 'g1',
+      message_id: 'notice-1',
+      tombstone_message_id: 'notice-1',
+      message_ids: ['gm-1'],
+      target_message_seqs: [42],
+      envelope: expect.objectContaining({
+        module_id: 'group',
+        group_id: 'g1',
+        message_id: 'notice-1',
+        seq: 43,
+      }),
+    }));
   });
 
   it('messageTargetsCurrentInstance 按 device_id / slot_id 过滤实例消息', () => {

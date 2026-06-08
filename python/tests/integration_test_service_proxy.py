@@ -9,11 +9,20 @@ from urllib.parse import urlparse
 
 import aiohttp
 import pytest
-import uvicorn
 from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestServer
 
 from aun_core.service_proxy import ServiceProxyClient
+
+try:
+    import uvicorn
+    import fastapi  # noqa: F401
+except ModuleNotFoundError as exc:
+    reason = f"service_proxy local ASGI integration tests require optional dependency: {exc.name}"
+    if __name__ == "__main__":
+        print(f"SKIP: {reason}")
+        raise SystemExit(0)
+    pytest.skip(reason, allow_module_level=True)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

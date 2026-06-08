@@ -1,10 +1,133 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.11）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.12）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → 工作区 (v0.4.11)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → `67d35b06` (v0.4.11) → 工作区 (v0.4.12)。
+
+---
+
+## v0.4.12 — 相对于 v0.4.11 的变更
+
+> 基线：`67d35b06`（git HEAD，即 v0.4.11 提交）vs 工作区未提交改动。
+>
+> 五大变更块：**① 应用层事件信封（envelope）**、**② 撤回事件补全 message_id 与信封**、**③ 入群首个事件 seq 基线对齐（self-join baseline）**、**④ 过期 token 重连清空（避免 4001 死循环）**、**⑤ Service Proxy 持久隧道指数退避 + auth 重认证**，外加配额语义注释修正。所有变更块均为四语言对齐项。
+
+### 块① 应用层事件信封（envelope）
+
+> 动机：应用层回调收到的 message/group 事件中，元数据字段（message_id、seq、from、to、group_id、action 等）散落在 payload 顶层，难以与业务 payload 区分。新增 `envelope` 聚合字段，统一承载这些元数据；顶层别名在兼容期保留，计划 `0.5.*` 移除。
+
+#### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L23 | 新增常量 | `_APP_MESSAGE_ENVELOPE_KEYS` | 26 个消息信封键：`module_id`/`message_id`/`id`/`seq`/`msg_seq`/`message_type`/`type`/`kind`/`version`/`from`/`from_aid`/`sender_aid`/`to`/`to_aid`/`group_id`/`timestamp`/`created_at`/`t_server`/`encrypted`/`status`/`delivery_mode`/`dispatch_mode`/`dispatch`/`device_id`/`slot_id` |
+| L30 | 新增常量 | `_APP_GROUP_EVENT_ENVELOPE_KEYS` | 18 个群事件信封键：`module_id`/`event_id`/`event_seq`/`seq`/`event_type`/`action`/`group_id`/`actor_aid`/`sender_aid`/`member_aid`/`target_aid`/`operator_aid`/`created_at`/`timestamp`/`t_server`/`status`/`device_id`/`slot_id` |
+| L261 | 重构 | `normalize_published_message_payload()` | 原仅处理实例级消息事件（非则原样返回）。新增分支：实例级事件 → `strip_internal_sender_device_fields(attach_current_instance_context(payload))` 后再 `attach_app_message_envelope`；`is_group_scoped_event` 为真（`group.changed`）→ `attach_current_instance_context` 后 `attach_app_group_event_envelope` |
+| L273 | 新增（静态） | `app_message_envelope(payload)` | 从 payload 抽取 `_APP_MESSAGE_ENVELOPE_KEYS` 中存在的键，返回信封 dict |
+| L279 | 新增（静态） | `is_group_scoped_event(event)` | 判断是否群作用域事件（当前仅 `group.changed`） |
+| L283 | 新增（静态） | `app_group_event_envelope(payload)` | 从 payload 抽取 `_APP_GROUP_EVENT_ENVELOPE_KEYS` 中存在的键 |
+| L289 | 新增（classmethod） | `attach_app_message_envelope(payload)` | 浅拷贝 payload 后写入 `result["envelope"] = app_message_envelope(result)`；注释标注顶层别名 0.5.* 移除 |
+| L298 | 新增（classmethod） | `attach_app_group_event_envelope(payload)` | 同上，写入群事件 envelope |
+
+**对齐要点**：Go 见 `client_delivery.go`（`appMessageEnvelopeKeys`/`appGroupEventEnvelopeKeys` 变量、`attachAppMessageEnvelope`/`attachAppGroupEventEnvelope`/`isGroupScopedEvent` 函数）；TS/JS 见 `src/client/delivery.ts`（`APP_MESSAGE_ENVELOPE_KEYS`/`APP_GROUP_EVENT_ENVELOPE_KEYS` 常量、`attachAppMessageEnvelope`/`attachAppGroupEventEnvelope`/`isGroupScopedEvent` 方法）。四语言键列表、顺序与 envelope 注入位置必须一致；`group.changed` 是唯一群作用域事件。
+
+---
+
+### 块② 撤回事件补全 message_id 与自身信封
+
+> 动机：`message.recalled` / `group.message_recalled` 通知原本只带 `tombstone_message_id`，应用层难以直接拿到被撤回消息的 `message_id` 与上下文。现补全 `message_id` 并继承原消息的信封键。
+
+#### `_client/delivery.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L316 | 修改 | `recall_event_from_message()` | 构造 event 后遍历 `_APP_MESSAGE_ENVELOPE_KEYS`，原消息中存在而 event 缺失的键补入（L325 起）；`message_id` 改为**始终覆盖** `event["message_id"] = message["message_id"]`（原仅 setdefault tombstone），同时保留 `tombstone_message_id` setdefault（L349） |
+| L365 | 修改 | `recall_event_from_group_message()` | 同上：信封键补全（L382 起）+ `message_id` 始终覆盖（L405） |
+
+**对齐要点**：Go 见 `client_delivery.go`（`recallEventFromMessage`/`recallEventFromGroupMessage`，遍历 `appMessageEnvelopeKeys` + `event["message_id"] = mid`）；TS/JS 见 `src/client/delivery.ts`（同名方法，`for...of APP_MESSAGE_ENVELOPE_KEYS` + `event.message_id = msg.message_id`）。`message_id` 必须始终写入（不再用 setdefault），`tombstone_message_id` 仍保持「缺失才补」语义。
+
+---
+
+### 块③ 入群首个事件 seq 基线对齐（self-join baseline）
+
+> 动机：自己刚入群时，服务端推送的首个 `group.changed` 事件 `event_seq` 可能 > 1（入群前已有其它成员事件累积），而本地 `group_event` tracker 基线为 0，导致首个可见事件被当作「有空洞」卡住或反复补拉入群前不可见的事件。修复：识别 self-join 时把本地 contiguous 基线直接对齐到 `event_seq-1`。
+
+#### `_client/delivery.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L159 | 修改 | `handle_group_changed_event()` | 取 `ns = group_event:{group_id}` 后、contiguous 判断前插入：若 `is_self_join_group_changed(data)` 且 `contig == 0 and max_seen == 0 and event_seq > 1`，调 `_seq_tracker.force_contiguous_seq(ns, event_seq - 1)` 建立基线（约 L176~L188） |
+| L225 | 新增 | `is_self_join_group_changed(data)` | 判定自己入群：`action` ∈ {`member_added`,`joined`,`join_approved`,`invite_code_used`}；取 `joined_aid`/`member_aid`/`aid` 与 `self._aid` 比对；或 `joined_aid` 为空且 action ∈ {`joined`,`invite_code_used`} 且 `actor_aid == self_aid` |
+
+**对齐要点**：Go 见 `client_delivery.go`（`isSelfJoinGroupChanged` + `handleGroupChangedEventSeq` 中 `ForceContiguousSeq(ns, es-1)`）；TS/JS 见 `src/client/delivery.ts`（`isSelfJoinGroupChanged` + `forceContiguousSeq(ns, eventSeq-1)`）。判定的 action 集合、aid 字段优先级（joined_aid→member_aid→aid）、`actor_aid` 兜底分支四语言必须一致；仅在 `contig==0 && maxSeen==0 && seq>1` 时建立基线。
+
+---
+
+### 块④ 过期 token 重连清空（避免 4001 死循环）
+
+> 动机：重连时若 sessionParams 仍携带已过期的 `access_token`，gateway 会反复返回 4001，且 4001 在 `_NO_RECONNECT_CODES` 内本应不重连——但单连接重连路径会拿旧 token 反复尝试。修复：重连前若缓存身份无有效 token，清空 `access_token` 强制走两阶段登录。
+
+#### `_client/lifecycle.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L821 | 修改 | `_invoke_reconnect_connect_once()` | 缓存 identity 无有效 access_token 分支：日志补充「clearing stale token to trigger re-login」，并新增 `client._session_params["access_token"] = ""` 清空过期 token |
+
+**对齐要点**：Go 见 `client_lifecycle.go`（`reconnectLoop` 中读取 `c.identity`，用 `auth.GetAccessTokenExpiry` 判断有效期，有效则 `params["access_token"]=cachedToken` 否则清空）；TS/JS 见 `src/client.ts`（重连循环内同逻辑，`getAccessTokenExpiry` + 过期/缺失清空）。注意：**Go/TS/JS 在重连入口同时做了「有效则回填、过期则清空」双向同步**，Python 此处仅清空（回填由 `_invoke_reconnect_connect_once` 上文 L814 的 refresh 分支处理），语义等价。过期判定阈值为 `now + 30s`。
+
+---
+
+### 块⑤ Service Proxy 持久隧道指数退避 + auth 重认证
+
+> 动机：持久模式（persistent）隧道断开后原本固定延迟重连，且不区分 auth 失败；access_token 过期时会无意义地反复重连。修复：引入指数退避（上限 60s，成功后重置），auth 类错误先重新获取 token 再退避重连。
+
+#### `service_proxy/client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L466 | 新增局部 | `_proxy_reconnect_max_delay = 60.0` | 退避上限 |
+| L468 | 新增局部 | `_delay = reconnect_delay_seconds` | persistent 循环退避初值 |
+| L483 | 修改 | `serve_forever()` 成功分支 | 连接成功后 `_delay = reconnect_delay_seconds` 重置退避 |
+| L486 | 新增分支 | `except AuthError as exc` | auth 失败：WARN「re-authenticating」→ `await self._authenticate_for_access_token()`（失败再 WARN）→ `_sleep_or_stop(_delay)` → `_delay = min(_delay*2, 60)` |
+| L497 | 修改 | `except Exception` 分支 | 延迟从固定 `reconnect_delay_seconds` 改为 `_delay`，退避后 `_delay = min(_delay*2, 60)` |
+
+**对齐要点**：Go 见 `service_proxy.go`（`ServeForever` 中 `maxReconnectDelay = 60*time.Second`、`handlePersistentTunnelError`（`errors.As(&authErr)` → `ensureAccessToken`）、`minDuration` 退避、成功后 `delay = opts.ReconnectDelay` 重置）；TS/JS 见 `src/service-proxy.ts`（`maxReconnectDelay = 60_000`、`exc instanceof AuthError` → `_authenticateForAccessToken`、`_delay = Math.min(_delay*2, maxReconnectDelay)`、成功后重置）。三语言均：成功重置、auth 错误先重认证、退避封顶 60s。
+
+---
+
+### 块⑥ 配额语义注释修正
+
+#### `client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L2148 | 修改（注释） | `_NO_RECONNECT_CODES` 上方注释 | 4015 说明移除不存在的 `device_aids` 踢出场景，改为「`aid_device_slot` / `aid_devices`」。集合值不变 |
+
+**对齐要点**：对应服务端 gateway 配额逻辑——`device → aid 数`（`device_aids`）不再触发踢出，仅 `aid_device_slot` / `aid_devices` 会。集成测试 `integration_test_gateway_quota.py` 的 `test_device_aids_quota` 已改名为 `test_device_aids_not_quota_limited`。
+
+---
+
+### 测试新增/修改
+
+| 文件 | 用例 | 说明 |
+|------|------|------|
+| `tests/unit/test_reconnect.py` | `TestReconnectTokenRefresh.test_stale_token_cleared_before_reconnect_connect_once` | 验证过期 token 在重连前被清空 |
+| `tests/unit/test_reconnect.py` | `TestReconnectTokenRefresh.test_valid_cached_token_used_in_reconnect` | 验证有效缓存 token 被复用 |
+| `tests/unit/test_client.py` | `test_group_changed_self_join_sets_visible_event_baseline` | 验证入群首个 event_seq>1 时建立可见基线 |
+| `tests/unit/test_client.py` | `test_group_changed_gap_fill_skips_permanent_hole_and_publishes_ordered` | 验证永久空洞不阻塞已就绪群事件发布 |
+| `tests/unit/test_service_proxy_serve_forever.py`（新文件） | `test_backoff_increases_on_repeated_failure` | 退避随重复失败递增 |
+| `tests/unit/test_service_proxy_serve_forever.py` | `test_backoff_resets_after_successful_connection` | 成功连接后退避重置 |
+| `tests/unit/test_service_proxy_serve_forever.py` | `test_auth_error_triggers_reauthentication` | AuthError 触发重新认证 |
+| `tests/unit/test_service_proxy_serve_forever.py` | `test_non_auth_error_does_not_trigger_reauthentication` | 非 auth 错误不触发重认证 |
+| `tests/integration_test_gateway_quota.py` | `test_device_aids_not_quota_limited`（原 `test_device_aids_quota`） | 验证 `device_aids` 不再限流（语义修正） |
+| `tests/integration_test_replay_guard.py` | 用例隔离改进 | 每个用例独立 AID/目录（`replay-{label}-...`），消除串扰 |
+| `tests/integration_test_signature.py` / `integration_test_storage.py` / `integration_test_service_proxy.py` | 断言补强 | 配合上述改动调整 |
+
+### `version.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1 | 修改 | `__version__` | `"0.4.11"` → `"0.4.12"` |
+
+### `pyproject.toml`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L7 | 修改 | `version` | `"0.4.11"` → `"0.4.12"` |
 
 ---
 

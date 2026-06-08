@@ -2302,6 +2302,22 @@ export class AUNClient {
         if (!this._sessionParams) {
           throw new StateError('missing connect params for reconnect');
         }
+        // 重连前同步 identity 里的 token 状态到 sessionParams，防止用过期 token 死循环 4001
+        {
+          const identity = this._identity;
+          if (identity) {
+            const cachedToken = String(identity.access_token ?? '');
+            const expiresAt = this._auth.getAccessTokenExpiry(identity);
+            if (cachedToken && (expiresAt === null || expiresAt > Date.now() / 1000 + 30)) {
+              this._sessionParams.access_token = cachedToken;
+            } else {
+              this._clientLog.debug(`reconnect: cached token expired or missing for aid=${this._aid ?? ''}, clearing to trigger re-login`);
+              this._sessionParams.access_token = '';
+            }
+          } else {
+            this._sessionParams.access_token = '';
+          }
+        }
         await this._connectOnce(this._sessionParams, true);
         this._lastError = null;
         this._lastErrorCode = null;

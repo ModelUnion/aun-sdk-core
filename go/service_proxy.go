@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -533,6 +534,8 @@ func (c *ServiceProxyClient) ServeForever(ctx context.Context, opts ServiceProxy
 	if mode == "on_demand" {
 		return c.serveOnDemand(ctx, stats, opts)
 	}
+	const maxReconnectDelay = 60 * time.Second
+	delay := opts.ReconnectDelay
 	for c.isRunning() {
 		if _, err := c.autoRegisterServicesWithGateway(ctx); err != nil {
 			return stats, err
@@ -542,8 +545,9 @@ func (c *ServiceProxyClient) ServeForever(ctx context.Context, opts ServiceProxy
 			if !c.isRunning() || ctx.Err() != nil {
 				break
 			}
-			c.logWarn("persistent tunnel reconnect scheduled after error: %v", err)
-			sleepWithCancel(ctx, opts.ReconnectDelay)
+			c.handlePersistentTunnelError(ctx, err)
+			sleepWithCancel(ctx, delay)
+			delay = minDuration(delay*2, maxReconnectDelay)
 			continue
 		}
 		c.setActiveTunnel(tunnel)
@@ -554,15 +558,37 @@ func (c *ServiceProxyClient) ServeForever(ctx context.Context, opts ServiceProxy
 		_ = tunnel.Close(websocket.StatusNormalClosure, "")
 		c.setActiveTunnel(nil)
 		if err != nil && c.isRunning() && ctx.Err() == nil {
-			c.logWarn("persistent tunnel reconnect scheduled after error: %v", err)
-			sleepWithCancel(ctx, opts.ReconnectDelay)
+			c.handlePersistentTunnelError(ctx, err)
+			sleepWithCancel(ctx, delay)
+			delay = minDuration(delay*2, maxReconnectDelay)
 			continue
 		}
 		stats["connections"] = intFromAny(stats["connections"]) + 1
 		stats["registered"] = intFromAny(result["registered"])
 		stats["handled_requests"] = intFromAny(stats["handled_requests"]) + intFromAny(result["handled_requests"])
+		delay = opts.ReconnectDelay // 成功后重置退避
 	}
 	return stats, nil
+}
+
+// handlePersistentTunnelError 处理隧道错误：auth 失败时触发重新登录，其它错误仅记录。
+func (c *ServiceProxyClient) handlePersistentTunnelError(ctx context.Context, err error) {
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		c.logWarn("persistent tunnel auth error, re-authenticating: %v", err)
+		if _, reAuthErr := c.ensureAccessToken(ctx); reAuthErr != nil {
+			c.logWarn("re-authentication failed: %v", reAuthErr)
+		}
+		return
+	}
+	c.logWarn("persistent tunnel reconnect scheduled after error: %v", err)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (c *ServiceProxyClient) RegisterServicesWithProxyServer(ctx context.Context, tunnel *serviceProxyTunnel, requestID string, services []ServiceSummary) (int, error) {

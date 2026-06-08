@@ -2145,7 +2145,7 @@ class AUNClient:
 
     # 不重连 close code 集合：客户端/认证/权限错误，重连无意义
     # 4014: 短连接 idle TTL 兜底（不重连）
-    # 4015: 长连接配额超限被踢（aid_device_slot / aid_devices / device_aids）
+    # 4015: 长连接配额超限被踢（aid_device_slot / aid_devices）
     _NO_RECONNECT_CODES = frozenset({4001, 4003, 4008, 4009, 4010, 4011, 4012, 4013, 4014, 4015})
 
     async def _on_gateway_disconnect(self, data: Any) -> None:

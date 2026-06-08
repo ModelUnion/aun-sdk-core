@@ -6,6 +6,26 @@
 
 ---
 
+## 0.4.12 — 2026-06-08
+
+### 新功能
+- **应用层事件信封（envelope）**：`message.*` 与 `group.changed` 事件发布给应用层时注入 `envelope` 字段，聚合 `message_id`/`seq`/`from`/`to`/`group_id`/`action` 等元数据；顶层别名字段在兼容期保留，计划于 `0.5.*` 移除，请改用 `envelope.*` 访问（四语言对齐）
+- **撤回事件携带 message_id 与自身信封**：`message.recalled` / `group.message_recalled` 通知补全 `message_id` 字段并继承原消息的信封键（四语言对齐）
+
+### 修复
+- **入群首个事件被旧序号阻塞**：`isSelfJoinGroupChanged` 识别自己入群后，将本地 `group_event` seq 基线对齐到 `eventSeq-1`，避免被入群前不可见事件挡住（四语言对齐）
+- **过期 token 重连死循环**：重连前同步 `_identity` 中的 token 状态到 `_sessionParams`，过期或缺失则清空以触发两阶段重新登录，避免反复用旧 token 触发 4001（四语言对齐）
+- **Service Proxy 持久隧道重连**：新增指数退避（上限 60s，成功后重置）；`AuthError` 触发 `_authenticateForAccessToken` 重新登录后再重连（四语言对齐）
+- **protected_headers 参数兼容**：`mergeInstanceProtectedHeaders` 同时识别 `protected_headers` 与 `headers` 别名
+
+### 测试
+- `自己入群首个 event_seq>1 不应被入群前不可见事件阻塞`
+- `pull 缺失中间 event_seq 时视为永久空洞，不阻塞已拿到的群事件发布`
+- `publishAppEvent 为群事件注入 envelope 并保留顶层兼容字段`
+- `撤回事件发布给应用层时带撤回通知自身 envelope`
+
+---
+
 ## 0.4.11 — 2026-06-08
 
 ### 新功能

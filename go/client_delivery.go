@@ -32,6 +32,19 @@ func (c *AUNClient) delivery() *messageDeliveryEngine {
 
 // ── 应用层事件发布 ──────────────────────────────────────────
 
+var appMessageEnvelopeKeys = []string{
+	"module_id", "message_id", "id", "seq", "msg_seq", "message_type", "type", "kind", "version",
+	"from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
+	"timestamp", "created_at", "t_server", "encrypted", "status", "delivery_mode",
+	"dispatch_mode", "dispatch", "device_id", "slot_id",
+}
+
+var appGroupEventEnvelopeKeys = []string{
+	"module_id", "event_id", "event_seq", "seq", "event_type", "action", "group_id",
+	"actor_aid", "sender_aid", "member_aid", "target_aid", "operator_aid",
+	"created_at", "timestamp", "t_server", "status", "device_id", "slot_id",
+}
+
 func (d *messageDeliveryEngine) attachCurrentInstanceContext(payload any) any {
 	c := d.runtime.client
 	message, ok := payload.(map[string]any)
@@ -49,10 +62,69 @@ func (d *messageDeliveryEngine) attachCurrentInstanceContext(payload any) any {
 }
 
 func (d *messageDeliveryEngine) normalizePublishedMessagePayload(event string, payload any) any {
-	if !isInstanceScopedMessageEvent(event) {
+	if isInstanceScopedMessageEvent(event) {
+		normalized := stripInternalSenderDeviceFields(d.runtime.client.attachCurrentInstanceContext(payload))
+		return attachAppMessageEnvelope(normalized)
+	}
+	if isGroupScopedEvent(event) {
+		normalized := d.runtime.client.attachCurrentInstanceContext(payload)
+		return attachAppGroupEventEnvelope(normalized)
+	}
+	return payload
+}
+
+func appMessageEnvelope(payload any) map[string]any {
+	message, ok := payload.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	envelope := make(map[string]any)
+	for _, key := range appMessageEnvelopeKeys {
+		if value, exists := message[key]; exists {
+			envelope[key] = value
+		}
+	}
+	return envelope
+}
+
+func isGroupScopedEvent(event string) bool {
+	return event == "group.changed"
+}
+
+func appGroupEventEnvelope(payload any) map[string]any {
+	event, ok := payload.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	envelope := make(map[string]any)
+	for _, key := range appGroupEventEnvelopeKeys {
+		if value, exists := event[key]; exists {
+			envelope[key] = value
+		}
+	}
+	return envelope
+}
+
+func attachAppMessageEnvelope(payload any) any {
+	message, ok := payload.(map[string]any)
+	if !ok {
 		return payload
 	}
-	return stripInternalSenderDeviceFields(d.runtime.client.attachCurrentInstanceContext(payload))
+	result := copyMapShallow(message)
+	// 兼容期保留顶层信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+	result["envelope"] = appMessageEnvelope(result)
+	return result
+}
+
+func attachAppGroupEventEnvelope(payload any) any {
+	event, ok := payload.(map[string]any)
+	if !ok {
+		return payload
+	}
+	result := copyMapShallow(event)
+	// 兼容期保留顶层群事件信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+	result["envelope"] = appGroupEventEnvelope(result)
+	return result
 }
 
 func stripInternalSenderDeviceFields(payload any) any {
@@ -96,6 +168,13 @@ func recallEventFromMessage(message any) (map[string]any, bool) {
 	event := make(map[string]any, len(payloadMap)+8)
 	for k, v := range payloadMap {
 		event[k] = v
+	}
+	for _, key := range appMessageEnvelopeKeys {
+		if _, exists := event[key]; !exists {
+			if value, ok := msg[key]; ok {
+				event[key] = value
+			}
+		}
 	}
 	messageIDs := []any{}
 	if rawIDs, ok := event["message_ids"].([]any); ok {
@@ -142,8 +221,9 @@ func recallEventFromMessage(message any) (map[string]any, bool) {
 			event["seq"] = seq
 		}
 	}
-	if _, ok := event["tombstone_message_id"]; !ok {
-		if mid, exists := msg["message_id"]; exists {
+	if mid, exists := msg["message_id"]; exists {
+		event["message_id"] = mid
+		if _, ok := event["tombstone_message_id"]; !ok {
 			event["tombstone_message_id"] = mid
 		}
 	}
@@ -194,6 +274,13 @@ func recallEventFromGroupMessage(message any) (map[string]any, bool) {
 	for k, v := range payloadMap {
 		event[k] = v
 	}
+	for _, key := range appMessageEnvelopeKeys {
+		if _, exists := event[key]; !exists {
+			if value, ok := msg[key]; ok {
+				event[key] = value
+			}
+		}
+	}
 	messageIDs := []any{}
 	if rawIDs, ok := event["message_ids"].([]any); ok {
 		for _, item := range rawIDs {
@@ -234,8 +321,9 @@ func recallEventFromGroupMessage(message any) (map[string]any, bool) {
 	if seq, exists := msg["seq"]; exists {
 		event["seq"] = seq
 	}
-	if _, ok := event["tombstone_message_id"]; !ok {
-		if mid, exists := msg["message_id"]; exists {
+	if mid, exists := msg["message_id"]; exists {
+		event["message_id"] = mid
+		if _, ok := event["tombstone_message_id"]; !ok {
 			event["tombstone_message_id"] = mid
 		}
 	}
@@ -1000,6 +1088,14 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 	}
 
 	ns := "group_event:" + groupID
+	if d.isSelfJoinGroupChanged(data) {
+		contig := c.seqTracker.GetContiguousSeq(ns)
+		maxSeen := c.seqTracker.GetMaxSeenSeq(ns)
+		if contig == 0 && maxSeen == 0 && es > 1 {
+			c.logEG.Debug("group.changed self-join baseline: group=%s event_seq=%d baseline=%d", groupID, es, es-1)
+			c.seqTracker.ForceContiguousSeq(ns, es-1)
+		}
+	}
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
 	if es <= contigBefore || c.isPushedSeq(ns, es) {
 		c.logEG.Debug("group.changed skipped duplicate/stale: group=%s event_seq=%d contiguous=%d", groupID, es, contigBefore)
@@ -1035,6 +1131,34 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 		c.logEG.Debug("group.changed event_seq gap detected, triggering gap fill: group=%s", groupID)
 		go d.fillGroupEventGap(groupID)
 	}
+}
+
+func (d *messageDeliveryEngine) isSelfJoinGroupChanged(data map[string]any) bool {
+	action := strings.TrimSpace(stringFromAny(data["action"]))
+	switch action {
+	case "member_added", "joined", "join_approved", "invite_code_used":
+	default:
+		return false
+	}
+	c := d.runtime.client
+	c.mu.RLock()
+	selfAID := strings.TrimSpace(c.aid)
+	c.mu.RUnlock()
+	if selfAID == "" {
+		return false
+	}
+	joinedAID := strings.TrimSpace(stringFromAny(data["joined_aid"]))
+	if joinedAID == "" {
+		joinedAID = strings.TrimSpace(stringFromAny(data["member_aid"]))
+	}
+	if joinedAID == "" {
+		joinedAID = strings.TrimSpace(stringFromAny(data["aid"]))
+	}
+	if joinedAID == selfAID {
+		return true
+	}
+	actorAID := strings.TrimSpace(stringFromAny(data["actor_aid"]))
+	return joinedAID == "" && (action == "joined" || action == "invite_code_used") && actorAID == selfAID
 }
 
 func (d *messageDeliveryEngine) onV2PushNotification(data any) {

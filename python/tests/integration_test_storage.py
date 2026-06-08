@@ -772,7 +772,8 @@ async def test_storage_cas_dedup_and_instant_upload_download():
 
     复现并验证 folder-path/CAS-path 映射 bug 的修复：
     - 对象1 首传同内容
-    - 对象2 同内容（不同 owner_aid + object_key），走 check_upload 秒传
+    - 对象2 同内容（不同 owner_aid + object_key），不能跨 owner 秒传，但正常上传后复用 CAS
+    - 对象3 同内容（同 owner 不同 object_key），走 check_upload 秒传
     - 两个对象的下载 URL 经签名→302→后端，都必须下到正确内容（非 404）
     """
     rid = uuid.uuid4().hex[:10]
@@ -781,6 +782,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
     bucket = f"storage-dedup-{rid}"
     key1 = f"dedup/{rid}/file1.bin"
     key2 = f"dedup/{rid}/file2.bin"
+    key3 = f"dedup/{rid}/file3.bin"
     payload = (b"AUN-CAS-DEDUP-" + rid.encode("ascii")) * 4096  # 大于 inline 上限
     sha256 = hashlib.sha256(payload).hexdigest()
 
@@ -814,26 +816,42 @@ async def test_storage_cas_dedup_and_instant_upload_download():
         if body1 != payload:
             raise AssertionError("对象1 下载内容与上传不一致（首传对象悬空）")
 
-        # ---- 对象2（bob）：同内容，check_upload 命中应秒传 ----
-        chk = await bob.call("storage.check_upload", {
+        # ---- 对象2（bob）：跨 owner 不能秒传，避免暴露全局 CAS 存在性 ----
+        chk_bob = await bob.call("storage.check_upload", {
             "sha256": sha256, "size_bytes": len(payload),
         })
-        if chk.get("exists") is not True or chk.get("skip_upload") is not True:
-            raise AssertionError(f"check_upload 未命中去重: {chk}")
+        if chk_bob.get("exists") is not False or chk_bob.get("skip_upload") is not False:
+            raise AssertionError(f"check_upload 不应允许跨 owner 秒传: {chk_bob}")
 
-        await bob.call("storage.create_upload_session", {
+        await _expect_failure(
+            lambda: bob.call("storage.complete_upload", {
+                "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
+                "is_private": False, "sha256": sha256, "size_bytes": len(payload),
+                "skip_blob": True, "expire_in_seconds": 300,
+            }),
+            "complete_upload skip_blob 拒绝跨 owner 秒传",
+            contains="仅允许复用当前 owner",
+        )
+
+        s2 = await bob.call("storage.create_upload_session", {
             "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
             "size_bytes": len(payload), "expire_in_seconds": 300,
         })
+        status_bob, _ = await _http_request(
+            str(s2.get("upload_url") or ""), method="PUT", payload=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if status_bob < 200 or status_bob >= 300:
+            raise AssertionError(f"对象2 HTTP PUT 上传失败: status={status_bob}")
         completed2 = await bob.call("storage.complete_upload", {
             "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
             "is_private": False, "sha256": sha256, "size_bytes": len(payload),
-            "skip_blob": True, "expire_in_seconds": 300,
+            "expire_in_seconds": 300,
         })
         if completed2.get("sha256") != sha256:
-            raise AssertionError(f"秒传 complete_upload sha256 异常: {completed2}")
+            raise AssertionError(f"对象2 complete_upload sha256 异常: {completed2}")
 
-        # ---- 对象2 下载验证（秒传对象必须可下载，这是 bug 的核心症状）----
+        # ---- 对象2 下载验证（跨 owner 正常上传后复用 CAS，也必须可下载）----
         t2 = await bob.call("storage.create_download_ticket", {
             "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
             "expire_in_seconds": 300,
@@ -842,9 +860,34 @@ async def test_storage_cas_dedup_and_instant_upload_download():
         _assert_non_loopback_url(download_url2, "对象2 download_url")
         status2, body2 = await _http_request(download_url2)
         if status2 != 200:
-            raise AssertionError(f"对象2（秒传）下载失败 status={status2}（CAS 路径悬空 404）")
+            raise AssertionError(f"对象2（跨 owner 同内容上传）下载失败 status={status2}（CAS 路径悬空 404）")
         if body2 != payload:
-            raise AssertionError("对象2（秒传）下载内容与上传不一致")
+            raise AssertionError("对象2（跨 owner 同内容上传）下载内容与上传不一致")
+
+        # ---- 对象3（alice）：同 owner 已拥有该内容，check_upload 命中并允许秒传 ----
+        chk_alice = await alice.call("storage.check_upload", {
+            "sha256": sha256, "size_bytes": len(payload),
+        })
+        if chk_alice.get("exists") is not True or chk_alice.get("skip_upload") is not True:
+            raise AssertionError(f"check_upload 同 owner 未命中去重: {chk_alice}")
+
+        completed3 = await alice.call("storage.complete_upload", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key3,
+            "is_private": False, "sha256": sha256, "size_bytes": len(payload),
+            "skip_blob": True, "expire_in_seconds": 300,
+        })
+        if completed3.get("sha256") != sha256:
+            raise AssertionError(f"同 owner 秒传 complete_upload sha256 异常: {completed3}")
+
+        t3 = await bob.call("storage.create_download_ticket", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key3,
+            "expire_in_seconds": 300,
+        })
+        status3, body3 = await _http_request(str(t3.get("download_url") or ""))
+        if status3 != 200:
+            raise AssertionError(f"对象3（同 owner 秒传）下载失败 status={status3}")
+        if body3 != payload:
+            raise AssertionError("对象3（同 owner 秒传）下载内容与上传不一致")
 
         _ok("storage_cas_dedup_and_instant_upload_download")
     finally:

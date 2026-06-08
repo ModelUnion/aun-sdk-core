@@ -52,8 +52,11 @@ def _make_client() -> AUNClient:
     return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
-async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    return await ensure_connected_identity(client, aid)
+async def _ensure_connected(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
+    options = {"background_sync": False}
+    if slot_id:
+        options["slot_id"] = slot_id
+    return await ensure_connected_identity(client, aid, connect_options=options)
 
 
 def _run_id() -> str:
@@ -84,11 +87,11 @@ async def test_update_announcement_has_signature():
     alice = _make_client()
     bob = _make_client()
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOBB_AID)
+        rid = _run_id()
+        await _ensure_connected(alice, _ALICE_AID, slot_id=f"sig-alice-{rid}")
+        await _ensure_connected(bob, _BOBB_AID, slot_id=f"sig-bob-{rid}")
 
         # 创建群
-        rid = _run_id()
         result = await alice.call("group.create", {"name": f"sig-test-{rid}"})
         group_id = result["group"]["group_id"]
         await alice.call("group.add_member", {"group_id": group_id, "aid": _BOBB_AID})
@@ -147,10 +150,10 @@ async def test_update_rules_has_signature():
     alice = _make_client()
     bob = _make_client()
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOBB_AID)
-
         rid = _run_id()
+        await _ensure_connected(alice, _ALICE_AID, slot_id=f"sig-alice-{rid}")
+        await _ensure_connected(bob, _BOBB_AID, slot_id=f"sig-bob-{rid}")
+
         result = await alice.call("group.create", {"name": f"rules-sig-{rid}"})
         group_id = result["group"]["group_id"]
         await alice.call("group.add_member", {"group_id": group_id, "aid": _BOBB_AID})
@@ -199,11 +202,11 @@ async def test_kick_member_has_signature():
     charlie_client = _make_client()
     charlie_aid = f"charlie.{_ISSUER}"
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOBB_AID)
-        await _ensure_connected(charlie_client, charlie_aid)
-
         rid = _run_id()
+        await _ensure_connected(alice, _ALICE_AID, slot_id=f"sig-alice-{rid}")
+        await _ensure_connected(bob, _BOBB_AID, slot_id=f"sig-bob-{rid}")
+        await _ensure_connected(charlie_client, charlie_aid, slot_id=f"sig-charlie-{rid}")
+
         result = await alice.call("group.create", {"name": f"kick-sig-{rid}"})
         group_id = result["group"]["group_id"]
         await alice.call("group.add_member", {"group_id": group_id, "aid": _BOBB_AID})
@@ -247,8 +250,8 @@ async def test_unsigned_event_no_verified():
     # 这个测试验证旧版客户端或服务端操作生成的事件不会被验签阻拦
     alice = _make_client()
     try:
-        await _ensure_connected(alice, _ALICE_AID)
         rid = _run_id()
+        await _ensure_connected(alice, _ALICE_AID, slot_id=f"sig-alice-{rid}")
         # group.create 事件（upsert）会有签名（因为 group.create 不在 SIGNED_METHODS）
         # 用 group.list_my 验证不触发签名
         result = await alice.call("group.list_my", {})

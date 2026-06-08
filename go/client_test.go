@@ -196,6 +196,71 @@ func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
 	}
 }
 
+func TestOrderedGroupEventPullSkipsPermanentHoleAndPublishesReadyEvents(t *testing.T) {
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	groupID := "group.example.com/g-events-hole"
+	ns := "group_event:" + groupID
+	c.seqTracker.ForceContiguousSeq(ns, 1)
+
+	var received []int
+	c.events.Subscribe("group.changed", func(payload any) {
+		if evt, ok := payload.(map[string]any); ok {
+			received = append(received, int(toInt64(evt["event_seq"])))
+		}
+	})
+
+	c.enqueueOrderedMessage(ns, "group.changed", 5, map[string]any{
+		"group_id":   groupID,
+		"event_seq":  5,
+		"event_type": "group.member_removed",
+		"action":     "member_removed",
+	})
+	if !c.seqTracker.OnMessageSeq(ns, 5) {
+		t.Fatal("event_seq=5 越过空洞时应触发补洞")
+	}
+	c.drainOrderedMessages(ns)
+	if len(received) != 0 {
+		t.Fatalf("空洞补齐前不应发布群事件: %v", received)
+	}
+
+	c.enqueueOrderedMessage(ns, "group.changed", 2, map[string]any{
+		"group_id":   groupID,
+		"event_seq":  2,
+		"event_type": "group.member_added",
+		"action":     "member_added",
+	})
+	c.enqueueOrderedMessage(ns, "group.changed", 4, map[string]any{
+		"group_id":   groupID,
+		"event_seq":  4,
+		"event_type": "group.announcement_updated",
+		"action":     "announcement_updated",
+	})
+	c.seqTracker.OnPullResult(ns, []map[string]any{{"event_seq": 2}, {"event_seq": 4}}, 1)
+	c.drainOrderedMessages(ns)
+
+	if fmt.Sprint(received) != "[2 4 5]" {
+		t.Fatalf("永久空洞不应阻塞已拉取群事件发布，实际: %v", received)
+	}
+	if got := c.seqTracker.GetContiguousSeq(ns); got != 5 {
+		t.Fatalf("group_event contiguousSeq 应跳过永久空洞推进到 5，got=%d", got)
+	}
+	if !c.isPushedSeq(ns, 2) || !c.isPushedSeq(ns, 4) || !c.isPushedSeq(ns, 5) {
+		t.Fatal("已发布群事件 seq 应进入应用层去重集合")
+	}
+
+	c.delivery().handleGroupChangedEventSeq(map[string]any{
+		"group_id":   groupID,
+		"event_seq":  5,
+		"event_type": "group.member_removed",
+		"action":     "member_removed",
+	}, groupID)
+	if fmt.Sprint(received) != "[2 4 5]" {
+		t.Fatalf("重复 event_seq=5 不应再次发布，实际: %v", received)
+	}
+}
+
 func TestPulledBatchPublishesInternalGap(t *testing.T) {
 	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
@@ -254,11 +319,56 @@ func TestP2PRecallTombstonePublishesRecalledEvent(t *testing.T) {
 	if fmt.Sprint(msg["message_ids"]) != "[m-1]" {
 		t.Fatalf("message_ids 归一化错误: %#v", msg["message_ids"])
 	}
+	if msg["message_id"] != "recall-1" {
+		t.Fatalf("message_id 应保留撤回通知自身 ID: %#v", msg)
+	}
 	if msg["tombstone_message_id"] != "recall-1" {
 		t.Fatalf("tombstone_message_id 错误: %#v", msg)
 	}
 	if toInt64(msg["seq"]) != 9 {
 		t.Fatalf("seq 错误: %#v", msg)
+	}
+	published, ok := attachAppMessageEnvelope(msg).(map[string]any)
+	if !ok {
+		t.Fatalf("发布 payload 类型错误: %#v", msg)
+	}
+	envelope, ok := published["envelope"].(map[string]any)
+	if !ok || envelope["message_id"] != "recall-1" || toInt64(envelope["seq"]) != 9 {
+		t.Fatalf("撤回事件 envelope 不正确: %#v", published["envelope"])
+	}
+}
+
+func TestGroupRecallTombstonePublishesNoticeEnvelope(t *testing.T) {
+	payload, ok := recallEventFromGroupMessage(map[string]any{
+		"module_id":  "group",
+		"group_id":   "g1",
+		"message_id": "notice-1",
+		"seq":        int64(43),
+		"type":       "group.message_recalled",
+		"payload": map[string]any{
+			"message_ids":         []any{"gm-1"},
+			"target_message_seqs": []any{int64(42)},
+			"sender_aid":          "alice.agentid.pub",
+			"recalled_by":         "owner.agentid.pub",
+		},
+	})
+	if !ok {
+		t.Fatal("群撤回 tombstone 应归一化为 group.message_recalled")
+	}
+	if payload["message_id"] != "notice-1" || payload["tombstone_message_id"] != "notice-1" {
+		t.Fatalf("群撤回通知 message_id 不正确: %#v", payload)
+	}
+	published, ok := attachAppMessageEnvelope(payload).(map[string]any)
+	if !ok {
+		t.Fatalf("发布 payload 类型错误: %#v", payload)
+	}
+	envelope, ok := published["envelope"].(map[string]any)
+	if !ok {
+		t.Fatalf("群撤回事件应包含 envelope: %#v", published)
+	}
+	if envelope["module_id"] != "group" || envelope["group_id"] != "g1" ||
+		envelope["message_id"] != "notice-1" || toInt64(envelope["seq"]) != 43 {
+		t.Fatalf("群撤回 envelope 不正确: %#v", envelope)
 	}
 }
 
@@ -275,24 +385,94 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 
 	var p2pEvent map[string]any
 	var groupEvent map[string]any
+	var groupChangedEvent map[string]any
 	c.events.Subscribe("message.received", func(payload any) {
 		p2pEvent, _ = payload.(map[string]any)
 	})
 	c.events.Subscribe("group.message_created", func(payload any) {
 		groupEvent, _ = payload.(map[string]any)
 	})
+	c.events.Subscribe("group.changed", func(payload any) {
+		groupChangedEvent, _ = payload.(map[string]any)
+	})
 
-	if !c.publishOrderedMessage("message.received", p2pNS, 1, map[string]any{"seq": 1, "payload": map[string]any{"type": "text"}}) {
+	if !c.publishOrderedMessage("message.received", p2pNS, 1, map[string]any{
+		"message_id": "m-1",
+		"seq":        1,
+		"from":       "bob.example.com",
+		"to":         "alice.example.com",
+		"payload":    map[string]any{"type": "text"},
+		"e2ee":       map[string]any{"payload_type": "text"},
+	}) {
 		t.Fatal("P2P seq=1 应发布")
 	}
-	if !c.publishOrderedMessage("group.message_created", groupNS, 1, map[string]any{"group_id": "g1", "seq": 1, "payload": map[string]any{"type": "text"}}) {
+	if !c.publishOrderedMessage("group.message_created", groupNS, 1, map[string]any{
+		"group_id":     "g1",
+		"message_id":   "gm-1",
+		"seq":          1,
+		"sender_aid":   "bob.example.com",
+		"message_type": "group.message",
+		"payload":      map[string]any{"type": "text"},
+	}) {
 		t.Fatal("群 seq=1 应发布")
 	}
 	if p2pEvent["device_id"] != "dev-1" || p2pEvent["slot_id"] != "slot-a" {
 		t.Fatalf("P2P 事件未 fallback 当前实例: %#v", p2pEvent)
 	}
+	if p2pEvent["message_id"] != "m-1" || p2pEvent["payload"] == nil || p2pEvent["e2ee"] == nil {
+		t.Fatalf("P2P 旧顶层字段应继续保留: %#v", p2pEvent)
+	}
+	p2pEnvelope, ok := p2pEvent["envelope"].(map[string]any)
+	if !ok {
+		t.Fatalf("P2P 事件应包含 envelope: %#v", p2pEvent)
+	}
+	if p2pEnvelope["message_id"] != "m-1" || toInt64(p2pEnvelope["seq"]) != 1 ||
+		p2pEnvelope["from"] != "bob.example.com" || p2pEnvelope["to"] != "alice.example.com" ||
+		p2pEnvelope["device_id"] != "dev-1" || p2pEnvelope["slot_id"] != "slot-a" {
+		t.Fatalf("P2P envelope 不正确: %#v", p2pEnvelope)
+	}
 	if groupEvent["device_id"] != "dev-1" || groupEvent["slot_id"] != "slot-a" {
 		t.Fatalf("群消息事件未 fallback 当前实例: %#v", groupEvent)
+	}
+	if groupEvent["group_id"] != "g1" || groupEvent["payload"] == nil {
+		t.Fatalf("群消息旧顶层字段应继续保留: %#v", groupEvent)
+	}
+	groupEnvelope, ok := groupEvent["envelope"].(map[string]any)
+	if !ok {
+		t.Fatalf("群消息事件应包含 envelope: %#v", groupEvent)
+	}
+	if groupEnvelope["message_id"] != "gm-1" || toInt64(groupEnvelope["seq"]) != 1 ||
+		groupEnvelope["message_type"] != "group.message" || groupEnvelope["sender_aid"] != "bob.example.com" ||
+		groupEnvelope["group_id"] != "g1" || groupEnvelope["device_id"] != "dev-1" || groupEnvelope["slot_id"] != "slot-a" {
+		t.Fatalf("群消息 envelope 不正确: %#v", groupEnvelope)
+	}
+
+	c.publishAppEventSync("group.changed", map[string]any{
+		"module_id":  "group",
+		"group_id":   "g1",
+		"event_seq":  2,
+		"event_type": "group.member_added",
+		"action":     "member_added",
+		"actor_aid":  "alice.example.com",
+		"member_aid": "bob.example.com",
+	})
+	if groupChangedEvent["group_id"] != "g1" || toInt64(groupChangedEvent["event_seq"]) != 2 ||
+		groupChangedEvent["action"] != "member_added" {
+		t.Fatalf("群事件旧顶层字段应继续保留: %#v", groupChangedEvent)
+	}
+	if groupChangedEvent["device_id"] != "dev-1" || groupChangedEvent["slot_id"] != "slot-a" {
+		t.Fatalf("群事件未 fallback 当前实例: %#v", groupChangedEvent)
+	}
+	groupChangedEnvelope, ok := groupChangedEvent["envelope"].(map[string]any)
+	if !ok {
+		t.Fatalf("群事件应包含 envelope: %#v", groupChangedEvent)
+	}
+	if groupChangedEnvelope["module_id"] != "group" || groupChangedEnvelope["group_id"] != "g1" ||
+		toInt64(groupChangedEnvelope["event_seq"]) != 2 || groupChangedEnvelope["event_type"] != "group.member_added" ||
+		groupChangedEnvelope["action"] != "member_added" || groupChangedEnvelope["actor_aid"] != "alice.example.com" ||
+		groupChangedEnvelope["member_aid"] != "bob.example.com" ||
+		groupChangedEnvelope["device_id"] != "dev-1" || groupChangedEnvelope["slot_id"] != "slot-a" {
+		t.Fatalf("群事件 envelope 不正确: %#v", groupChangedEnvelope)
 	}
 }
 
@@ -308,6 +488,38 @@ func TestPublishedMessageEventsAttachEmptyDeviceID(t *testing.T) {
 	}
 	if payload["device_id"] != "" || payload["slot_id"] != "slot-a" {
 		t.Fatalf("事件实例上下文不正确: %#v", payload)
+	}
+}
+
+func TestProtectedHeadersFromParamsSupportsHeadersAlias(t *testing.T) {
+	got := protectedHeadersFromParams(map[string]any{
+		"headers": map[string]any{"trace": "alias", "payload_type": "text"},
+	})
+	if got["trace"] != "alias" || got["payload_type"] != "text" {
+		t.Fatalf("headers 别名应作为 protected_headers 读取: %#v", got)
+	}
+
+	got = protectedHeadersFromParams(map[string]any{
+		"protected_headers": map[string]any{"trace": "primary"},
+		"headers":           map[string]any{"trace": "alias"},
+	})
+	if got["trace"] != "primary" {
+		t.Fatalf("protected_headers 应优先于 headers 别名: %#v", got)
+	}
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.SetProtectedHeaders(map[string]string{"tenant": "global", "trace": "root"})
+	params := map[string]any{
+		"headers": map[string]any{"trace": "alias", "payload_type": "text"},
+	}
+	c.mergeInstanceProtectedHeaders("message.send", params)
+	merged, ok := params["protected_headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("实例级合并应写入 protected_headers: %#v", params)
+	}
+	if merged["tenant"] != "global" || merged["trace"] != "alias" || merged["payload_type"] != "text" {
+		t.Fatalf("headers 别名合并结果不正确: %#v", merged)
 	}
 }
 
@@ -1378,6 +1590,87 @@ func TestOnRawGroupChangedPushPersistsAndAcksContiguousEventSeq(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("group.changed 连续 push 未触发 group.ack_events: %#v", getCalls())
+}
+
+func TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline(t *testing.T) {
+	groupID := "g-self-join.example.com"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "bob.example.com"
+	c.mu.Unlock()
+
+	published := make(chan int64, 1)
+	sub := c.On("group.changed", func(payload any) {
+		if evt, ok := payload.(map[string]any); ok {
+			published <- toInt64(evt["event_seq"])
+		}
+	})
+	defer sub.Unsubscribe()
+
+	c.onRawGroupChanged(map[string]any{
+		"group_id":   groupID,
+		"event_seq":  5,
+		"action":     "member_added",
+		"joined_aid": "bob.example.com",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	sawPublished := false
+	for time.Now().Before(deadline) {
+		var sawAck, sawPull bool
+		for _, call := range getCalls() {
+			if call.Method == "group.pull_events" {
+				sawPull = true
+			}
+			if call.Method == "group.ack_events" &&
+				toInt64(call.Params["event_seq"]) == 5 &&
+				call.Params["device_id"] == c.deviceID &&
+				call.Params["slot_id"] == "slot-a" {
+				sawAck = true
+			}
+		}
+		if sawPull {
+			t.Fatalf("自己入群首个 group.changed 不应触发 group.pull_events: %#v", getCalls())
+		}
+		select {
+		case seq := <-published:
+			if seq != 5 {
+				t.Fatalf("发布 event_seq 错误: got=%d", seq)
+			}
+			sawPublished = true
+		default:
+		}
+		if sawPublished && sawAck && c.seqTracker.GetContiguousSeq("group_event:"+groupID) == 5 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("自己入群首个 group.changed 未发布或未 ack: calls=%#v contiguous=%d",
+		getCalls(), c.seqTracker.GetContiguousSeq("group_event:"+groupID))
 }
 
 func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {

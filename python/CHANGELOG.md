@@ -6,6 +6,28 @@
 
 ---
 
+## 0.4.12 — 2026-06-08
+
+### 新功能
+- **应用层事件信封（envelope）**：`message.*` 与 `group.changed` 事件发布给应用层时注入 `envelope` 字段，聚合 `message_id`/`seq`/`from`/`to`/`group_id`/`action` 等元数据；顶层别名字段在兼容期保留，计划于 `0.5.*` 移除，请改用 `envelope.*` 访问（四语言对齐）
+- **撤回事件携带 message_id 与自身信封**：`message.recalled` / `group.message_recalled` 通知补全 `message_id` 字段并继承原消息的信封键，应用层可直接定位被撤回消息（四语言对齐）
+
+### 修复
+- **入群首个事件被旧序号阻塞**：自己入群（`member_added`/`joined`/`join_approved`/`invite_code_used`）后，若本地 `group_event` seq 基线为 0 而服务端首个 `event_seq>1`，将基线对齐到 `event_seq-1`，避免被入群前不可见事件挡住（四语言对齐）
+- **过期 token 重连死循环**：重连前若缓存身份的 `access_token` 已失效，清空它以触发两阶段重新登录，避免反复用旧 token 触发 4001（四语言对齐）
+- **Service Proxy 持久隧道重连**：新增指数退避（上限 60s，成功后重置）；认证类错误（`AuthError`）触发重新获取 access_token 后再重连，区别于普通错误（四语言对齐）
+- **配额语义修正**：移除 `device → aid 数` 超限（`device_aids`）这一不存在的踢出场景，`4015` 仅覆盖 `aid_device_slot` / `aid_devices`
+
+### 测试
+- `TestReconnectTokenRefresh`：验证过期 token 重连前被清空、有效 token 被复用
+- `test_group_changed_self_join_sets_visible_event_baseline`：验证入群事件基线对齐
+- `test_group_changed_gap_fill_skips_permanent_hole_and_publishes_ordered`：验证永久空洞不阻塞后续群事件
+- `test_service_proxy_serve_forever.py`：新增退避递增/成功重置/auth 错误重认证 4 个用例
+- `integration_test_gateway_quota.py`：改为验证 `device_aids` 不再限流（`test_device_aids_not_quota_limited`）
+- `integration_test_replay_guard.py` / `integration_test_signature.py` / `integration_test_storage.py` / `integration_test_service_proxy.py`：用例隔离与断言补强
+
+---
+
 ## 0.4.11 — 2026-06-08
 
 ### 新功能

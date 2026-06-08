@@ -17,6 +17,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
@@ -76,22 +77,50 @@ def _fail(name: str, reason: str):
 # 辅助
 # ---------------------------------------------------------------------------
 
-def _make_client() -> AUNClient:
-    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
+def _make_client(aun_path: str = _TEST_AUN_PATH) -> AUNClient:
+    return make_client_for_path(aun_path, require_forward_secrecy=False)
+
+
+def _make_case_clients(label: str) -> tuple[AUNClient, AUNClient, str, str]:
+    rid = uuid.uuid4().hex[:8]
+    base = Path(_TEST_AUN_PATH).parent / "replay_guard_cases" / f"{label}_{rid}"
+    alice_aid = f"replay-{label}-alice-{rid}.{_ISSUER}"
+    bob_aid = f"replay-{label}-bob-{rid}.{_ISSUER}"
+    return (
+        _make_client(str(base / "alice")),
+        _make_client(str(base / "bob")),
+        alice_aid,
+        bob_aid,
+    )
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     return await ensure_connected_identity(client, aid)
 
 
-async def _wait_for_message(client: AUNClient, from_aid: str, *, timeout: float = 5.0) -> dict | None:
+async def _wait_for_message(
+    client: AUNClient,
+    from_aid: str,
+    *,
+    payload_text: str = "",
+    timeout: float = 10.0,
+) -> dict | None:
     inbox: list[dict] = []
     event = asyncio.Event()
+
+    def _matches(data: dict) -> bool:
+        if data.get("from") != from_aid:
+            return False
+        if payload_text:
+            payload = data.get("payload") or {}
+            if not isinstance(payload, dict) or payload.get("text") != payload_text:
+                return False
+        return True
 
     def handler(data):
         if not isinstance(data, dict):
             return
-        if data.get("from") != from_aid:
+        if not _matches(data):
             return
         inbox.append(data)
         event.set()
@@ -104,9 +133,9 @@ async def _wait_for_message(client: AUNClient, from_aid: str, *, timeout: float 
             pass
         if inbox:
             return inbox[0]
-        result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
+        result = await client.call("message.pull", {"after_seq": 0, "limit": 100})
         for msg in result.get("messages", []):
-            if isinstance(msg, dict) and msg.get("from") == from_aid:
+            if isinstance(msg, dict) and _matches(msg):
                 return msg
         return None
     finally:
@@ -119,18 +148,19 @@ async def _wait_for_message(client: AUNClient, from_aid: str, *, timeout: float 
 
 async def test_replay_guard_fail_close():
     """测试 replay guard RPC 失败时消息不被消费（fail-close）"""
-    alice = _make_client()
-    bob = _make_client()
+    alice, bob, alice_aid, bob_aid = _make_case_clients("basic")
 
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOB_AID)
+        await _ensure_connected(alice, alice_aid)
+        await _ensure_connected(bob, bob_aid)
 
         # 1. Alice 发送消息给 Bob
-        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
+        text = "test replay guard"
+        wait_task = asyncio.create_task(_wait_for_message(bob, alice_aid, payload_text=text))
+        await asyncio.sleep(0)
         send_result = await alice.call("message.send", {
-            "to": _BOB_AID,
-            "payload": {"type": "text", "text": "test replay guard"},
+            "to": bob_aid,
+            "payload": {"type": "text", "text": text},
             "encrypt": True
         })
         message_id = send_result.get("message_id")
@@ -181,18 +211,19 @@ async def test_replay_guard_fail_close():
 
 async def test_replay_guard_rpc_timeout():
     """测试 replay guard RPC 超时时的行为"""
-    alice = _make_client()
-    bob = _make_client()
+    alice, bob, alice_aid, bob_aid = _make_case_clients("timeout")
 
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOB_AID)
+        await _ensure_connected(alice, alice_aid)
+        await _ensure_connected(bob, bob_aid)
 
         # 1. Alice 发送消息
-        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
+        text = "test timeout"
+        wait_task = asyncio.create_task(_wait_for_message(bob, alice_aid, payload_text=text))
+        await asyncio.sleep(0)
         await alice.call("message.send", {
-            "to": _BOB_AID,
-            "payload": {"type": "text", "text": "test timeout"},
+            "to": bob_aid,
+            "payload": {"type": "text", "text": text},
             "encrypt": True
         })
 
@@ -220,18 +251,19 @@ async def test_replay_guard_rpc_timeout():
 
 async def test_replay_guard_error_handling():
     """测试 replay guard 错误处理"""
-    alice = _make_client()
-    bob = _make_client()
+    alice, bob, alice_aid, bob_aid = _make_case_clients("error")
 
     try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOB_AID)
+        await _ensure_connected(alice, alice_aid)
+        await _ensure_connected(bob, bob_aid)
 
         # 1. Alice 发送消息
-        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
+        text = "test error handling"
+        wait_task = asyncio.create_task(_wait_for_message(bob, alice_aid, payload_text=text))
+        await asyncio.sleep(0)
         await alice.call("message.send", {
-            "to": _BOB_AID,
-            "payload": {"type": "text", "text": "test error handling"},
+            "to": bob_aid,
+            "payload": {"type": "text", "text": text},
             "encrypt": True
         })
 

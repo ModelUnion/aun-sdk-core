@@ -463,8 +463,10 @@ class ServiceProxyClient:
             "handled_requests": 0,
             "wakeup_count": 0,
         }
+        _proxy_reconnect_max_delay = 60.0
         try:
             if mode == "persistent":
+                _delay = reconnect_delay_seconds
                 while self._running:
                     try:
                         await self._auto_register_services_with_gateway()
@@ -478,13 +480,25 @@ class ServiceProxyClient:
                             stats["connections"] += 1
                             stats["registered"] = int(result.get("registered", stats["registered"]))
                             stats["handled_requests"] += int(result.get("handled_requests", 0))
+                            _delay = reconnect_delay_seconds  # 连接成功后重置退避
                     except asyncio.CancelledError:
                         raise
+                    except AuthError as exc:
+                        if not self._running:
+                            break
+                        self._log_warning("persistent tunnel auth error, re-authenticating: %s", exc)
+                        try:
+                            await self._authenticate_for_access_token()
+                        except Exception as reauth_exc:
+                            self._log_warning("re-authentication failed: %s", reauth_exc)
+                        await self._sleep_or_stop(_delay)
+                        _delay = min(_delay * 2, _proxy_reconnect_max_delay)
                     except Exception as exc:
                         if not self._running:
                             break
                         self._log_warning("persistent tunnel reconnect scheduled after error: %s", exc)
-                        await self._sleep_or_stop(reconnect_delay_seconds)
+                        await self._sleep_or_stop(_delay)
+                        _delay = min(_delay * 2, _proxy_reconnect_max_delay)
                 return stats
             return await self._serve_on_demand(
                 stats=stats,

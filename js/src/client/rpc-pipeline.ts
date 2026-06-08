@@ -294,7 +294,8 @@ export class RpcPipeline {
     if (!client._instanceProtectedHeaders || !PROTECTED_HEADERS_METHODS.has(method)) {
       return;
     }
-    const existing = isJsonObject(params.protected_headers) ? params.protected_headers : {};
+    const existingValue = params.protected_headers ?? params.headers;
+    const existing = isJsonObject(existingValue) ? existingValue : {};
     params.protected_headers = { ...client._instanceProtectedHeaders, ...existing };
   }
 

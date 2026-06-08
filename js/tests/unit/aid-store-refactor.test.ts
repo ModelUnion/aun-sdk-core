@@ -150,8 +150,10 @@ describe('浏览器 SDK v4 三主体 API', () => {
     };
     await client.call('meta.ping', {});
     await client.call('message.send', { to: 'peer.agentid.pub', payload: { text: 'hi' }, encrypt: false, protected_headers: { priority: 2 } });
+    await client.call('group.send', { group_id: 'group.agentid.pub/g1', payload: { text: 'hi' }, encrypt: false, headers: { priority: 3, payload_type: 'text' } });
     expect(calls[0]!.params.protected_headers).toBeUndefined();
     expect(calls[1]!.params.protected_headers).toEqual({ app: 'sdk-test', priority: 2 });
+    expect(calls[2]!.params.protected_headers).toEqual({ app: 'sdk-test', priority: 3, payload_type: 'text' });
   });
 });
 

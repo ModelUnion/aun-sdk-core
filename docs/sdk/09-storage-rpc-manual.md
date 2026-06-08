@@ -534,7 +534,7 @@ for obj in result["items"]:
 | `content_type` | string | 否 | MIME 类型，默认 `"application/octet-stream"` |
 | `is_private` | boolean | 否 | 是否私有，默认 `true` |
 | `size_bytes` | integer | 否 | 预期文件大小（用于校验） |
-| `skip_blob` | boolean | 否 | 秒传模式，默认 `false`；为 `true` 时跳过 blob 上传，必须提供 `sha256` 且服务端已存在对应内容 |
+| `skip_blob` | boolean | 否 | 秒传模式，默认 `false`；为 `true` 时跳过 blob 上传，必须提供 `sha256`，且当前 owner 已拥有相同内容 |
 | `expected_version` | integer | 否 | 乐观并发控制版本号 |
 | `expire_in_seconds` | integer | 否 | 过期时间（秒） |
 | `metadata` | object | 否 | 自定义元数据 |
@@ -650,7 +650,9 @@ print(f"配额: {limits['quota_used_bytes']}/{limits['quota_total_bytes']}")
 
 ## storage.check_upload
 
-上传预检：一次调用同时回答"文件是否超限"和"是否可秒传"。客户端应在计算完文件 SHA-256 后、实际上传前调用。
+上传预检：一次调用同时回答"文件是否超限"和"当前 owner 是否可秒传"。客户端应在计算完文件 SHA-256 后、实际上传前调用。
+
+> `check_upload` / `complete_upload(skip_blob=true)` 只允许复用当前 owner 已拥有的内容，避免跨 owner 暴露全局 CAS 存在性或跳过上传克隆他人私有内容。不同 owner 上传相同内容时，仍会在完成上传后归一到同一个 CAS blob，由服务端引用计数管理物理去重。
 
 ### 参数
 
@@ -658,13 +660,14 @@ print(f"配额: {limits['quota_used_bytes']}/{limits['quota_total_bytes']}")
 |------|------|------|------|
 | `sha256` | string | 是 | 文件内容的 SHA-256 hex（64 字符） |
 | `size_bytes` | integer | 是 | 文件大小（字节） |
+| `owner_aid` | string | 否 | 检查指定 owner 是否可秒传，默认当前用户；必须等于当前登录 AID |
 
 ### 响应
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `within_limit` | boolean | 文件大小是否在限制内 |
-| `exists` | boolean | 服务端是否已有相同内容 |
+| `exists` | boolean | 当前 owner 是否已拥有相同内容且 CAS blob 可用 |
 | `skip_upload` | boolean | 是否可跳过上传（秒传） |
 
 ### 使用场景
@@ -683,7 +686,7 @@ check = await client.call("storage.check_upload", {
 if not check["within_limit"]:
     print("文件超限，无法上传")
 elif check["skip_upload"]:
-    # 秒传：服务端已有相同内容，跳过上传直接 complete
+    # 秒传：当前 owner 已拥有相同内容，跳过上传直接 complete
     await client.call("storage.complete_upload", {
         "object_key": "my/file.bin",
         "sha256": sha256,

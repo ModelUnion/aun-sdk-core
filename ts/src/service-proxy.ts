@@ -508,6 +508,8 @@ export class ServiceProxyClient {
     };
     try {
       if (mode === 'persistent') {
+        const maxReconnectDelay = 60_000;
+        let _delay = Math.max(0, opts.reconnectDelaySeconds ?? 1) * 1000;
         while (this._running) {
           try {
             await this._autoRegisterServicesWithGateway();
@@ -521,10 +523,19 @@ export class ServiceProxyClient {
             stats.connections = Number(stats.connections) + 1;
             stats.registered = Number(result.registered ?? stats.registered);
             stats.handled_requests = Number(stats.handled_requests) + Number(result.handled_requests ?? 0);
+            _delay = Math.max(0, opts.reconnectDelaySeconds ?? 1) * 1000; // 成功后重置退避
           } catch (exc) {
             if (!this._running) break;
-            this._logWarn(`persistent tunnel reconnect scheduled after error: ${formatError(exc)}`);
-            await sleep(Math.max(0, opts.reconnectDelaySeconds ?? 1) * 1000);
+            if (exc instanceof AuthError) {
+              this._logWarn(`persistent tunnel auth error, re-authenticating: ${formatError(exc)}`);
+              try { await this._authenticateForAccessToken(); } catch (reAuthExc) {
+                this._logWarn(`re-authentication failed: ${formatError(reAuthExc)}`);
+              }
+            } else {
+              this._logWarn(`persistent tunnel reconnect scheduled after error: ${formatError(exc)}`);
+            }
+            await sleep(_delay);
+            _delay = Math.min(_delay * 2, maxReconnectDelay);
           } finally {
             this._activeTunnel?.close();
             this._activeTunnel = null;

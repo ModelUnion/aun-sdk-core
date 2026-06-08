@@ -7,6 +7,17 @@ import type { ClientRuntime } from './runtime.js';
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
 const GROUP_RECALL_SEEN_LIMIT = 10_000;
+const APP_MESSAGE_ENVELOPE_KEYS = [
+  'module_id', 'message_id', 'id', 'seq', 'msg_seq', 'message_type', 'type', 'kind', 'version',
+  'from', 'from_aid', 'sender_aid', 'to', 'to_aid', 'group_id',
+  'timestamp', 'created_at', 't_server', 'encrypted', 'status', 'delivery_mode',
+  'dispatch_mode', 'dispatch', 'device_id', 'slot_id',
+];
+const APP_GROUP_EVENT_ENVELOPE_KEYS = [
+  'module_id', 'event_id', 'event_seq', 'seq', 'event_type', 'action', 'group_id',
+  'actor_aid', 'sender_aid', 'member_aid', 'target_aid', 'operator_aid',
+  'created_at', 'timestamp', 't_server', 'status', 'device_id', 'slot_id',
+];
 
 function formatDeliveryError(error: unknown): Error | string {
   return error instanceof Error ? error : String(error);
@@ -106,8 +117,53 @@ export class MessageDeliveryEngine {
   }
 
   normalizePublishedMessagePayload(event: string, payload: EventPayload): EventPayload {
-    if (!this.isInstanceScopedMessageEvent(event)) return payload;
-    return this.stripInternalSenderDeviceFields(this.attachCurrentInstanceContext(payload));
+    if (this.isInstanceScopedMessageEvent(event)) {
+      return this.attachAppMessageEnvelope(this.stripInternalSenderDeviceFields(this.attachCurrentInstanceContext(payload)));
+    }
+    if (this.isGroupScopedEvent(event)) {
+      return this.attachAppGroupEventEnvelope(this.attachCurrentInstanceContext(payload));
+    }
+    return payload;
+  }
+
+  appMessageEnvelope(payload: EventPayload): JsonObject {
+    if (!isJsonObject(payload)) return {};
+    const message = payload as JsonObject;
+    const envelope: JsonObject = {};
+    for (const key of APP_MESSAGE_ENVELOPE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(message, key)) envelope[key] = message[key] as JsonValue;
+    }
+    return envelope;
+  }
+
+  isGroupScopedEvent(event: string): boolean {
+    return event === 'group.changed';
+  }
+
+  appGroupEventEnvelope(payload: EventPayload): JsonObject {
+    if (!isJsonObject(payload)) return {};
+    const groupEvent = payload as JsonObject;
+    const envelope: JsonObject = {};
+    for (const key of APP_GROUP_EVENT_ENVELOPE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(groupEvent, key)) envelope[key] = groupEvent[key] as JsonValue;
+    }
+    return envelope;
+  }
+
+  attachAppMessageEnvelope(payload: EventPayload): EventPayload {
+    if (!isJsonObject(payload)) return payload;
+    const result: JsonObject = { ...(payload as JsonObject) };
+    // 兼容期保留顶层信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+    result.envelope = this.appMessageEnvelope(result as EventPayload);
+    return result as EventPayload;
+  }
+
+  attachAppGroupEventEnvelope(payload: EventPayload): EventPayload {
+    if (!isJsonObject(payload)) return payload;
+    const result: JsonObject = { ...(payload as JsonObject) };
+    // 兼容期保留顶层群事件信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+    result.envelope = this.appGroupEventEnvelope(result as EventPayload);
+    return result as EventPayload;
   }
 
   stripInternalSenderDeviceFields(payload: EventPayload): EventPayload {
@@ -129,6 +185,11 @@ export class MessageDeliveryEngine {
     const payloadType = String(payload.type ?? payload.kind ?? '').trim();
     if (msgType !== 'message.recalled' && payloadType !== 'message.recalled') return null;
     const event: JsonObject = { ...payload };
+    for (const key of APP_MESSAGE_ENVELOPE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(msg, key) && !(key in event)) {
+        event[key] = msg[key] as JsonValue;
+      }
+    }
     const rawIds = event.message_ids;
     let messageIds = Array.isArray(rawIds)
       ? rawIds.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -149,7 +210,10 @@ export class MessageDeliveryEngine {
     if (!('to' in event)) event.to = msg.to ?? msg.to_aid ?? '';
     if (!('timestamp' in event)) event.timestamp = msg.timestamp ?? msg.t_server ?? event.recalled_at ?? 0;
     if ('seq' in msg && !('seq' in event)) event.seq = msg.seq;
-    if ('message_id' in msg && !('tombstone_message_id' in event)) event.tombstone_message_id = msg.message_id;
+    if ('message_id' in msg) {
+      event.message_id = msg.message_id as JsonValue;
+      if (!('tombstone_message_id' in event)) event.tombstone_message_id = msg.message_id as JsonValue;
+    }
     if ('device_id' in msg && !('device_id' in event)) event.device_id = msg.device_id;
     if ('slot_id' in msg && !('slot_id' in event)) event.slot_id = msg.slot_id;
     return event;
@@ -170,6 +234,11 @@ export class MessageDeliveryEngine {
     const payloadType = String(payload.type ?? payload.kind ?? '').trim();
     if (msgType !== 'group.message_recalled' && payloadType !== 'group.message_recalled') return null;
     const event: JsonObject = { ...payload };
+    for (const key of APP_MESSAGE_ENVELOPE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(msg, key) && !(key in event)) {
+        event[key] = msg[key] as JsonValue;
+      }
+    }
     const rawIds = event.message_ids;
     let messageIds = Array.isArray(rawIds)
       ? rawIds.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -189,7 +258,10 @@ export class MessageDeliveryEngine {
     if (!('group_id' in event)) event.group_id = msg.group_id ?? '';
     if (!('timestamp' in event)) event.timestamp = msg.timestamp ?? msg.t_server ?? event.recalled_at ?? 0;
     if ('seq' in msg) event.seq = msg.seq;
-    if ('message_id' in msg && !('tombstone_message_id' in event)) event.tombstone_message_id = msg.message_id;
+    if ('message_id' in msg) {
+      event.message_id = msg.message_id as JsonValue;
+      if (!('tombstone_message_id' in event)) event.tombstone_message_id = msg.message_id as JsonValue;
+    }
     return event;
   }
 
@@ -715,6 +787,14 @@ export class MessageDeliveryEngine {
     }
 
     const ns = `group_event:${groupId}`;
+    if (this.isSelfJoinGroupChanged(data)) {
+      const contig = client._seqTracker.getContiguousSeq(ns);
+      const maxSeen = client._seqTracker.getMaxSeenSeq(ns);
+      if (contig === 0 && maxSeen === 0 && eventSeq > 1) {
+        client._clientLog.debug(`group.changed self-join baseline: group=${groupId}, event_seq=${eventSeq}, baseline=${eventSeq - 1}`);
+        client._seqTracker.forceContiguousSeq(ns, eventSeq - 1);
+      }
+    }
     const contigBefore = client._seqTracker.getContiguousSeq(ns);
     if (eventSeq <= contigBefore || client._pushedSeqs.get(ns)?.has(eventSeq)) {
       client._clientLog.debug(`group.changed skipped duplicate/stale: group=${groupId}, event_seq=${eventSeq}, contiguous=${contigBefore}`);
@@ -742,6 +822,17 @@ export class MessageDeliveryEngine {
     if (needPull && groupId && !data._from_gap_fill) {
       client._safeAsync(this.fillGroupEventGap(groupId));
     }
+  }
+
+  isSelfJoinGroupChanged(data: JsonObject): boolean {
+    const action = String(data.action ?? '').trim();
+    if (!['member_added', 'joined', 'join_approved', 'invite_code_used'].includes(action)) return false;
+    const selfAid = String(this.runtime.client._aid ?? '').trim();
+    if (!selfAid) return false;
+    const joinedAid = String(data.joined_aid ?? data.member_aid ?? data.aid ?? '').trim();
+    if (joinedAid === selfAid) return true;
+    const actorAid = String(data.actor_aid ?? '').trim();
+    return !joinedAid && ['joined', 'invite_code_used'].includes(action) && actorAid === selfAid;
   }
 
   enqueueOnlineUnreadHint(data: JsonObject): void {

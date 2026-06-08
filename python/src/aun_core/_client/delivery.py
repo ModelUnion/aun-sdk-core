@@ -20,6 +20,20 @@ _ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
 _ONLINE_UNREAD_HINT_INTERVAL = 0.05
 
 
+_APP_MESSAGE_ENVELOPE_KEYS = (
+    "module_id", "message_id", "id", "seq", "msg_seq", "message_type", "type", "kind", "version",
+    "from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
+    "timestamp", "created_at", "t_server", "encrypted", "status", "delivery_mode",
+    "dispatch_mode", "dispatch", "device_id", "slot_id",
+)
+
+_APP_GROUP_EVENT_ENVELOPE_KEYS = (
+    "module_id", "event_id", "event_seq", "seq", "event_type", "action", "group_id",
+    "actor_aid", "sender_aid", "member_aid", "target_aid", "operator_aid",
+    "created_at", "timestamp", "t_server", "status", "device_id", "slot_id",
+)
+
+
 class MessageDeliveryEngine:
     """消息推送、拉取、有序投递、补洞与 ack 协调器。"""
 
@@ -162,6 +176,16 @@ class MessageDeliveryEngine:
             return
 
         ns = f"group_event:{group_id}"
+        if self.is_self_join_group_changed(data):
+            contig = client._seq_tracker.get_contiguous_seq(ns)
+            max_seen = client._seq_tracker.get_max_seen_seq(ns)
+            if contig == 0 and max_seen == 0 and event_seq > 1:
+                client._log.debug(
+                    "client",
+                    "group.changed self-join baseline: group=%s event_seq=%d baseline=%d",
+                    group_id, event_seq, event_seq - 1,
+                )
+                client._seq_tracker.force_contiguous_seq(ns, event_seq - 1)
         contig_before = client._seq_tracker.get_contiguous_seq(ns)
         if event_seq <= contig_before or client._is_published_seq(ns, event_seq):
             client._log.debug(
@@ -198,6 +222,20 @@ class MessageDeliveryEngine:
             loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
             loop.create_task(client._fill_group_event_gap(group_id))
 
+    def is_self_join_group_changed(self, data: dict[str, Any]) -> bool:
+        action = str(data.get("action") or "").strip()
+        join_actions = {"member_added", "joined", "join_approved", "invite_code_used"}
+        if action not in join_actions:
+            return False
+        self_aid = str(getattr(self.client, "_aid", "") or "").strip()
+        if not self_aid:
+            return False
+        joined_aid = str(data.get("joined_aid") or data.get("member_aid") or data.get("aid") or "").strip()
+        if joined_aid == self_aid:
+            return True
+        actor_aid = str(data.get("actor_aid") or "").strip()
+        return not joined_aid and action in {"joined", "invite_code_used"} and actor_aid == self_aid
+
     @staticmethod
     def is_instance_scoped_message_event(event: str) -> bool:
         return event in {
@@ -221,11 +259,49 @@ class MessageDeliveryEngine:
         return result
 
     def normalize_published_message_payload(self, event: str, payload: Any) -> Any:
-        if not self.client._is_instance_scoped_message_event(event):
+        if self.client._is_instance_scoped_message_event(event):
+            normalized = self.strip_internal_sender_device_fields(
+                self.client._attach_current_instance_context(payload)
+            )
+            return self.attach_app_message_envelope(normalized)
+        if self.is_group_scoped_event(event):
+            normalized = self.client._attach_current_instance_context(payload)
+            return self.attach_app_group_event_envelope(normalized)
+        return payload
+
+    @staticmethod
+    def app_message_envelope(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        return {key: payload[key] for key in _APP_MESSAGE_ENVELOPE_KEYS if key in payload}
+
+    @staticmethod
+    def is_group_scoped_event(event: str) -> bool:
+        return event in {"group.changed"}
+
+    @staticmethod
+    def app_group_event_envelope(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        return {key: payload[key] for key in _APP_GROUP_EVENT_ENVELOPE_KEYS if key in payload}
+
+    @classmethod
+    def attach_app_message_envelope(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
             return payload
-        return self.strip_internal_sender_device_fields(
-            self.client._attach_current_instance_context(payload)
-        )
+        result = dict(payload)
+        # 兼容期保留顶层信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+        result["envelope"] = cls.app_message_envelope(result)
+        return result
+
+    @classmethod
+    def attach_app_group_event_envelope(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        result = dict(payload)
+        # 兼容期保留顶层群事件信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
+        result["envelope"] = cls.app_group_event_envelope(result)
+        return result
 
     @staticmethod
     def strip_internal_sender_device_fields(payload: Any) -> Any:
@@ -248,6 +324,9 @@ class MessageDeliveryEngine:
         if msg_type != "message.recalled" and payload_type != "message.recalled":
             return None
         event = dict(payload_dict)
+        for key in _APP_MESSAGE_ENVELOPE_KEYS:
+            if key in message and key not in event:
+                event[key] = message[key]
         raw_ids = event.get("message_ids")
         if isinstance(raw_ids, list):
             message_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
@@ -268,6 +347,7 @@ class MessageDeliveryEngine:
         if "seq" in message:
             event.setdefault("seq", message.get("seq"))
         if "message_id" in message:
+            event["message_id"] = message.get("message_id")
             event.setdefault("tombstone_message_id", message.get("message_id"))
         if "device_id" in message:
             event.setdefault("device_id", message.get("device_id"))
@@ -298,6 +378,9 @@ class MessageDeliveryEngine:
         if msg_type != "group.message_recalled" and payload_type != "group.message_recalled":
             return None
         event = dict(payload_dict)
+        for key in _APP_MESSAGE_ENVELOPE_KEYS:
+            if key in message and key not in event:
+                event[key] = message[key]
         raw_ids = event.get("message_ids")
         if isinstance(raw_ids, list):
             message_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
@@ -320,6 +403,7 @@ class MessageDeliveryEngine:
         if "seq" in message:
             event["seq"] = message.get("seq")
         if "message_id" in message:
+            event["message_id"] = message.get("message_id")
             event.setdefault("tombstone_message_id", message.get("message_id"))
         return event
 

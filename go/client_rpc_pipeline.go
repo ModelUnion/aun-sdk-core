@@ -448,12 +448,7 @@ func (p *rpcPipeline) mergeInstanceProtectedHeaders(method string, params map[st
 	}
 
 	merged := make(map[string]any)
-	switch existing := params["protected_headers"].(type) {
-	case map[string]any:
-		for k, v := range existing {
-			merged[k] = v
-		}
-	case map[string]string:
+	if existing := protectedHeadersFromParams(params); existing != nil {
 		for k, v := range existing {
 			merged[k] = v
 		}
@@ -465,6 +460,38 @@ func (p *rpcPipeline) mergeInstanceProtectedHeaders(method string, params map[st
 		}
 	}
 	params["protected_headers"] = merged
+}
+
+func protectedHeadersFromParams(params map[string]any) map[string]any {
+	if params == nil {
+		return nil
+	}
+	if value, exists := params["protected_headers"]; exists {
+		return protectedHeadersMap(value)
+	}
+	if value, exists := params["headers"]; exists {
+		return protectedHeadersMap(value)
+	}
+	return nil
+}
+
+func protectedHeadersMap(value any) map[string]any {
+	switch headers := value.(type) {
+	case map[string]any:
+		copied := make(map[string]any, len(headers))
+		for k, v := range headers {
+			copied[k] = v
+		}
+		return copied
+	case map[string]string:
+		copied := make(map[string]any, len(headers))
+		for k, v := range headers {
+			copied[k] = v
+		}
+		return copied
+	default:
+		return nil
+	}
 }
 
 // signClientOperation 为关键操作附加客户端 ECDSA 签名（_client_signature 字段）。

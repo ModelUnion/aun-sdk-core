@@ -666,6 +666,7 @@ func (l *lifecycleController) reconnectLoop(ctx context.Context, serverInitiated
 
 		c.mu.RLock()
 		params := c.sessionParams
+		identity := c.identity
 		c.mu.RUnlock()
 		if params == nil {
 			c.mu.Lock()
@@ -674,6 +675,20 @@ func (l *lifecycleController) reconnectLoop(ctx context.Context, serverInitiated
 			c.events.Publish("state_change", map[string]any{"state": string(c.ConnectionState())})
 			c.reconnecting.Store(false)
 			return
+		}
+
+		// 重连前同步 identity 里的 token 状态到 params，防止用过期 token 死循环 4001
+		if identity != nil {
+			cachedToken, _ := identity["access_token"].(string)
+			expiresAt := c.auth.GetAccessTokenExpiry(identity)
+			if cachedToken != "" && (expiresAt == 0 || expiresAt > float64(time.Now().Unix())+30) {
+				params["access_token"] = cachedToken
+			} else {
+				c.log.Debug("reconnect: cached token expired or missing for aid=%s, clearing to trigger re-login", c.aid)
+				params["access_token"] = ""
+			}
+		} else {
+			params["access_token"] = ""
 		}
 
 		err := l.connectOnce(context.Background(), params, true)

@@ -635,3 +635,52 @@ class TestNoReconnectCodes:
 
         assert client.state == ConnectionState.CONNECTION_FAILED
         assert reconnect_started == []
+
+
+class TestReconnectTokenRefresh:
+    """reconnect 时 token 刷新逻辑：过期 token 应被清空，使 connect_session 走两阶段登录"""
+
+    @pytest.mark.asyncio
+    async def test_stale_token_cleared_before_reconnect_connect_once(self):
+        """cached identity token 失效时，session_params["access_token"] 应被清空，
+        避免用旧 token 反复触发 4001 死循环"""
+        client = _make_client(auto_reconnect=True)
+        client._session_params = {"access_token": "stale-token", "gateway": "wss://gw.test/aun"}
+        client._identity = {"aid": "alice.test", "access_token": "", "access_token_expires_at": 0.0}
+
+        connect_once_params: list[dict] = []
+
+        async def mock_connect_once(params, *, allow_reauth):
+            connect_once_params.append(dict(params))
+            client._state = "connected"
+
+        client._connect_once = mock_connect_once
+
+        await client._invoke_reconnect_connect_once()
+
+        # stale token 应被清空，让 connect_session 走两阶段登录
+        assert connect_once_params[0].get("access_token") == ""
+
+    @pytest.mark.asyncio
+    async def test_valid_cached_token_used_in_reconnect(self):
+        """cached identity token 有效时，应用到 session_params 并传入 connect_once"""
+        import time as _time
+        client = _make_client(auto_reconnect=True)
+        client._session_params = {"access_token": "old-token", "gateway": "wss://gw.test/aun"}
+        client._identity = {
+            "aid": "alice.test",
+            "access_token": "fresh-token",
+            "access_token_expires_at": _time.time() + 3600,
+        }
+
+        connect_once_params: list[dict] = []
+
+        async def mock_connect_once(params, *, allow_reauth):
+            connect_once_params.append(dict(params))
+            client._state = "connected"
+
+        client._connect_once = mock_connect_once
+
+        await client._invoke_reconnect_connect_once()
+
+        assert connect_once_params[0].get("access_token") == "fresh-token"

@@ -27,7 +27,7 @@ def test_rpc_pipeline_merges_instance_protected_headers():
         _instance_protected_headers = {"tenant": "global", "trace": "root"}
 
         def _protected_headers_from_params(self, params):
-            return params.get("protected_headers")
+            return params.get("protected_headers") if params.get("protected_headers") is not None else params.get("headers")
 
     params = {"protected_headers": {"trace": "local", "payload_type": "chat"}}
 
@@ -36,6 +36,14 @@ def test_rpc_pipeline_merges_instance_protected_headers():
     assert result["protected_headers"] == {
         "tenant": "global",
         "trace": "local",
+        "payload_type": "chat",
+    }
+
+    alias_params = {"headers": {"trace": "alias", "payload_type": "chat"}}
+    alias_result = RpcPipeline(FakeClient()).merge_instance_protected_headers("group.send", alias_params)
+    assert alias_result["protected_headers"] == {
+        "tenant": "global",
+        "trace": "alias",
         "payload_type": "chat",
     }
 
@@ -75,8 +83,35 @@ def test_message_delivery_maps_recall_tombstone_to_app_event():
 
     assert event == "message.recalled"
     assert payload["message_ids"] == ["m-1"]
+    assert payload["message_id"] == "recall-1"
     assert payload["tombstone_message_id"] == "recall-1"
     assert payload["seq"] == 9
+    published = engine.attach_app_message_envelope(payload)
+    assert published["envelope"]["message_id"] == "recall-1"
+    assert published["envelope"]["seq"] == 9
+
+    group_payload = engine.recall_event_from_group_message({
+        "module_id": "group",
+        "group_id": "g1",
+        "message_id": "notice-1",
+        "seq": 43,
+        "type": "group.message_recalled",
+        "payload": {
+            "message_ids": ["gm-1"],
+            "target_message_seqs": [42],
+            "sender_aid": "alice.agentid.pub",
+            "recalled_by": "owner.agentid.pub",
+        },
+    })
+    assert group_payload is not None
+    assert group_payload["message_id"] == "notice-1"
+    assert group_payload["tombstone_message_id"] == "notice-1"
+    assert group_payload["message_ids"] == ["gm-1"]
+    group_published = engine.attach_app_message_envelope(group_payload)
+    assert group_published["envelope"]["module_id"] == "group"
+    assert group_published["envelope"]["group_id"] == "g1"
+    assert group_published["envelope"]["message_id"] == "notice-1"
+    assert group_published["envelope"]["seq"] == 43
 
 
 def test_v2_e2ee_metadata_filters_auth_fields_and_attaches_public_fields():
