@@ -144,12 +144,6 @@ class SpkLifecycleManager:
         sign_data = spk_pub_der + self._scope.encode() + self._device_id.encode() + str(int(now)).encode()
         signature = ecdsa_sign_raw(self._ik_priv, sign_data)
 
-        # 标记旧 SPK 为 pending_drain
-        if self._current_spk_id and self._current_spk_id in self._spk_store:
-            old_entry = self._spk_store[self._current_spk_id]
-            if old_entry.status == "active":
-                old_entry.status = "pending_drain"
-
         # 存入新 SPK
         entry = SpkEntry(
             spk_id=spk_id,
@@ -159,11 +153,18 @@ class SpkLifecycleManager:
             status="active",
         )
         self._spk_store[spk_id] = entry
-        self._current_spk_id = spk_id
-        self._last_rotation_time = now
 
-        # 回调通知（上传到服务端）
+        # 先上传新 SPK，成功后再标记旧 SPK 为 pending_drain
         if self._on_spk_publish:
             self._on_spk_publish(self._scope, spk_id, spk_pub_der, signature)
+
+        # 上传成功后才标记旧 SPK 为 pending_drain
+        if self._current_spk_id and self._current_spk_id in self._spk_store:
+            old_entry = self._spk_store[self._current_spk_id]
+            if old_entry.status == "active":
+                old_entry.status = "pending_drain"
+
+        self._current_spk_id = spk_id
+        self._last_rotation_time = now
 
         return entry

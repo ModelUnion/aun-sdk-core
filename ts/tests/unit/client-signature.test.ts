@@ -6,17 +6,23 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 /** 从 client.ts 源文件中提取 SIGNED_METHODS 集合的方法名 */
-function extractSignedMethods(): string[] {
+function extractSignedMethods(file = '../../src/client.ts'): string[] {
+  return extractMethodSet('SIGNED_METHODS', file);
+}
+
+function extractNonIdempotentMethods(file = '../../src/client.ts'): string[] {
+  return extractMethodSet('NON_IDEMPOTENT_METHODS', file);
+}
+
+function extractMethodSet(name: string, file: string): string[] {
   const src = readFileSync(
-    resolve(__dirname, '../../src/client.ts'),
+    resolve(__dirname, file),
     'utf-8',
   );
-  // 匹配 const SIGNED_METHODS = new Set([ ... ]);
   const match = src.match(
-    /const\s+SIGNED_METHODS\s*=\s*new\s+Set\(\[\s*([\s\S]*?)\]\)/,
+    new RegExp(`const\\s+${name}\\s*=\\s*new\\s+Set\\(\\[\\s*([\\s\\S]*?)\\]\\)`),
   );
-  if (!match) throw new Error('未找到 SIGNED_METHODS 定义');
-  // 提取所有单引号字符串
+  if (!match) throw new Error(`未找到 ${name} 定义`);
   const methods: string[] = [];
   for (const m of match[1].matchAll(/'([^']+)'/g)) {
     methods.push(m[1]);
@@ -24,7 +30,26 @@ function extractSignedMethods(): string[] {
   return methods;
 }
 
-/** 预期需要签名的 45 个方法 */
+const STORAGE_MUTATION_METHODS = [
+  'storage.put_object',
+  'storage.delete_object',
+  'storage.get_by_share',
+  'storage.create_share_link',
+  'storage.revoke_share_link',
+  'storage.create_upload_session',
+  'storage.complete_upload',
+  'storage.create_folder',
+  'storage.rename_folder',
+  'storage.move_folder',
+  'storage.delete_folder',
+  'storage.move_object',
+  'storage.copy_object',
+  'storage.batch_delete',
+  'storage.set_object_meta',
+  'storage.append_object',
+] as const;
+
+/** 预期需要签名的方法 */
 const EXPECTED_SIGNED_METHODS = [
   'message.send',
   'message.v2.put_peer_pk',
@@ -59,25 +84,35 @@ const EXPECTED_SIGNED_METHODS = [
   'message.thought.put',
   'group.set_settings',
   'group.resources.put',
+  'group.resources.create_folder',
+  'group.resources.rename',
+  'group.resources.move',
+  'group.resources.mount_object',
   'group.resources.update',
   'group.resources.delete',
+  'group.resources.cleanup_by_storage_ref',
   'group.resources.request_add',
+  'group.resources.request_mount_object',
   'group.resources.direct_add',
   'group.resources.approve_request',
   'group.resources.reject_request',
+  'group.resources.unmount',
+  'group.resources.get_access',
+  'group.resources.resolve_access_ticket',
   'group.commit_state',
   'group.ban',
   'group.unban',
   'group.dissolve',
   'group.suspend',
   'group.resume',
+  ...STORAGE_MUTATION_METHODS,
 ] as const;
 
 describe('SIGNED_METHODS 签名覆盖面', () => {
   const actual = extractSignedMethods();
 
-  it('应包含全部 45 个预期方法', () => {
-    expect(actual).toHaveLength(45);
+  it('应包含全部预期方法', () => {
+    expect(actual).toHaveLength(EXPECTED_SIGNED_METHODS.length);
   });
 
   it('每个预期方法都应在 SIGNED_METHODS 中', () => {
@@ -95,5 +130,30 @@ describe('SIGNED_METHODS 签名覆盖面', () => {
   it('不应包含已移除的 V1 E2EE 控制面方法', () => {
     expect(actual.some((m) => m.startsWith('message.e2ee.') || m.startsWith('group.e2ee.'))).toBe(false);
     expect(actual).not.toContain('group.rotate_epoch');
+  });
+
+  it('storage 写操作和有副作用读操作应进入非幂等长超时集合', () => {
+    const nonIdempotent = extractNonIdempotentMethods();
+    for (const method of STORAGE_MUTATION_METHODS) {
+      expect(nonIdempotent, `缺少非幂等方法: ${method}`).toContain(method);
+    }
+  });
+
+  it('运行时 RpcPipeline 应覆盖同一组 storage 签名和非幂等方法', () => {
+    const signed = extractSignedMethods('../../src/client/rpc-pipeline.ts');
+    const nonIdempotent = extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts');
+    for (const method of STORAGE_MUTATION_METHODS) {
+      expect(signed, `运行时签名集合缺少: ${method}`).toContain(method);
+      expect(nonIdempotent, `运行时非幂等集合缺少: ${method}`).toContain(method);
+    }
+  });
+
+  it('资源票据类方法应进入签名和非幂等长超时集合', () => {
+    for (const method of ['group.resources.get_access', 'group.resources.resolve_access_ticket']) {
+      expect(extractSignedMethods(), `缺少签名方法: ${method}`).toContain(method);
+      expect(extractSignedMethods('../../src/client/rpc-pipeline.ts'), `运行时签名集合缺少: ${method}`).toContain(method);
+      expect(extractNonIdempotentMethods(), `缺少非幂等方法: ${method}`).toContain(method);
+      expect(extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts'), `运行时非幂等集合缺少: ${method}`).toContain(method);
+    }
   });
 });

@@ -61,6 +61,39 @@ export class MessageDeliveryEngine {
     }
   }
 
+  isGroupEventNamespace(ns: string): boolean {
+    return ns.startsWith('group_event:');
+  }
+
+  async publishOrderedQueueItem(ns: string, event: string, seq: number, payload: EventPayload, source: string, pullResponse = false): Promise<void> {
+    const client = this.runtime.client;
+    if (event === 'group.changed' && this.isGroupEventNamespace(ns)) {
+      await this.publishOrderedGroupChanged(payload, source);
+      return;
+    }
+    if (pullResponse) {
+      const published = client._withPullResponseProcessing(ns, () => client._publishAppEvent(event, payload, source));
+      if (isPromiseLike(published)) await published;
+    } else {
+      const published = client._publishAppEvent(event, payload, source);
+      if (isPromiseLike(published)) await published;
+    }
+  }
+
+  async publishOrderedGroupChanged(payload: EventPayload, source = 'ordered'): Promise<void> {
+    const client = this.runtime.client;
+    if (isJsonObject(payload as JsonValue | object | null | undefined)) {
+      const eventPayload = payload as JsonObject;
+      client._groupState?.handleGroupChangedV2Membership?.(eventPayload);
+      if (eventPayload.action === 'dissolved') {
+        const groupId = normalizeGroupId(String(eventPayload.group_id ?? '')) || String(eventPayload.group_id ?? '').trim();
+        if (groupId) client._cleanupDissolvedGroup?.(groupId);
+      }
+    }
+    const published = client._publishAppEvent('group.changed', payload, source);
+    if (isPromiseLike(published)) await published;
+  }
+
   isInstanceScopedMessageEvent(event: string): boolean {
     return event === 'message.received'
       || event === 'message.recalled'
@@ -697,10 +730,12 @@ export class MessageDeliveryEngine {
           }
         }
         const eventSeqs: number[] = [];
+        let hasDissolvedEvent = false;
         for (const evt of eventObjects) {
           const eventSeq = Number(evt.event_seq ?? 0);
           if (Number.isFinite(eventSeq) && eventSeq > 0) eventSeqs.push(eventSeq);
           evt._from_gap_fill = true;
+          if (evt.action === 'dissolved') hasDissolvedEvent = true;
           const et = String(evt.event_type ?? '');
           if (et !== 'group.message_created') {
             const cs = evt.client_signature;
@@ -711,19 +746,19 @@ export class MessageDeliveryEngine {
                 evt._verified = await client._verifyEventSignatureAsync(evt, cs as JsonObject);
               }
             }
-            await client._dispatcher.publish('group.changed', evt);
-          }
-          if (Number.isFinite(eventSeq) && eventSeq > 0) {
-            client._markPulledSeqDelivered(ns, eventSeq);
+            if (Number.isFinite(eventSeq) && eventSeq > 0 && !client._pushedSeqs.get(ns)?.has(eventSeq)) {
+              this.enqueueOrderedMessage(ns, 'group.changed', eventSeq, evt);
+            }
           }
           filled += 1;
         }
-        const contig = client._seqTracker.getContiguousSeq(ns);
-        if (contig !== pageContigBefore) {
+        const ackContig = client._seqTracker.getContiguousSeq(ns);
+        await this.drainOrderedMessages(ns);
+        if (ackContig !== pageContigBefore && !hasDissolvedEvent) {
           this.saveSeqTrackerState();
         }
-        if (eventObjects.length > 0 && contig > 0 && contig !== pageContigBefore) {
-          const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, contig);
+        if (eventObjects.length > 0 && ackContig > 0 && ackContig !== pageContigBefore) {
+          const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
           client._transport.call('group.ack_events', {
             group_id: groupId,
             event_seq: ackSeq,
@@ -752,29 +787,39 @@ export class MessageDeliveryEngine {
     }
   }
 
-  handleGroupChangedEventSeq(data: JsonObject, groupId: string): void {
+  async handleGroupChangedEventSeq(data: JsonObject, groupId: string): Promise<void> {
     const client = this.runtime.client;
     let needPull = false;
     const rawEventSeq = data.event_seq;
-    if (rawEventSeq != null && groupId) {
-      const es = Number(rawEventSeq);
-      if (Number.isFinite(es) && es > 0) {
-        needPull = client._seqTracker.onMessageSeq(`group_event:${groupId}`, es);
-      }
-      this.saveSeqTrackerState();
-      const ns = `group_event:${groupId}`;
-      const contig = client._seqTracker.getContiguousSeq(ns);
-      if (contig > 0) {
-        const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, contig);
-        client._transport.call('group.ack_events', {
-          group_id: groupId,
-          event_seq: ackSeq,
-          device_id: client._deviceId,
-          slot_id: client._slotId,
-        }, undefined, undefined, true).catch((e: unknown) => {
-          client._clientLog.debug(`group event push auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`);
-        });
-      }
+    const eventSeq = Number(rawEventSeq);
+    if (!groupId || !Number.isFinite(eventSeq) || !Number.isInteger(eventSeq) || eventSeq <= 0) {
+      await this.publishOrderedGroupChanged(data, 'legacy');
+      return;
+    }
+
+    const ns = `group_event:${groupId}`;
+    const contigBefore = client._seqTracker.getContiguousSeq(ns);
+    if (eventSeq <= contigBefore || client._pushedSeqs.get(ns)?.has(eventSeq)) {
+      client._clientLog.debug(`group.changed skipped duplicate/stale: group=${groupId}, event_seq=${eventSeq}, contiguous=${contigBefore}`);
+      return;
+    }
+
+    this.enqueueOrderedMessage(ns, 'group.changed', eventSeq, data);
+    needPull = client._seqTracker.onMessageSeq(ns, eventSeq);
+    const ackContig = client._seqTracker.getContiguousSeq(ns);
+    await this.drainOrderedMessages(ns);
+
+    if (ackContig > 0 && ackContig !== contigBefore) {
+      if (data.action !== 'dissolved') this.saveSeqTrackerState();
+      const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
+      client._transport.call('group.ack_events', {
+        group_id: groupId,
+        event_seq: ackSeq,
+        device_id: client._deviceId,
+        slot_id: client._slotId,
+      }, undefined, undefined, true).catch((e: unknown) => {
+        client._clientLog.debug(`group event push auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`);
+      });
     }
 
     if (needPull && groupId && !data._from_gap_fill) {
@@ -1196,13 +1241,7 @@ export class MessageDeliveryEngine {
         client._markOrderedSeqDelivered(ns, seq);
         continue;
       }
-      if (pullResponse) {
-        const published = client._withPullResponseProcessing(ns, () => client._publishAppEvent(item.event, item.payload, 'ordered-drain'));
-        if (isPromiseLike(published)) await published;
-      } else {
-        const published = client._publishAppEvent(item.event, item.payload, 'ordered-drain');
-        if (isPromiseLike(published)) await published;
-      }
+      await this.publishOrderedQueueItem(ns, item.event, seq, item.payload, 'ordered-drain', pullResponse);
       this.markPublishedSeq(ns, seq);
       client._markOrderedSeqDelivered(ns, seq);
       client._clientLog.debug(`publish ordered drain delivered: ns=${ns}, seq=${seq}, event=${item.event}`);
@@ -1215,8 +1254,7 @@ export class MessageDeliveryEngine {
     const seqNum = Number(seq);
     if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0) {
       client._clientLog.debug(`publish ordered direct(no-seq): event=${event}, ns=${ns || '<none>'}, seq=${String(seq)}`);
-      const published = client._publishAppEvent(event, payload, 'ordered');
-      if (isPromiseLike(published)) await published;
+      await this.publishOrderedQueueItem(ns, event, seqNum, payload, 'ordered');
       return true;
     }
     if (client._pushedSeqs.get(ns)?.has(seqNum)) {
@@ -1249,8 +1287,7 @@ export class MessageDeliveryEngine {
     const queue = client._pendingOrderedMsgs.get(ns) as Map<number, { event: string; payload: EventPayload }> | undefined;
     queue?.delete(seqNum);
     if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
-    const published = client._publishAppEvent(event, payload, 'ordered');
-    if (isPromiseLike(published)) await published;
+    await this.publishOrderedQueueItem(ns, event, seqNum, payload, 'ordered');
     this.markPublishedSeq(ns, seqNum);
     client._markOrderedSeqDelivered(ns, seqNum);
     client._clientLog.debug(`publish ordered delivered: event=${event}, ns=${ns}, seq=${seqNum}`);

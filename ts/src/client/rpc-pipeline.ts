@@ -57,10 +57,20 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
-  'group.resources.put', 'group.resources.update',
-  'group.resources.delete', 'group.resources.request_add',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
   'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access', 'group.resources.resolve_access_ticket',
+  'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -74,10 +84,24 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
   'group.update_name', 'group.update_avatar', 'group.update_announcement',
   'group.update_settings',
-  'storage.create_upload_session', 'storage.complete_upload', 'storage.delete_object',
+  'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
+  'group.resources.direct_add', 'group.resources.approve_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access',
+  'group.resources.resolve_access_ticket',
 ]);
 
 export interface RpcPreflightResult {
@@ -150,9 +174,12 @@ export class RpcPipeline {
         const encrypt = p.encrypt ?? true;
         delete p.encrypt;
         if (encrypt) {
-          const v2Error = 'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)';
-          if (!client._v2Session || !String(p.group_id ?? '').trim()) {
-            throw new StateError(v2Error);
+          await client._ensureV2SessionReady(
+            'group.thought.put',
+            'V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)',
+          );
+          if (!String(p.group_id ?? '').trim()) {
+            throw new ValidationError('group.thought.put requires group_id');
           }
           return await runWithRpcPriority(() => client._putGroupThoughtEncryptedV2(p)) as RpcResult;
         }

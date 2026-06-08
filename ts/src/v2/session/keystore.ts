@@ -272,7 +272,7 @@ export class V2KeyStore {
   }
 
   listExpiredSPKIds(deviceId: string, maxAgeMs: number): string[] {
-    const cutoff = Date.now() / 1000 - maxAgeMs / 1000;
+    const cutoff = Date.now() - maxAgeMs;
     const rows = this.db
       .prepare(
         `SELECT key_id FROM v2_device_keys

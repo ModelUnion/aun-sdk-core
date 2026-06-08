@@ -434,28 +434,57 @@ const nonIdempotentTimeout = 35 * time.Second
 const maxNotifyPayloadSize = 64 * 1024
 
 var nonIdempotentMethods = map[string]bool{
-	"message.send":                  true,
-	"group.send":                    true,
-	"group.create":                  true,
-	"group.invite":                  true,
-	"group.kick":                    true,
-	"group.remove_member":           true,
-	"group.leave":                   true,
-	"group.dissolve":                true,
-	"group.update_name":             true,
-	"group.update_avatar":           true,
-	"group.update_announcement":     true,
-	"group.update_settings":         true,
-	"group.rotate_epoch":            true,
-	"storage.create_upload_session": true,
-	"storage.complete_upload":       true,
-	"storage.delete_object":         true,
-	"auth.create_aid":               true,
-	"auth.renew_cert":               true,
-	"auth.rekey":                    true,
-	"message.thought.put":           true,
-	"group.thought.put":             true,
-	"group.add_member":              true,
+	"message.send":                           true,
+	"group.send":                             true,
+	"group.create":                           true,
+	"group.invite":                           true,
+	"group.kick":                             true,
+	"group.remove_member":                    true,
+	"group.leave":                            true,
+	"group.dissolve":                         true,
+	"group.update_name":                      true,
+	"group.update_avatar":                    true,
+	"group.update_announcement":              true,
+	"group.update_settings":                  true,
+	"group.rotate_epoch":                     true,
+	"storage.put_object":                     true,
+	"storage.delete_object":                  true,
+	"storage.create_share_link":              true,
+	"storage.revoke_share_link":              true,
+	"storage.get_by_share":                   true,
+	"storage.create_upload_session":          true,
+	"storage.complete_upload":                true,
+	"storage.create_folder":                  true,
+	"storage.rename_folder":                  true,
+	"storage.move_folder":                    true,
+	"storage.delete_folder":                  true,
+	"storage.move_object":                    true,
+	"storage.copy_object":                    true,
+	"storage.batch_delete":                   true,
+	"storage.set_object_meta":                true,
+	"storage.append_object":                  true,
+	"auth.create_aid":                        true,
+	"auth.renew_cert":                        true,
+	"auth.rekey":                             true,
+	"message.thought.put":                    true,
+	"group.thought.put":                      true,
+	"group.add_member":                       true,
+	"group.resources.put":                    true,
+	"group.resources.create_folder":          true,
+	"group.resources.rename":                 true,
+	"group.resources.move":                   true,
+	"group.resources.mount_object":           true,
+	"group.resources.update":                 true,
+	"group.resources.delete":                 true,
+	"group.resources.cleanup_by_storage_ref": true,
+	"group.resources.request_add":            true,
+	"group.resources.request_mount_object":   true,
+	"group.resources.direct_add":             true,
+	"group.resources.approve_request":        true,
+	"group.resources.reject_request":         true,
+	"group.resources.unmount":                true,
+	"group.resources.get_access":             true,
+	"group.resources.resolve_access_ticket":  true,
 }
 
 // cachedPeerCert 缓存的对端证书条目
@@ -582,7 +611,8 @@ type AUNClient struct {
 	// V2 E2EE 状态（参见 v2_p2p.go）
 	v2State *v2P2PState
 	// V2 安全增强状态（验签缓存 + fork 检测，参见 v2_state.go）
-	v2Security *v2StateSecurityState
+	v2Security     *v2StateSecurityState
+	v2SecurityOnce sync.Once
 	// V2 sender IK 缺失 pending 队列：解密路径不在 RPC 回调栈内同步 bootstrap。
 	v2SenderIKMu       sync.Mutex
 	v2SenderIKPending  map[string]v2SenderIKPendingEntry
@@ -1583,29 +1613,39 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 		}
 	}
 
-	c.events.Publish("group.changed", dataMap)
-
-	// V2 bootstrap 缓存失效 + auto_propose 触发
-	c.onRawGroupChangedV2(groupID, action, dataMap)
-
 	c.delivery().handleGroupChangedEventSeq(dataMap, groupID)
+}
 
-	// V2-only: epoch 轮换由 V2 session 层处理，此处不再触发 V1 轮换逻辑
-
-	// 群组解散：清理本地 V2/seq 运行态。V1 epoch key 编排已移除。
-	if action == "dissolved" && groupID != "" {
-		c.seqTracker.RemoveNamespace("group:" + groupID)
-		c.seqTracker.RemoveNamespace("group_event:" + groupID)
-		c.pushedSeqsMu.Lock()
-		delete(c.pushedSeqs, "group:"+groupID)
-		delete(c.pushedSeqs, "group_event:"+groupID)
-		c.pushedSeqsMu.Unlock()
-		c.pendingOrderedMsgsMu.Lock()
-		delete(c.pendingOrderedMsgs, "group:"+groupID)
-		c.pendingOrderedMsgsMu.Unlock()
-		c.getV2E2EECoordinator().deleteGroupBootstrapCache(groupID)
-		c.logEG.Info("group %s dissolved, cleaned up local V2 group runtime state and seq tracker", groupID)
+func (c *AUNClient) cleanupDissolvedGroup(groupID string) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return
 	}
+	c.seqTracker.RemoveNamespace("group:" + groupID)
+	c.seqTracker.RemoveNamespace("group_event:" + groupID)
+	c.saveSeqTrackerState()
+
+	c.pushedSeqsMu.Lock()
+	delete(c.pushedSeqs, "group:"+groupID)
+	delete(c.pushedSeqs, "group_event:"+groupID)
+	c.pushedSeqsMu.Unlock()
+
+	c.pendingOrderedMsgsMu.Lock()
+	delete(c.pendingOrderedMsgs, "group:"+groupID)
+	delete(c.pendingOrderedMsgs, "group_event:"+groupID)
+	c.pendingOrderedMsgsMu.Unlock()
+
+	sec := c.v2GetSecurityState()
+	if sec != nil {
+		sec.stateChainsMu.Lock()
+		delete(sec.stateChains, groupID)
+		sec.stateChainsMu.Unlock()
+		sec.groupSecurityLevelsMu.Lock()
+		delete(sec.groupSecurityLevels, groupID)
+		sec.groupSecurityLevelsMu.Unlock()
+	}
+	c.getV2E2EECoordinator().deleteGroupBootstrapCache(groupID)
+	c.logEG.Info("group %s dissolved, cleaned up local V2 group runtime state and seq tracker", groupID)
 }
 
 // onRawGroupStateCommitted 处理 event/group.state_committed：验证 state_hash 链并更新本地存储
@@ -1652,11 +1692,15 @@ func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
 	cached := c.certCache[certCacheKey(sigAID, expectedFP)]
 	c.certCacheMu.RUnlock()
 	if cached == nil || len(cached.certBytes) == 0 {
-		// 异步触发证书获取
+		// 异步拉取证书；拉到后发布 signature_pending 通知上层对原事件重新验签
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			c.fetchPeerCert(ctx, sigAID, expectedFP)
+			if _, err := c.fetchPeerCert(ctx, sigAID, expectedFP); err == nil && c.events != nil {
+				c.events.Publish("signature_pending", map[string]any{
+					"aid": sigAID, "method": method,
+				})
+			}
 		}()
 		return "pending"
 	}

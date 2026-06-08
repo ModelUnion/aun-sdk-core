@@ -164,6 +164,8 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
 
     if code in {4001, 4010, -32001, -32003}:
         cls = AuthError
+    elif code == -32004 and message.lower().startswith("rpc handler timeout"):
+        cls = TimeoutError
     elif code in {4030, 403, -32004}:
         cls = PermissionError
     elif code == -32008:
@@ -187,5 +189,5 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
     else:
         cls = AUNError
 
-    retryable = cls is RateLimitError or (5000 <= code < 6000)
+    retryable = cls in {RateLimitError, TimeoutError} or (5000 <= code < 6000)
     return cls(message, code=code, data=data, retryable=retryable, trace_id=trace_id)

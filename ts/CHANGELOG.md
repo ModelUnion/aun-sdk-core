@@ -6,6 +6,38 @@
 
 ---
 
+## 0.4.11 — 2026-06-08
+
+### 新功能
+- **Storage 目录树与扩展操作**：`storage.*` 新增 16 个目录/对象操作方法，加入签名集合和非幂等集合（四语言+服务端对齐）
+- **group.resources 树形资源系统**：新增 `create_folder`/`rename`/`move`/`mount_object`/`unmount`/`cleanup_by_storage_ref`/`request_mount_object`/`resolve_access_ticket` 等方法，加入签名和非幂等集合；支持跨域访问票据（四语言+服务端对齐）
+- **V2 会话初始化并发锁**：新增初始化 Promise 锁，防止并发多次初始化导致重复操作
+- **group.changed 事件保序去重**：`handleGroupChangedEventSeq` 重构，支持有序队列项发布、gap 补洞后保序、自动 ack（四语言对齐）
+
+### 修复
+- **重连竞态**：进入重连前原子化设置 `_reconnectActive` 标志，避免 await 期间并发重连
+- **重连 sleep 可取消**：监听 `_reconnectAbort` 信号提前中断延迟等待
+- **群解散清理**：将清理操作移入交付引擎有序处理流程，添加 `group_event` 命名空间清理（四语言对齐）
+- **SPK 过期时间计算**：`Date.now() / 1000` 改为 `Date.now()`（毫秒单位修正）
+- **重复 ack 事件**：`group.changed` push 已有序号时跳过；补洞事件进入有序队列而非直接发布
+- **V2 E2EE bootstrap 缓存**：避免不必要的重复写入
+- **`group.thought.put` 错误类型**：改为 `ValidationError` 并补充 `group_id` 验证
+- **storage/group.resources 签名和幂等性补全**：补全写操作方法进入签名集合与非幂等集合（四语言对齐）
+
+### 优化
+- **群事件 gap 填充路径**：已填充事件进入有序队列而非直接发布；群解散事件跳过持久化
+- **公共发布方法**：提取 `publishOrderedQueueItem` / `publishOrderedGroupChanged`，统一有序事件处理路径
+- **联邦消息测试**：使用事件订阅替代轮询拉取，减少测试延迟
+
+### 测试
+- 新增群资源跨域树形访问集成测试（创建目录、挂载对象、重命名、跨域访问）
+- 新增群资源跨域申请清理边界集成测试（挂载申请、批量清理、卸载）
+- 新增签名方法覆盖测试，验证 `storage.*` 和 `group.resources.*` 进入签名和非幂等长超时集合
+- 新增有序事件去重测试，验证高序号 push 先到时补洞后 SDK 内部和应用层消费顺序
+- 修复 `fillGroupEventGap` 单元测试预期行为（进入有序队列而非直接标记已交付）
+
+---
+
 ## 0.4.10 — 2026-06-06
 
 ### 新功能

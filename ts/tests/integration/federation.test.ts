@@ -49,6 +49,10 @@ function msgSender(msg: Message): string {
   return String(msg.from ?? (msg as JsonObject).sender_aid ?? '');
 }
 
+function isTargetMessage(msg: Message, fromAid: string, text: string): boolean {
+  return msgSender(msg) === fromAid && msgText(msg) === text;
+}
+
 async function waitFor<T>(
   fn: () => Promise<T>,
   predicate: (value: T) => boolean,
@@ -74,8 +78,30 @@ async function waitFor<T>(
 }
 
 async function pullMessages(client: AUNClient, afterSeq = 0, limit = 50): Promise<Message[]> {
-  const result = await client.call('message.pull', { after_seq: afterSeq, limit, force: true }) as JsonObject;
+  const result = await client.call('message.pull', { after_seq: afterSeq, limit }) as JsonObject;
   return (result.messages ?? []) as Message[];
+}
+
+async function waitForReceivedMessage(
+  client: AUNClient,
+  receivedEvents: Message[],
+  fromAid: string,
+  text: string,
+): Promise<Message> {
+  const messages = await waitFor(
+    async () => {
+      const eventHit = receivedEvents.find(msg => isTargetMessage(msg, fromAid, text));
+      if (eventHit) return [eventHit];
+      return await pullMessages(client, 0, 50);
+    },
+    list => list.some(msg => isTargetMessage(msg, fromAid, text)),
+    20_000,
+    500,
+    '等待 Bob 收到跨域消息',
+  );
+  const target = messages.find(msg => isTargetMessage(msg, fromAid, text));
+  if (!target) throw new Error(`目标消息缺失: from=${fromAid} text=${text}`);
+  return target;
 }
 
 async function pullGroupMessages(client: AUNClient, groupId: string, afterSeq = 0, limit = 50): Promise<Message[]> {
@@ -111,31 +137,32 @@ describe('双域 Federation 集成测试', () => {
     await ensureConnected(alice, aliceAid);
     await ensureConnected(bob, bobAid);
 
+    const bobReceived: Message[] = [];
+    const sub = bob.on('message.received', data => {
+      bobReceived.push(data as Message);
+    });
+
     const sendText = `ts federation hello ${rid}`;
-    const sendResult = await alice.call('message.send', {
-      to: bobAid,
-      payload: { type: 'text', text: sendText },
-      encrypt: true,
-    }) as JsonObject;
+    try {
+      const sendResult = await alice.call('message.send', {
+        to: bobAid,
+        payload: { type: 'text', text: sendText },
+        encrypt: true,
+      }) as JsonObject;
 
-    expect(sendResult.status).toBeTruthy();
+      expect(sendResult.status).toBeTruthy();
 
-    const messages = await waitFor(
-      () => pullMessages(bob, 0, 50),
-      list => list.some(msg => msgSender(msg) === aliceAid && msgText(msg) === sendText),
-      20_000,
-      500,
-      '等待 Bob 收到跨域消息',
-    );
+      const target = await waitForReceivedMessage(bob, bobReceived, aliceAid, sendText);
 
-    const target = messages.find(msg => msgSender(msg) === aliceAid && msgText(msg) === sendText);
-    expect(target).toBeTruthy();
-    expect(target?.encrypted).toBe(true);
+      expect(target.encrypted).toBe(true);
 
-    const e2ee = (target?.e2ee ?? {}) as JsonObject;
-    expect(e2ee.version).toBe('v2');
-    expect(String(e2ee.encryption_mode ?? '')).toMatch(/^v2_/);
-    expect(e2ee.forward_secrecy).toBe(true);
+      const e2ee = (target.e2ee ?? {}) as JsonObject;
+      expect(e2ee.version).toBe('v2');
+      expect(String(e2ee.encryption_mode ?? '')).toMatch(/^v2_/);
+      expect(e2ee.forward_secrecy).toBe(true);
+    } finally {
+      sub.unsubscribe();
+    }
   }, TEST_TIMEOUT);
 
   it('group 跨域加人、发消息、邀请码入群走公开接口', async () => {

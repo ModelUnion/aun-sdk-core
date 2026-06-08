@@ -222,10 +222,25 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
   'group.update_name', 'group.update_avatar', 'group.update_announcement',
   'group.update_settings',
-  'storage.create_upload_session', 'storage.complete_upload', 'storage.delete_object',
+  'storage.put_object', 'storage.delete_object',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.get_by_share',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
+  'group.resources.direct_add', 'group.resources.approve_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access',
+  'group.resources.resolve_access_ticket',
 ]);
 
 /** 需要客户端签名的关键方法。运行时逻辑已迁入 RpcPipeline，此处保留给源码审计测试。 */
@@ -249,10 +264,21 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
-  'group.resources.put', 'group.resources.update',
-  'group.resources.delete', 'group.resources.request_add',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
   'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access', 'group.resources.resolve_access_ticket',
+  'storage.put_object', 'storage.delete_object',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.get_by_share',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -1428,23 +1454,13 @@ export class AUNClient {
           if (this._shouldSkipEventSignature(d)) {
             delete d.client_signature;
           } else {
-            d._verified = await this._verifyEventSignature(d, cs);
+            const verified = await this._verifyEventSignature(d, cs);
+            d._verified = this._isEventSignatureVerified(verified);
           }
         }
-        await this._dispatcher.publish('group.changed', d);
-
         const groupId = (d.group_id ?? '') as string;
 
-        this._groupState.handleGroupChangedV2Membership(d);
-
-        this._delivery.handleGroupChangedEventSeq(d, groupId);
-
-        // 群组解散 → 清理本地 seq_tracker、补洞去重缓存
-        if (d.action === 'dissolved') {
-          if (groupId) {
-            this._cleanupDissolvedGroup(groupId);
-          }
-        }
+        await this._delivery.handleGroupChangedEventSeq(d, groupId);
       } else {
         // data 非对象也透传给用户（兼容旧版）
         await this._dispatcher.publish('group.changed', data);
@@ -1491,11 +1507,12 @@ export class AUNClient {
     this._pushedSeqs.delete(`group:${groupId}`);
     this._pushedSeqs.delete(`group_event:${groupId}`);
     this._pendingOrderedMsgs.delete(`group:${groupId}`);
+    this._pendingOrderedMsgs.delete(`group_event:${groupId}`);
 
     this._clientLog.info(`cleanup dissolved group ${groupId}  local state`);
   }
 
-  private async _verifyEventSignature(_event: JsonObject, cs: JsonObject): Promise<string | boolean> {
+  private async _verifyEventSignature(_event: JsonObject, cs: JsonObject): Promise<boolean | 'pending'> {
     const sigAid = String(cs.aid ?? '');
     const method = String(cs._method ?? '');
     const expectedFP = String(cs.cert_fingerprint ?? '').trim().toLowerCase();
@@ -1541,6 +1558,10 @@ export class AUNClient {
       });
       return false;
     }
+  }
+
+  private _isEventSignatureVerified(value: unknown): value is true {
+    return value === true;
   }
 
   private _protectedHeadersFromParams(params: RpcParams): ProtectedHeadersInput {
@@ -3028,5 +3049,3 @@ export class AUNClient {
     });
   }
 }
-
-

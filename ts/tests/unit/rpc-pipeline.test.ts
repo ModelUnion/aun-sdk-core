@@ -102,4 +102,42 @@ describe('RpcPipeline 组件边界', () => {
     expect(client._signClientOperation).toHaveBeenCalledWith('message.send', normalParams);
     expect(normalParams.client_signature).toEqual({ signed: true });
   });
+
+  it('storage.get_by_share 实际走签名和非幂等 35 秒超时', async () => {
+    const { client, pipeline } = createPipeline({
+      _transport: { call: vi.fn().mockResolvedValue({ ok: true }) },
+      _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
+    });
+
+    await pipeline.call('storage.get_by_share', { share_id: 'share-1' });
+
+    expect(client._signClientOperation).toHaveBeenCalledWith(
+      'storage.get_by_share',
+      expect.objectContaining({ share_id: 'share-1', client_signature: { signed: true } }),
+    );
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'storage.get_by_share',
+      expect.objectContaining({ share_id: 'share-1', client_signature: { signed: true } }),
+      35_000,
+    );
+  });
+
+  it('resolve_access_ticket 实际走签名和非幂等 35 秒超时', async () => {
+    const { client, pipeline } = createPipeline({
+      _transport: { call: vi.fn().mockResolvedValue({ ok: true }) },
+      _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
+    });
+
+    await pipeline.call('group.resources.resolve_access_ticket', { access_ticket: 'ticket-1' });
+
+    expect(client._signClientOperation).toHaveBeenCalledWith(
+      'group.resources.resolve_access_ticket',
+      expect.objectContaining({ access_ticket: 'ticket-1', client_signature: { signed: true } }),
+    );
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'group.resources.resolve_access_ticket',
+      expect.objectContaining({ access_ticket: 'ticket-1', client_signature: { signed: true } }),
+      35_000,
+    );
+  });
 });

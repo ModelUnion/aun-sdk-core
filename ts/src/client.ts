@@ -250,10 +250,24 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
   'group.update_name', 'group.update_avatar', 'group.update_announcement',
   'group.update_settings',
-  'storage.create_upload_session', 'storage.complete_upload', 'storage.delete_object',
+  'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
+  'group.resources.direct_add', 'group.resources.approve_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access',
+  'group.resources.resolve_access_ticket',
 ]);
 
 /** 需要客户端签名的关键方法。运行时逻辑已迁入 RpcPipeline，此处保留给源码审计测试。 */
@@ -277,10 +291,20 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
-  'group.resources.put', 'group.resources.update',
-  'group.resources.delete', 'group.resources.request_add',
+  'group.resources.put', 'group.resources.create_folder',
+  'group.resources.rename', 'group.resources.move',
+  'group.resources.mount_object', 'group.resources.update',
+  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
+  'group.resources.request_add', 'group.resources.request_mount_object',
   'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request',
+  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.get_access', 'group.resources.resolve_access_ticket',
+  'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
+  'storage.create_share_link', 'storage.revoke_share_link',
+  'storage.create_upload_session', 'storage.complete_upload',
+  'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
+  'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
+  'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -1566,18 +1590,7 @@ export class AUNClient {
           d._verified = await this._verifyEventSignatureAsync(d, cs);
         }
       }
-      await this._dispatcher.publish('group.changed', d);
-
-      this._groupState.handleGroupChangedV2Membership(d);
-
-      this._delivery.handleGroupChangedEventSeq(d, groupId);
-
-      // 群组解散 → 清理本地 epoch key、seq_tracker、补洞去重缓存
-      if (d.action === 'dissolved') {
-        if (groupId) {
-          this._cleanupDissolvedGroup(groupId);
-        }
-      }
+      await this._delivery.handleGroupChangedEventSeq(d, groupId);
     } else {
       // data 非对象也透传给用户（兼容旧版）
       await this._dispatcher.publish('group.changed', data);
@@ -1615,6 +1628,7 @@ export class AUNClient {
     this._pushedSeqs.delete(`group:${groupId}`);
     this._pushedSeqs.delete(`group_event:${groupId}`);
     this._pendingOrderedMsgs.delete(`group:${groupId}`);
+    this._pendingOrderedMsgs.delete(`group_event:${groupId}`);
 
     this._clientLog.info(`cleaned up disbanded group ${groupId} local state`);
   }
@@ -3137,13 +3151,17 @@ export class AUNClient {
     if (this._closing || this.state === ConnectionState.CLOSED) return;
     // 已在重连中则跳过，避免心跳超时和 transport 断线回调重复触发
     if (this._reconnectActive) return;
+    // 原子化标志，防止 await 期间并发调用再次进入
+    this._reconnectActive = true;
     this._clientLog.warn(`transport disconnected: closeCode=${closeCode ?? 'none'}, error=${error ? formatCaughtError(error) : 'none'}`);
     this._state = 'standby';
     this._stopBackgroundTasks();
     await this._dispatcher.publish('state_change', { state: this._publicState(this._state), error });
 
-    if (!this._sessionOptions.auto_reconnect) return;
-    if (this._reconnectActive) return;
+    if (!this._sessionOptions.auto_reconnect) {
+      this._reconnectActive = false;
+      return;
+    }
     // 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
     if (this._serverKicked || (closeCode !== undefined && AUNClient._NO_RECONNECT_CODES.has(closeCode))) {
       this._state = 'connection_failed';
@@ -3268,11 +3286,15 @@ export class AUNClient {
     this._reconnectAbort = null;
   }
 
-  /** 可取消的 sleep */
+  /** 可取消的 sleep，监听 _reconnectAbort.signal，abort 时提前 resolve */
   private _sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
       const timer = setTimeout(resolve, ms);
       this._unrefTimer(timer);
+      const signal = this._reconnectAbort?.signal;
+      if (signal) {
+        signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+      }
     });
   }
 

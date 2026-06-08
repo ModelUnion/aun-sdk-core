@@ -14,7 +14,7 @@ import time
 import pytest
 
 from aun_core import AUNClient
-from aun_core.client import _PEER_CERT_CACHE_TTL
+from aun_core.client import _NON_IDEMPOTENT_METHODS, _PEER_CERT_CACHE_TTL
 
 
 # ── ECDSA 密钥对生成工具 ──────────────────────────────────
@@ -87,6 +87,28 @@ def _make_client_with_identity(tmp_path):
 class TestSignedMethodsCoverage:
     """验证 _SIGNED_METHODS 包含所有群关键修改操作。"""
 
+    STORAGE_MUTATION_METHODS = [
+        "storage.put_object", "storage.delete_object", "storage.get_by_share",
+        "storage.create_share_link", "storage.revoke_share_link",
+        "storage.create_upload_session", "storage.complete_upload",
+        "storage.create_folder", "storage.rename_folder", "storage.move_folder",
+        "storage.delete_folder", "storage.move_object", "storage.copy_object",
+        "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
+    ]
+
+    GROUP_RESOURCE_SIGNED_METHODS = [
+        "group.resources.put", "group.resources.create_folder",
+        "group.resources.rename", "group.resources.move",
+        "group.resources.mount_object", "group.resources.update",
+        "group.resources.delete", "group.resources.cleanup_by_storage_ref",
+        "group.resources.request_add", "group.resources.request_mount_object",
+        "group.resources.direct_add", "group.resources.approve_request",
+        "group.resources.reject_request", "group.resources.unmount",
+        "group.resources.get_access", "group.resources.resolve_access_ticket",
+    ]
+
+    GROUP_RESOURCE_NON_IDEMPOTENT_METHODS = GROUP_RESOURCE_SIGNED_METHODS
+
     EXPECTED_METHODS = [
         # P2P / V2 入口
         "message.send",
@@ -100,7 +122,7 @@ class TestSignedMethodsCoverage:
         "group.v2.get_proposal",
         # 群管理
         "group.send", "group.kick", "group.add_member",
-        "group.leave", "group.remove_member", "group.update_rules",
+        "group.leave", "group.remove_member", "group.recall", "group.update_rules",
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
         "group.transfer_owner", "group.review_join_request",
@@ -117,11 +139,7 @@ class TestSignedMethodsCoverage:
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
         # 群资源
-        "group.resources.put", "group.resources.update",
-        "group.resources.delete", "group.resources.request_add",
-        "group.resources.direct_add", "group.resources.approve_request",
-        "group.resources.reject_request",
-    ]
+    ] + GROUP_RESOURCE_SIGNED_METHODS + STORAGE_MUTATION_METHODS
 
     # 服务端通过 _require_actor_aid_verified 强制要求签名的方法
     # 如果服务端新增了签名要求，必须同步加入 SDK _SIGNED_METHODS
@@ -154,6 +172,18 @@ class TestSignedMethodsCoverage:
             assert m in self.EXPECTED_METHODS, (
                 f"_SIGNED_METHODS 中包含未预期的方法: {m}"
             )
+
+    @pytest.mark.parametrize("method", STORAGE_MUTATION_METHODS)
+    def test_storage_mutation_method_is_non_idempotent(self, method):
+        assert method in _NON_IDEMPOTENT_METHODS, (
+            f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免写操作沿用短超时"
+        )
+
+    @pytest.mark.parametrize("method", GROUP_RESOURCE_NON_IDEMPOTENT_METHODS)
+    def test_group_resource_method_is_non_idempotent(self, method):
+        assert method in _NON_IDEMPOTENT_METHODS, (
+            f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免资源写入或单次票据消费沿用短超时"
+        )
 
     @pytest.mark.parametrize("method", SERVER_VERIFIED_METHODS)
     def test_server_verified_method_in_sdk_signed(self, method):

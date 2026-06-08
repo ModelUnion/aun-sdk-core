@@ -57,6 +57,32 @@ export class MessageDeliveryEngine {
     }
   }
 
+  isGroupEventNamespace(ns: string): boolean {
+    return ns.startsWith('group_event:');
+  }
+
+  async publishOrderedQueueItem(ns: string, event: string, seq: number, payload: EventPayload): Promise<void> {
+    const client = this.runtime.client;
+    if (event === 'group.changed' && this.isGroupEventNamespace(ns)) {
+      await this.publishOrderedGroupChanged(payload);
+      return;
+    }
+    await client._publishAppEvent(event, payload);
+  }
+
+  async publishOrderedGroupChanged(payload: EventPayload): Promise<void> {
+    const client = this.runtime.client;
+    if (isJsonObject(payload)) {
+      const eventPayload = payload as JsonObject;
+      client._groupState?.handleGroupChangedV2Membership?.(eventPayload);
+      if (eventPayload.action === 'dissolved') {
+        const groupId = normalizeGroupId(String(eventPayload.group_id ?? '')) || String(eventPayload.group_id ?? '').trim();
+        if (groupId) client._cleanupDissolvedGroup?.(groupId);
+      }
+    }
+    await client._publishAppEvent('group.changed', payload);
+  }
+
   isInstanceScopedMessageEvent(event: string): boolean {
     return event === 'message.received'
       || event === 'message.recalled'
@@ -628,10 +654,12 @@ export class MessageDeliveryEngine {
           }
         }
         const eventSeqs: number[] = [];
+        let hasDissolvedEvent = false;
         for (const evt of eventObjects) {
           const eventSeq = Number(evt.event_seq ?? 0);
           if (Number.isFinite(eventSeq) && eventSeq > 0) eventSeqs.push(eventSeq);
           evt._from_gap_fill = true;
+          if (evt.action === 'dissolved') hasDissolvedEvent = true;
           const et = String(evt.event_type ?? '');
           if (et === 'group.message_created') continue;
           const cs = evt.client_signature;
@@ -639,17 +667,21 @@ export class MessageDeliveryEngine {
             if (client._shouldSkipEventSignature(evt)) {
               delete evt.client_signature;
             } else {
-              evt._verified = await client._verifyEventSignature(evt, cs as JsonObject);
+              const verified = await client._verifyEventSignature(evt, cs as JsonObject);
+              evt._verified = client._isEventSignatureVerified(verified);
             }
           }
-          await client._dispatcher.publish('group.changed', evt);
+          if (Number.isFinite(eventSeq) && eventSeq > 0 && !client._pushedSeqs.get(ns)?.has(eventSeq)) {
+            this.enqueueOrderedMessage(ns, 'group.changed', eventSeq, evt);
+          }
         }
-        const contig = client._seqTracker.getContiguousSeq(ns);
-        if (contig !== pageContigBefore) {
+        const ackContig = client._seqTracker.getContiguousSeq(ns);
+        await this.drainOrderedMessages(ns);
+        if (ackContig !== pageContigBefore && !hasDissolvedEvent) {
           this.saveSeqTrackerState();
         }
-        if (eventObjects.length > 0 && contig > 0 && contig !== pageContigBefore) {
-          const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, contig);
+        if (eventObjects.length > 0 && ackContig > 0 && ackContig !== pageContigBefore) {
+          const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
           client._transport.call('group.ack_events', {
             group_id: groupId,
             event_seq: ackSeq,
@@ -672,15 +704,39 @@ export class MessageDeliveryEngine {
     }
   }
 
-  handleGroupChangedEventSeq(data: JsonObject, groupId: string): void {
+  async handleGroupChangedEventSeq(data: JsonObject, groupId: string): Promise<void> {
     const client = this.runtime.client;
     let needPull = false;
     const rawEventSeq = data.event_seq;
-    if (rawEventSeq != null && groupId) {
-      const es = Number(rawEventSeq);
-      if (Number.isFinite(es) && es > 0) {
-        needPull = client._seqTracker.onMessageSeq(`group_event:${groupId}`, es);
-      }
+    const eventSeq = Number(rawEventSeq);
+    if (!groupId || !Number.isFinite(eventSeq) || !Number.isInteger(eventSeq) || eventSeq <= 0) {
+      await this.publishOrderedGroupChanged(data);
+      return;
+    }
+
+    const ns = `group_event:${groupId}`;
+    const contigBefore = client._seqTracker.getContiguousSeq(ns);
+    if (eventSeq <= contigBefore || client._pushedSeqs.get(ns)?.has(eventSeq)) {
+      client._clientLog.debug(`group.changed skipped duplicate/stale: group=${groupId}, event_seq=${eventSeq}, contiguous=${contigBefore}`);
+      return;
+    }
+
+    this.enqueueOrderedMessage(ns, 'group.changed', eventSeq, data);
+    needPull = client._seqTracker.onMessageSeq(ns, eventSeq);
+    const ackContig = client._seqTracker.getContiguousSeq(ns);
+    await this.drainOrderedMessages(ns);
+
+    if (ackContig > 0 && ackContig !== contigBefore) {
+      if (data.action !== 'dissolved') this.saveSeqTrackerState();
+      const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
+      client._transport.call('group.ack_events', {
+        group_id: groupId,
+        event_seq: ackSeq,
+        device_id: client._deviceId,
+        slot_id: client._slotId,
+      }).catch((e: unknown) => {
+        client._clientLog.warn('group event push auto-ack failed: group=' + groupId, e);
+      });
     }
 
     if (needPull && groupId && !data._from_gap_fill) {
@@ -1127,7 +1183,7 @@ export class MessageDeliveryEngine {
       const item = queue.get(seq);
       queue.delete(seq);
       if (!item || client._pushedSeqs.get(ns)?.has(seq)) continue;
-      await client._publishAppEvent(item.event, item.payload);
+      await this.publishOrderedQueueItem(ns, item.event, seq, item.payload);
       this.markPublishedSeq(ns, seq);
     }
     if (queue.size === 0) client._pendingOrderedMsgs.delete(ns);
@@ -1137,7 +1193,7 @@ export class MessageDeliveryEngine {
     const client = this.runtime.client;
     const seqNum = Number(seq);
     if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0) {
-      await client._publishAppEvent(event, payload);
+      await this.publishOrderedQueueItem(ns, event, seqNum, payload);
       return true;
     }
     if (client._pushedSeqs.get(ns)?.has(seqNum)) {
@@ -1158,7 +1214,7 @@ export class MessageDeliveryEngine {
     const queue = client._pendingOrderedMsgs.get(ns) as Map<number, { event: string; payload: EventPayload }> | undefined;
     queue?.delete(seqNum);
     if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
-    await client._publishAppEvent(event, payload);
+    await this.publishOrderedQueueItem(ns, event, seqNum, payload);
     this.markPublishedSeq(ns, seqNum);
     await this.drainOrderedMessages(ns);
     return true;

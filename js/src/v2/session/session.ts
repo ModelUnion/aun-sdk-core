@@ -6,7 +6,7 @@
  * - SPK 设备级 P-256 密钥对，IK 签名背书
  * - SPK 销毁三重条件：
  *     contig_seq >= 该 SPK 引用的最大 seq
- *  && now - last_seen >= 7 小时
+ *  && now - last_seen >= 7 天
  *  && 不在最近 7 代保留窗口内
  * - 对端 IK 公钥缓存 TTL 1 小时
  * - SPK 注册：`callFn("message.v2.put_peer_pk", ...)`
@@ -96,6 +96,7 @@ export class V2Session {
   private _oldSPKMaxSeq = new Map<string, { seq: number; lastSeenAt: number }>();
   private _spkCache = new Map<string, Uint8Array>();
   private _nowFn: () => number = () => Date.now();
+  private _registeringPromise: Promise<void> | null = null;
 
   constructor(
     store: V2KeyStore,
@@ -196,9 +197,22 @@ export class V2Session {
     });
   }
 
-  /** 注册本设备 SPK 到服务端。IK = AID 长期密钥，无需注册。幂等。 */
+  /** 注册本设备 SPK 到服务端。IK = AID 长期密钥，无需注册。幂等，并发安全。 */
   async ensureRegistered(callFn: CallFn): Promise<void> {
     if (this._registered) return;
+    if (this._registeringPromise) {
+      await this._registeringPromise;
+      return;
+    }
+    this._registeringPromise = this._doRegister(callFn);
+    try {
+      await this._registeringPromise;
+    } finally {
+      this._registeringPromise = null;
+    }
+  }
+
+  private async _doRegister(callFn: CallFn): Promise<void> {
     await this.ensureKeys();
     const uploadedSPKId = await this._store.loadLatestUploadedSPKId(this._storeDeviceId);
     if (uploadedSPKId) {
@@ -318,8 +332,8 @@ export class V2Session {
       if (now - info.lastSeenAt < DESTROY_DELAY_MS) continue;
       if (recentKeep.has(spkId)) continue;
       try {
-        await this._store.deleteSPK(this._deviceId, spkId);
         await this._store.deleteSPK(this._storeDeviceId, spkId);
+        await this._store.deleteSPK(this._deviceId, spkId);
       } catch (err) {
         // 销毁失败时记录到控制台并跳过本轮，下次再重试
         // eslint-disable-next-line no-console
@@ -342,7 +356,11 @@ export class V2Session {
         try {
           await this._store.deleteSPK(this._storeDeviceId, spkId);
           await this._store.deleteSPK(this._deviceId, spkId);
-        } catch { continue; }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[V2Session] deleteSPK (hard-limit) failed', { spkId, err });
+          continue;
+        }
         this._oldSPKMaxSeq.delete(spkId);
         if (!destroyed.includes(spkId)) destroyed.push(spkId);
       }

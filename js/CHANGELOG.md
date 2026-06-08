@@ -6,6 +6,36 @@
 
 ---
 
+## 0.4.11 — 2026-06-08
+
+### 新功能
+- **Storage 目录树与扩展操作**：`storage.*` 新增 15 个存储操作方法（含 `create_folder`/`rename_folder`/`move_object`/`batch_delete` 等），加入签名集合和非幂等集合（四语言+服务端对齐）
+- **group.resources 树形资源系统**：新增 11 个资源管理方法，加入签名和非幂等集合；支持跨域访问票据（四语言+服务端对齐）
+- **group.changed 事件保序去重**：新增 `handleGroupChangedEventSeq` 支持 event_seq 追踪和有序消息队列，空洞先到时缓存补洞；新增 `_isEventSignatureVerified()` 区分 pending 不标记已验签（四语言对齐）
+- **V2 E2EE 注册并发保护**：SPK 注册改用 `_registeringPromise` 缓存并发请求，多并发调用时等待同一 Promise（四语言对齐）
+
+### 修复
+- **IndexedDB 事务原子性**：`addSPK` 改用单事务处理原始记录和别名，避免独立事务导致一致性问题
+- **SPK 销毁顺序**：`_doAutoDestroy` 中先删设备级密钥再删存储级密钥
+- **sdk_version 拼写**：`sdk_vesion` → `sdk_version`
+- **V2 并发冲突检测**：检查对端操作的 `inflightSet`，防止 SPK 注册与轮换并发冲突
+- **storage/group.resources 签名和幂等性补全**：补全写操作方法进入签名集合与非幂等集合（四语言对齐）
+
+### 优化
+- **群事件处理流程重构**：`group.changed` 事件分发逻辑从 `client.ts` 迁移到 `delivery.ts`，支持按 event_seq 保序发布；新增 `publishOrderedQueueItem()` / `publishOrderedGroupChanged()`
+- **群组解散清理**：解散事件处理改为异步 `drainOrderedMessages`，保证 seq 追踪一致性
+- **群事件自动 ack**：`handleGroupChangedEventSeq` 无需补洞时直接 ack event cursor
+- **错误日志补充**：V2Session SPK 销毁异常捕获并输出日志
+
+### 测试
+- 新增事件验签状态单元测试（pending 状态不标记已验签）
+- 新增消息乱序补洞保序测试（高序号 push 先到时 SDK 内部消费和应用层发布的保序去重）
+- 新增签名方法覆盖测试（storage 写操作和有副作用读操作进入非幂等集合）
+- 新增 RPC 管道非幂等超时测试（storage/resources 方法按非幂等长超时 35s 发送）
+- 修复 `handleGroupChangedEventSeq` 单元测试 async/await 标记和 ack cursor 验证
+
+---
+
 ## 0.4.10 — 2026-06-06
 
 ### 新功能

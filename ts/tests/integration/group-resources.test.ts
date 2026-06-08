@@ -3,7 +3,7 @@
  *
  * 覆盖：
  *   1. direct_add + list + access + delete 全流程（含权限校验）
- *   2. 审批流（request_add → list_requests → review_request approve/reject）
+ *   2. 审批流（request_add → list_pending → approve_request/reject_request）
  *   3. access_ticket 一次性使用
  *
  * 运行方法：
@@ -240,7 +240,7 @@ describe('Group Resources: direct_add + list + access + delete', () => {
 // -- 2. Group Resources: 审批流 -----------------------------------------------
 
 describe('Group Resources: 审批流', () => {
-  it('member request_add → pending, list_requests, owner approve → accessible, reject → not accessible', async () => {
+  it('member request_add → pending, list_pending, owner approve → accessible, reject → not accessible', async () => {
     const rid = runId();
     const ownerAid = `gr-req-o-${rid}.${ISSUER}`;
     const memberAid = `gr-req-m-${rid}.${ISSUER}`;
@@ -336,16 +336,16 @@ describe('Group Resources: 审批流', () => {
 
       await sleep(500);
 
-      // ---- owner list_requests → 找到 pending 请求 ----
+      // ---- owner list_pending → 找到 pending 请求 ----
       let listReqResult: Record<string, unknown>;
       try {
-        listReqResult = await owner.call('group.resources.list_requests', {
+        listReqResult = await owner.call('group.resources.list_pending', {
           group_id: groupId,
           status: 'pending',
         }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.resources.list_requests 未实现，跳过');
+          console.log('group.resources.list_pending 未实现，跳过');
           return;
         }
         throw e;
@@ -358,14 +358,12 @@ describe('Group Resources: 审批流', () => {
       // ---- owner approve → 资源可访问 ----
       let reviewApprove: Record<string, unknown>;
       try {
-        reviewApprove = await owner.call('group.resources.review_request', {
-          group_id: groupId,
+        reviewApprove = await owner.call('group.resources.approve_request', {
           request_id: requestId,
-          approve: true,
         }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.resources.review_request 未实现，跳过');
+          console.log('group.resources.approve_request 未实现，跳过');
           return;
         }
         throw e;
@@ -416,10 +414,8 @@ describe('Group Resources: 审批流', () => {
       expect(rejectRequestId).toBeTruthy();
 
       // ---- owner reject ----
-      const reviewReject = await owner.call('group.resources.review_request', {
-        group_id: groupId,
+      const reviewReject = await owner.call('group.resources.reject_request', {
         request_id: rejectRequestId,
-        approve: false,
       }) as Record<string, unknown>;
       expect(reviewReject).toBeDefined();
       const rejectedReq = reviewReject.request as Record<string, unknown> | undefined;

@@ -448,19 +448,18 @@ export class V2KeyStore {
       public_key: pubDer,
       created_at: Date.now(),
     };
-    await new Promise<void>((resolve, reject) => {
-      const req = this.store('readwrite').put(record);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+    const aliasKeyId = await spkIdForPubDer(pubDer);
     const alias: V2KeyRecord = {
       ...record,
-      key_id: await spkIdForPubDer(pubDer),
+      key_id: aliasKeyId,
     };
     return new Promise((resolve, reject) => {
-      const req = this.store('readwrite').put(alias);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
+      const tx = this.db.transaction(V2_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(V2_STORE_NAME);
+      store.put(record);
+      store.put(alias);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
   }
 

@@ -401,6 +401,7 @@ func (v *v2E2EECoordinator) scheduleGroupSpkRegistration(groupID, reason string)
 	}
 	v.groupSpkRegistrationInflight[groupID] = true
 	v.groupSpkMu.Unlock()
+	sess := state.session // 捕获局部变量，避免 goroutine 内 use-after-close
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -410,9 +411,14 @@ func (v *v2E2EECoordinator) scheduleGroupSpkRegistration(groupID, reason string)
 			delete(v.groupSpkRegistrationInflight, groupID)
 			v.groupSpkMu.Unlock()
 		}()
+		// 操作前重新检查 state 是否已被释放
+		if cur := c.v2GetState(); cur == nil || cur.session != sess {
+			c.logE2.Debug("group SPK registration skipped (session released): group=%s", groupID)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := state.session.EnsureGroupRegistered(ctx, groupID, c.v2CallFn()); err != nil {
+		if err := sess.EnsureGroupRegistered(ctx, groupID, c.v2CallFn()); err != nil {
 			c.logE2.Debug("group SPK registration failed (non-fatal): group=%s reason=%s err=%v", groupID, reason, err)
 		} else {
 			c.logE2.Debug("group SPK registered: group=%s reason=%s", groupID, reason)
@@ -437,6 +443,7 @@ func (v *v2E2EECoordinator) scheduleGroupSpkRotation(groupID, reason string) {
 	}
 	v.groupSpkRotationInflight[groupID] = true
 	v.groupSpkMu.Unlock()
+	sess := state.session // 捕获局部变量，避免 goroutine 内 use-after-close
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -446,9 +453,14 @@ func (v *v2E2EECoordinator) scheduleGroupSpkRotation(groupID, reason string) {
 			delete(v.groupSpkRotationInflight, groupID)
 			v.groupSpkMu.Unlock()
 		}()
+		// 操作前重新检查 state 是否已被释放
+		if cur := c.v2GetState(); cur == nil || cur.session != sess {
+			c.logE2.Debug("group SPK rotation skipped (session released): group=%s", groupID)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := state.session.RotateGroupSPK(ctx, groupID, c.v2CallFn()); err != nil {
+		if err := sess.RotateGroupSPK(ctx, groupID, c.v2CallFn()); err != nil {
 			c.logE2.Debug("group SPK rotation failed (non-fatal): group=%s reason=%s err=%v", groupID, reason, err)
 		} else {
 			c.logE2.Debug("group SPK rotated: group=%s reason=%s", groupID, reason)
@@ -758,6 +770,7 @@ func (v *v2E2EECoordinator) resolveV2SenderIKPending(fromAID, senderDeviceID, gr
 		shortCancel()
 	}
 
+	// 持锁复制 pending 列表后释放锁，锁外处理，处理完持锁删已处理条目
 	c.v2SenderIKMu.Lock()
 	pendingItems := make(map[string]v2SenderIKPendingEntry)
 	for key, entry := range c.v2SenderIKPending {
@@ -767,13 +780,12 @@ func (v *v2E2EECoordinator) resolveV2SenderIKPending(fromAID, senderDeviceID, gr
 	}
 	c.v2SenderIKMu.Unlock()
 
+	processedKeys := make([]string, 0, len(pendingItems))
 	for key, entry := range pendingItems {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		plaintext := c.decryptV2MessageWithPending(retryCtx, state, entry.Msg, false)
 		retryCancel()
-		c.v2SenderIKMu.Lock()
-		delete(c.v2SenderIKPending, key)
-		c.v2SenderIKMu.Unlock()
+		processedKeys = append(processedKeys, key)
 		if plaintext == nil {
 			c.logE2.Debug("V2 sender IK pending retry failed: key=%s", key)
 			continue
@@ -786,6 +798,16 @@ func (v *v2E2EECoordinator) resolveV2SenderIKPending(fromAID, senderDeviceID, gr
 			c.publishPulledMessage("message.received", "p2p:"+c.AID(), seq, plaintext)
 		}
 		c.logE2.Debug("V2 sender IK pending retry delivered: key=%s", key)
+	}
+	// 批量删除已处理条目，仅删除未被替换的（CreatedAt 一致）
+	if len(processedKeys) > 0 {
+		c.v2SenderIKMu.Lock()
+		for _, key := range processedKeys {
+			if cur, ok := c.v2SenderIKPending[key]; ok && cur.CreatedAt == pendingItems[key].CreatedAt {
+				delete(c.v2SenderIKPending, key)
+			}
+		}
+		c.v2SenderIKMu.Unlock()
 	}
 }
 

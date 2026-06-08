@@ -127,6 +127,75 @@ func TestOrderedGroupPublishWaitsForGapFill(t *testing.T) {
 	}
 }
 
+func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	groupID := "group.example.com/g-events"
+	ns := "group_event:" + groupID
+	c.seqTracker.OnMessageSeq(ns, 1)
+	c.mu.Lock()
+	c.v2State = &v2P2PState{
+		bootstrapCache:      make(map[string]v2BootstrapEntry),
+		groupBootstrapCache: map[string]*v2GroupBootstrapEntry{groupID: {CachedAt: time.Now()}},
+	}
+	c.mu.Unlock()
+
+	var received []int
+	c.events.Subscribe("group.changed", func(payload any) {
+		if evt, ok := payload.(map[string]any); ok {
+			received = append(received, int(toInt64(evt["event_seq"])))
+		}
+	})
+
+	c.enqueueOrderedMessage(ns, "group.changed", 3, map[string]any{
+		"group_id":   groupID,
+		"event_seq":  3,
+		"event_type": "group.member_removed",
+		"action":     "member_removed",
+	})
+	if !c.seqTracker.OnMessageSeq(ns, 3) {
+		t.Fatal("event_seq=3 越过空洞时应触发补洞")
+	}
+	c.drainOrderedMessages(ns)
+	if len(received) != 0 {
+		t.Fatalf("空洞补齐前不应发布群事件: %v", received)
+	}
+
+	c.enqueueOrderedMessage(ns, "group.changed", 2, map[string]any{
+		"group_id":   groupID,
+		"event_seq":  2,
+		"event_type": "group.member_added",
+		"action":     "member_added",
+	})
+	c.seqTracker.OnPullResult(ns, []map[string]any{{"event_seq": 2}}, 1)
+	c.drainOrderedMessages(ns)
+
+	if fmt.Sprint(received) != "[2 3]" {
+		t.Fatalf("群事件应按 [2 3] 顺序发布，实际: %v", received)
+	}
+	if !c.isPushedSeq(ns, 2) || !c.isPushedSeq(ns, 3) {
+		t.Fatal("已发布群事件 seq 应进入应用层去重集合")
+	}
+	state := c.v2GetState()
+	state.bootstrapCacheM.Lock()
+	_, cached := state.groupBootstrapCache[groupID]
+	state.bootstrapCacheM.Unlock()
+	if cached {
+		t.Fatal("有序 drain 应先执行 SDK 内部群事件消费并清理 group bootstrap cache")
+	}
+
+	c.delivery().handleGroupChangedEventSeq(map[string]any{
+		"group_id":   groupID,
+		"event_seq":  3,
+		"event_type": "group.member_removed",
+		"action":     "member_removed",
+	}, groupID)
+	if fmt.Sprint(received) != "[2 3]" {
+		t.Fatalf("重复 event_seq=3 不应再次发布，实际: %v", received)
+	}
+}
+
 func TestPulledBatchPublishesInternalGap(t *testing.T) {
 	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
@@ -1242,6 +1311,75 @@ func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
 	t.Fatalf("group.changed gap fill 未触发 pull/ack: %#v", getCalls())
 }
 
+func TestOnRawGroupChangedPushPersistsAndAcksContiguousEventSeq(t *testing.T) {
+	groupID := "g-push.example.com"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	ns := "group_event:" + groupID
+	c.seqTracker.ForceContiguousSeq(ns, 5)
+	c.onRawGroupChanged(map[string]any{
+		"group_id":  groupID,
+		"event_seq": 6,
+		"action":    "member_added",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, call := range getCalls() {
+			if call.Method == "group.ack_events" &&
+				toInt64(call.Params["event_seq"]) == 6 &&
+				call.Params["device_id"] == c.deviceID &&
+				call.Params["slot_id"] == "slot-a" {
+				seqStore, ok := c.tokenStore.(interface {
+					LoadSeq(aid, deviceID, slotID, namespace string) (int, error)
+				})
+				if !ok {
+					t.Fatal("测试 token store 应支持 LoadSeq")
+				}
+				persisted, err := seqStore.LoadSeq("alice.example.com", c.deviceID, "slot-a", ns)
+				if err != nil {
+					t.Fatalf("读取 group_event seq 失败: %v", err)
+				}
+				if persisted != 6 {
+					t.Fatalf("group_event seq 未持久化到 6，got=%d", persisted)
+				}
+				if got := c.seqTracker.GetContiguousSeq(ns); got != 6 {
+					t.Fatalf("group_event contiguous 未推进到 6，got=%d", got)
+				}
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("group.changed 连续 push 未触发 group.ack_events: %#v", getCalls())
+}
+
 func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
 	groupID := "group.example.com/g-invite"
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
@@ -1350,12 +1488,12 @@ func TestGroupEventGapFillAcksFinalContiguousAfterPublish(t *testing.T) {
 				ackSeq = toInt64(call.Params["event_seq"])
 			}
 		}
-		if ackCount == 1 && ackSeq == 4 && c.seqTracker.GetContiguousSeq(ns) == 4 {
+		if ackCount == 1 && ackSeq == 3 && c.seqTracker.GetContiguousSeq(ns) == 4 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("group.pull_events 应在发布后只 ack 一次最终 contiguous_seq=4: %#v", getCalls())
+	t.Fatalf("group.pull_events 应只 ack SDK 内部消费 contiguous_seq=3，且不受应用回调推进影响: %#v", getCalls())
 }
 
 func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {

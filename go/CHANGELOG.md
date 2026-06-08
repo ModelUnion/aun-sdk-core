@@ -8,6 +8,34 @@
 
 ---
 
+## 0.4.11 — 2026-06-08
+
+### 新功能
+- **Storage 目录树与扩展操作**：`storage.*` 新增 `create_folder`/`rename_folder`/`move_folder`/`delete_folder`/`move_object`/`copy_object`/`batch_delete`/`set_object_meta`/`append_object` 等方法，加入签名集合和非幂等集合（四语言+服务端对齐）
+- **group.resources 树形资源系统**：新增 `create_folder`/`rename`/`move`/`mount_object`/`unmount`/`cleanup_by_storage_ref`/`request_mount_object`/`resolve_access_ticket` 等方法，加入签名集合和非幂等集合（四语言+服务端对齐）
+- **group.changed 事件保序去重**：`handleGroupChangedEventSeq` 完整重构，支持 event_seq 去重、contiguous seq 追踪、空洞检测、自动 ack 机制（四语言对齐）
+- **群解散本地清理**：`fillGroupEventGap` 中群解散事件不持久化 seq tracker 状态；解散时清理本地 V2 缓存和 seq 追踪（四语言对齐）
+
+### 修复
+- **RenewCert 签名协议**：改为仅对 raw nonce 签名，移除 `client_time` 参数，解决签名协议不一致问题
+- **错误码映射**：`-32013` 从 `SessionError` 改为 `ClientSignatureError`
+- **V2 E2EE goroutine use-after-close**：`scheduleGroupSpkRegistration`/`scheduleGroupSpkRotation` 改为捕获 session 局部变量，避免 goroutine 关闭后访问
+- **V2 sender IK pending 批量删除**：改为锁外处理，避免长锁持有
+- **storage/group.resources 签名和幂等性补全**：补全写操作方法进入签名集合与非幂等集合（四语言对齐）
+
+### 优化
+- **v2GetSecurityState 懒初始化**：改为 `sync.Once`，避免并发初始化竞态
+- **群事件 gap 填充路径**：已填充事件进入有序队列而非直接发布；群解散事件跳过持久化
+
+### 测试
+- `TestAIDStoreRenewCertSignsRawNonce`：验证 RenewCert 签名协议修复
+- `TestOrderedGroupEventPublishWaitsForGapFillAndDedups`：验证群事件去重和补洞
+- `TestOnRawGroupChangedPushPersistsAndAcksContiguousEventSeq`：验证 push 事件 seq 持久化和 ack
+- `TestStorageMutationMethodsAreNonIdempotent` / `TestGroupResourceSideEffectMethodsAreNonIdempotent`：验证签名方法覆盖
+- `TestGroupEventGapFillAcksFinalContiguousAfterPublish`：修正预期 ack_seq（4→3）
+
+---
+
 ## 0.4.10 — 2026-06-06
 
 ### 新功能

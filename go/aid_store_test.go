@@ -8,15 +8,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelunion/aun-sdk-core/go/keystore"
+	"nhooyr.io/websocket"
 )
 
 // genAIDIdentity 生成测试用身份：CN==aid 的自签名证书 + P-256 私钥。
@@ -352,6 +355,156 @@ func TestAIDStoreResolve_CertNotFound(t *testing.T) {
 	if r.Error.Code != ErrCodeCertNotFound {
 		t.Errorf("证书 404 应映射为 %s, 实际错误码: %s", ErrCodeCertNotFound, r.Error.Code)
 	}
+}
+
+func TestAIDStoreRenewCertSignsRawNonce(t *testing.T) {
+	aid := "renew-sign.aid.com"
+	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	s := newTestAIDStore(t)
+	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
+
+	authCertPEM, authPrivPEM, _ := genAIDIdentity(t, "auth.aid.com", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	authKey := parseTestPrivateKey(t, authPrivPEM)
+	renewNonce := "renew-nonce"
+	renewedCertPEM := certPEM
+
+	var (
+		mu              sync.Mutex
+		renewParamsSeen map[string]any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("接受 WebSocket 失败: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		if err := conn.Write(r.Context(), websocket.MessageText, []byte(`{"jsonrpc":"2.0","method":"challenge","params":{"nonce":"test"}}`)); err != nil {
+			t.Errorf("发送 challenge 失败: %v", err)
+			return
+		}
+		_, data, err := conn.Read(r.Context())
+		if err != nil {
+			t.Errorf("读取 shortRPC 请求失败: %v", err)
+			return
+		}
+		var request map[string]any
+		if err := json.Unmarshal(data, &request); err != nil {
+			t.Errorf("解析 shortRPC 请求失败: %v", err)
+			return
+		}
+		method := authGetStr(request, "method")
+		params, _ := request["params"].(map[string]any)
+		if params == nil {
+			params = map[string]any{}
+		}
+
+		var result map[string]any
+		switch method {
+		case "auth.aid_login1":
+			clientNonce := authGetStr(params, "client_nonce")
+			sig, err := aidSignBytes(authKey, []byte(clientNonce))
+			if err != nil {
+				t.Errorf("签名 client_nonce 失败: %v", err)
+				return
+			}
+			result = map[string]any{
+				"success":                true,
+				"request_id":             "renew-rid",
+				"nonce":                  renewNonce,
+				"auth_cert":              authCertPEM,
+				"client_nonce_signature": base64.StdEncoding.EncodeToString(sig),
+			}
+		case "auth.renew_cert":
+			mu.Lock()
+			renewParamsSeen = cloneTestMap(params)
+			mu.Unlock()
+			result = map[string]any{"success": true, "cert": renewedCertPEM}
+		default:
+			t.Errorf("收到未预期方法: %s", method)
+			result = map[string]any{"success": false, "error": "unexpected method"}
+		}
+
+		response, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request["id"],
+			"result":  result,
+		})
+		if err != nil {
+			t.Errorf("序列化 shortRPC 响应失败: %v", err)
+			return
+		}
+		if err := conn.Write(r.Context(), websocket.MessageText, response); err != nil {
+			t.Errorf("发送 shortRPC 响应失败: %v", err)
+		}
+	}))
+	defer server.Close()
+	s.gatewayURL = gatewayWSURL(server)
+
+	result := s.RenewCert(context.Background(), aid)
+	if !result.Ok {
+		t.Fatalf("RenewCert 失败: %s", result.Error.Message)
+	}
+
+	mu.Lock()
+	params := cloneTestMap(renewParamsSeen)
+	mu.Unlock()
+	if params == nil {
+		t.Fatal("未捕获 auth.renew_cert 请求")
+	}
+	if _, ok := params["client_time"]; ok {
+		t.Fatal("auth.renew_cert 不应发送 client_time")
+	}
+	if got := authGetStr(params, "nonce"); got != renewNonce {
+		t.Fatalf("renew nonce 不匹配: got=%q want=%q", got, renewNonce)
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(authGetStr(params, "signature"))
+	if err != nil {
+		t.Fatalf("续期签名不是有效 base64: %v", err)
+	}
+	cert, err := authParsePEMCertificate(certPEM)
+	if err != nil {
+		t.Fatalf("解析测试证书失败: %v", err)
+	}
+	if err := verifySignature(cert.PublicKey, sigBytes, []byte(renewNonce)); err != nil {
+		t.Fatalf("续期签名必须覆盖 raw nonce: %v", err)
+	}
+	if err := verifySignature(cert.PublicKey, sigBytes, []byte(renewNonce+":1234567890.0")); err == nil {
+		t.Fatal("续期签名不应覆盖 nonce:client_time")
+	}
+}
+
+func parseTestPrivateKey(t *testing.T, privateKeyPEM string) *ecdsa.PrivateKey {
+	t.Helper()
+	block, _ := pem.Decode([]byte(privateKeyPEM))
+	if block == nil {
+		t.Fatal("测试私钥 PEM 解析失败")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("测试私钥解析失败: %v", err)
+	}
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatalf("测试私钥类型错误: %T", key)
+	}
+	return ecKey
+}
+
+func cloneTestMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 var _ = keystore.AgentMDCacheRecord{}

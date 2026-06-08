@@ -225,4 +225,24 @@ describe('浏览器群事件验签', () => {
     );
     expect(result).toBe('pending');
   });
+
+  it('pending 不应被对外标记为已验签', async () => {
+    const client = new AUNClient();
+    const published: Array<Record<string, unknown>> = [];
+    (client as any)._dispatcher.publish = async (_event: string, payload: Record<string, unknown>) => {
+      published.push(payload);
+    };
+    (client as any)._verifyEventSignature = async () => 'pending';
+
+    await (client as any)._onRawGroupChanged({
+      group_id: 'g-1',
+      action: 'member_added',
+      client_signature: {
+        aid: 'alice.agentid.pub',
+        _method: 'group.add_member',
+      },
+    });
+
+    expect(published[0]._verified).toBe(false);
+  });
 });

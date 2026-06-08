@@ -121,6 +121,16 @@
 | 方法 | 说明 |
 |------|------|
 | [group.resources.put](#groupresourcesput) | 分享资源 |
+| [group.resources.create_folder](#groupresourcescreate_folder) | 创建资源目录 |
+| [group.resources.list_children](#groupresourceslist_children) | 列出目录子节点 |
+| [group.resources.rename](#groupresourcesrename) | 重命名资源节点 |
+| [group.resources.move](#groupresourcesmove) | 移动资源节点 |
+| [group.resources.mount_object](#groupresourcesmount_object) | 挂载 storage 对象为资源 |
+| [group.resources.request_mount_object](#groupresourcesrequest_mount_object) | 申请挂载 storage 对象 |
+| [group.resources.unmount](#groupresourcesunmount) | 取消挂载资源 |
+| [group.resources.resolve_path](#groupresourcesresolve_path) | 按路径解析资源 |
+| [group.resources.list_refs_by_storage](#groupresourceslist_refs_by_storage) | 按 storage 引用反查资源 |
+| [group.resources.cleanup_by_storage_ref](#groupresourcescleanup_by_storage_ref) | 清理失效 storage 引用 |
 | [group.resources.get](#groupresourcesget) | 查看资源 |
 | [group.resources.list](#groupresourceslist) | 列出资源 |
 | [group.resources.update](#groupresourcesupdate) | 更新资源元数据 |
@@ -1358,6 +1368,122 @@ result = await client.call("group.thought.get", {
 
 > `created` 为 `true` 表示新建，`false` 表示更新已有资源。
 
+### group.resources.create_folder
+
+创建群资源目录。需要 **member 及以上**权限。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `path` / `resource_path` | string | 否 | 完整目录路径 |
+| `name` | string | 否 | 目录名；未提供完整路径时使用 |
+| `parent_resource_id` / `parent_path` | string | 否 | 父目录 |
+| `title` | string | 否 | 显示标题，默认目录名 |
+| `metadata` | object | 否 | 自定义元数据 |
+| `visibility` | string | 否 | `"members_only"` / `"public"` |
+| `tags` | array | 否 | 标签 |
+| `mkdirs` | boolean | 否 | 是否递归创建父目录 |
+| `sort_order` | integer | 否 | 排序值 |
+
+**响应**：`{ "group_id": "...", "resource": { ... }, "created": true }`。
+
+### group.resources.list_children
+
+列出某个资源目录下的直接子节点。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `resource_id` / `path` / `resource_path` | string | 否 | 父目录；不传表示根目录 |
+| `type` / `resource_type` | string | 否 | `"folder"` / `"file"` / `"link"` |
+| `include_status` | boolean | 否 | 是否附带 storage 状态 |
+| `page` / `offset` | integer | 否 | 分页位置 |
+| `size` / `limit` | integer | 否 | 每页数量 |
+| `sort_by` | string | 否 | 排序字段，默认 `sort_order` |
+| `order` | string | 否 | `"asc"` / `"desc"` |
+
+**响应**：`group_id`、`resource_id`、`path`、`items`、`total`、`count`、`page`、`size`、`offset`。
+
+### group.resources.rename
+
+重命名资源节点。需要资源创建者、storage owner、owner 或 admin 权限。
+
+**参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`），`new_name`；可选 `title`、`expected_version`。
+
+**响应**：更新后的 `resource`。
+
+### group.resources.move
+
+移动资源节点。目录不能移动到自身或自身子目录。
+
+**参数**：`group_id`，资源选择器，目标父目录（`dst_parent_resource_id` / `dst_parent_path`），可选 `new_name` / `dst_name`、`expected_version`。
+
+**响应**：更新后的 `resource`。
+
+### group.resources.mount_object
+
+将 `storage.*` 对象挂载为群资源。需要 **owner/admin** 权限。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `storage_ref` | object | 是 | storage 引用，通常包含 `owner_aid`、`bucket`、`object_id` 或 `object_key` |
+| `path` / `resource_path` | string | 否 | 资源路径；不传时用 storage 文件名 |
+| `title` | string | 否 | 显示标题 |
+| `metadata` | object | 否 | 自定义元数据 |
+| `visibility` | string | 否 | `"members_only"` / `"public"` |
+| `tags` | array | 否 | 标签 |
+| `mkdirs` | boolean | 否 | 是否递归创建父目录，默认 `true` |
+| `conflict_policy` | string | 否 | `"reject"` / `"replace"` / `"keep_both"` |
+
+**响应**：`{ "group_id": "...", "resource": { ... }, "created": true }`。
+
+### group.resources.request_mount_object
+
+成员申请挂载自己的 storage 对象，进入待审批队列。语义等同 `group.resources.request_add`，但输入按挂载对象组织。
+
+**参数**：同 `group.resources.mount_object`，但不需要 owner/admin 权限。
+
+**响应**：`{ "group_id": "...", "request": { ... } }`。
+
+### group.resources.unmount
+
+取消挂载资源，等价于非递归 `group.resources.delete`。
+
+**参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`）。
+
+**响应**：删除结果。
+
+### group.resources.resolve_path
+
+按路径解析资源节点。
+
+**参数**：`group_id`、`path` / `resource_path`；可选 `expected_type`。
+
+**响应**：`resource_id`、`resource_type`、`resource_path`、`path`、`status`、`resource`。
+
+### group.resources.list_refs_by_storage
+
+按 storage 引用反查群资源。传 `group_id` 时要求调用者是该群成员；不传 `group_id` 时要求调用者是 `owner_aid`。
+
+**参数**：`owner_aid` 必填，`object_id` 或 `object_key` 至少一个；可选 `bucket`、`group_id`、`include_missing`、`offset`、`limit` / `size`。
+
+**响应**：`items`、`total`、`count`、`limit`、`offset`，并回显 storage 选择器字段。
+
+### group.resources.cleanup_by_storage_ref
+
+清理指向已删除或失效 storage 对象的资源引用。传 `group_id` 时要求 owner/admin 或 storage owner；不传 `group_id` 时要求 storage owner。
+
+**参数**：`owner_aid` 必填，`object_id` 或 `object_key` 至少一个；可选 `bucket`、`group_id`、`mode`。
+
+**响应**：`affected_count` 和被影响的资源 `items`。
+
 ### group.resources.get
 
 查看资源详情。
@@ -1485,7 +1611,7 @@ result = await client.call("group.thought.get", {
 
 ### group.resources.direct_add
 
-Owner 直接添加资源（无需审批）。需要 **owner** 权限。
+Owner/Admin 直接添加资源（无需审批）。需要 **owner/admin** 权限。
 
 **参数**：同 `group.resources.put`（`resource_type` 不能是 `"folder"`）。
 
@@ -1835,7 +1961,8 @@ CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
 {
     "module_id": "group",
     "action": "member_added",
-    "group_id": "g-abc123.agentid.pub"
+    "group_id": "g-abc123.agentid.pub",
+    "event_seq": 42
 }
 ```
 
@@ -1844,8 +1971,20 @@ CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
 | `module_id` | string | 固定 `"group"` |
 | `action` | string | 变更类型（见下表） |
 | `group_id` | string | 群组 ID |
+| `event_seq` | integer | 可选，服务端分配的单调递增序号，用于 SDK 内部保序去重 |
 | `request_id` | string | 可选，仅资源审批相关 action |
 | `resource_path` | string | 可选，仅资源相关 action |
+
+**保序去重（SDK 内部行为）**：
+
+服务端为每条 `group.changed` 事件分配 `event_seq`（按群 `group_event:{group_id}` 命名空间单调递增）。SDK 收到事件后：
+
+1. **去重**：`event_seq` ≤ 已连续消费序号，或已处理过该序号，则丢弃
+2. **保序**：事件入有序队列，按序号连续后才发布给应用层
+3. **补洞**：检测到序号空洞时，自动调用 `group.pull_events` 拉取缺失事件补齐
+4. **ack**：连续段推进后自动发送 `group.ack_events`（namespace `group_event:{group_id}`）
+
+不携带 `event_seq` 的旧格式事件直接发布，不参与保序（兼容旧服务端）。
 
 **action 取值**：
 

@@ -363,7 +363,7 @@ export class V2E2EECoordinator {
     const gid = String(groupId ?? '').trim();
     if (!gid || !client._v2Session) return;
     const inflight = this.runtime.v2.groupSpkRegistrationInflight;
-    if (inflight.has(gid)) return;
+    if (inflight.has(gid) || this.runtime.v2.groupSpkRotationInflight.has(gid)) return;
     inflight.add(gid);
     client._safeAsync((async () => {
       try {
@@ -382,7 +382,7 @@ export class V2E2EECoordinator {
     const gid = String(groupId ?? '').trim();
     if (!gid || !client._v2Session) return;
     const inflight = this.runtime.v2.groupSpkRotationInflight;
-    if (inflight.has(gid)) return;
+    if (inflight.has(gid) || this.runtime.v2.groupSpkRegistrationInflight.has(gid)) return;
     inflight.add(gid);
     client._safeAsync((async () => {
       try {
@@ -517,6 +517,13 @@ export class V2E2EECoordinator {
         client._v2SenderIKPending.delete(key);
         if (plaintext === null) {
           client._clientLog.debug(`V2 sender IK pending retry failed: key=${key}`);
+          client.emit('message.undecryptable', {
+            from: entry.fromAid,
+            sender_device_id: entry.senderDeviceId,
+            group_id: entry.groupId || undefined,
+            seq: Number(entry.msg.seq ?? 0),
+            reason: 'sender_ik_retry_failed',
+          });
           continue;
         }
         const seq = Number(entry.msg.seq ?? 0);

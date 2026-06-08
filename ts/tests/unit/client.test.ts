@@ -2986,7 +2986,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await expect(client.call('group.thought.put', {
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: 'group-thought' },
-    })).rejects.toBeInstanceOf(StateError);
+    })).rejects.toBeInstanceOf(ValidationError);
   });
 
   it('group.thought.get 逐条解密 V2 envelope 并返回 thoughts[]', async () => {

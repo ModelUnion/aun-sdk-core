@@ -154,6 +154,15 @@ class V2KeyStore:
         )
         conn.commit()
 
+    def delete_group_spk(self, device_id: str, group_id: str, spk_id: str) -> None:
+        """删除指定群 SPK 密钥对（用于上传失败后回滚）。"""
+        conn = self._db._get_conn()
+        conn.execute(
+            "DELETE FROM v2_device_keys WHERE device_id=? AND key_type='group_spk' AND group_id=? AND key_id=?",
+            (device_id, group_id, spk_id),
+        )
+        conn.commit()
+
     def load_group_spk(self, device_id: str, group_id: str, spk_id: str) -> bytes | None:
         conn = self._db._get_conn()
         row = conn.execute(

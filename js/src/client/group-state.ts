@@ -417,11 +417,11 @@ export class GroupStateCoordinator {
           delete data.client_signature;
         } else {
           const verified = await client._verifyEventSignature(data, cs);
-          if (verified === false) {
+          if (!client._isEventSignatureVerified(verified)) {
             client._clientLog.warn(`state_committed committer signature verify failed group=%s${String(groupId)}`);
             return;
           }
-          data._verified = verified;
+          data._verified = true;
         }
       }
 

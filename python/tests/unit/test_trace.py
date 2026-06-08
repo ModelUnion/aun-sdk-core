@@ -257,6 +257,35 @@ async def test_trace_event_stripped_from_params(transport):
 
 
 @pytest.mark.asyncio
+async def test_trace_event_observer_can_filter_after_background_rpc(transport):
+    """observer 同时收到后台 RPC 与事件 trace 时，目标事件仍可按 type/event 筛选。"""
+    observed = []
+    transport.set_trace_observer(lambda info: observed.append(info))
+
+    observed.append({
+        "type": "rpc",
+        "method": "group.v2.get_proposal",
+        "trace": {"trace_id": "background", "mode": "diag"},
+    })
+    await transport._route_message({
+        "jsonrpc": "2.0",
+        "method": "event/message.received",
+        "params": {
+            "from": "alice.aid.com",
+            "payload": {"text": "hello"},
+            "_trace": {"trace_id": "event123", "mode": "log"},
+        },
+    })
+
+    message_events = [
+        item for item in observed
+        if item.get("type") == "event" and item.get("event") == "message.received"
+    ]
+    assert len(message_events) == 1
+    assert message_events[0]["trace"]["trace_id"] == "event123"
+
+
+@pytest.mark.asyncio
 async def test_debug_logs_full_rpc_event(transport):
     event_msg = {
         "jsonrpc": "2.0",

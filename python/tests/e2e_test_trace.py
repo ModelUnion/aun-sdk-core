@@ -68,8 +68,16 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
             await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
-            # 等待 V2 初始化后台任务完成
-            await asyncio.sleep(1.0)
+            # 静默同步历史消息，推进固定 slot 的本地 cursor，避免历史 gap 卡住新 push 的有序发布。
+            try:
+                await client.call("message.pull", {
+                    "after_seq": 0,
+                    "limit": 200,
+                    "max_pages": 100,
+                })
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
             return
         except Exception as e:
             if attempt < 3:
@@ -97,6 +105,24 @@ def _fail(name: str, reason: str):
     global failed
     failed += 1
     print(f"  FAIL: {name} — {reason}")
+
+
+def _trace_methods(traces: list[dict]) -> list[str]:
+    return [str(t.get("method") or t.get("event") or "?") for t in traces if isinstance(t, dict)]
+
+
+def _rpc_traces(traces: list[dict], method: str) -> list[dict]:
+    return [
+        t for t in traces
+        if isinstance(t, dict) and t.get("type") == "rpc" and t.get("method") == method
+    ]
+
+
+def _event_traces(traces: list[dict], event: str) -> list[dict]:
+    return [
+        t for t in traces
+        if isinstance(t, dict) and t.get("type") == "event" and t.get("event") == event
+    ]
 
 
 async def test_diag_mode_returns_spans():
@@ -191,10 +217,14 @@ async def test_log_mode_no_trace_in_response():
         })
         print(f"    send result: {result}")
 
-        # log 模式下 observer 不应被调用（response 不带 _trace）
-        if traces_received:
-            _fail("log_no_trace", f"log 模式下 observer 不应被调用，但收到: {traces_received}")
+        # log 模式下本次 message.send response 不应携带 _trace。
+        # V2 后台同步 RPC 可能在同一个 observer 中产生自己的 trace，不能把它们算作本断言失败。
+        send_traces = _rpc_traces(traces_received, "message.send")
+        if send_traces:
+            _fail("log_no_trace", f"log 模式下 message.send 不应触发 trace observer，但收到: {send_traces}")
         else:
+            if traces_received:
+                print(f"    ignored background traces: {_trace_methods(traces_received)}")
             _ok("log_no_trace")
     finally:
         await alice.disconnect()
@@ -243,6 +273,8 @@ async def test_event_trace_propagation():
     alice = _make_client("alice-evt")
     bobb = _make_client("bobb-evt")
     event_traces = []
+    received_messages = []
+    target_received = asyncio.Event()
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -250,27 +282,46 @@ async def test_event_trace_propagation():
 
         # bobb 注册 trace observer
         bobb.set_trace_observer(lambda info: event_traces.append(info))
+        event_traces.clear()
+
+        target_text = f"trace-event-test-{int(time.time() * 1000)}"
+
+        def _on_message(data):
+            if isinstance(data, dict):
+                received_messages.append(data)
+                if data.get("payload", {}).get("text") == target_text:
+                    target_received.set()
+
+        bobb.on("message.received", _on_message)
 
         # alice 用 log 模式发消息（事件中应携带 trace_id）
         alice.set_trace_mode("log")
         await alice.call("message.send", {
             "to": _BOBB_AID,
-            "payload": {"text": "trace-event-test"},
+            "payload": {"text": target_text},
             "encrypt": False,
         })
 
         # 等待 bobb 收到事件
-        await asyncio.sleep(2.0)
+        try:
+            await asyncio.wait_for(target_received.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            _fail("event_trace", f"bobb 未收到目标消息，received={len(received_messages)}")
+            return
 
-        if event_traces:
-            evt_trace = event_traces[0]
+        message_event_traces = _event_traces(event_traces, "message.received")
+        if message_event_traces:
+            evt_trace = next(
+                (t for t in message_event_traces if t.get("trace", {}).get("trace_id")),
+                message_event_traces[0],
+            )
             print(f"    event trace: {evt_trace}")
-            if evt_trace.get("type") == "event" and evt_trace.get("trace", {}).get("trace_id"):
+            if evt_trace.get("trace", {}).get("trace_id"):
                 _ok("event_trace")
             else:
-                _fail("event_trace", f"事件 trace 格式不符: {evt_trace}")
+                _fail("event_trace", f"message.received trace 缺少 trace_id: {evt_trace}")
         else:
-            _fail("event_trace", "bobb 未收到事件 trace")
+            _fail("event_trace", f"bobb 未收到 message.received 事件 trace，observer got: {_trace_methods(event_traces)}")
     finally:
         await alice.disconnect()
         await bobb.disconnect()

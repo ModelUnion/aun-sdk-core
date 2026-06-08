@@ -4,10 +4,15 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import logging
 import time
+from collections import OrderedDict
 from typing import Any, TYPE_CHECKING
+
+_logger = logging.getLogger(__name__)
 
 from .crypto.ecdh import generate_p256_keypair
 from .crypto.ecdsa import ecdsa_sign_raw, ecdsa_verify_raw
@@ -19,6 +24,9 @@ if TYPE_CHECKING:
 
 # 对端公钥缓存 TTL（秒）
 _PEER_KEY_CACHE_TTL = 3600
+# 缓存容量上限
+_PEER_IK_CACHE_MAX = 200
+_VERIFIED_SPKS_MAX = 500
 
 
 class V2Session:
@@ -52,12 +60,14 @@ class V2Session:
         self._registered = False
         self._last_uploaded_spk_id: str | None = None
         self._last_uploaded_group_spk_ids: dict[str, str] = {}
-        # 对端 IK 公钥缓存：{(peer_aid, device_id): (ik_pub_der, cached_at)}
-        self._peer_ik_cache: dict[str, tuple[bytes, float]] = {}
+        # 对端 IK 公钥缓存：{(peer_aid, device_id): (ik_pub_der, cached_at)}，LRU 淘汰
+        self._peer_ik_cache: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
         # 已验证的 SPK 签名缓存：{(peer_aid, device_id, spk_id)}
         self._verified_spks: set[tuple[str, str, str]] = set()
         # 旧 SPK 私钥内存缓存：{spk_id: priv}
         self._spk_cache: dict[str, bytes] = {}
+        # ensure_group_registered 并发保护锁
+        self._group_register_lock = asyncio.Lock()
 
     @staticmethod
     def _group_key(group_id: str) -> str:
@@ -194,14 +204,15 @@ class V2Session:
 
     async def ensure_group_registered(self, group_id: str, call_fn) -> None:
         """注册指定群的 group SPK。已有本地上传成功标记时只恢复状态。"""
-        self.ensure_keys()
-        group_id = self._group_key(group_id)
-        uploaded_spk_id = self._store.load_latest_uploaded_group_spk_id(self._device_id, group_id)
-        if uploaded_spk_id:
-            self._last_uploaded_group_spk_ids[group_id] = uploaded_spk_id
-            return
-        spk_id, _spk_priv, spk_pub_der = self.ensure_group_spk(group_id)
-        await self._publish_group_spk(group_id, spk_id, spk_pub_der, call_fn)
+        async with self._group_register_lock:
+            self.ensure_keys()
+            group_id = self._group_key(group_id)
+            uploaded_spk_id = self._store.load_latest_uploaded_group_spk_id(self._device_id, group_id)
+            if uploaded_spk_id:
+                self._last_uploaded_group_spk_ids[group_id] = uploaded_spk_id
+                return
+            spk_id, _spk_priv, spk_pub_der = self.ensure_group_spk(group_id)
+            await self._publish_group_spk(group_id, spk_id, spk_pub_der, call_fn)
 
     async def rotate_group_spk(self, group_id: str, call_fn) -> tuple[str, bytes, bytes]:
         """轮换指定群的 group SPK，保留旧私钥用于缓存窗口内的历史 wrap 解密。"""
@@ -273,7 +284,8 @@ class V2Session:
         RECENT_GENERATIONS = 7  # 最近 N 代保留窗口
         try:
             recent_keep = set(self._store.list_recent_spk_ids(self._device_id, RECENT_GENERATIONS))
-        except Exception:
+        except Exception as e:
+            _logger.warning("[V2Session] list_recent_spk_ids failed, fallback to empty: %s", e)
             recent_keep = set()
         for spk_id in list(self._old_spk_max_seq.keys()):
             max_seq, last_seen_at = self._old_spk_max_seq[spk_id]
@@ -287,8 +299,8 @@ class V2Session:
                 continue  # 在最近 7 代保留窗口内，跳过
             try:
                 self._store.delete_spk(self._device_id, spk_id)
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.warning("[V2Session] delete_spk(%s) failed: %s", spk_id, e)
             self._old_spk_max_seq.pop(spk_id, None)
             destroyed.append(spk_id)
 
@@ -301,13 +313,13 @@ class V2Session:
                     continue
                 try:
                     self._store.delete_spk(self._device_id, spk_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _logger.warning("[V2Session] delete_spk(%s) hard-limit failed: %s", spk_id, e)
                 self._old_spk_max_seq.pop(spk_id, None)
                 if spk_id not in destroyed:
                     destroyed.append(spk_id)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.warning("[V2Session] list_expired_spk_ids failed: %s", e)
 
         return destroyed
 
@@ -336,8 +348,15 @@ class V2Session:
         self._last_uploaded_spk_id = spk_id
 
     def cache_peer_ik(self, peer_aid: str, device_id: str, ik_pub_der: bytes) -> None:
-        """缓存对端 IK 公钥（带 TTL）。"""
-        self._peer_ik_cache[f"{peer_aid}#{device_id}"] = (ik_pub_der, time.time())
+        """缓存对端 IK 公钥（带 TTL + LRU 淘汰）。"""
+        key = f"{peer_aid}#{device_id}"
+        # 移到末尾（最近使用）
+        if key in self._peer_ik_cache:
+            self._peer_ik_cache.move_to_end(key)
+        self._peer_ik_cache[key] = (ik_pub_der, time.time())
+        # LRU 淘汰最旧条目
+        while len(self._peer_ik_cache) > _PEER_IK_CACHE_MAX:
+            self._peer_ik_cache.popitem(last=False)
 
     def get_peer_ik(self, peer_aid: str, device_id: str) -> bytes | None:
         """获取对端 IK 公钥，过期返回 None。"""
@@ -355,7 +374,9 @@ class V2Session:
         return (peer_aid, device_id, spk_id) in self._verified_spks
 
     def mark_peer_spk_verified(self, peer_aid: str, device_id: str, spk_id: str) -> None:
-        """标记对端 SPK 已验证。"""
+        """标记对端 SPK 已验证。超过上限时清空重建，避免无限增长。"""
+        if len(self._verified_spks) >= _VERIFIED_SPKS_MAX:
+            self._verified_spks.clear()
         self._verified_spks.add((peer_aid, device_id, spk_id))
 
     @property

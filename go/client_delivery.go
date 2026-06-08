@@ -933,8 +933,12 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 				}
 			}
 		}
+		hasDissolvedEvent := false
 		for _, evt := range pullEvts {
 			evt["_from_gap_fill"] = true
+			if action, _ := evt["action"].(string); action == "dissolved" {
+				hasDissolvedEvent = true
+			}
 			et, _ := evt["event_type"].(string)
 			// 消息事件由 fillGroupGap 负责，事件补洞不重复投递
 			if et == "group.message_created" {
@@ -948,15 +952,18 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 					evt["_verified"] = c.verifyEventSignature(cs)
 				}
 			}
-			// group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
-			c.events.publishSync("group.changed", evt)
+			eventSeq := int(toInt64(evt["event_seq"]))
+			if eventSeq > 0 && !c.isPushedSeq(ns, eventSeq) {
+				c.enqueueOrderedMessage(ns, "group.changed", eventSeq, evt)
+			}
 		}
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig != pageContigBefore {
+		ackContig := c.seqTracker.GetContiguousSeq(ns)
+		d.drainOrderedMessages(ns)
+		if ackContig != pageContigBefore && !hasDissolvedEvent {
 			c.saveSeqTrackerState()
 		}
-		if len(pullEvts) > 0 && contig > 0 && contig != pageContigBefore {
-			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(contig))
+		if len(pullEvts) > 0 && ackContig > 0 && ackContig != pageContigBefore {
+			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(ackContig))
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
@@ -986,11 +993,41 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, groupID string) {
 	c := d.runtime.client
 	needPull := false
-	if rawES, ok := data["event_seq"]; ok && groupID != "" {
-		if es := toInt64(rawES); es > 0 {
-			ns := "group_event:" + groupID
-			c.seqTracker.UpdateMaxSeen(ns, int(es))
-			needPull = c.seqTracker.OnMessageSeq(ns, int(es))
+	es := int(toInt64(data["event_seq"]))
+	if groupID == "" || es <= 0 {
+		d.publishOrderedGroupChanged(data)
+		return
+	}
+
+	ns := "group_event:" + groupID
+	contigBefore := c.seqTracker.GetContiguousSeq(ns)
+	if es <= contigBefore || c.isPushedSeq(ns, es) {
+		c.logEG.Debug("group.changed skipped duplicate/stale: group=%s event_seq=%d contiguous=%d", groupID, es, contigBefore)
+		return
+	}
+
+	c.enqueueOrderedMessage(ns, "group.changed", es, data)
+	needPull = c.seqTracker.OnMessageSeq(ns, es)
+	ackContig := c.seqTracker.GetContiguousSeq(ns)
+	d.drainOrderedMessages(ns)
+	if ackContig > 0 && ackContig != contigBefore {
+		if data["action"] != "dissolved" {
+			c.saveSeqTrackerState()
+		}
+		if c.transport != nil {
+			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(ackContig))
+			go func() {
+				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ackCancel()
+				if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
+					"group_id":  groupID,
+					"event_seq": ackSeq,
+					"device_id": c.deviceID,
+					"slot_id":   c.slotID,
+				}); ackErr != nil {
+					c.logEG.Warn("group event push auto-ack failed: group=%s %v", groupID, ackErr)
+				}
+			}()
 		}
 	}
 
@@ -1551,17 +1588,39 @@ func (d *messageDeliveryEngine) drainOrderedMessages(ns string, beforeSeq ...int
 			c.log.Debug("publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
 			continue
 		}
-		c.publishAppEventSync(ready.item.event, ready.item.payload)
+		d.publishOrderedQueueItem(ns, ready.item.event, ready.seq, ready.item.payload)
 		c.markPushedSeq(ns, ready.seq)
 		c.log.Debug("publish ordered drain delivered: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
 	}
+}
+
+func (d *messageDeliveryEngine) publishOrderedQueueItem(ns, event string, seq int, payload any) {
+	c := d.runtime.client
+	if event == "group.changed" && strings.HasPrefix(ns, "group_event:") {
+		d.publishOrderedGroupChanged(payload)
+		return
+	}
+	c.publishAppEventSync(event, payload)
+}
+
+func (d *messageDeliveryEngine) publishOrderedGroupChanged(payload any) {
+	c := d.runtime.client
+	if dataMap, ok := payload.(map[string]any); ok {
+		groupID, _ := dataMap["group_id"].(string)
+		action, _ := dataMap["action"].(string)
+		c.onRawGroupChangedV2(groupID, action, dataMap)
+		if action == "dissolved" && groupID != "" {
+			c.cleanupDissolvedGroup(groupID)
+		}
+	}
+	c.publishAppEventSync("group.changed", payload)
 }
 
 func (d *messageDeliveryEngine) publishOrderedMessage(event, ns string, seq int, payload any) bool {
 	c := d.runtime.client
 	if ns == "" || seq <= 0 {
 		c.log.Debug("publish ordered direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
-		c.publishAppEvent(event, payload)
+		d.publishOrderedQueueItem(ns, event, seq, payload)
 		return true
 	}
 	if c.isPushedSeq(ns, seq) {
@@ -1581,7 +1640,7 @@ func (d *messageDeliveryEngine) publishOrderedMessage(event, ns string, seq int,
 		return false
 	}
 	c.removePendingOrderedSeq(ns, seq)
-	c.publishAppEventSync(event, payload)
+	d.publishOrderedQueueItem(ns, event, seq, payload)
 	c.markPushedSeq(ns, seq)
 	c.log.Debug("publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq)
 	c.drainOrderedMessages(ns)

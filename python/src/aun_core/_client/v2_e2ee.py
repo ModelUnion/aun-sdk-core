@@ -114,12 +114,42 @@ class V2E2EECoordinator:
             try:
                 if client._state != "connected" or not client._v2_session:
                     return
-                await client._v2_session.rotate_group_spk(group_id, client.call)
-                client._log.debug("client", "group SPK rotated: group=%s reason=%s", group_id, reason)
+                session = client._v2_session
+                # 尝试记录轮换前的 group SPK，用于上传失败时回滚
+                old_spk = None
+                normalized_gid = None
+                try:
+                    normalized_gid = session._group_key(group_id)
+                    old_spk = session._store.load_current_group_spk(session._device_id, normalized_gid)
+                except Exception:
+                    pass  # session 不支持这些方法时跳过回滚准备
+                try:
+                    await session.rotate_group_spk(group_id, client.call)
+                    client._log.debug("client", "group SPK rotated: group=%s reason=%s", group_id, reason)
+                except Exception as exc:
+                    # 上传失败：回滚本地新 SPK，避免本地/服务端 spk_id 不一致
+                    if normalized_gid is not None:
+                        try:
+                            new_spk = session._store.load_current_group_spk(session._device_id, normalized_gid)
+                            if new_spk and (not old_spk or new_spk[0] != old_spk[0]):
+                                session._store.delete_group_spk(session._device_id, normalized_gid, new_spk[0])
+                                client._log.warn(
+                                    "client",
+                                    "group SPK rotation upload failed, rolled back local spk_id=%s: group=%s reason=%s err=%s",
+                                    new_spk[0], group_id, reason, exc,
+                                )
+                                return
+                        except Exception:
+                            pass  # 回滚不可用时走 non-fatal 路径
+                    client._log.debug(
+                        "client",
+                        "group SPK rotation failed (non-fatal): group=%s reason=%s err=%s",
+                        group_id, reason, exc,
+                    )
             except Exception as exc:
                 client._log.debug(
                     "client",
-                    "group SPK rotation failed (non-fatal): group=%s reason=%s err=%s",
+                    "group SPK rotation schedule error (non-fatal): group=%s reason=%s err=%s",
                     group_id,
                     reason,
                     exc,
@@ -163,6 +193,17 @@ class V2E2EECoordinator:
         if not from_aid:
             return
         message_key = client._v2_pending_sender_ik_message_key(msg, group_id)
+        # 队列上限保护：超限时丢弃最旧的条目
+        _V2_SENDER_IK_PENDING_MAX = 1000
+        if len(client._v2_sender_ik_pending) >= _V2_SENDER_IK_PENDING_MAX and message_key not in client._v2_sender_ik_pending:
+            oldest_key = min(client._v2_sender_ik_pending, key=lambda k: client._v2_sender_ik_pending[k].get("created_at", 0))
+            client._v2_sender_ik_pending.pop(oldest_key, None)
+            client._log.warn(
+                "client",
+                "V2 sender IK pending queue full (%d), evicted oldest: key=%s",
+                _V2_SENDER_IK_PENDING_MAX,
+                oldest_key,
+            )
         client._v2_sender_ik_pending[message_key] = {
             "msg": dict(msg),
             "from_aid": from_aid,
@@ -254,8 +295,16 @@ class V2E2EECoordinator:
                     client._v2_sender_ik_pending.pop(key, None)
                     continue
                 if plaintext is None:
-                    client._log.debug("client", "V2 sender IK pending retry failed: key=%s", key)
-                    client._v2_sender_ik_pending.pop(key, None)
+                    client._log.warn("client", "V2 sender IK pending retry still undecryptable: key=%s", key)
+                    # 不 pop —— 保留在队列中，等待后续重试机会
+                    # 发射 undecryptable 事件通知上层
+                    seq = int(msg.get("seq") or 0)
+                    is_group = bool(group_id)
+                    event_name = "group.message_undecryptable" if is_group else "message.undecryptable"
+                    safe_event = client._safe_undecryptable_push_event(msg, group=is_group)
+                    safe_event["_decrypt_error"] = "sender IK pending retry failed"
+                    safe_event["_decrypt_stage"] = "sender_ik_pending_retry"
+                    await client._publish_app_event(event_name, safe_event, source="pending_retry")
                     continue
                 client._v2_sender_ik_pending.pop(key, None)
                 seq = int(msg.get("seq") or 0)

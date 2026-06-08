@@ -16,6 +16,30 @@
 | [storage.get_limits](#storageget_limits) | 查询上传限制 |
 | [storage.check_upload](#storagecheck_upload) | 上传预检（秒传检测 + 超限检测） |
 
+### 目录树方法
+
+| 方法 | 说明 |
+|------|------|
+| [storage.create_folder](#storagecreate_folder) | 创建目录 |
+| [storage.get_folder](#storageget_folder) | 查询目录 |
+| [storage.list_children](#storagelist_children) | 列出目录子节点 |
+| [storage.rename_folder](#storagerename_folder) | 重命名目录 |
+| [storage.move_folder](#storagemove_folder) | 移动目录 |
+| [storage.delete_folder](#storagedelete_folder) | 删除目录 |
+| [storage.resolve_path](#storageresolve_path) | 按路径解析节点 |
+
+### 对象管理方法
+
+| 方法 | 说明 |
+|------|------|
+| [storage.move_object](#storagemove_object) | 移动或重命名对象 |
+| [storage.copy_object](#storagecopy_object) | 复制对象 |
+| [storage.batch_delete](#storagebatch_delete) | 批量删除对象/目录 |
+| [storage.batch_head_object](#storagebatch_head_object) | 批量查询对象元数据 |
+| [storage.set_object_meta](#storageset_object_meta) | 更新对象元数据 |
+| [storage.get_object_url](#storageget_object_url) | 获取稳定对象 URL |
+| [storage.append_object](#storageappend_object) | 追加写对象 |
+
 ### 数据面协调方法
 
 | 方法 | 说明 |
@@ -31,6 +55,7 @@
 | [storage.create_share_link](#storagecreate_share_link) | 创建分享链接 |
 | [storage.list_share_links](#storagelist_share_links) | 列举分享链接 |
 | [storage.revoke_share_link](#storagerevoke_share_link) | 撤销分享链接 |
+| [storage.get_by_share](#storageget_by_share) | 通过分享短码读取对象 |
 
 ---
 
@@ -274,6 +299,186 @@ for obj in result["items"]:
 | `used_bytes` | integer | 已使用空间（字节） |
 | `object_count` | integer | 对象数量 |
 | `quota_bytes` | integer | 配额上限（字节），0 表示无限制 |
+
+---
+
+## storage.create_folder
+
+创建目录节点。目录和对象共用同一个 `bucket`，默认 bucket 为 `"default"`。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 否 | 完整目录路径；提供时优先使用 |
+| `name` | string | 否 | 目录名；未提供 `path` 时必填 |
+| `parent_folder_id` | string | 否 | 父目录 ID |
+| `parent_path` | string | 否 | 父目录路径，默认根目录 |
+| `bucket` | string | 否 | 存储桶，默认 `"default"` |
+| `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
+| `mkdirs` | boolean | 否 | 是否递归创建父目录 |
+| `metadata` | object | 否 | 目录元数据 |
+| `conflict_policy` | string | 否 | `"reject"` / `"return_existing"` |
+
+**响应**：返回 `folder`，同时在顶层展开 `folder_id`、`path`、`name`、`parent_folder_id`、`version` 等字段。
+
+---
+
+## storage.get_folder
+
+查询目录节点。
+
+**参数**：`folder_id` 或 `path` 至少提供一个；可选 `bucket`、`owner_aid`。
+
+**响应**：同 `storage.create_folder` 的 `folder` 视图。
+
+---
+
+## storage.list_children
+
+列出目录下的直接子目录和对象。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `folder_id` / `path` | string | 否 | 目标目录；都不传表示根目录 |
+| `type` | string | 否 | `"all"` / `"folder"` / `"object"`，默认 `"all"` |
+| `bucket` | string | 否 | 存储桶，默认 `"default"` |
+| `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
+| `page` | integer | 否 | 页码，默认 1 |
+| `size` | integer | 否 | 每页数量，最大受服务配置限制 |
+| `order_by` | string | 否 | `"name"` / `"updated_at"` / `"size_bytes"` |
+| `order` | string | 否 | `"asc"` / `"desc"` |
+| `include_metadata` | boolean | 否 | 是否返回元数据，默认 `true` |
+| `include_urls` | boolean | 否 | 是否返回 URL 字段，默认 `true` |
+
+**响应**：`folder`、`items`、`total`、`page`、`size`、`next_marker`。`items[].node_type` 区分 `folder` / `object`。
+
+---
+
+## storage.rename_folder
+
+重命名目录。根目录不可改名。
+
+**参数**：`folder_id` 或 `path`，`new_name` 必填；可选 `bucket`、`owner_aid`、`expected_version`。
+
+**响应**：更新后的 `folder` 视图。
+
+---
+
+## storage.move_folder
+
+移动目录。不能移动到自身或自身子目录。
+
+**参数**：`folder_id` 或 `path`，目标目录通过 `dst_parent_folder_id` 或 `dst_parent_path` 指定；可选 `new_name`、`bucket`、`owner_aid`、`expected_version`。
+
+**响应**：更新后的 `folder` 视图。
+
+---
+
+## storage.delete_folder
+
+删除目录。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `folder_id` / `path` | string | 是 | 待删除目录 |
+| `recursive` | boolean | 否 | 非空目录必须传 `true` |
+| `dry_run` | boolean | 否 | 只预览将删除的目录/对象 |
+| `bucket` | string | 否 | 存储桶，默认 `"default"` |
+| `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
+
+**响应**：`deleted_folders`、`deleted_objects`、`deleted_object_items`、`errors`；`dry_run=true` 时返回预览列表。
+
+---
+
+## storage.resolve_path
+
+按路径解析目录或对象。
+
+**参数**：`path` 必填；可选 `expected_type`（`"any"` / `"object"` / `"folder"`）、`bucket`、`owner_aid`。
+
+**响应**：`type`、`folder_id` 或 `object_id`、`path`、`status`。
+
+---
+
+## storage.move_object
+
+移动或重命名对象。
+
+**参数**：对象选择器（`object_id` / `object_key` / `path`），目标目录 `dst_parent_folder_id` 或 `dst_parent_path`；可选 `new_name`、`conflict_policy`（`"reject"` / `"replace"` / `"keep_both"`）、`expected_version`。
+
+**响应**：返回 `object`，同时在顶层展开对象视图字段。
+
+---
+
+## storage.copy_object
+
+复制对象，底层内容按 CAS 引用计数复用。
+
+**参数**：源对象选择器（`object_id` / `object_key` / `path`，也接受 `src_object_key` / `src_path`），目标 `dst_object_key` / `dst_path` 或目标父目录 + `new_name`；可选 `conflict_policy`、`copy_metadata`。
+
+**响应**：新对象视图。
+
+---
+
+## storage.batch_delete
+
+批量删除对象或目录。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `items` | array | 否 | 每项含 `type`、`object_id` / `object_key` / `path` / `folder_id` |
+| `object_keys` | string[] | 否 | 兼容简写，转为对象删除 |
+| `recursive` | boolean | 否 | 删除目录时是否递归 |
+| `dry_run` | boolean | 否 | 只预览 |
+
+**响应**：`deleted`、`errors`、`deleted_count`、`summary`。
+
+---
+
+## storage.batch_head_object
+
+批量查询对象元数据。
+
+**参数**：`object_ids`、`paths` 至少提供一类；可选 `owner_aid`、`bucket`、`include_missing`、`include_metadata`、`include_urls`。
+
+**响应**：`items` 和 `errors`。
+
+---
+
+## storage.set_object_meta
+
+更新对象元数据和可选 MIME 类型。
+
+**参数**：对象选择器，`metadata`；可选 `merge`（默认 `true`）、`content_type`、`expected_version`。
+
+**响应**：更新后的对象视图。
+
+---
+
+## storage.get_object_url
+
+获取稳定对象 URL。
+
+**参数**：对象选择器；可选 `include_path_url`。
+
+**响应**：`object_id`、`object_url`、`path_url`、`stable`。
+
+---
+
+## storage.append_object
+
+向对象尾部追加 base64 内容；对象不存在时创建。
+
+**参数**：与 `storage.put_object` 类似，`content` 必填；可选 `object_key` / `path` / `name`、`bucket`、`owner_aid`、`content_type`、`metadata`、`expected_version`、`is_private`。
+
+**响应**：对象视图。
 
 ---
 
@@ -596,6 +801,20 @@ share_url = result["aid_share_url"]
 | `share_id` | string | 被撤销的分享短码 |
 
 > 链接不存在或已撤销时返回通用错误（`-32000`）。
+
+---
+
+## storage.get_by_share
+
+通过分享短码读取对象。公开分享无需额外授权；私有白名单分享需要请求者 AID 在 `allowed_aids` 内。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `share_id` | string | 是 | 分享短码 |
+
+**响应**：小对象返回 `content`；大对象返回 `download_url`。同时返回 `object_id`、`object_key`、`path`、`size_bytes`、`content_type`、`sha256`。
 
 ---
 

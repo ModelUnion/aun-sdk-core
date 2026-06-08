@@ -1,10 +1,136 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.10）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.11）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → 工作区 (v0.4.11)。
+
+---
+
+## v0.4.11 — 相对于 v0.4.10 的变更
+
+> 基线：`0dbe71b4`（git HEAD，即 v0.4.10 提交）vs 工作区未提交改动。
+>
+> 四大变更块：**① Storage 目录树与扩展操作**、**② group.resources 树形资源系统**、**③ group.changed 事件保序去重重构**、**④ V2 E2EE 并发与容量保护**，外加若干独立修复（errors.py、SPK lifecycle、_pushed_seqs 防护）。
+
+### 块① Storage / group.resources 签名与非幂等方法扩展
+
+#### `client.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +208 | 修改 | `_NON_IDEMPOTENT_METHODS` | 新增 15 个 `storage.*` 方法：`storage.put_object`、`storage.get_by_share`、`storage.create_share_link`、`storage.revoke_share_link`、`storage.create_folder`、`storage.rename_folder`、`storage.move_folder`、`storage.delete_folder`、`storage.move_object`、`storage.copy_object`、`storage.batch_delete`、`storage.set_object_meta`、`storage.append_object`（原有 `storage.create_upload_session`/`storage.complete_upload`/`storage.delete_object` 保留） |
+| +208 | 修改 | `_NON_IDEMPOTENT_METHODS` | 新增 16 个 `group.resources.*` 方法：`create_folder`/`rename`/`move`/`mount_object`/`update`/`delete`/`cleanup_by_storage_ref`/`request_add`/`request_mount_object`/`direct_add`/`approve_request`/`reject_request`/`unmount`/`get_access`/`resolve_access_ticket`（在原有 `put` 基础上补全） |
+| +943 | 修改 | `_SIGNED_METHODS`（frozenset） | 与 `_NON_IDEMPOTENT_METHODS` 同步扩展：所有上述 `storage.*` 和 `group.resources.*` 方法均加入签名集合 |
+| +1069 | 修复 | `_cert_sha256_fingerprint` | 静态方法补 `self` 参数（原本缺失导致调用报错） |
+
+**对齐要点**：`_NON_IDEMPOTENT_METHODS` 控制非幂等 RPC 超时（35 秒 vs 默认 15 秒）；`_SIGNED_METHODS` 控制 `client_signature` 注入。Go 见 `client.go:nonIdempotentMethods` / `client.go:signedMethods`；TS/JS 见 `src/client/rpc-pipeline.ts`。所有 16 个 `group.resources.*` 和 15 个 `storage.*` 方法必须在四语言同步存在于这两个集合。
+
+---
+
+### 块② group.changed 事件保序去重重构
+
+> 原实现：`_on_raw_group_changed` 中直接 `dispatcher.publish("group.changed", data)`，event_seq 仅做空洞检测，不做有序缓冲和去重。新实现：将 group.changed 分发逻辑整体下沉到 `MessageDeliveryEngine`，通过 `group_event:{group_id}` namespace 做 SDK 内部保序消费，应用层回调不再影响 SDK 内部 cursor。
+
+#### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +92 | 修复 | `mark_published_seq()` / `is_published_seq()` | 改用 `getattr(client, "_pushed_seqs", None)` 防护，避免连接初期 `_pushed_seqs` 未初始化时 `AttributeError` |
+| +121 | 新增 | `is_group_event_namespace(ns)` (静态) | 判断 ns 是否为 `group_event:` 前缀 |
+| +128 | 新增 | `async publish_ordered_queue_item(ns, event, seq, payload, *, source)` | 有序队列项发布路由：`group.changed` + `group_event:` namespace 走 `publish_ordered_group_changed`，其余走 `_publish_app_event` |
+| +135 | 新增 | `async publish_ordered_group_changed(payload, *, source)` | group.changed 统一发布入口：①调 `handle_group_changed_v2_membership` SDK 内部消费；②`action == "dissolved"` 时调 `_cleanup_dissolved_group`；③发布给应用层 |
+| +145 | 新增 | `async handle_group_changed_event(data, group_id)` | 按 `group_event:{group_id}` 保序去重的完整实现：解析 `event_seq`（失败走 legacy 直发）→ 跳过 ≤ contiguous 或已发布的 seq → 入有序队列 → `on_message_seq` → drain → contiguous 推进后 `_persist_seq` + `_fire_ack(group.ack_events, ...)` → gap 检测触发补拉 |
+| +503 | 修改 | `publish_ordered_message()` 内 drain 路径 | 原 `_publish_app_event(event, payload)` 改为 `publish_ordered_queue_item(ns, event, seq, payload)`，使 group.changed drain 也走统一路由 |
+| +516 | 修改 | `publish_ordered_message()` 无 seq 分支 | 同上，改用 `publish_ordered_queue_item` |
+| +656 | 修改 | `_clamp_ack_params()` group.ack_events 分支 | ns 从 `group:{group_id}` 改为 `group_event:{group_id}`，防止与群消息 cursor 串用 |
+| +1271 | 修改 | `fill_group_event_gap_inner()` 补洞事件处理 | 原 `dispatcher.publish("group.changed", evt)` 改为：若 `es > 0` 且未发布则 `_enqueue_ordered_message`，之后统一 `drain_ordered_messages` 发布；`action == "dissolved"` 不持久化 seq（群已解散）|
+
+**对齐要点**：Go `handleGroupChangedEvent`（delivery.go）、TS/JS `handleGroupChangedEventSeq`（client/delivery.ts）需与此保持一致：1) 无 event_seq 时走 legacy 直发；2) ≤ contiguous 或已发布 seq 直接丢弃；3) 入有序队列后 drain；4) ack 使用 `group_event:` namespace；5) 补洞事件不触发二次补拉（`_from_gap_fill` 标记）；6) 解散事件不持久化 cursor。
+
+#### `client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1201 | 修改 | `_on_raw_group_changed()` | 有 group_id + dict 时改为 `await self._delivery().handle_group_changed_event(data, group_id)`；否则 `publish_ordered_group_changed(data, source="legacy")` |
+| +1393 | 新增 | `_cleanup_dissolved_group(group_id)` | 群解散后清理本地运行态：从 `_v2_bootstrap_cache` 移除 `group:{group_id}`、`_v2_group_security_levels` 移除 `group_id`、`_seq_tracker` 移除 `group:{group_id}` 和 `group_event:{group_id}`、`save_seq_tracker_state()`、清理 `_gap_fill_done`/`_pushed_seqs`/`_pending_ordered()` 中与 group_id 相关条目 |
+
+**对齐要点**：Go 见 `client.go:cleanupDissolvedGroup`；TS/JS 见 `client.ts:_cleanupDissolvedGroup`。解散清理必须同时清 `group:` 和 `group_event:` 两个 namespace。
+
+---
+
+### 块③ V2 E2EE 并发与容量保护
+
+#### `v2/session.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +24 | 新增常量 | `_PEER_IK_CACHE_MAX = 200` | 对端 IK 公钥缓存 LRU 容量上限 |
+| +23 | 新增常量 | `_VERIFIED_SPKS_MAX = 500` | 已验证 SPK 签名缓存上限 |
+| +60 | 修改 | `V2Session.__init__` | `_peer_ik_cache` 改为 `OrderedDict`（支持 LRU）；新增 `_group_register_lock = asyncio.Lock()` |
+| +204 | 修改 | `ensure_group_registered()` | 整体加 `async with self._group_register_lock`，防止并发注册产生重复 group SPK 上传 |
+| +348 | 修改 | `cache_peer_ik()` | 改为 LRU 逻辑：命中时 `move_to_end`，超 `_PEER_IK_CACHE_MAX` 时 `popitem(last=False)` 淘汰最旧 |
+| +374 | 修改 | `mark_peer_spk_verified()` | 超 `_VERIFIED_SPKS_MAX` 时 `_verified_spks.clear()` 重建，避免无限增长 |
+| +284 | 修改 | `_auto_destroy_spks()` 异常处理 | 三处 `except Exception: pass` 改为 `except Exception as e: _logger.warning(...)` |
+
+**对齐要点**：Go 见 `v2/session.go`（`groupRegisterMu sync.Mutex` / `peerIKCache` LRU 实现）；TS/JS 见 `v2/session/session.ts`（`_registeringPromise` 并发保护 / `_peerIKCache` Map + LRU）。`_group_register_lock` 须在注册期间全程持有（含 `ensure_keys` + `load_latest_uploaded` + `publish_group_spk`）。
+
+#### `v2/keystore.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +154 | 新增 | `V2KeyStore.delete_group_spk(device_id, group_id, spk_id)` | DELETE 单条群 SPK（`v2_device_keys` 表，key_type=group_spk）；供上传失败回滚用 |
+
+**对齐要点**：Go 见 `v2/keystore/sqlite.go:DeleteGroupSPK`；TS/JS 见 `v2/session/keystore.ts:deleteGroupSpk`。
+
+#### `v2/e2ee/spk_lifecycle.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +144 | 修改 | `SpkLifecycleManager._rotate_spk()` | 旧逻辑：先标记旧 SPK `pending_drain` → 写新 SPK → 回调上传。新逻辑：**先写新 SPK 入 store → 先上传（回调） → 上传成功后才标记旧 SPK `pending_drain`**，避免回调抛异常时旧 SPK 已被标记但新 SPK 未上传 |
+
+**对齐要点**：Go 见 `v2/e2ee/spk_lifecycle.go`（`rotateSPK`）；TS/JS 见 `v2/session/session.ts`（`_rotateGroupSpk`）。"先上传后 pending_drain" 是四语言一致的顺序要求。
+
+#### `_client/v2_e2ee.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +114 | 修改 | `_schedule_group_spk_rotation()` | 捕获 `rotate_group_spk` 异常后做回滚：若本地新 SPK（`session._store.load_current_group_spk`）与旧 SPK id 不同，则调 `session._store.delete_group_spk` 删除新 SPK，防止本地/服务端 spk_id 不一致 |
+| +193 | 修改 | `_retry_v2_sender_ik_pending()` | 仍未能解密的消息从原 `pop + 丢弃` 改为**保留队列继续重试**；同时发射 `message.undecryptable` / `group.message_undecryptable` 事件通知应用层；新增 `_V2_SENDER_IK_PENDING_MAX = 1000` 上限，超限淘汰最旧并 WARN |
+
+**对齐要点**：Go `scheduleGroupSpkRotation` 捕获局部变量 session 的 goroutine 逻辑（见 `client_v2_e2ee.go`）；TS/JS `_scheduleGroupSpkRotation` 捕获 session + rollback 逻辑。IK pending 保留+事件通知是四语言一致行为：不可静默丢弃；Go/TS/JS 需同步。
+
+---
+
+### 块④ 独立修复
+
+#### `errors.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +164 | 修复 | `map_remote_error()` | 在 `-32004 → PermissionError` 判断前插入特判：`code == -32004 and message.lower().startswith("rpc handler timeout")` 时映射为 `TimeoutError` |
+| +189 | 修改 | `map_remote_error()` retryable 计算 | `cls is RateLimitError` → `cls in {RateLimitError, TimeoutError}`，使 handler timeout 可重试 |
+
+**对齐要点**：Go 见 `errors.go:mapRemoteError`；TS/JS 见 `src/errors.ts:mapRemoteError`。-32004 的双分支映射需四语言完全一致：前缀匹配 `"rpc handler timeout"` → `TimeoutError`（retryable=true），其余 → `PermissionError`（retryable=false）。
+
+---
+
+### 测试新增
+
+| 文件 | 新增用例 | 说明 |
+|------|----------|------|
+| `tests/unit/test_client.py` | `test_group_changed_push_persists_and_acks_contiguous_event_seq` | 连续 push 推进 group_event tracker、持久化并 ack |
+| `tests/unit/test_client.py` | `test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app` | 高序号先到时补洞后保序去重，SDK 内部消费与应用层回调分离 |
+| `tests/unit/test_client.py` | `test_group_pull_events_acks_once_after_event_publish_final_contiguous` | ack_seq 断言从 4 改为 3（SDK 内部 contiguous_seq，不含 drain 中的应用层 seq） |
+| `tests/unit/test_client_signature.py` | `test_storage_mutation_method_is_non_idempotent`（参数化） | 16 个 storage 方法均在 `_NON_IDEMPOTENT_METHODS` |
+| `tests/unit/test_client_signature.py` | `test_group_resource_method_is_non_idempotent`（参数化） | 16 个 group.resources 方法均在 `_NON_IDEMPOTENT_METHODS` |
+| `tests/unit/test_trace.py` | `test_trace_event_observer_can_filter_after_background_rpc` | 后台 RPC trace 与目标事件 trace 混合时，observer 可按 type/event 筛选 |
+| `tests/integration_test_storage.py` | `test_storage_directory_tree_rename_move_delete` | 目录树 RPC 完整流程（权限/同名冲突/递归 path 更新/dry_run） |
+| `tests/integration_test_storage.py` | `test_storage_object_move_copy_batch_and_meta_edges` | move/copy/batch_delete/set_object_meta 边界（冲突策略/ID 稳定/dry_run 不删） |
+| `tests/integration_test_group_resources.py` | `test_group_resources_tree_folder_mount_rename_move_delete` | 群资源树操作完整流程（权限/create_folder/mount_object/rename/move/递归删除） |
+| `tests/integration_test_group_resources.py` | `test_group_resources_request_mount_cleanup_and_unmount_edges` | request_mount_object/approve/cleanup_by_storage_ref/unmount 边界 |
+| `tests/integration_test_group_resources.py` | `test_group_resources_storage_delete_marks_resource_missing` | storage 删除后群资源 status 自动标记 missing |
+| `tests/integration_test_group_resources.py` | `test_group_resources_mount_object_conflict_policy` | mount_object 冲突策略（reject/replace/keep_both） |
+| `tests/e2e_test_trace.py` | trace E2E 整体改进 | 新增 `_rpc_traces`/`_event_traces` 过滤辅助函数；`test_event_trace_propagation` 改用 `asyncio.Event` 等待目标消息，消除 sleep 竞态 |
+| `tests/e2e_test_group_e2ee.py` | `_ensure_connected` 重试 | 捕获 `TimeoutError`/`OSError` |
+
+### `version.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| +1 | 修改 | `__version__` | `"0.4.10"` → `"0.4.11"` |
 
 ---
 

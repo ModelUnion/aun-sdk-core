@@ -211,11 +211,81 @@ describe('group.changed 事件补洞行为', () => {
     expect(ackCalls).toHaveLength(1);
     expect(ackCalls[0].params).toMatchObject({
       group_id: 'g1',
-      event_seq: 4,
+      event_seq: 3,
       device_id: 'device-1',
       slot_id: 'slot-a',
     });
-    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(4);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
+    saveSpy.mockRestore();
+  });
+
+  it('高序号 push 先到时，补洞后 SDK 内部消费和应用层发布都按 event_seq 保序去重', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'slot-a';
+    const groupId = 'g1';
+    const ns = `group_event:${groupId}`;
+    (client as any)._seqTracker.restoreState({ [ns]: 1 });
+    const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
+
+    const internalConsumed: number[] = [];
+    vi.spyOn((client as any)._groupState, 'handleGroupChangedV2Membership').mockImplementation((payload: any) => {
+      internalConsumed.push(Number(payload.event_seq));
+    });
+    const appPublished: number[] = [];
+    client.on('group.changed', (payload: any) => {
+      appPublished.push(Number(payload.event_seq));
+    });
+
+    const delivery = (client as any)._delivery;
+    const fillSpy = vi.spyOn(delivery, 'fillGroupEventGap').mockResolvedValue(undefined);
+    await delivery.handleGroupChangedEventSeq({
+      group_id: groupId,
+      event_seq: 3,
+      event_type: 'group.member_removed',
+      action: 'member_removed',
+    }, groupId);
+    expect(internalConsumed).toEqual([]);
+    expect(appPublished).toEqual([]);
+    fillSpy.mockRestore();
+
+    let pullCount = 0;
+    (client as any).call = vi.fn(async (method: string) => {
+      if (method === 'group.pull_events') {
+        pullCount += 1;
+        if (pullCount === 1) {
+          return {
+            events: [{
+              group_id: groupId,
+              event_seq: 2,
+              event_type: 'group.member_added',
+              action: 'member_added',
+            }],
+            cursor: { current_seq: 2 },
+          };
+        }
+        return { events: [], cursor: { current_seq: 3 } };
+      }
+      return { ok: true };
+    });
+    (client as any)._transport.call = vi.fn(async () => ({ ok: true }));
+
+    await delivery.fillGroupEventGap(groupId);
+
+    expect(internalConsumed).toEqual([2, 3]);
+    expect(appPublished).toEqual([2, 3]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
+
+    await delivery.handleGroupChangedEventSeq({
+      group_id: groupId,
+      event_seq: 3,
+      event_type: 'group.member_removed',
+      action: 'member_removed',
+    }, groupId);
+    expect(internalConsumed).toEqual([2, 3]);
+    expect(appPublished).toEqual([2, 3]);
     saveSpy.mockRestore();
   });
 });

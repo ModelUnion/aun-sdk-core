@@ -271,4 +271,164 @@ describe('双域 Federation Storage 测试', () => {
       resource_path: resourcePath,
     })).rejects.toThrow();
   }, TEST_TIMEOUT);
+
+  it('群资源目录树跨域访问', async () => {
+    const rid = runId();
+    const alice = tracked('tree-alice');
+    const bob = tracked('tree-bob');
+    const eve = tracked('tree-eve');
+    const aliceAid = `ts-sto-tree-a-${rid}.aid.com`;
+    const bobAid = `ts-sto-tree-b-${rid}.aid.net`;
+    const eveAid = `ts-sto-tree-e-${rid}.aid.net`;
+
+    await ensureConnected(alice, aliceAid);
+    await ensureConnected(bob, bobAid);
+    await ensureConnected(eve, eveAid);
+
+    const objectKey = `group-tree/private-${rid}.txt`;
+    const content = Buffer.from(`TS_GROUP_TREE_RESOURCE_${rid}`, 'utf-8');
+    const put = await rpc(alice, 'storage.put_object', {
+      object_key: objectKey, content: content.toString('base64'),
+      content_type: 'text/plain', is_private: true,
+    });
+    const objectId = String(put.object_id ?? '');
+    expect(objectId).not.toBe('');
+
+    const created = await rpc(alice, 'group.create', { name: `ts-fed-tree-${rid}` });
+    const groupId = String(((created.group ?? {}) as JsonObject).group_id ?? '');
+    expect(groupId).not.toBe('');
+    await rpc(alice, 'group.add_member', { group_id: groupId, aid: bobAid });
+
+    const folder = await rpc(alice, 'group.resources.create_folder', {
+      group_id: groupId, path: `files/${rid}`, mkdirs: true,
+    });
+    const folderId = String(((folder.resource ?? {}) as JsonObject).resource_id ?? '');
+    expect(folderId).not.toBe('');
+
+    const mounted = await rpc(alice, 'group.resources.mount_object', {
+      group_id: groupId, parent_resource_id: folderId, name: 'private.txt',
+      storage_ref: { owner_aid: aliceAid, bucket: 'default', object_id: objectId, object_key: objectKey, filename: 'private.txt' },
+    });
+    const resource = (mounted.resource ?? {}) as JsonObject;
+    const resourceId = String(resource.resource_id ?? '');
+    const oldPath = `files/${rid}/private.txt`;
+    expect(resourceId).not.toBe('');
+    expect(String(resource.resource_path ?? '')).toBe(oldPath);
+    expect(String(((resource.storage_ref ?? {}) as JsonObject).object_id ?? '')).toBe(objectId);
+
+    await waitFor(
+      () => rpc(bob, 'group.resources.list_children', { group_id: groupId, resource_id: folderId }),
+      (value) => (Array.isArray(value.items) ? value.items : []).some(
+        (item) => String((item as JsonObject).resource_id ?? '') === resourceId,
+      ),
+      20_000, 500, '等待 Bob 列出群资源目录',
+    );
+
+    const access = await rpc(bob, 'group.resources.get_access', { group_id: groupId, resource_id: resourceId });
+    const downloadUrl = String(((access.download ?? {}) as JsonObject).download_url ?? '');
+    expect(downloadUrl).not.toBe('');
+    assertNonLoopbackUrl(downloadUrl, 'tree group.resources.get_access.download_url');
+    const body = await downloadBytes(downloadUrl);
+    expect(body.equals(content)).toBe(true);
+
+    const renamed = await rpc(alice, 'group.resources.rename', {
+      group_id: groupId, resource_id: resourceId, new_name: 'private-v2.txt',
+    });
+    const renamedRes = (renamed.resource ?? {}) as JsonObject;
+    expect(String(renamedRes.resource_id ?? '')).toBe(resourceId);
+    expect(String(renamedRes.resource_path ?? '')).toBe(`files/${rid}/private-v2.txt`);
+
+    await expect(rpc(bob, 'group.resources.resolve_path', {
+      group_id: groupId, path: oldPath, expected_type: 'file',
+    })).rejects.toThrow();
+
+    await expect(rpc(eve, 'group.resources.get_access', {
+      group_id: groupId, resource_id: resourceId,
+    })).rejects.toThrow();
+  }, TEST_TIMEOUT);
+
+  it('群资源申请清理边界跨域', async () => {
+    const rid = runId();
+    const alice = tracked('edge-alice');
+    const bob = tracked('edge-bob');
+    const aliceAid = `ts-sto-edge-a-${rid}.aid.com`;
+    const bobAid = `ts-sto-edge-b-${rid}.aid.net`;
+
+    await ensureConnected(alice, aliceAid);
+    await ensureConnected(bob, bobAid);
+
+    const created = await rpc(alice, 'group.create', { name: `ts-fed-edge-${rid}` });
+    const groupId = String(((created.group ?? {}) as JsonObject).group_id ?? '');
+    expect(groupId).not.toBe('');
+    await rpc(alice, 'group.add_member', { group_id: groupId, aid: bobAid });
+
+    // Bob 申请挂载公开对象
+    const bobObjectKey = `edge/request-${rid}.txt`;
+    const bobContent = Buffer.from(`REQUEST_MOUNT_${rid}`, 'utf-8');
+    const bobPut = await rpc(bob, 'storage.put_object', {
+      object_key: bobObjectKey, content: bobContent.toString('base64'),
+      content_type: 'text/plain', is_private: false,
+    });
+    const bobObjectId = String(bobPut.object_id ?? '');
+    expect(bobObjectId).not.toBe('');
+
+    const requestResult = await rpc(bob, 'group.resources.request_mount_object', {
+      group_id: groupId, path: `requests/${rid}/proposal.txt`,
+      storage_ref: { owner_aid: bobAid, bucket: 'default', object_id: bobObjectId, object_key: bobObjectKey, filename: 'proposal.txt' },
+    });
+    const reqObj = (requestResult.request ?? {}) as JsonObject;
+    const requestId = String(reqObj.request_id ?? '');
+    expect(requestId).not.toBe('');
+    expect(String(((reqObj.storage_ref ?? {}) as JsonObject).object_id ?? '')).toBe(bobObjectId);
+
+    await expect(rpc(bob, 'group.resources.approve_request', { request_id: requestId })).rejects.toThrow();
+
+    const approved = await rpc(alice, 'group.resources.approve_request', { request_id: requestId });
+    const approvedRes = (approved.resource ?? {}) as JsonObject;
+    const resourceId = String(approvedRes.resource_id ?? '');
+    expect(resourceId).not.toBe('');
+
+    const refs = await rpc(bob, 'group.resources.list_refs_by_storage', {
+      group_id: groupId, owner_aid: bobAid, object_key: bobObjectKey,
+    });
+    expect(Number(refs.total ?? 0)).toBe(1);
+
+    // cleanup（mark_missing）两个 Alice 的引用
+    const cleanupKey = `edge/cleanup-${rid}.txt`;
+    const cleanupPut = await rpc(alice, 'storage.put_object', {
+      object_key: cleanupKey, content: Buffer.from('cleanup').toString('base64'), content_type: 'text/plain',
+    });
+    const cleanupObjectId = String(cleanupPut.object_id ?? '');
+    for (const name of ['one.txt', 'two.txt']) {
+      await rpc(alice, 'group.resources.mount_object', {
+        group_id: groupId, path: `cleanup/${rid}/${name}`,
+        storage_ref: { owner_aid: aliceAid, bucket: 'default', object_id: cleanupObjectId, object_key: cleanupKey, filename: name },
+      });
+    }
+    const cleanup = await rpc(alice, 'group.resources.cleanup_by_storage_ref', {
+      group_id: groupId, owner_aid: aliceAid, object_id: cleanupObjectId, mode: 'mark_missing',
+    });
+    expect(Number(cleanup.affected_count ?? 0)).toBe(2);
+    const head = await rpc(alice, 'storage.head_object', { owner_aid: aliceAid, object_id: cleanupObjectId });
+    expect(String(head.object_id ?? '')).toBe(cleanupObjectId);
+
+    // unmount
+    const unmountKey = `edge/unmount-${rid}.txt`;
+    const unmountPut = await rpc(alice, 'storage.put_object', {
+      object_key: unmountKey, content: Buffer.from('unmount').toString('base64'), content_type: 'text/plain',
+    });
+    const unmountObjectId = String(unmountPut.object_id ?? '');
+    const mountedRes = await rpc(alice, 'group.resources.mount_object', {
+      group_id: groupId, path: `unmount/${rid}/file.txt`,
+      storage_ref: { owner_aid: aliceAid, bucket: 'default', object_id: unmountObjectId, object_key: unmountKey, filename: 'file.txt' },
+    });
+    const mountedId = String(((mountedRes.resource ?? {}) as JsonObject).resource_id ?? '');
+    const unmounted = await rpc(alice, 'group.resources.unmount', { group_id: groupId, resource_id: mountedId });
+    expect(unmounted.deleted).toBe(true);
+    await expect(rpc(bob, 'group.resources.resolve_path', {
+      group_id: groupId, path: `unmount/${rid}/file.txt`,
+    })).rejects.toThrow();
+    const stillHead = await rpc(alice, 'storage.head_object', { owner_aid: aliceAid, object_id: unmountObjectId });
+    expect(String(stillHead.object_id ?? '')).toBe(unmountObjectId);
+  }, TEST_TIMEOUT);
 });

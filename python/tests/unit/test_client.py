@@ -3247,6 +3247,52 @@ async def test_group_changed_skips_fill_when_no_gap():
 
 
 @pytest.mark.asyncio
+async def test_group_changed_push_persists_and_acks_contiguous_event_seq():
+    """连续 group.changed push 应推进 group_event tracker，并持久化/ack 服务端事件 cursor。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker.restore_state({"group_event:G1": 5})
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    client._fill_group_event_gap = AsyncMock()
+    client._group_state_coordinator = MagicMock()
+    client._group_state_coordinator.handle_group_changed_v2_membership = MagicMock()
+    persisted: list[str] = []
+    client._persist_seq = lambda ns: persisted.append(ns)
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_safe_ack(method, params, label=""):
+        calls.append((method, dict(params)))
+
+    client._safe_ack = fake_safe_ack
+    client._transport = object()
+
+    await client._on_raw_group_changed({"group_id": "G1", "event_seq": 6, "action": "foo"})
+    await asyncio.sleep(0)
+
+    assert persisted == ["group_event:G1"]
+    assert calls == [("group.ack_events", {
+        "group_id": "G1",
+        "event_seq": 6,
+        "device_id": "device-1",
+        "slot_id": "slot-a",
+    })]
+    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 6
+    client._fill_group_event_gap.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_group_changed_triggers_fill_when_gap():
     """gap 检测：event_seq 跳跃触发 _fill_group_event_gap。"""
     from unittest.mock import AsyncMock, MagicMock
@@ -3371,6 +3417,92 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
 
 
 @pytest.mark.asyncio
+async def test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app():
+    """高序号 push 先到时，pull 补洞后 SDK 内部消费和应用发布都必须保序去重。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._state = "connected"
+    client._closing = False
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._seq_tracker = SeqTracker()
+    ns = "group_event:g1"
+    client._seq_tracker.restore_state({ns: 1})
+    client._gap_fill_done = {}
+    client._pushed_seqs = {}
+    client._loop = asyncio.get_running_loop()
+    client._persist_seq = lambda _ns: None
+    client._verify_event_signature = AsyncMock(return_value=True)
+    client._fill_group_event_gap = AsyncMock()
+
+    internal_consumed: list[int] = []
+    group_state = MagicMock()
+    group_state.handle_group_changed_v2_membership = MagicMock(
+        side_effect=lambda payload: internal_consumed.append(int(payload["event_seq"]))
+    )
+    client._group_state_coordinator = group_state
+
+    app_published: list[int] = []
+
+    async def fake_publish(event, payload):
+        if event == "group.changed":
+            app_published.append(int(payload["event_seq"]))
+
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock(side_effect=fake_publish)
+
+    async def fake_call(method, params):
+        if method == "group.pull_events":
+            return {
+                "events": [{
+                    "group_id": "g1",
+                    "event_seq": 2,
+                    "event_type": "group.member_added",
+                    "action": "member_added",
+                }],
+                "count": 1,
+                "cursor": {"current_seq": 2},
+            }
+        return {"ok": True}
+
+    client.call = AsyncMock(side_effect=fake_call)
+    transport = MagicMock()
+    transport.call = AsyncMock(return_value={"ok": True})
+    client._transport = transport
+
+    await client._on_raw_group_changed({
+        "group_id": "g1",
+        "event_seq": 3,
+        "event_type": "group.member_removed",
+        "action": "member_removed",
+    })
+    await asyncio.sleep(0)
+    assert internal_consumed == []
+    assert app_published == []
+
+    await client._delivery().fill_group_event_gap_inner("g1", ns)
+
+    assert internal_consumed == [2, 3]
+    assert app_published == [2, 3]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+
+    await client._on_raw_group_changed({
+        "group_id": "g1",
+        "event_seq": 3,
+        "event_type": "group.member_removed",
+        "action": "member_removed",
+    })
+    assert internal_consumed == [2, 3]
+    assert app_published == [2, 3]
+
+
+@pytest.mark.asyncio
 async def test_group_pull_events_empty_page_advances_cursor_without_ack():
     """group.pull_events 空页可修正本地 cursor，但不应发送 ack_events。"""
     from unittest.mock import AsyncMock, MagicMock
@@ -3413,7 +3545,7 @@ async def test_group_pull_events_empty_page_advances_cursor_without_ack():
 
 @pytest.mark.asyncio
 async def test_group_pull_events_acks_once_after_event_publish_final_contiguous():
-    """事件发布阶段可继续推进 tracker，pull 结束后只 ack 一次最终 contiguous_seq。"""
+    """应用层回调不应影响 SDK group_event 消费 cursor，pull 结束后只 ack SDK 内部 contiguous_seq。"""
     from unittest.mock import AsyncMock, MagicMock
 
     from aun_core.client import AUNClient
@@ -3431,6 +3563,9 @@ async def test_group_pull_events_acks_once_after_event_publish_final_contiguous(
     client._gap_fill_done = {}
     client._persist_seq = lambda ns: None
     client._verify_event_signature = AsyncMock(return_value=True)
+    client._group_state_coordinator = MagicMock()
+    client._group_state_coordinator.handle_group_changed_v2_membership = MagicMock()
+    client._group_state_coordinator.postprocess_result = AsyncMock(side_effect=lambda _method, _params, result: result)
     transport = MagicMock()
     calls: list[tuple[str, dict]] = []
 
@@ -3463,7 +3598,7 @@ async def test_group_pull_events_acks_once_after_event_publish_final_contiguous(
     await client._fill_group_event_gap("g1")
 
     ack_calls = [params for method, params in calls if method == "group.ack_events"]
-    assert ack_calls == [{"group_id": "g1", "event_seq": 4, "device_id": "device-1", "slot_id": "slot-a"}]
+    assert ack_calls == [{"group_id": "g1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}]
     assert client._seq_tracker.get_contiguous_seq(ns) == 4
 
 

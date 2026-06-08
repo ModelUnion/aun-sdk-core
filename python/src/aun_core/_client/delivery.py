@@ -92,12 +92,19 @@ class MessageDeliveryEngine:
     def mark_published_seq(self, ns: str, seq: int) -> None:
         """记录已发布到应用层的 seq，供 push/pull/补洞路径统一去重。"""
         client = self.client
-        client._pushed_seqs.setdefault(ns, set()).add(seq)
+        pushed = getattr(client, "_pushed_seqs", None)
+        if pushed is None:
+            pushed = {}
+            client._pushed_seqs = pushed
+        pushed.setdefault(ns, set()).add(seq)
         client._enforce_pushed_seqs_limit(ns)
 
     def is_published_seq(self, ns: str, seq: int) -> bool:
         """republish guard：同一 namespace + seq 在应用层只发布一次。"""
-        return seq in self.client._pushed_seqs.get(ns, set())
+        pushed = getattr(self.client, "_pushed_seqs", None)
+        if pushed is None:
+            return False
+        return seq in pushed.get(ns, set())
 
     def is_pending_ordered_seq(self, ns: str, seq: int) -> bool:
         """同一 namespace + seq 已解密并等待有序发布。"""
@@ -113,6 +120,83 @@ class MessageDeliveryEngine:
         if len(queue) > _PENDING_ORDERED_LIMIT:
             for old_seq in sorted(queue)[: len(queue) - _PENDING_ORDERED_LIMIT]:
                 queue.pop(old_seq, None)
+
+    @staticmethod
+    def is_group_event_namespace(ns: str) -> bool:
+        return ns.startswith("group_event:")
+
+    async def publish_ordered_queue_item(self, ns: str, event: str, seq: int, payload: Any, *, source: str) -> None:
+        client = self.client
+        if event == "group.changed" and self.is_group_event_namespace(ns):
+            await self.publish_ordered_group_changed(payload, source=source)
+            return
+        await client._publish_app_event(event, payload, source=source)
+
+    async def publish_ordered_group_changed(self, payload: Any, *, source: str = "ordered") -> None:
+        client = self.client
+        if isinstance(payload, dict):
+            client._group_state().handle_group_changed_v2_membership(payload)
+            if payload.get("action") == "dissolved":
+                group_id = str(payload.get("group_id") or "").strip()
+                if group_id:
+                    client._cleanup_dissolved_group(group_id)
+        await client._publish_app_event("group.changed", payload, source=source)
+
+    async def handle_group_changed_event(self, data: dict[str, Any], group_id: str) -> None:
+        """按 group_event:{group_id} 对 group.changed 做 SDK 内部消费和应用发布保序。"""
+        client = self.client
+        raw_event_seq = data.get("event_seq")
+        try:
+            event_seq = int(raw_event_seq)
+        except (TypeError, ValueError) as exc:
+            client._log.debug(
+                "client",
+                "group.changed event_seq parse failed: group=%s event_seq=%r err=%s",
+                group_id, raw_event_seq, exc,
+            )
+            await self.publish_ordered_group_changed(data, source="legacy")
+            return
+
+        if event_seq <= 0 or not group_id:
+            await self.publish_ordered_group_changed(data, source="legacy")
+            return
+
+        ns = f"group_event:{group_id}"
+        contig_before = client._seq_tracker.get_contiguous_seq(ns)
+        if event_seq <= contig_before or client._is_published_seq(ns, event_seq):
+            client._log.debug(
+                "client",
+                "group.changed skipped duplicate/stale: group=%s event_seq=%d contiguous=%d",
+                group_id, event_seq, contig_before,
+            )
+            return
+
+        client._enqueue_ordered_message(ns, "group.changed", event_seq, data)
+        need_pull = client._seq_tracker.on_message_seq(ns, event_seq)
+        ack_contig = client._seq_tracker.get_contiguous_seq(ns)
+        ack_max_seen = client._seq_tracker.get_max_seen_seq(ns)
+        await client._drain_ordered_messages(ns)
+
+        if ack_contig > 0 and ack_contig != contig_before:
+            if getattr(client, "_aid", "") and data.get("action") != "dissolved":
+                client._persist_seq(ns)
+            if getattr(client, "_transport", None) is not None:
+                ack_seq = min(ack_contig, ack_max_seen or ack_contig)
+                client._fire_ack("group.ack_events", {
+                    "group_id": group_id,
+                    "event_seq": ack_seq,
+                    "device_id": getattr(client, "_device_id", ""),
+                    "slot_id": getattr(client, "_slot_id", ""),
+                }, "group event push")
+
+        if need_pull and not data.get("_from_gap_fill"):
+            client._log.debug(
+                "client",
+                "group.changed event gap detected, triggering gap fill: group=%s event_seq=%s",
+                group_id, raw_event_seq,
+            )
+            loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
+            loop.create_task(client._fill_group_event_gap(group_id))
 
     @staticmethod
     def is_instance_scoped_message_event(event: str) -> bool:
@@ -419,7 +503,7 @@ class MessageDeliveryEngine:
             if client._is_published_seq(ns, seq):
                 client._log.debug("client", "publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, seq, event)
                 continue
-            await client._publish_app_event(event, payload, source="ordered-drain")
+            await self.publish_ordered_queue_item(ns, event, seq, payload, source="ordered-drain")
             client._mark_published_seq(ns, seq)
             client._log.debug("client", "publish ordered drain delivered: ns=%s seq=%d event=%s", ns, seq, event)
         if not pending:
@@ -432,11 +516,11 @@ class MessageDeliveryEngine:
             seq_i = int(seq)
         except (TypeError, ValueError):
             client._log.debug("client", "publish ordered direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq)
-            await client._publish_app_event(event, payload, source="ordered")
+            await self.publish_ordered_queue_item(ns, event, 0, payload, source="ordered")
             return True
         if seq_i <= 0:
             client._log.debug("client", "publish ordered direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq_i)
-            await client._publish_app_event(event, payload, source="ordered")
+            await self.publish_ordered_queue_item(ns, event, seq_i, payload, source="ordered")
             return True
         if client._is_published_seq(ns, seq_i):
             # 如果同 seq 也曾挂起，顺手清理，避免后续 drain 重复处理。
@@ -470,7 +554,7 @@ class MessageDeliveryEngine:
             pending.pop(seq_i, None)
             if not pending:
                 client._pending_ordered().pop(ns, None)
-        await client._publish_app_event(event, payload, source="ordered")
+        await self.publish_ordered_queue_item(ns, event, seq_i, payload, source="ordered")
         client._mark_published_seq(ns, seq_i)
         client._log.debug("client", "publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
         await client._drain_ordered_messages(ns)
@@ -572,12 +656,14 @@ class MessageDeliveryEngine:
         # Group ack: ns 来自 group_id
         if method in ("group.v2.ack", "group.ack_messages", "group.ack_events"):
             group_id = str(params.get("group_id") or "").strip()
-            ns = f"group:{group_id}" if group_id else ""
             if method == "group.v2.ack":
+                ns = f"group:{group_id}" if group_id else ""
                 return _clamp_field(params, "up_to_seq", ns)
             if method == "group.ack_messages":
+                ns = f"group:{group_id}" if group_id else ""
                 return _clamp_field(params, "msg_seq", ns)
             if method == "group.ack_events":
+                ns = f"group_event:{group_id}" if group_id else ""
                 return _clamp_field(params, "event_seq", ns)
         return params
 
@@ -1185,6 +1271,7 @@ class MessageDeliveryEngine:
                         client._seq_tracker.force_contiguous_seq(ns, server_ack)
 
                 event_seqs: list[int] = []
+                has_dissolved_event = False
                 for evt in events:
                     if isinstance(evt, dict):
                         try:
@@ -1194,6 +1281,8 @@ class MessageDeliveryEngine:
                         if es > 0:
                             event_seqs.append(es)
                         evt["_from_gap_fill"] = True
+                        if evt.get("action") == "dissolved":
+                            has_dissolved_event = True
                         et = evt.get("event_type", "")
                         if et == "group.message_created":
                             continue
@@ -1203,14 +1292,17 @@ class MessageDeliveryEngine:
                                 evt.pop("client_signature", None)
                             else:
                                 evt["_verified"] = await client._verify_event_signature(evt, cs)
-                        await client._dispatcher.publish("group.changed", evt)
+                        if es > 0 and not client._is_published_seq(ns, es):
+                            client._enqueue_ordered_message(ns, "group.changed", es, evt)
 
-                contig = client._seq_tracker.get_contiguous_seq(ns)
-                if contig != page_contig_before:
+                ack_contig = client._seq_tracker.get_contiguous_seq(ns)
+                ack_max_seen = client._seq_tracker.get_max_seen_seq(ns)
+                await client._drain_ordered_messages(ns)
+
+                if ack_contig != page_contig_before and not has_dissolved_event:
                     client._persist_seq(ns)
-                if events and contig > 0 and contig != page_contig_before:
-                    max_seen_ack = client._seq_tracker.get_max_seen_seq(ns)
-                    ack_seq = min(contig, max_seen_ack) if max_seen_ack > 0 else contig
+                if events and ack_contig > 0 and ack_contig != page_contig_before:
+                    ack_seq = min(ack_contig, ack_max_seen) if ack_max_seen > 0 else ack_contig
                     try:
                         await client._transport.call("group.ack_events", {
                             "group_id": group_id, "event_seq": ack_seq,

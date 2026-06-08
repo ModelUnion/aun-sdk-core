@@ -293,8 +293,8 @@ async def test_storage_inline_permissions_events_and_quota():
                 for item in events
             )
             expected_events = sorted([
-                ("put", private_key),
-                ("put", public_key),
+                ("put_object", private_key),
+                ("put_object", public_key),
                 ("delete", private_key),
                 ("delete", public_key),
             ])
@@ -852,6 +852,187 @@ async def test_storage_cas_dedup_and_instant_upload_download():
         await alice.close()
 
 
+async def test_storage_directory_tree_rename_move_delete():
+    """覆盖目录树 RPC：权限、同名冲突、递归 path 更新、ID 稳定和非空删除。"""
+    rid = uuid.uuid4().hex[:10]
+    alice = _make_client()
+    bob = _make_client()
+    bucket = f"storage-tree-{rid}"
+    body = f"tree-report-{rid}".encode("utf-8")
+    share_id = ""
+
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+
+        await _expect_failure(
+            lambda: bob.call("storage.create_folder", {
+                "owner_aid": _ALICE_AID,
+                "bucket": bucket,
+                "path": "docs",
+            }),
+            "Bob 不能管理 Alice 的 storage 目录",
+        )
+
+        folder = await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "path": "docs/sub",
+            "mkdirs": True,
+            "metadata": {"rid": rid},
+        })
+        folder_id = str(folder.get("folder_id") or "")
+        if not folder_id:
+            raise AssertionError(f"create_folder 未返回 folder_id: {folder}")
+
+        put = await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_key": "docs/sub/report.txt",
+            "content": _b64(body),
+            "content_type": "text/plain",
+            "is_private": False,
+        })
+        object_id = str(put.get("object_id") or "")
+        if not object_id:
+            raise AssertionError(f"put_object 未返回 object_id: {put}")
+
+        listed = await alice.call("storage.list_children", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "path": "docs/sub",
+        })
+        names = {(item.get("node_type"), item.get("name")) for item in listed.get("items", [])}
+        if ("object", "report.txt") not in names:
+            raise AssertionError(f"list_children 未返回文件节点: {listed}")
+
+        share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_id": object_id,
+            "allowed_aids": ["*"],
+            "expire_in_seconds": 300,
+        })
+        share_id = str(share.get("share_id") or "")
+        if not share_id:
+            raise AssertionError(f"create_share_link 未返回 share_id: {share}")
+
+        await alice.call("storage.rename_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "folder_id": folder_id,
+            "new_name": "renamed",
+        })
+        by_id = await alice.call("storage.head_object", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_id": object_id,
+        })
+        if by_id.get("path") != "docs/renamed/report.txt":
+            raise AssertionError(f"rename_folder 后 object path 异常: {by_id}")
+        await _expect_failure(
+            lambda: alice.call("storage.resolve_path", {
+                "owner_aid": _ALICE_AID,
+                "bucket": bucket,
+                "path": "docs/sub/report.txt",
+                "expected_type": "object",
+            }),
+            "rename_folder 后旧 path 失效",
+        )
+
+        shared_after_rename = await bob.call("storage.get_by_share", {"share_id": share_id})
+        if shared_after_rename.get("object_id") != object_id:
+            raise AssertionError(f"分享链接未通过 target_id 稳定解析: {shared_after_rename}")
+        if base64.b64decode(str(shared_after_rename.get("content") or "")) != body:
+            raise AssertionError("rename_folder 后分享链接内容不匹配")
+
+        archive = await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "path": "archive",
+        })
+        renamed = await alice.call("storage.resolve_path", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "path": "docs/renamed",
+            "expected_type": "folder",
+        })
+        await alice.call("storage.move_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "folder_id": renamed["folder_id"],
+            "dst_parent_folder_id": archive["folder_id"],
+            "new_name": "moved",
+        })
+        moved = await alice.call("storage.resolve_path", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "path": "archive/moved/report.txt",
+            "expected_type": "object",
+        })
+        if moved.get("object_id") != object_id:
+            raise AssertionError(f"move_folder 后 object_id 不稳定: {moved}")
+
+        url_info = await alice.call("storage.get_object_url", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_id": object_id,
+        })
+        _assert_non_loopback_url(str(url_info.get("object_url") or ""), "storage.get_object_url.object_url")
+
+        await _expect_failure(
+            lambda: alice.call("storage.delete_folder", {
+                "owner_aid": _ALICE_AID,
+                "bucket": bucket,
+                "folder_id": archive["folder_id"],
+            }),
+            "非空目录 recursive=false 删除被拒绝",
+        )
+        dry = await alice.call("storage.delete_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "folder_id": archive["folder_id"],
+            "recursive": True,
+            "dry_run": True,
+        })
+        if dry.get("dry_run") is not True or int(dry.get("deleted_objects") or 0) != 1:
+            raise AssertionError(f"delete_folder dry_run 返回异常: {dry}")
+        still_there = await alice.call("storage.head_object", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_id": object_id,
+        })
+        if still_there.get("object_id") != object_id:
+            raise AssertionError(f"dry_run 误删对象: {still_there}")
+
+        deleted = await alice.call("storage.delete_folder", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "folder_id": archive["folder_id"],
+            "recursive": True,
+        })
+        if int(deleted.get("deleted_objects") or 0) != 1:
+            raise AssertionError(f"recursive delete 未删除子对象: {deleted}")
+        await _expect_failure(
+            lambda: alice.call("storage.head_object", {
+                "owner_aid": _ALICE_AID,
+                "bucket": bucket,
+                "object_id": object_id,
+            }),
+            "recursive delete 后 object_id 失效",
+        )
+
+        _ok("storage_directory_tree_rename_move_delete")
+    finally:
+        if share_id:
+            try:
+                await alice.call("storage.revoke_share_link", {"share_id": share_id})
+            except Exception:
+                pass
+        await bob.close()
+        await alice.close()
+
+
 async def test_storage_share_links_and_short_urls():
     """覆盖分享链接 RPC、短链接 HTTP 下载、授权名单、次数限制和撤销。"""
     rid = uuid.uuid4().hex[:10]
@@ -1012,6 +1193,7 @@ async def test_storage_logical_url_public_and_private():
     bucket = "default"  # 逻辑 URL 仅支持 default bucket
     pub_key = f"logical/{rid}/pub.bin"
     priv_key = f"logical/{rid}/priv.bin"
+    small_key = f"logical/{rid}/small.txt"
     pub_body = (b"LOGICAL-PUB-" + rid.encode()) * 4096
     priv_body = (b"LOGICAL-PRIV-" + rid.encode()) * 4096
 
@@ -1060,7 +1242,6 @@ async def test_storage_logical_url_public_and_private():
         print(f"  logical_url={logical_url}")
 
         # 验证 put_object 也返回 url 字段
-        small_key = f"logical/{rid}/small.txt"
         put_res = await alice.call("storage.put_object", {
             "owner_aid": _ALICE_AID, "object_key": small_key,
             "content": __import__("base64").b64encode(b"hello").decode(),
@@ -1108,6 +1289,167 @@ async def test_storage_logical_url_public_and_private():
         await alice.close()
 
 
+async def test_storage_object_move_copy_batch_and_meta_edges():
+    """覆盖 move/copy/batch/meta 的真实 RPC 边界：冲突策略、ID 稳定、dry_run 不删除。"""
+    rid = uuid.uuid4().hex[:10]
+    alice = _make_client()
+    bob = _make_client()
+    bucket = f"storage-ops-{rid}"
+    share_id = ""
+
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+
+        await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "path": "docs",
+        })
+        archive = await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "path": "archive",
+        })
+        await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "path": "archive/existing",
+        })
+        first_body = f"alpha-{rid}".encode("utf-8")
+        first = await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": "docs/a.txt",
+            "content": _b64(first_body), "content_type": "text/plain",
+            "metadata": {"stage": "new"},
+        })
+        second = await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": "archive/a.txt",
+            "content": _b64(f"beta-{rid}".encode("utf-8")), "content_type": "text/plain",
+        })
+        object_id = str(first.get("object_id") or "")
+        if not object_id:
+            raise AssertionError(f"put_object 未返回 object_id: {first}")
+
+        await _expect_failure(
+            lambda: alice.call("storage.move_object", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+                "dst_parent_path": "archive",
+            }),
+            "move_object 同名文件 reject 冲突",
+        )
+        await _expect_failure(
+            lambda: alice.call("storage.move_object", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+                "dst_parent_path": "archive", "new_name": "existing",
+            }),
+            "move_object 目标同名目录冲突",
+        )
+        await _expect_failure(
+            lambda: bob.call("storage.move_object", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+                "dst_parent_path": "archive", "new_name": "blocked.txt",
+            }),
+            "Bob 不能 move Alice 对象",
+        )
+
+        moved = await alice.call("storage.move_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "dst_parent_path": "archive", "new_name": "a.txt",
+            "conflict_policy": "keep_both",
+        })
+        if moved.get("object_id") != object_id or moved.get("path") != "archive/a-1.txt":
+            raise AssertionError(f"move_object keep_both 返回异常: {moved}")
+        await _expect_failure(
+            lambda: alice.call("storage.head_object", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": "docs/a.txt",
+            }),
+            "move_object 后旧 path 失效",
+        )
+
+        share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "allowed_aids": ["*"], "expire_in_seconds": 300,
+        })
+        share_id = str(share.get("share_id") or "")
+        renamed = await alice.call("storage.move_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "dst_parent_path": "docs", "new_name": "final.txt",
+        })
+        if renamed.get("path") != "docs/final.txt":
+            raise AssertionError(f"move_object rename path 异常: {renamed}")
+        shared = await bob.call("storage.get_by_share", {"share_id": share_id})
+        if shared.get("object_id") != object_id or base64.b64decode(str(shared.get("content") or "")) != first_body:
+            raise AssertionError(f"分享链接未按 target_id 稳定解析: {shared}")
+
+        copied_keep = await alice.call("storage.copy_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "dst_parent_path": "archive", "new_name": "a.txt", "conflict_policy": "keep_both",
+        })
+        if copied_keep.get("object_id") == object_id or copied_keep.get("path") != "archive/a-1.txt":
+            raise AssertionError(f"copy_object keep_both 返回异常: {copied_keep}")
+        copied_replace = await alice.call("storage.copy_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "dst_parent_path": "archive", "new_name": "a.txt", "conflict_policy": "replace",
+        })
+        if copied_replace.get("object_id") in {object_id, second.get("object_id")} or copied_replace.get("path") != "archive/a.txt":
+            raise AssertionError(f"copy_object replace 返回异常: {copied_replace}")
+
+        await _expect_failure(
+            lambda: bob.call("storage.set_object_meta", {
+                "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+                "metadata": {"blocked": True},
+            }),
+            "Bob 不能 set Alice 对象 meta",
+        )
+        updated = await alice.call("storage.set_object_meta", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": object_id,
+            "metadata": {"stage": "final"}, "content_type": "text/markdown",
+        })
+        if updated.get("path") != "docs/final.txt" or (updated.get("metadata") or {}).get("stage") != "final":
+            raise AssertionError(f"set_object_meta 返回异常: {updated}")
+
+        keep_folder = await alice.call("storage.create_folder", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "path": "batch/folder", "mkdirs": True,
+        })
+        batch_obj = await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": "batch/folder/item.txt",
+            "content": _b64(b"batch"), "content_type": "text/plain",
+        })
+        dry = await alice.call("storage.batch_delete", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "dry_run": True, "recursive": True,
+            "items": [
+                {"type": "object", "object_id": copied_keep["object_id"]},
+                {"type": "folder", "folder_id": keep_folder["folder_id"]},
+            ],
+        })
+        if (dry.get("summary") or {}).get("errors") != 0:
+            raise AssertionError(f"batch_delete dry_run 返回异常: {dry}")
+        still_copy = await alice.call("storage.head_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": copied_keep["object_id"],
+        })
+        still_batch = await alice.call("storage.head_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": batch_obj["object_id"],
+        })
+        if not still_copy.get("object_id") or not still_batch.get("object_id"):
+            raise AssertionError("batch_delete dry_run 误删对象")
+        mixed = await alice.call("storage.batch_delete", {
+            "owner_aid": _ALICE_AID, "bucket": bucket,
+            "items": [
+                {"type": "folder", "folder_id": keep_folder["folder_id"]},
+                {"type": "object", "object_id": copied_keep["object_id"]},
+            ],
+        })
+        if (mixed.get("summary") or {}).get("errors") != 1 or (mixed.get("summary") or {}).get("deleted") != 1:
+            raise AssertionError(f"batch_delete 混合删除摘要异常: {mixed}")
+        await alice.call("storage.head_object", {
+            "owner_aid": _ALICE_AID, "bucket": bucket, "object_id": batch_obj["object_id"],
+        })
+
+        _ok("storage_object_move_copy_batch_and_meta_edges")
+    finally:
+        if share_id:
+            try:
+                await alice.call("storage.revoke_share_link", {"share_id": share_id})
+            except Exception:
+                pass
+        await bob.close()
+        await alice.close()
+
+
 async def main():
     global _failed
 
@@ -1121,10 +1463,12 @@ async def main():
         test_storage_inline_permissions_events_and_quota,
         test_storage_upload_session_roundtrip_and_download_ticket,
         test_storage_cas_dedup_and_instant_upload_download,
+        test_storage_directory_tree_rename_move_delete,
         test_storage_prefix_pagination_and_version_conflict,
         test_storage_validation_ttl_and_upload_conflicts,
         test_storage_share_links_and_short_urls,
         test_storage_logical_url_public_and_private,
+        test_storage_object_move_copy_batch_and_meta_edges,
     ]
 
     for fn in tests:

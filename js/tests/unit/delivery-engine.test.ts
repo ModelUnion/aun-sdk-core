@@ -15,6 +15,7 @@ function createSeqTracker(initial: Record<string, number> = {}) {
     onMessageSeq: vi.fn((ns: string, seq: number) => {
       const current = contiguous.get(ns) ?? 0;
       const next = Number(seq) || 0;
+      if (next > 0) maxSeen.set(ns, Math.max(maxSeen.get(ns) ?? 0, next));
       if (next === current + 1) {
         contiguous.set(ns, next);
         return false;
@@ -124,6 +125,7 @@ function createEngine(): {
     _callRawV2Rpc: vi.fn(async () => ({ ok: true })),
     _shouldSkipEventSignature: vi.fn(() => false),
     _verifyEventSignature: vi.fn(async () => true),
+    _isEventSignatureVerified: vi.fn((value: unknown) => value === true),
     _transport: { call: vi.fn(async () => ({ ok: true })) },
     call: vi.fn(async () => ({ ok: true })),
   };
@@ -443,12 +445,12 @@ describe('MessageDeliveryEngine 组件边界', () => {
     expect(seqTracker.getContiguousSeq(ns)).toBe(2);
   });
 
-  it('handleGroupChangedEventSeq 遇到 _from_gap_fill 事件不递归触发补洞', () => {
+  it('handleGroupChangedEventSeq 遇到 _from_gap_fill 事件不递归触发补洞', async () => {
     const { engine, client, seqTracker } = createEngine();
     const groupId = 'g1';
     seqTracker.setContiguousSeq(`group_event:${groupId}`, 1);
 
-    engine.handleGroupChangedEventSeq({
+    await engine.handleGroupChangedEventSeq({
       group_id: groupId,
       event_seq: 3,
       _from_gap_fill: true,
@@ -456,5 +458,27 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
     expect(client._safeAsync).not.toHaveBeenCalled();
     expect(client.call).not.toHaveBeenCalled();
+  });
+
+  it('handleGroupChangedEventSeq 连续 push 后持久化并 ack 事件 cursor', async () => {
+    const { engine, client, seqTracker } = createEngine();
+    const groupId = 'g1';
+    const ns = `group_event:${groupId}`;
+    seqTracker.setContiguousSeq(ns, 5);
+
+    await engine.handleGroupChangedEventSeq({
+      group_id: groupId,
+      event_seq: 6,
+    }, groupId);
+
+    expect(seqTracker.getContiguousSeq(ns)).toBe(6);
+    expect(client._tokenStore.saveSeq).toHaveBeenCalledWith('alice.agentid.pub', 'device-a', 'slot-a', ns, 6);
+    expect(client._transport.call).toHaveBeenCalledWith('group.ack_events', {
+      group_id: groupId,
+      event_seq: 6,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+    });
+    expect(client._safeAsync).not.toHaveBeenCalled();
   });
 });

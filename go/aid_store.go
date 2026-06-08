@@ -995,16 +995,15 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)
 	}
 	nonce := authGetStr(phase1, "nonce")
-	signature, clientTime, err := s.registerFlow.SignLoginNonce(privateKeyPEM, nonce, "")
+	signature, err := loaded.Sign([]byte(nonce))
 	if err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)
 	}
 	response, err := s.registerFlow.ShortRPC(ctx, gatewayURL, "auth.renew_cert", map[string]any{
-		"aid":         target,
-		"request_id":  phase1["request_id"],
-		"nonce":       nonce,
-		"client_time": clientTime,
-		"signature":   signature,
+		"aid":        target,
+		"request_id": phase1["request_id"],
+		"nonce":      nonce,
+		"signature":  signature,
 	})
 	if err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)

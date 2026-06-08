@@ -18,6 +18,8 @@ function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: Rp
     _signClientOperation: vi.fn(async (_method: string, params: Record<string, unknown>) => {
       params.client_signature = { signed: true };
     }),
+    _transport: { call: vi.fn(async () => ({ ok: true })) },
+    _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
     ...overrides,
   };
   return { client, pipeline: new RpcPipeline(new ClientRuntime(client)) };
@@ -95,5 +97,30 @@ describe('RpcPipeline 组件边界', () => {
     await pipeline.applyClientSignature('message.send', normalParams);
     expect(client._signClientOperation).toHaveBeenCalledWith('message.send', normalParams);
     expect(normalParams.client_signature).toEqual({ signed: true });
+  });
+
+  it('有副作用资源/存储方法按非幂等长超时发送', async () => {
+    const { client, pipeline } = createPipeline();
+
+    await pipeline.call('storage.get_by_share', { share_id: 'share-1' });
+    expect(client._signClientOperation).toHaveBeenCalledWith('storage.get_by_share', expect.any(Object));
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'storage.get_by_share',
+      expect.objectContaining({ share_id: 'share-1', client_signature: { signed: true } }),
+      35,
+    );
+
+    client._signClientOperation.mockClear();
+    client._transport.call.mockClear();
+    await pipeline.call('group.resources.resolve_access_ticket', { ticket: 'ticket-1' });
+    expect(client._signClientOperation).toHaveBeenCalledWith(
+      'group.resources.resolve_access_ticket',
+      expect.objectContaining({ ticket: 'ticket-1', client_signature: { signed: true } }),
+    );
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'group.resources.resolve_access_ticket',
+      expect.objectContaining({ ticket: 'ticket-1', client_signature: { signed: true }, device_id: 'device-a', slot_id: 'slot-a' }),
+      35,
+    );
   });
 });

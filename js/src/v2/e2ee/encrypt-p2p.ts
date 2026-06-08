@@ -257,7 +257,7 @@ export function normalizeProtectedHeaders(
     normalized['payload_type'] = payloadType;
   }
   normalized.sdk_lang = E2EE_SDK_LANG;
-  delete normalized.sdk_vesion;
+  delete normalized.sdk_version;
   normalized.sdk_version = E2EE_SDK_VERSION;
   return normalized;
 }

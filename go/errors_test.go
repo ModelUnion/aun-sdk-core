@@ -61,11 +61,18 @@ func TestMapRemoteError_RateLimitCodes(t *testing.T) {
 
 // TestMapRemoteError_SessionCodes 验证会话错误码映射
 func TestMapRemoteError_SessionCodes(t *testing.T) {
-	for _, code := range []int{-32010, -32011, -32013} {
+	for _, code := range []int{-32010, -32011} {
 		err := MapRemoteError(map[string]any{"code": code, "message": "session err"})
 		if _, ok := err.(*SessionError); !ok {
 			t.Errorf("code=%d 应映射为 SessionError, 实际: %T", code, err)
 		}
+	}
+}
+
+func TestMapRemoteError_ClientSignatureCode32013(t *testing.T) {
+	err := MapRemoteError(map[string]any{"code": -32013, "message": "client signature failed"})
+	if _, ok := err.(*ClientSignatureError); !ok {
+		t.Fatalf("code=-32013 应映射为 ClientSignatureError, 实际: %T", err)
 	}
 }
 

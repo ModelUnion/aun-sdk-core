@@ -208,10 +208,25 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "group.kick", "group.remove_member", "group.leave", "group.dissolve",
     "group.update_name", "group.update_avatar", "group.update_announcement",
     "group.update_settings", "group.rotate_epoch",
-    "storage.create_upload_session", "storage.complete_upload", "storage.delete_object",
+    "storage.put_object", "storage.delete_object", "storage.get_by_share",
+    "storage.create_share_link", "storage.revoke_share_link",
+    "storage.create_upload_session", "storage.complete_upload",
+    "storage.create_folder", "storage.rename_folder", "storage.move_folder",
+    "storage.delete_folder", "storage.move_object", "storage.copy_object",
+    "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
     "auth.create_aid", "auth.renew_cert", "auth.rekey",
     "message.thought.put", "group.thought.put",
     "group.add_member",
+    "group.resources.put", "group.resources.create_folder",
+    "group.resources.rename", "group.resources.move",
+    "group.resources.mount_object", "group.resources.update",
+    "group.resources.delete", "group.resources.cleanup_by_storage_ref",
+    "group.resources.request_add", "group.resources.request_mount_object",
+    "group.resources.direct_add", "group.resources.approve_request",
+    "group.resources.reject_request",
+    "group.resources.unmount",
+    "group.resources.get_access",
+    "group.resources.resolve_access_ticket",
 })
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
@@ -943,10 +958,22 @@ class AUNClient:
         "group.e2ee.abort_rotation",
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
-        "group.resources.put", "group.resources.update",
-        "group.resources.delete", "group.resources.request_add",
+        "storage.put_object", "storage.delete_object", "storage.get_by_share",
+        "storage.create_share_link", "storage.revoke_share_link",
+        "storage.create_upload_session", "storage.complete_upload",
+        "storage.create_folder", "storage.rename_folder", "storage.move_folder",
+        "storage.delete_folder", "storage.move_object", "storage.copy_object",
+        "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
+        "group.resources.put", "group.resources.create_folder",
+        "group.resources.rename", "group.resources.move",
+        "group.resources.mount_object", "group.resources.update",
+        "group.resources.delete", "group.resources.cleanup_by_storage_ref",
+        "group.resources.request_add", "group.resources.request_mount_object",
         "group.resources.direct_add", "group.resources.approve_request",
         "group.resources.reject_request",
+        "group.resources.unmount",
+        "group.resources.get_access",
+        "group.resources.resolve_access_ticket",
     })
 
     def _sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
@@ -1069,7 +1096,7 @@ class AUNClient:
     def _merge_instance_protected_headers(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         return self._rpc().merge_instance_protected_headers(method, params)
 
-    def _cert_sha256_fingerprint(cert_pem: bytes | str | None) -> str:
+    def _cert_sha256_fingerprint(self, cert_pem: bytes | str | None) -> str:
         if not cert_pem:
             return ""
         try:
@@ -1174,40 +1201,33 @@ class AUNClient:
                     data.pop("client_signature", None)
                 else:
                     data["_verified"] = await self._verify_event_signature(data, cs)
-            # 发布给用户（publish 流程保持不变）
-            await self._dispatcher.publish("group.changed", data)
-
-            group_id = data.get("group_id", "")
-
-            # V2 群状态副作用（bootstrap cache、SPK、auto propose）委托给 GroupStateCoordinator。
-            self._group_state().handle_group_changed_v2_membership(data)
-
-            # event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
-            # 用 on_message_seq 返回值决定是否补拉，与 P2P / group.message 路径对齐
-            need_pull = False
-            raw_event_seq = data.get("event_seq")
-            if raw_event_seq is not None and group_id:
-                try:
-                    es = int(raw_event_seq)
-                    ns = f"group_event:{group_id}"
-                    need_pull = self._seq_tracker.on_message_seq(ns, es)
-                except (ValueError, TypeError) as exc:
-                    self._log.debug(
-                        "client",
-                        "group.changed event_seq parse failed: group=%s event_seq=%r err=%s",
-                        group_id, raw_event_seq, exc,
-                    )
-
-            # 仅真实存在 gap 时才补拉（补洞回来的事件不再触发新补洞）
-            if need_pull and group_id and not data.get("_from_gap_fill"):
-                self._log.debug("client", "group.changed event gap detected, triggering gap fill: group=%s event_seq=%s", group_id, raw_event_seq)
-                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                loop.create_task(self._fill_group_event_gap(group_id))
+            await self._delivery().handle_group_changed_event(data, group_id)
 
             self._log.debug("client", "_on_raw_group_changed exit: elapsed=%.3fs group=%s action=%s", time.time() - _t_start, group_id, action)
         else:
-            await self._dispatcher.publish("group.changed", data)
+            await self._delivery().publish_ordered_group_changed(data, source="legacy")
             self._log.debug("client", "_on_raw_group_changed exit (non-dict): elapsed=%.3fs", time.time() - _t_start)
+
+    def _cleanup_dissolved_group(self, group_id: str) -> None:
+        """群组解散后清理本地 V2 缓存、seq_tracker 和有序队列运行态。"""
+        group_id = str(group_id or "").strip()
+        if not group_id:
+            return
+        self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+        self._v2_group_security_levels.pop(group_id, None)
+        self._seq_tracker.remove_namespace(f"group:{group_id}")
+        self._seq_tracker.remove_namespace(f"group_event:{group_id}")
+        self._delivery().save_seq_tracker_state()
+
+        for key in list(self._gap_fill_done):
+            if group_id in key:
+                self._gap_fill_done.pop(key, None)
+
+        self._pushed_seqs.pop(f"group:{group_id}", None)
+        self._pushed_seqs.pop(f"group_event:{group_id}", None)
+        self._pending_ordered().pop(f"group:{group_id}", None)
+        self._pending_ordered().pop(f"group_event:{group_id}", None)
+        self._log.info("client", "cleaned up dissolved group local state: group=%s", group_id)
 
     async def _on_v2_epoch_rotated(self, data: Any) -> None:
         """处理 V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation。"""

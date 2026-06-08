@@ -154,7 +154,7 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
                 f"trace={_GROUP_E2E_TRACE_MODE}"
             )
             return aid
-        except (AuthError, RateLimitError) as exc:
+        except (AuthError, RateLimitError, TimeoutError, OSError) as exc:
             last_error = exc
             print(f"[connect diag] aid={aid} attempt={attempt} retryable_error={type(exc).__name__}: {exc}")
             if attempt >= 3:

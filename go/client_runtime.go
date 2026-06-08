@@ -345,6 +345,7 @@ func (s *runtimeV2State) resetForIdentityLocked() {
 	old := c.v2State
 	c.v2State = nil
 	c.v2Security = nil
+	c.v2SecurityOnce = sync.Once{}
 	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
 	c.v2SenderIKFetching = make(map[string]bool)
 	c.v2AutoProposeLastSnapshot = make(map[string]string)

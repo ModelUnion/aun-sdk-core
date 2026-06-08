@@ -53,15 +53,17 @@ func newV2StateSecurityState() *v2StateSecurityState {
 
 // v2GetSecurityState 获取或懒初始化安全状态。
 func (c *AUNClient) v2GetSecurityState() *v2StateSecurityState {
+	c.v2SecurityOnce.Do(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.v2Security == nil {
+			c.v2Security = newV2StateSecurityState()
+		}
+	})
 	c.mu.RLock()
 	st := c.v2Security
 	c.mu.RUnlock()
-	if st != nil {
-		return st
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.getClientRuntime().groupState.securityStateLocked()
+	return st
 }
 
 // ── v2VerifyStateSignature ──────────────────────────────────────────────

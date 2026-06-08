@@ -6,6 +6,40 @@
 
 ---
 
+## 0.4.11 — 2026-06-08
+
+### 新功能
+- **Storage 目录树与扩展操作**：`storage.*` 新增 `create_folder`/`rename_folder`/`move_folder`/`delete_folder`/`move_object`/`copy_object`/`batch_delete`/`set_object_meta`/`append_object` 等目录与对象操作，支持递归删除和 `dry_run` 模式（四语言+服务端对齐）
+- **group.resources 树形资源系统**：新增 `create_folder`/`rename`/`move`/`mount_object`/`unmount`/`cleanup_by_storage_ref`/`request_mount_object`/`resolve_access_ticket` 等资源管理方法，支持挂载、卸载、跨域访问票据、冲突策略（`reject`/`replace`/`keep_both`）（四语言+服务端对齐）
+- **group.changed 事件保序去重**：新增 `handle_group_changed_event()` 按 `group_event:{group_id}` namespace 保序消费，支持事件序号解析和空洞检测补拉；新增 `publish_ordered_queue_item()` / `publish_ordered_group_changed()` 路由有序事件发布（四语言对齐）
+- **群解散本地清理**：新增 `_cleanup_dissolved_group()`，群解散后清理 V2 缓存、seq_tracker、有序队列和推送记录（四语言对齐）
+- **SPK 上传失败回滚**：`delete_group_spk()` 支持上传失败时回滚本地新 SPK，避免本地/服务端 `spk_id` 不一致
+- **群 SPK 注册并发保护**：`ensure_group_registered()` 新增 `_group_register_lock`，防止群 SPK 注册竞态
+- **IK/SPK 缓存容量限制**：IK 公钥缓存改为 LRU 淘汰（上限 200），已验证 SPK 缓存上限 500；sender IK pending 队列限制 1000 条，超限淘汰最旧条目并告警
+
+### 修复
+- **群事件 ACK 命名空间**：`group.ack_events` 使用 `group_event:{group_id}` 而非 `group:{group_id}`（四语言对齐）
+- **超时错误分类**：`code=-32004` + `"rpc handler timeout"` 前缀映射为 `TimeoutError`，支持重试（四语言对齐）
+- **V2 sender IK 未解密重试**：改为保留队列中继续重试而非直接删除，同时发射 `undecryptable` 事件通知应用层（四语言对齐）
+- **`_pushed_seqs` 初始化防护**：访问前检查属性存在性，避免连接初期空指针异常
+- **`is_published_seq()` 空值处理**：属性不存在时返回 `False` 而非报错
+- **storage/group.resources 签名和幂等性补全**：补全写操作方法进入签名集合与非幂等集合的检查
+
+### 优化
+- **群事件 gap 填充路径**：已填充事件通过 `_from_gap_fill` 标记避免二次补拉；群解散事件跳过持久化 cursor
+- **错误日志细化**：SPK 旋转失败、V2 会话操作异常增加详细日志
+- **Trace observer 过滤**：支持后台 RPC 与事件混合时按类型筛选目标事件
+
+### 测试
+- `test_group_changed_push_persists_and_acks_contiguous_event_seq`：验证事件 cursor 持久化和 ACK
+- `test_group_changed_gap_fill_publishes_ordered_and_deduped_to_app`：验证补洞后保序去重
+- `test_group_pull_events_acks_once_after_event_publish_final_contiguous`：修正 ACK 序号断言（4→3）
+- 新增参数化测试验证 `storage.*` 和 `group.resources.*` 方法的签名与幂等性
+- 新增 4 个群资源完整流程集成测试（树形结构、清理、卸载、冲突策略）和 3 个存储功能集成测试（目录树、对象移动/复制/批删、元数据）
+- Trace E2E 测试改进事件等待机制（`wait_for` + `target_received Event`），解决时序竞态
+
+---
+
 ## 0.4.10 — 2026-06-06
 
 ### 新功能

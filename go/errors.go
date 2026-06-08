@@ -467,7 +467,7 @@ func MapRemoteError(errMap map[string]any) error {
 	case code == 4290 || code == 429 || code == -32029:
 		return &RateLimitError{AUNError{Message: message, Code: code, Data: data, Retryable: true, TraceID: traceID}}
 
-	case code == -32010 || code == -32011 || code == -32013:
+	case code == -32010 || code == -32011:
 		return &SessionError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
 	case code == -32600 || code == -32601 || code == -32602 || code == 4000:
@@ -497,7 +497,7 @@ func MapRemoteError(errMap map[string]any) error {
 		return &E2EEGroupDecryptFailedError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_DECRYPT_FAILED"}}
 	case code == -32050:
 		return &CertificateRevokedError{AuthError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}}
-	case code == -32051:
+	case code == -32013 || code == -32051:
 		return &ClientSignatureError{ValidationError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}}
 
 	default:

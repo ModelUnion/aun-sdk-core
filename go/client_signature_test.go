@@ -121,12 +121,37 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.thought.put",
 		"message.thought.put",
 		"group.resources.put",
+		"group.resources.create_folder",
+		"group.resources.rename",
+		"group.resources.move",
+		"group.resources.mount_object",
 		"group.resources.update",
 		"group.resources.delete",
+		"group.resources.cleanup_by_storage_ref",
 		"group.resources.request_add",
+		"group.resources.request_mount_object",
 		"group.resources.direct_add",
 		"group.resources.approve_request",
 		"group.resources.reject_request",
+		"group.resources.unmount",
+		"group.resources.get_access",
+		"group.resources.resolve_access_ticket",
+		"storage.put_object",
+		"storage.delete_object",
+		"storage.create_share_link",
+		"storage.revoke_share_link",
+		"storage.get_by_share",
+		"storage.create_upload_session",
+		"storage.complete_upload",
+		"storage.create_folder",
+		"storage.rename_folder",
+		"storage.move_folder",
+		"storage.delete_folder",
+		"storage.move_object",
+		"storage.copy_object",
+		"storage.batch_delete",
+		"storage.set_object_meta",
+		"storage.append_object",
 		"group.request_join",
 		"group.use_invite_code",
 		"group.set_settings",
@@ -145,6 +170,58 @@ func TestSignedMethodsCoverage(t *testing.T) {
 	for _, m := range expected {
 		if !signedMethods[m] {
 			t.Errorf("signedMethods 缺少方法: %s", m)
+		}
+	}
+}
+
+func TestStorageMutationMethodsAreNonIdempotent(t *testing.T) {
+	methods := []string{
+		"storage.put_object",
+		"storage.delete_object",
+		"storage.create_share_link",
+		"storage.revoke_share_link",
+		"storage.get_by_share",
+		"storage.create_upload_session",
+		"storage.complete_upload",
+		"storage.create_folder",
+		"storage.rename_folder",
+		"storage.move_folder",
+		"storage.delete_folder",
+		"storage.move_object",
+		"storage.copy_object",
+		"storage.batch_delete",
+		"storage.set_object_meta",
+		"storage.append_object",
+	}
+	for _, method := range methods {
+		if !nonIdempotentMethods[method] {
+			t.Errorf("nonIdempotentMethods 缺少 storage 写操作: %s", method)
+		}
+	}
+}
+
+func TestGroupResourceSideEffectMethodsAreNonIdempotent(t *testing.T) {
+	methods := []string{
+		"group.resources.put",
+		"group.resources.create_folder",
+		"group.resources.rename",
+		"group.resources.move",
+		"group.resources.mount_object",
+		"group.resources.update",
+		"group.resources.delete",
+		"group.resources.cleanup_by_storage_ref",
+		"group.resources.request_add",
+		"group.resources.request_mount_object",
+		"group.resources.direct_add",
+		"group.resources.approve_request",
+		"group.resources.reject_request",
+		"group.resources.unmount",
+		"group.resources.get_access",
+		"group.resources.resolve_access_ticket",
+	}
+	for _, method := range methods {
+		if !nonIdempotentMethods[method] {
+			t.Errorf("nonIdempotentMethods 缺少 group.resources 副作用方法: %s", method)
 		}
 	}
 }

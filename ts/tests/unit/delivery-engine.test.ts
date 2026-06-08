@@ -418,8 +418,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       device_id: 'device-a',
       slot_id: 'slot-a',
     }, undefined, undefined, true);
-    expect(client._markPulledSeqDelivered).toHaveBeenCalledWith(ns, 2);
-    expect(client._markPulledSeqDelivered).toHaveBeenCalledWith(ns, 3);
+    expect(client._markPulledSeqDelivered).not.toHaveBeenCalled();
   });
 
   it('fillGroupEventGap 空页只按 retention floor 推进 tracker，不发送 ack_events', async () => {
@@ -473,12 +472,12 @@ describe('MessageDeliveryEngine 组件边界', () => {
     expect(seqTracker.getContiguousSeq(ns)).toBe(2);
   });
 
-  it('handleGroupChangedEventSeq 遇到 _from_gap_fill 事件不递归触发补洞', () => {
+  it('handleGroupChangedEventSeq 遇到 _from_gap_fill 事件不递归触发补洞', async () => {
     const { engine, client, seqTracker } = createEngine();
     const groupId = 'group.agentid.pub/g1';
     seqTracker.setContiguousSeq(`group_event:${groupId}`, 1);
 
-    engine.handleGroupChangedEventSeq({
+    await engine.handleGroupChangedEventSeq({
       group_id: groupId,
       event_seq: 3,
       _from_gap_fill: true,
@@ -486,5 +485,27 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
     expect(client._tryAcquirePullGate).not.toHaveBeenCalled();
     expect(client.call).not.toHaveBeenCalled();
+  });
+
+  it('handleGroupChangedEventSeq 连续 push 后持久化并 ack 事件 cursor', async () => {
+    const { engine, client, seqTracker } = createEngine();
+    const groupId = 'group.agentid.pub/g1';
+    const ns = `group_event:${groupId}`;
+    seqTracker.setContiguousSeq(ns, 5);
+
+    await engine.handleGroupChangedEventSeq({
+      group_id: groupId,
+      event_seq: 6,
+    }, groupId);
+
+    expect(seqTracker.getContiguousSeq(ns)).toBe(6);
+    expect(client._tokenStore.saveSeq).toHaveBeenCalledWith('alice.agentid.pub', 'device-a', 'slot-a', ns, 6);
+    expect(client._transport.call).toHaveBeenCalledWith('group.ack_events', {
+      group_id: groupId,
+      event_seq: 6,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+    }, undefined, undefined, true);
+    expect(client._tryAcquirePullGate).not.toHaveBeenCalled();
   });
 });

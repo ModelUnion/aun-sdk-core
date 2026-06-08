@@ -157,6 +157,7 @@ function applyV2WrapPolicyToTargets(targets: Target[], policy: V2WrapPolicy): Ta
 
 export class V2E2EECoordinator {
   private readonly runtime: ClientRuntime;
+  private _initSessionPromise: Promise<void> | null = null;
 
   constructor(runtime: ClientRuntime) {
     this.runtime = runtime;
@@ -211,6 +212,22 @@ export class V2E2EECoordinator {
   }
 
   async initV2Session(): Promise<void> {
+    const client = this.client;
+    if (!client._aid) return;
+
+    // 并发锁：复用已在进行中的初始化 Promise
+    if (this._initSessionPromise) {
+      return this._initSessionPromise;
+    }
+    this._initSessionPromise = this._doInitV2Session();
+    try {
+      await this._initSessionPromise;
+    } finally {
+      this._initSessionPromise = null;
+    }
+  }
+
+  private async _doInitV2Session(): Promise<void> {
     const client = this.client;
     if (!client._aid) return;
     const aidAtStart = client._aid;
@@ -428,6 +445,13 @@ export class V2E2EECoordinator {
         client._v2SenderIKPending.delete(key);
         if (plaintext === null) {
           client._clientLog.debug(`V2 sender IK pending retry failed: key=${key}`);
+          client.emit('message.undecryptable', {
+            messageId: entry.msg.message_id ?? entry.msg.id ?? key,
+            error: 'V2 sender IK pending retry failed after IK resolution',
+            fromAid,
+            senderDeviceId,
+            groupId: entry.groupId ?? null,
+          });
           continue;
         }
         const seq = Number(entry.msg.seq ?? 0);
@@ -483,7 +507,7 @@ export class V2E2EECoordinator {
       peerDevices = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
       auditRaw = (Array.isArray(bs?.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
       client._clientLog.debug(`message.v2.bootstrap fetched: to=${to}, devices=${peerDevices.length}, audit=${auditRaw.length}`);
-      if (peerDevices.length > 0) {
+      if (peerDevices.length > 0 && !this.getBootstrapCacheEntry(to)) {
         this.setBootstrapCacheEntry(to, {
           devices: peerDevices,
           auditRecipients: auditRaw,
