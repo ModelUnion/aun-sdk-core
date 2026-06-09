@@ -30,6 +30,12 @@ func (c *AUNClient) sendV2Internal(ctx context.Context, params map[string]any) (
 		return nil, NewValidationError("message.send payload must be a map for V2 encryption")
 	}
 	opts := e2ee.EncryptOptions{}
+	if messageID := strings.TrimSpace(stringFromAny(params["message_id"])); messageID != "" {
+		opts.MessageID = messageID
+	}
+	if timestamp := toInt64(params["timestamp"]); timestamp > 0 {
+		opts.Timestamp = timestamp
+	}
 	if ph := protectedHeadersFromParams(params); len(ph) > 0 {
 		opts.ProtectedHeaders = ph
 	}
@@ -147,6 +153,12 @@ func (c *AUNClient) sendGroupV2Internal(ctx context.Context, params map[string]a
 		return nil, NewValidationError("group.send payload must be a map for V2 encryption")
 	}
 	opts := e2ee.EncryptOptions{}
+	if messageID := strings.TrimSpace(stringFromAny(params["message_id"])); messageID != "" {
+		opts.MessageID = messageID
+	}
+	if timestamp := toInt64(params["timestamp"]); timestamp > 0 {
+		opts.Timestamp = timestamp
+	}
 	if ph := protectedHeadersFromParams(params); len(ph) > 0 {
 		opts.ProtectedHeaders = ph
 	}

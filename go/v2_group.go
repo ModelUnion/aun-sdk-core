@@ -60,15 +60,28 @@ func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID str
 		"group_id": groupID,
 		"payload":  payload,
 	}, payload, nil)
+	resultParams := map[string]any{
+		"group_id":          groupID,
+		"payload":           payload,
+		"protected_headers": opts.ProtectedHeaders,
+		"context":           opts.Context,
+	}
+	if opts.Timestamp > 0 {
+		resultParams["timestamp"] = opts.Timestamp
+	}
 
 	resp, err := v.v2GroupSendOnce(ctx, state, groupID, payload, true, opts)
 	if err == nil {
-		return resp, nil
+		return c.delivery().attachSendResultEnvelope("group.send", resultParams, resp, true).(map[string]any), nil
 	}
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 Group speculative send rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
 		v.deleteGroupBootstrapCache(groupID)
-		return v.v2GroupSendOnce(ctx, state, groupID, payload, false, opts)
+		resp, retryErr := v.v2GroupSendOnce(ctx, state, groupID, payload, false, opts)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		return c.delivery().attachSendResultEnvelope("group.send", resultParams, resp, true).(map[string]any), nil
 	}
 	return nil, err
 }

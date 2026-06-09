@@ -333,8 +333,21 @@ func TestP2PRecallTombstonePublishesRecalledEvent(t *testing.T) {
 		t.Fatalf("发布 payload 类型错误: %#v", msg)
 	}
 	envelope, ok := published["envelope"].(map[string]any)
-	if !ok || envelope["message_id"] != "recall-1" || toInt64(envelope["seq"]) != 9 {
+	if !ok {
+		t.Fatalf("撤回事件应包含 envelope: %#v", published)
+	}
+	if published["message_id"] != "recall-1" || toInt64(published["seq"]) != 9 {
+		t.Fatalf("撤回事件旧顶层字段应继续保留: %#v", published)
+	}
+	if envelope["from"] != "alice.agentid.pub" || envelope["to"] != "bob.agentid.pub" ||
+		envelope["type"] != "message.recalled" || envelope["kind"] != "message.recalled" ||
+		toInt64(envelope["timestamp"]) != 123 {
 		t.Fatalf("撤回事件 envelope 不正确: %#v", published["envelope"])
+	}
+	for _, key := range []string{"message_id", "seq", "device_id", "slot_id"} {
+		if _, exists := envelope[key]; exists {
+			t.Fatalf("撤回事件 envelope 不应包含投递字段 %s: %#v", key, envelope)
+		}
 	}
 }
 
@@ -366,9 +379,17 @@ func TestGroupRecallTombstonePublishesNoticeEnvelope(t *testing.T) {
 	if !ok {
 		t.Fatalf("群撤回事件应包含 envelope: %#v", published)
 	}
-	if envelope["module_id"] != "group" || envelope["group_id"] != "g1" ||
-		envelope["message_id"] != "notice-1" || toInt64(envelope["seq"]) != 43 {
+	if published["message_id"] != "notice-1" || toInt64(published["seq"]) != 43 {
+		t.Fatalf("群撤回旧顶层字段应继续保留: %#v", published)
+	}
+	if envelope["group_id"] != "g1" || envelope["type"] != "group.message_recalled" ||
+		envelope["kind"] != "group.message_recalled" {
 		t.Fatalf("群撤回 envelope 不正确: %#v", envelope)
+	}
+	for _, key := range []string{"module_id", "message_id", "seq", "device_id", "slot_id"} {
+		if _, exists := envelope[key]; exists {
+			t.Fatalf("群撤回 envelope 不应包含投递字段 %s: %#v", key, envelope)
+		}
 	}
 }
 
@@ -426,10 +447,14 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if !ok {
 		t.Fatalf("P2P 事件应包含 envelope: %#v", p2pEvent)
 	}
-	if p2pEnvelope["message_id"] != "m-1" || toInt64(p2pEnvelope["seq"]) != 1 ||
-		p2pEnvelope["from"] != "bob.example.com" || p2pEnvelope["to"] != "alice.example.com" ||
-		p2pEnvelope["device_id"] != "dev-1" || p2pEnvelope["slot_id"] != "slot-a" {
+	if p2pEnvelope["from"] != "bob.example.com" || p2pEnvelope["to"] != "alice.example.com" ||
+		p2pEnvelope["type"] != "text" {
 		t.Fatalf("P2P envelope 不正确: %#v", p2pEnvelope)
+	}
+	for _, key := range []string{"message_id", "seq", "device_id", "slot_id"} {
+		if _, exists := p2pEnvelope[key]; exists {
+			t.Fatalf("P2P envelope 不应包含投递字段 %s: %#v", key, p2pEnvelope)
+		}
 	}
 	if groupEvent["device_id"] != "dev-1" || groupEvent["slot_id"] != "slot-a" {
 		t.Fatalf("群消息事件未 fallback 当前实例: %#v", groupEvent)
@@ -441,10 +466,14 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if !ok {
 		t.Fatalf("群消息事件应包含 envelope: %#v", groupEvent)
 	}
-	if groupEnvelope["message_id"] != "gm-1" || toInt64(groupEnvelope["seq"]) != 1 ||
-		groupEnvelope["message_type"] != "group.message" || groupEnvelope["sender_aid"] != "bob.example.com" ||
-		groupEnvelope["group_id"] != "g1" || groupEnvelope["device_id"] != "dev-1" || groupEnvelope["slot_id"] != "slot-a" {
+	if groupEnvelope["from"] != "bob.example.com" || groupEnvelope["group_id"] != "g1" ||
+		groupEnvelope["type"] != "text" {
 		t.Fatalf("群消息 envelope 不正确: %#v", groupEnvelope)
+	}
+	for _, key := range []string{"message_id", "seq", "device_id", "slot_id"} {
+		if _, exists := groupEnvelope[key]; exists {
+			t.Fatalf("群消息 envelope 不应包含投递字段 %s: %#v", key, groupEnvelope)
+		}
 	}
 
 	c.publishAppEventSync("group.changed", map[string]any{
@@ -488,6 +517,38 @@ func TestPublishedMessageEventsAttachEmptyDeviceID(t *testing.T) {
 	}
 	if payload["device_id"] != "" || payload["slot_id"] != "slot-a" {
 		t.Fatalf("事件实例上下文不正确: %#v", payload)
+	}
+}
+
+func TestAppMessageEnvelopeKeepsForwardableMetadata(t *testing.T) {
+	envelope := appMessageEnvelope(map[string]any{
+		"message_id": "m-1",
+		"seq":        9,
+		"from_aid":   "alice.example.com",
+		"to_aid":     "bob.example.com",
+		"created_at": int64(1234567890000),
+		"payload":    map[string]any{"type": "text", "text": "hello"},
+		"headers":    map[string]any{"trace_id": "trace-1", "_auth": "drop"},
+		"context":    map[string]any{"run_id": "run-1", "_auth": "drop"},
+		"device_id":  "dev-1",
+		"slot_id":    "slot-a",
+	})
+
+	want := map[string]any{
+		"from":              "alice.example.com",
+		"to":                "bob.example.com",
+		"type":              "text",
+		"timestamp":         int64(1234567890000),
+		"context":           map[string]any{"run_id": "run-1"},
+		"protected_headers": map[string]any{"trace_id": "trace-1"},
+	}
+	if !reflect.DeepEqual(envelope, want) {
+		t.Fatalf("应用层 envelope 应只保留可转发元数据: %#v", envelope)
+	}
+	for _, key := range []string{"message_id", "seq", "device_id", "slot_id", "headers", "from_aid", "to_aid", "created_at"} {
+		if _, exists := envelope[key]; exists {
+			t.Fatalf("应用层 envelope 不应包含 %s: %#v", key, envelope)
+		}
 	}
 }
 

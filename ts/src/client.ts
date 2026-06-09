@@ -383,6 +383,22 @@ function formatCaughtError(error: any): Error | string {
   return error instanceof Error ? error : String(error);
 }
 
+const RELOGIN_REFRESH_ERRORS = new Set([
+  'missing refresh_token',
+  'invalid_or_expired_refresh_token',
+  'refresh not supported',
+]);
+
+function authErrorRequiresRelogin(error: AuthError): boolean {
+  const data = error.data;
+  if (isJsonObject(data)) {
+    if (data.relogin_required === true) return true;
+    const code = String(data.error ?? '').trim().toLowerCase();
+    if (RELOGIN_REFRESH_ERRORS.has(code)) return true;
+  }
+  return RELOGIN_REFRESH_ERRORS.has(error.message.trim().toLowerCase());
+}
+
 function normalizeDeliveryModeConfig(
   raw: JsonValue | object | undefined,
   opts: {
@@ -3047,6 +3063,18 @@ export class AUNClient {
           this._tokenRefreshFailures = 0;
         } catch (exc) {
           if (exc instanceof AuthError) {
+            if (authErrorRequiresRelogin(exc)) {
+              this._clientLog.warn(`token refresh requires relogin, stopping refresh loop and triggering reconnect: ${exc.message}`);
+              await this._dispatcher.publish('token.refresh_exhausted', {
+                aid: this._identity?.aid ?? null,
+                consecutive_failures: 1,
+                last_error: String(exc),
+                relogin_required: true,
+              });
+              this._tokenRefreshFailures = 0;
+              await this._handleTransportDisconnect(new Error('token refresh relogin required, triggering reconnect'));
+              return;
+            }
             this._tokenRefreshFailures++;
             if (this._tokenRefreshFailures >= 3) {
               this._clientLog.warn(`token refresh failed ${this._tokenRefreshFailures} consecutive times, stopping refresh loop and triggering reconnect`);
@@ -3056,7 +3084,7 @@ export class AUNClient {
                 last_error: String(exc),
               });
               this._tokenRefreshFailures = 0;
-              this._handleTransportDisconnect(new Error('token refresh exhausted, triggering reconnect'));
+              await this._handleTransportDisconnect(new Error('token refresh exhausted, triggering reconnect'));
               return;
             }
             this._clientLog.debug(`token refresh failed (${this._tokenRefreshFailures}/3), will retry: ${exc}`);
@@ -3179,10 +3207,12 @@ export class AUNClient {
         eventPayload.code = disconnectInfo.code;
       }
       await this._dispatcher.publish('state_change', eventPayload);
+      this._reconnectActive = false;
       return;
     }
     // 1000 = 正常关闭, 1006 = 网络异常断开（无 close frame），其他 code = 服务端主动关闭
     const serverInitiated = closeCode !== undefined && closeCode !== 1000 && closeCode !== 1006;
+    this._reconnectActive = false;
     this._startReconnect(serverInitiated);
   }
 

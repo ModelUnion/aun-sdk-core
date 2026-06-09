@@ -5,7 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { AuthFlow } from '../../src/auth.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
-import { StateError } from '../../src/errors.js';
+import { AuthError, StateError } from '../../src/errors.js';
 import type { IdentityRecord, JsonObject, KeyPairRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
@@ -146,6 +146,104 @@ describe('AuthFlow 空 device_id 实例态', () => {
       access_token: 'tok-empty-device',
       refresh_token: 'ref-empty-device',
     });
+  });
+
+  it('refresh 业务失败且要求重登时应清掉本地 token 缓存', async () => {
+    const updatedStates: Record<string, unknown>[] = [];
+    const keystore = {
+      saveIdentity: vi.fn().mockResolvedValue(undefined),
+      updateInstanceState: vi.fn(async (_aid: string, _deviceId: string, _slotId: string, updater: (state: Record<string, unknown>) => Record<string, unknown> | void) => {
+        const current: Record<string, unknown> = {
+          access_token: 'old-access',
+          refresh_token: 'old-refresh',
+          kite_token: 'old-kite',
+          access_token_expires_at: 123456,
+        };
+        const updated = updater(current) ?? current;
+        updatedStates.push({ ...updated });
+        return updated;
+      }),
+    };
+    const auth = new AuthFlow({
+      tokenStore: keystore as any,
+      crypto: {} as any,
+      deviceId: 'dev-refresh',
+      slotId: 'slot-refresh',
+      verifySsl: false,
+    });
+    const identity: Record<string, unknown> = {
+      aid: 'alice.agentid.pub',
+      access_token: 'old-access',
+      refresh_token: 'old-refresh',
+      kite_token: 'old-kite',
+      access_token_expires_at: 123456,
+    };
+    (auth as any)._refreshAccessToken = vi.fn().mockRejectedValue(new AuthError('invalid_or_expired_refresh_token', {
+      data: {
+        success: false,
+        error: 'invalid_or_expired_refresh_token',
+        relogin_required: true,
+      },
+    }));
+
+    await expect(auth.refreshCachedTokens('ws://gateway/aun', identity as any)).rejects.toThrow(AuthError);
+
+    expect(identity.access_token).toBe('');
+    expect(identity.refresh_token).toBe('');
+    expect(identity.kite_token).toBe('');
+    expect(identity.access_token_expires_at).toBe(0);
+    expect(keystore.updateInstanceState).toHaveBeenCalledWith('alice.agentid.pub', 'dev-refresh', 'slot-refresh', expect.any(Function));
+    expect(updatedStates[updatedStates.length - 1]).toMatchObject({
+      access_token: '',
+      refresh_token: '',
+      kite_token: '',
+      access_token_expires_at: 0,
+    });
+  });
+
+  it('connectSession 在 refresh 失败后应继续走两步登录', async () => {
+    const keystore = {
+      saveIdentity: vi.fn().mockResolvedValue(undefined),
+      updateInstanceState: vi.fn(async (_aid: string, _deviceId: string, _slotId: string, updater: (state: Record<string, unknown>) => Record<string, unknown> | void) => {
+        const current: Record<string, unknown> = {};
+        return updater(current) ?? current;
+      }),
+    };
+    const auth = new AuthFlow({
+      tokenStore: keystore as any,
+      crypto: {} as any,
+      deviceId: 'dev-refresh',
+      slotId: 'slot-refresh',
+      verifySsl: false,
+    });
+    const identity: Record<string, unknown> = {
+      aid: 'alice.agentid.pub',
+      access_token: 'expired-access',
+      refresh_token: 'expired-refresh',
+      kite_token: 'old-kite',
+      access_token_expires_at: 1,
+    };
+    auth.loadIdentity = vi.fn().mockResolvedValue(identity as any);
+    auth.refreshCachedTokens = vi.fn().mockRejectedValue(new AuthError('invalid_or_expired_refresh_token', {
+      data: {
+        success: false,
+        error: 'invalid_or_expired_refresh_token',
+        relogin_required: true,
+      },
+    }));
+    auth.authenticate = vi.fn().mockResolvedValue({ access_token: 'login-access' });
+    (auth as any)._initializeSession = vi.fn().mockResolvedValue({ status: 'ok' });
+
+    const result = await auth.connectSession(
+      { call: vi.fn() } as any,
+      { params: { nonce: 'nonce-1' } },
+      'ws://gateway/aun',
+    );
+
+    expect(auth.authenticate).toHaveBeenCalledWith('ws://gateway/aun', 'alice.agentid.pub');
+    expect(result.token).toBe('login-access');
+    expect(identity.access_token).toBe('');
+    expect(identity.refresh_token).toBe('');
   });
 });
 describe('AuthFlow.getAccessTokenExpiry', () => {

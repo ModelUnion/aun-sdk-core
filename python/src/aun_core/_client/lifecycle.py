@@ -563,6 +563,24 @@ class LifecycleController:
                     })
                     self.runtime.lifecycle.set_token_refresh_failures(0)  # 刷新成功，重置连续失败计数
                 except AuthError as exc:
+                    if client._auth._refresh_failure_requires_relogin(exc):
+                        client._log.warn(
+                            "client",
+                            "token 刷新明确要求重新登录，停止刷新循环并触发重连: %s",
+                            exc,
+                        )
+                        await client._dispatcher.publish("token.refresh_exhausted", {
+                            "aid": client._identity.get("aid") if client._identity else None,
+                            "consecutive_failures": 1,
+                            "last_error": str(exc),
+                            "relogin_required": True,
+                        })
+                        self.runtime.lifecycle.set_token_refresh_failures(0)
+                        # refresh_cached_tokens 已清理本地 token；关闭 transport 后由 on_disconnect 进入重连，
+                        # 重连时 connect_session 会因为无可用 token 自动走两步登录。
+                        if client._transport and not getattr(client._transport, "_closed", True):
+                            await client._transport.close()
+                        return
                     failures = self.runtime.lifecycle.increment_token_refresh_failures()
                     if failures >= _TOKEN_REFRESH_MAX_FAILURES:
                         client._log.warn(

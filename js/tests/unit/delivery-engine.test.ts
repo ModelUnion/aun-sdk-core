@@ -162,15 +162,41 @@ describe('MessageDeliveryEngine 组件边界', () => {
         device_id: 'device-a',
         slot_id: 'slot-a',
         envelope: {
-          message_id: 'm-1',
-          seq: 7,
           from: 'bob.agentid.pub',
           to: 'alice.agentid.pub',
-          device_id: 'device-a',
-          slot_id: 'slot-a',
+          type: 'text',
         },
       },
     }]);
+  });
+
+  it('应用层消息 envelope 只保留可转发字段并归一化 headers', () => {
+    const { engine } = createEngine();
+
+    const envelope = engine.appMessageEnvelope({
+      message_id: 'm-1',
+      seq: 7,
+      from_aid: 'bob.agentid.pub',
+      to_aid: 'alice.agentid.pub',
+      created_at: 1234567890000,
+      payload: { type: 'text', text: 'hello' },
+      headers: { trace_id: 'trace-1', _auth: 'drop' },
+      context: { run_id: 'run-1', _auth: 'drop' },
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+    });
+
+    expect(envelope).toEqual({
+      from: 'bob.agentid.pub',
+      to: 'alice.agentid.pub',
+      type: 'text',
+      timestamp: 1234567890000,
+      context: { run_id: 'run-1' },
+      protected_headers: { trace_id: 'trace-1' },
+    });
+    for (const key of ['message_id', 'seq', 'device_id', 'slot_id', 'headers', 'from_aid', 'to_aid', 'created_at']) {
+      expect(envelope).not.toHaveProperty(key);
+    }
   });
 
   it('publishAppEvent 为群事件注入 envelope 并保留顶层兼容字段', async () => {
@@ -252,12 +278,16 @@ describe('MessageDeliveryEngine 组件边界', () => {
       tombstone_message_id: 'recall-1',
       message_ids: ['m-1'],
       envelope: expect.objectContaining({
-        message_id: 'recall-1',
-        seq: 9,
         from: 'alice.agentid.pub',
         to: 'bob.agentid.pub',
+        type: 'message.recalled',
+        kind: 'message.recalled',
+        timestamp: 123,
       }),
     }));
+    for (const key of ['message_id', 'seq', 'device_id', 'slot_id']) {
+      expect(published[0].payload.envelope).not.toHaveProperty(key);
+    }
     expect(published[1].payload).toEqual(expect.objectContaining({
       module_id: 'group',
       group_id: 'g1',
@@ -266,12 +296,15 @@ describe('MessageDeliveryEngine 组件边界', () => {
       message_ids: ['gm-1'],
       target_message_seqs: [42],
       envelope: expect.objectContaining({
-        module_id: 'group',
+        from: 'alice.agentid.pub',
         group_id: 'g1',
-        message_id: 'notice-1',
-        seq: 43,
+        type: 'group.message_recalled',
+        kind: 'group.message_recalled',
       }),
     }));
+    for (const key of ['module_id', 'message_id', 'seq', 'device_id', 'slot_id']) {
+      expect(published[1].payload.envelope).not.toHaveProperty(key);
+    }
   });
 
   it('messageTargetsCurrentInstance 按 device_id / slot_id 过滤实例消息', () => {

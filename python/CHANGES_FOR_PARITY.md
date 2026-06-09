@@ -1,10 +1,152 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.12）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.4.13）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → `67d35b06` (v0.4.11) → 工作区 (v0.4.12)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → `67d35b06` (v0.4.11) → `d85a6f62` (v0.4.12) → 工作区 (v0.4.13)。
+
+---
+
+## v0.4.13 — 相对于 v0.4.12 的变更
+
+> 基线：`d85a6f62`（git HEAD，即 v0.4.12 提交）vs 工作区未提交改动。
+>
+> 四大变更块：**① 发送结果回填 envelope（send 回执带信封）**、**② refresh_token 失效自愈（清缓存 + token.refresh_exhausted 触发重登）**、**③ protected_headers 类型归一（ProtectedHeaders 对象转 dict）**、**④ app_message_envelope 字段收窄 + RPC 日志 token 脱敏**。四块均为四语言对齐项；另有服务端配套改动见块末「服务端协同」。
+
+### 块① 发送结果回填 envelope
+
+> 动机：接收端事件已带 `envelope`（v0.4.12 块①），但发送方调用 `message.send`/`group.send`/`message.thought.put`/`group.thought.put` 拿到的回执只有 `message_id`/`seq`，没有与接收端一致的信封元数据。本块为四个发送方法的返回结果统一回填规范化 `envelope`，并把原始 `payload`/`content` 一并回填。明文路径在 rpc-pipeline postprocess 后自动附加；V2 加密路径用内部标志跳过明文附加、由加密协调器在密文构造后自行补挂，避免重复封装。
+
+#### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L36 | 新增常量 | `_APP_SEND_ENVELOPE_METHODS` | 四个发送方法集合：`message.send`/`group.send`/`message.thought.put`/`group.thought.put` |
+| L349 | 新增 | `send_result_envelope(method, params, result, *, encrypted)` | 仅当 method ∈ 集合时构造发送结果信封：从 params/result 归一 `from`/`to`/`group_id`/`type`/`kind`/`version`/`timestamp`/`encrypted`/`context`/`protected_headers`/`payload_type`，回填原始 `payload`/`content` |
+| L400 | 新增 | `attach_send_result_envelope(method, params, result, *, encrypted)` | method 命中且 result 为 dict 时，浅拷贝后写入 `result["envelope"]`；否则原样返回 |
+
+#### `_client/rpc_pipeline.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L79 | 新增 | `call_after_pipeline()` 入口 | `skip_send_result_envelope = bool(params.pop("_skip_send_result_envelope", False))`：弹出内部标志，V2 加密路径置 True 以跳过明文自动附加 |
+| L85 | 修改 | pull-gate 二次进入透传 | 锁定 params 时透传 `locked_params["_skip_send_result_envelope"] = True`，避免 gate 重入丢标志 |
+| L229 | 修改 | postprocess 后附加 | `postprocess_result` 之后，若未跳过则 `result = client._delivery().attach_send_result_envelope(method, params, result, encrypted=False)`（L231） |
+
+#### `_client/v2_e2ee.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L543 | 新增 | 内层调用置标志 | V2 加密发送内层 `_attempt()` 的 params 写 `"_skip_send_result_envelope": True`，阻止明文路径重复附加 |
+| L558 | 修改 | `message.send` 加密路径 | 加密发送拿到 result 后改为 `return client._delivery().attach_send_result_envelope("message.send", params, result, encrypted=True)`（原直接 return） |
+| L1093 | 修改 | `group.send` 加密路径 | 同上，`attach_send_result_envelope("group.send", ..., encrypted=True)` |
+| L1305 | 修改 | `message.thought.put` 加密路径 | 同上 |
+| L1379 | 修改 | `group.thought.put` 加密路径 | 同上 |
+
+**对齐要点**：Go 见 `client_delivery.go`（`appSendEnvelopeMethods`:42 / `sendResultEnvelope`:146 / `attachSendResultEnvelope`:190）、`client_rpc_pipeline.go`（skip 标志读取/透传:123/129、附加:268）、`client_v2_e2ee.go`（加密回填:849/859、内层置标志:957）、`v2_group.go`:75/84、`v2_thought.go`:307/323/417/433。TS 见 `client/delivery.ts`（`APP_SEND_ENVELOPE_METHODS`:16 / `sendResultEnvelope`:220 / `attachSendResultEnvelope`:258）、`client/rpc-pipeline.ts`:134/144/282、`client/v2-e2ee.ts`（内层标志:659、各加密路径附加:666/680/927/942/1330/1343/1403/1416）。JS 见 `client/delivery.ts`:16/208/246、`client/rpc-pipeline.ts`:130/200/263、`client/v2-e2ee.ts`:571/577/591/792/815/1030/1043/1103/1116。**四语言内部标志键统一为字符串 `_skip_send_result_envelope`**（TS/JS 用局部变量 `skipSendResultEnvelope` 接收，键名一致）；明文路径自动附加（encrypted=False），加密路径由 V2 协调器手动附加（encrypted=True），二者互斥不重复。
+
+---
+
+### 块② refresh_token 失效自愈（清缓存 + 强制重登）
+
+> 动机：refresh_token 过期或被服务端判定不可用时，客户端原本会无限循环刷新失败、卡死无法自愈。本块新增「失败是否需重新登录」的判定，命中时清空本地缓存的所有 token 并持久化；后台 token 刷新循环捕获到需重登错误时发布 `token.refresh_exhausted` 事件、关闭 transport 触发重连，下次 `connect_session` 因无可用 token 自动走两阶段登录。同时 `auth.refresh_token` RPC 补传诊断/路由参数，并通过 `AuthError(data=result)` 把服务端结构化响应透传给判定逻辑。
+
+#### `auth.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1231 | 新增（静态） | `_refresh_failure_requires_relogin(exc)` | 判定刷新失败是否需重登：非 `AuthError` 返回 False；`exc.data` 含 `relogin_required is True` → True；否则取 `data["error"]` 或 `str(exc)` 命中 {`missing refresh_token`,`invalid_or_expired_refresh_token`,`refresh not supported`} → True |
+| L1247 | 新增 | `_clear_cached_tokens(identity, *, reason)` | 清空 identity 的 `access_token`/`refresh_token`/`kite_token`/`token` 与 `access_token_expires_at=0` 并 `_persist_identity`；无 token 且无过期时间则提前返回；持久化失败仅 WARN 不抛 |
+| L634 | 修改签名 | `_refresh_access_token(gateway_url, refresh_token, identity=None)` | 新增 `identity` 入参：从中提取 `aid`/`device_id`/`slot_id`/`access_token`/`access_token_expires_at` 补入 RPC params，并固定加 `sdk_lang`/`sdk_version`；服务端 `success=False` 时 `raise AuthError(str(error), data=result)`（携带完整响应供 relogin 判定） |
+| L345 | 修改 | `refresh_cached_tokens()` | 缺 refresh_token 分支调 `_clear_cached_tokens(identity, reason="missing refresh_token")` 后再抛；`_refresh_access_token` 调用补传 `identity` |
+| L356 | 修改 | `refresh_cached_tokens()` except | 捕获异常时 `if self._refresh_failure_requires_relogin(exc): self._clear_cached_tokens(...)` 再重抛 |
+| L515 | 修改 | `connect_session()` except | refresh 预登录失败分支同样判定 + 清缓存 |
+| L711 | 修改 | `_pre_auth_rpc()` | `success is False` 改为 `raise AuthError(..., data=result)`（原无 data） |
+
+#### `_client/lifecycle.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L564 | 修改 | `token_refresh_loop()` 成功分支 | 刷新成功 `set_token_refresh_failures(0)` 重置计数 |
+| L566 | 新增分支 | `token_refresh_loop()` 需重登分支 | 捕获 `AuthError` 且 `client._auth._refresh_failure_requires_relogin(exc)` 为真时：发布 `token.refresh_exhausted` 事件（payload 带 `relogin_required: True`，L572~576）、`set_token_refresh_failures(0)`、关闭 transport 触发重连 |
+| L584 | 修改 | `token_refresh_loop()` 普通失败分支 | 非重登错误走原 `increment_token_refresh_failures()` 计数路径，达上限同样发 `token.refresh_exhausted`（L591，不带 relogin_required） |
+
+**对齐要点**：Go 见 `auth.go`（包级函数 `authRefreshFailureRequiresRelogin`:2032 读 `relogin_required`:2041、方法 `clearCachedTokens`:1813、调用点 429/436/558、判定点 435/557、refresh RPC `auth.refresh_token`:849）、`client.go`（刷新循环判定:2173、发布 `token.refresh_exhausted`:2175/2190、payload `relogin_required:true`:2179）。TS 见 `auth.ts`（`_refreshFailureRequiresRelogin`:2032、读 relogin_required:2036、`_clearCachedTokens`:2044、清缓存调用 563/575/740）、`client.ts`（发布事件:3068/3081、payload:3072、判定:395）。JS 见 `auth.ts`（`_refreshFailureRequiresRelogin`:1652、`_clearCachedTokens`:1664、清缓存 849/889/899）、`client.ts`（发布事件:2149/2162、payload:2153、判定:529）。**判定的三个错误字符串与 `relogin_required` 字段语义四语言必须一致**；`token.refresh_exhausted` 事件名与 `relogin_required` payload 字段对齐。
+>
+> **语言特有**：TS/JS 额外修复重连状态位 `_reconnectActive`（TS `client.ts`:703 字段 + 3181/3190/3210… 置位复位；JS `client.ts`:744 字段 + 2227/2253/2283… ），断连分支补齐复位避免重连标志残留；Go 无此字段。JS 另修正日志拼写（`client.ts`:2161，原 `token refreshconsecutivefailed` → 规范文案）。
+
+---
+
+### 块③ protected_headers 类型归一
+
+> 动机：V2 发送方法构造 envelope 元数据时，原先仅当 protected_headers 为 dict 才接受；当应用层传入 `ProtectedHeaders` 对象（非 dict）时会被丢弃。修复：统一识别并转为 dict。
+
+#### `_client/v2_e2ee.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L22 | 新增（静态） | `_protected_headers_dict(value)` | 对支持 `to_dict()` 的 `ProtectedHeaders` 对象统一转 dict；已是 dict 则原样返回 |
+| L395 | 修改 | `message.send` 加密路径取值 | `protected_headers = self._protected_headers_dict(client._protected_headers_from_params(params))` |
+| L930 | 修改 | `group.send` 加密路径取值 | 同上 |
+| L1253 | 修改 | `message.thought.put` 加密路径取值 | 同上 |
+| L1327 | 修改 | `group.thought.put` 加密路径取值 | 同上 |
+
+**对齐要点**：Go 见 `client_delivery.go`:260/262 与 `client_rpc_pipeline.go`:504/506 的类型 switch（`case *ProtectedHeaders` / `case ProtectedHeaders` → `ToMap()`）。TS 见 `client/delivery.ts`:149/150（探测 `toObject` 并归一）；JS 见 `client/delivery.ts`:138/139（同 TS）。**Go 用 `ToMap()`、TS/JS 用 `toObject()`、Python 用 `to_dict()`**，均归一为对象/字典；归一后剔除 `_auth`。
+
+---
+
+### 块④ app_message_envelope 字段收窄 + RPC 日志 token 脱敏
+
+> 动机一（字段收窄）：v0.4.12 的消息信封键集合包含 `message_id`/`seq`/`device_id`/`slot_id`/`status`/`delivery_mode` 等本地与传输层字段，会向应用层泄漏内部状态。收窄为只保留跨端可转发的语义元数据。
+> 动机二（日志脱敏）：短 RPC 的请求/响应全量 debug 日志会把明文 token 落盘，新增递归脱敏。
+
+#### `_client/delivery.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L23 | 修改常量 | `_APP_MESSAGE_ENVELOPE_KEYS` | 收窄为 18 键：`module_id`/`message_type`/`type`/`kind`/`version`/`from`/`from_aid`/`sender_aid`/`to`/`to_aid`/`group_id`/`timestamp`/`created_at`/`encrypted`/`context`/`protected_headers`/`headers`/`payload_type`。**移除**：`message_id`/`id`/`seq`/`msg_seq`/`t_server`/`status`/`delivery_mode`/`dispatch_mode`/`dispatch`/`device_id`/`slot_id`；**新增**：`context`/`protected_headers`/`headers`/`payload_type`（群事件键 `_APP_GROUP_EVENT_ENVELOPE_KEYS` 不变） |
+| L280 | 新增（静态） | `envelope_metadata(value)` | 从信封 dict 过滤掉 `_auth` 字段后返回 |
+| L290 | 修改（classmethod） | `app_message_envelope(payload)` | 由静态方法改为类方法并重写：用 `first_value`/`set_if_present` 从顶层与 `payload` body 多来源归一上述键，提取 `context`/`protected_headers`/`payload_type` |
+
+#### `auth.py`（相对 python/src/aun_core/）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L29 | 新增常量 | `_SENSITIVE_RPC_LOG_KEYS` | 敏感键集合：`access_token`/`refresh_token`/`kite_token`/`token` |
+| L50 | 新增 | `_redact_rpc_log_payload(value, *, key, depth)` | 递归脱敏：命中敏感键或 `_token` 结尾时替换为 `<redacted len=.. sha256=..>`（sha256 取前 12 位）；限深 6 层（超出返回 `<max-depth>`）；dict/list 递归 |
+| L694 | 修改 | `_short_rpc()` 请求日志 | `json.dumps(_redact_rpc_log_payload(request_envelope), ...)` |
+| L704 | 修改 | `_short_rpc()` 响应日志 | `json.dumps(_redact_rpc_log_payload(message), ...)` |
+
+**对齐要点**：收窄后 18 键三语言完全一致。Go 见 `client_delivery.go`（`appMessageEnvelopeKeys`:35、按白名单过滤:311/416）、`auth.go`（`authRedactRPCLogPayload`:2060、日志脱敏:664/685）。TS 见 `client/delivery.ts`（`APP_MESSAGE_ENVELOPE_KEYS`:10、过滤:297/346）、`auth.ts`（`SENSITIVE_RPC_LOG_KEYS`:49、`_redactRpcLogPayload`:56、调用:859/865）。JS 见 `client/delivery.ts`:10/285/334、`auth.ts`（`SENSITIVE_RPC_LOG_KEYS`:14、`redactRpcLogPayload`:21、调用:994/1000）。**JS 浏览器环境受 crypto 限制，脱敏只输出 `<redacted len=N>` 不含 sha256**，Go/TS 含 sha256（与 Python 一致）。
+
+---
+
+### 服务端协同（本版本配套，影响 SDK 行为）
+
+> 仅列与 SDK 契约直接相关的服务端变化；实现细节见服务端代码。涉及 `extensions/services/{auth,gateway,message}/`。
+
+| 主题 | 说明 |
+|------|------|
+| `auth.refresh_token` 响应结构化 | 新增 `relogin_required`/`retryable`/`diagnostic`/`aid`/`refresh_count` 字段；SDK 块② 据 `relogin_required` 判定是否清缓存重登，不再按 `error` 字符串硬匹配。失败分支统一走 `_refresh_failure_response`（auth/entry.py） |
+| refresh_token 按 token_hash 分锁 | 服务端 `_refresh_token_lock(token_hash)` 替代全局单锁，不同 token 刷新不再互相阻塞 |
+| JWT 老 SDK 兼容 | `AUN_JWT_LEGACY_ACCESS_TOKEN_COMPAT`（默认开）：合法 JWT access_token 直接放行，避免 refresh_token 迁移期老客户端重连风暴；gateway `_verify_jwt_local` 绕过 60s 信任时长限制 |
+| JWT jti 即时吊销 | `auth.token.revoked` 事件新增 `jti`/`expires_at`；gateway 按真实 TTL 调 `revoke_token_jti`，吊销即时生效 |
+| V2 P2P 写入幂等 | `v2_write_peer_message`/`v2_write_peer_wrap`（message/db.py）捕获唯一键冲突逐字段比对：重发相同 message_id 幂等返回原 seq、不再分配新序号产生空洞；自发自收（from==to）跳过重复 self-sync 推送（message/entry.py） |
+
+### 测试新增/修改
+
+| 文件 | 用例 | 说明 |
+|------|------|------|
+| `tests/unit/test_auth.py` | `test_refresh_failure_clears_cached_tokens` | 验证刷新失败后本地 token 被清空并持久化 |
+| `tests/unit/test_auth.py` | `test_connect_session_relogins_after_refresh_failure` | 验证刷新失败后 `connect_session` 自动走重新登录、token 被清理 |
+| `tests/unit/test_client_components.py` | `test_message_delivery_envelope_keeps_only_forwardable_metadata` | 验证只保留可转发元数据且 `context`/`headers` 中 `_auth` 被剔除 |
+| `tests/unit/test_client.py` | `test_published_message_events_fallback_current_instance_context`（改写） | envelope 断言改为收窄字段集（不含 message_id/seq/device_id/slot_id/message_type/sender_aid） |
+| `tests/unit/test_client_components.py` | 撤回墓碑事件断言（改写） | envelope 断言改为收窄字段集 |
+
+**对齐要点**：Go 见 `token_gateway_reuse_test.go`（`TestTokenGatewayReuse_RefreshFailureClearsCachedTokens`:227 / `TestTokenGatewayReuse_ReloginRequiredRefreshError`）、`client_test.go`（`TestAppMessageEnvelopeKeepsForwardableMetadata` 新增 + 撤回/fallback 用例改写）。TS/JS 见 `auth.test.ts`（`refresh 业务失败且要求重登时应清掉本地 token 缓存` / `connectSession 在 refresh 失败后应继续走两步登录`）、`delivery-engine.test.ts`（`应用层消息 envelope 只保留可转发字段并归一化 headers` + `publishAppEvent`/群撤回用例改写）。
+
+### `version.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L1 | 修改 | `__version__` | `"0.4.12"` → `"0.4.13"` |
+
+### `pyproject.toml`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L7 | 修改 | `version` | `"0.4.12"` → `"0.4.13"` |
 
 ---
 

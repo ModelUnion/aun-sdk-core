@@ -513,10 +513,9 @@ result = await client.call("message.ack", {"seq": 150})
 ```json
 {
     "envelope": {
-        "message_id": "uuid-1",
         "from": "alice.agentid.pub",
         "to": "bob.agentid.pub",
-        "seq": 42,
+        "type": "text",
         "timestamp": 1234567890000,
         "encrypted": false
     },
@@ -531,7 +530,7 @@ result = await client.call("message.ack", {"seq": 150})
 }
 ```
 
-SDK 交付给应用层的 `payload` 是明文业务 JSON 对象；信封字段统一放在 `envelope`。0.4.x 兼容期仍保留顶层 `message_id` / `from` / `to` / `seq` / `timestamp` 等别名，下一个大版本 0.5.* 将移除这些顶层别名，请通过 `msg["envelope"]["seq"]` 等路径访问。
+SDK 交付给应用层的 `payload` 是明文业务 JSON 对象；信封字段统一放在 `envelope`。`envelope` 只保留可转发的归一化元数据，`from` 由 `from_aid` / `sender_aid` 归一化而来，`timestamp` 由 `created_at` / `t_server` 归一化而来。0.4.x 兼容期仍保留顶层 `message_id` / `from` / `to` / `seq` / `timestamp` 等别名，下一个大版本 0.5.* 将移除这些顶层别名；请通过 `msg["envelope"]["from"]`、`msg["envelope"]["timestamp"]` 等路径访问。
 
 ### 订阅
 
@@ -550,10 +549,10 @@ client.on("message.received", lambda msg: print(msg["payload"]))
 ```json
 {
     "envelope": {
-        "message_id": "recall-uuid",
         "from": "alice.agentid.pub",
         "to": "bob.agentid.pub",
-        "seq": 43,
+        "type": "message.recalled",
+        "kind": "message.recalled",
         "timestamp": 1234567890000
     },
     "message_id": "recall-uuid",
@@ -565,11 +564,11 @@ client.on("message.received", lambda msg: print(msg["payload"]))
 }
 ```
 
-SDK 交付给应用层的撤回事件同样带 `envelope`。`envelope` 表示撤回 tombstone / 通知自身的信封，不是被撤回原消息的信封；被撤回的原消息继续通过 `message_ids` 表达。0.4.x 兼容期仍保留顶层 `message_id` / `from` / `to` / `seq` / `timestamp` 等别名，下一个大版本 0.5.* 将移除这些顶层别名。
+SDK 交付给应用层的撤回事件同样带 `envelope`。`envelope` 表示撤回 tombstone / 通知自身的信封，不是被撤回原消息的信封；被撤回的原消息继续通过 `message_ids` 表达。`message_id` / `seq` 继续只保留在顶层兼容字段中，不进入 `envelope`。0.4.x 兼容期仍保留顶层 `message_id` / `from` / `to` / `seq` / `timestamp` 等别名，下一个大版本 0.5.* 将移除这些顶层别名。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `envelope` | object | 撤回 tombstone / 通知自身信封，包含 `message_id`、`from`、`to`、`seq`、`timestamp`、`device_id`、`slot_id` 等存在的字段 |
+| `envelope` | object | 撤回 tombstone / 通知自身信封，包含 `from`、`to`、`type`、`kind`、`timestamp`、`encrypted`、`context`、`protected_headers` 等存在的字段 |
 | `message_id` | string | 撤回 tombstone / 通知自身的 message_id |
 | `tombstone_message_id` | string | 兼容别名，等同于撤回 tombstone / 通知自身的 `message_id` |
 | `from` | string | 发送方（撤回者）AID |

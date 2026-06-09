@@ -6,6 +6,33 @@
 
 ---
 
+## 0.4.13 — 2026-06-09
+
+### 新功能
+- **发送结果回填 envelope**：`message.send` / `group.send` / `message.thought.put` / `group.thought.put` 的返回结果新增规范化 `envelope` 字段，使发送方回执与接收端信封元数据一致；新增 `APP_SEND_ENVELOPE_METHODS` 与 `sendResultEnvelope()` / `attachSendResultEnvelope()`，rpc-pipeline 在 `postprocess` 后统一附加，V2 加密路径经 `_skipSendResultEnvelope` 标志跳过明文附加、由外层 V2 协调器在加密后补挂避免重复（四语言对齐）
+
+### 修复
+- **refresh_token 失效自愈**：新增需重登判定（命中 `relogin_required` 或 `missing refresh_token` / `invalid_or_expired_refresh_token` / `refresh not supported`）与清缓存逻辑；刷新失败需重登时清空本地 `access_token`/`refresh_token`/`kite_token` 并持久化，client 层 token 刷新循环检测到需重登时发布 `token.refresh_exhausted` 事件（带 `relogin_required: true`）、断连触发重连，下次 `connectSession` 因无可用 token 自动走两步登录；refresh RPC 补传 `aid`/`device_id`/`slot_id`/`access_token`/`sdk_lang`/`sdk_version`，`AuthError` 携带 `data` 透传服务端响应（四语言对齐）
+- **token 刷新日志文案修正**：修复连续刷新失败日志拼写错误（`token refreshconsecutivefailed` → 规范文案），token 循环中 `publish`/`_handleTransportDisconnect` 补齐 `await`
+- **protected_headers 类型归一**：V2 发送方法的 envelope 元数据归一时识别 `ProtectedHeaders` 对象（经 `toObject()` 探测）并转 dict，修复传入对象（非 dict）时 protected_headers 被丢弃的问题（四语言对齐）
+
+### 优化
+- **app_message_envelope 字段收窄**：envelope 键收窄为可转发元数据（`from`/`to`/`group_id`/`type`/`kind`/`version`/`timestamp`/`encrypted`/`context`/`protected_headers`/`payload_type`），移除 `message_id`/`seq`/`device_id`/`slot_id` 等本地与传输层字段，不再向应用层泄漏内部字段并剔除 `_auth`（四语言对齐）
+- **RPC 日志 token 脱敏**：短 RPC 请求/响应 debug 日志对 `access_token`/`refresh_token`/`kite_token`/`token` 及 `_token` 结尾键递归脱敏，避免明文 token 落日志；浏览器环境受 crypto 限制只输出 `<redacted len=N>`（不含 sha256，与 Node/Go 略有差异）
+
+### 测试
+- `refresh 业务失败且要求重登时应清掉本地 token 缓存`
+- `connectSession 在 refresh 失败后应继续走两步登录`
+- `应用层消息 envelope 只保留可转发字段并归一化 headers`
+- 更新 `publishAppEvent` 与群撤回相关用例断言 envelope 收窄、不含 `message_id`/`seq`/`device_id`/`slot_id`
+
+### 服务端协同（本版本配套）
+- **`auth.refresh_token` 响应结构化**：新增 `relogin_required` / `retryable` / `diagnostic` / `aid` / `refresh_count` 字段，SDK 据 `relogin_required`/`retryable` 区分"重新登录"与"退避重试"，不再单纯按 `error` 字符串判断
+- **JWT 老 SDK 兼容与即时吊销**：`AUN_JWT_LEGACY_ACCESS_TOKEN_COMPAT`（默认开）放行合法 JWT 避免迁移期重连风暴；`auth.token.revoked` 事件携带 `jti`/`expires_at`，gateway 按真实 TTL 缓存吊销
+- **V2 P2P 写入幂等**：服务端 `v2_write_peer_message`/`v2_write_peer_wrap` 捕获唯一键冲突逐字段比对，重发相同 message_id 幂等返回、不再产生 seq 空洞；自发自收跳过重复 self-sync 推送
+
+---
+
 ## 0.4.12 — 2026-06-08
 
 ### 新功能

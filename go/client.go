@@ -2170,6 +2170,20 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 		if err != nil {
 			var authErr *AuthError
 			if errors.As(err, &authErr) {
+				if authRefreshFailureRequiresRelogin(err) {
+					c.log.Warn("token refresh requires relogin, stopping refresh loop and triggering reconnect: %v", err)
+					c.events.Publish("token.refresh_exhausted", map[string]any{
+						"aid":                  authGetStr(identity, "aid"),
+						"consecutive_failures": 1,
+						"last_error":           err.Error(),
+						"relogin_required":     true,
+					})
+					c.tokenRefreshFailures.Store(0)
+					c.handleTransportDisconnect(
+						fmt.Errorf("token refresh relogin required, triggering reconnect"), -1,
+					)
+					return
+				}
 				failures := int(c.tokenRefreshFailures.Add(1))
 				if failures >= 3 {
 					c.log.Warn("token refresh consecutive failures %d, stopping refresh loop and triggering reconnect", failures)

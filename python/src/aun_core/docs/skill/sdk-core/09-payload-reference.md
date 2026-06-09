@@ -40,7 +40,7 @@
 | `to` | `message.send.params` | P2P 接收方 AID |
 | `group_id` | `group.send.params` 和群消息信封 | 群组 ID |
 | `context.type + context.id` | `message.thought.put/get.params` 和 `group.thought.put/get.params` | 思考内容 selector；必填，不要只放在 payload 内 |
-| `protected_headers` / `headers` | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 参数 | E2EE 信封元数据，类似 HTTP headers；SDK 验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
+| `protected_headers` / `headers` | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 参数 | E2EE 信封元数据，类似 HTTP headers；推荐 `protected_headers`，`headers` 仅为兼容别名；SDK 验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
 | `from` / `sender_aid` | 服务端生成的消息信封 | 发送方身份 |
 | `message_id` / `seq` / `timestamp` / `created_at` | 服务端生成或发送参数 | 当前消息 ID、序号和服务端时间 |
 | `encrypted` / `delivery_mode` | 发送参数或连接上下文 | 加密和 P2P 投递语义 |

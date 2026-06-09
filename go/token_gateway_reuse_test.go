@@ -223,3 +223,52 @@ func TestTokenGatewayReuse_LoadCachedGatewayURLReturnsEmptyWhenAbsent(t *testing
 	// 兼容性：strings.TrimSpace 在 namespace 层做，AuthFlow 直接读裸值。
 	_ = strings.TrimSpace(got)
 }
+
+func TestTokenGatewayReuse_RefreshFailureClearsCachedTokens(t *testing.T) {
+	flow, ks := newTestAuthFlow(t)
+	const aid = "heidi.test.local"
+	identity := map[string]any{
+		"aid":                     aid,
+		"access_token":            "old-access",
+		"refresh_token":           "",
+		"kite_token":              "old-kite",
+		"access_token_expires_at": int(time.Now().Unix()) + 3600,
+	}
+	if err := flow.persistIdentity(identity); err != nil {
+		t.Fatalf("persistIdentity 失败: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := flow.RefreshCachedTokens(ctx, "ws://127.0.0.1:1/aun", identity)
+	if err == nil {
+		t.Fatal("缺失 refresh_token 应返回错误")
+	}
+	if identity["access_token"] != "" || identity["refresh_token"] != "" || identity["kite_token"] != "" || identity["access_token_expires_at"] != 0 {
+		t.Fatalf("内存 token 未清理: %#v", identity)
+	}
+	state, err := ks.LoadInstanceState(aid, "", "")
+	if err != nil {
+		t.Fatalf("LoadInstanceState 失败: %v", err)
+	}
+	if state["access_token"] != "" || state["refresh_token"] != "" || state["kite_token"] != "" {
+		t.Fatalf("持久化 token 未清理: %#v", state)
+	}
+	if state["access_token_expires_at"] != float64(0) && state["access_token_expires_at"] != 0 {
+		t.Fatalf("持久化 expires_at 未清理: %#v", state)
+	}
+}
+
+func TestTokenGatewayReuse_ReloginRequiredRefreshError(t *testing.T) {
+	err := NewAuthError("invalid_or_expired_refresh_token", WithData(map[string]any{
+		"success":          false,
+		"error":            "invalid_or_expired_refresh_token",
+		"relogin_required": true,
+	}))
+	if !authRefreshFailureRequiresRelogin(err) {
+		t.Fatal("relogin_required=true 的 refresh 失败应触发清理和两步登录")
+	}
+	if authRefreshFailureRequiresRelogin(NewConnectionError("network down")) {
+		t.Fatal("网络错误不应触发 token 清理")
+	}
+}

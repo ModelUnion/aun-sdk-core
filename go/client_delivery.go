@@ -33,10 +33,17 @@ func (c *AUNClient) delivery() *messageDeliveryEngine {
 // ── 应用层事件发布 ──────────────────────────────────────────
 
 var appMessageEnvelopeKeys = []string{
-	"module_id", "message_id", "id", "seq", "msg_seq", "message_type", "type", "kind", "version",
+	"module_id", "message_type", "type", "kind", "version",
 	"from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
-	"timestamp", "created_at", "t_server", "encrypted", "status", "delivery_mode",
-	"dispatch_mode", "dispatch", "device_id", "slot_id",
+	"timestamp", "created_at", "encrypted",
+	"context", "protected_headers", "headers", "payload_type",
+}
+
+var appSendEnvelopeMethods = map[string]bool{
+	"message.send":        true,
+	"group.send":          true,
+	"message.thought.put": true,
+	"group.thought.put":   true,
 }
 
 var appGroupEventEnvelopeKeys = []string{
@@ -78,12 +85,32 @@ func appMessageEnvelope(payload any) map[string]any {
 	if !ok {
 		return map[string]any{}
 	}
-	envelope := make(map[string]any)
-	for _, key := range appMessageEnvelopeKeys {
-		if value, exists := message[key]; exists {
-			envelope[key] = value
-		}
+	body := map[string]any{}
+	if rawBody, ok := message["payload"].(map[string]any); ok {
+		body = rawBody
 	}
+	envelope := make(map[string]any)
+	setEnvelopeValue(envelope, "from", firstEnvelopeValue(message["from"], message["from_aid"], message["sender_aid"]))
+	setEnvelopeValue(envelope, "to", firstEnvelopeValue(message["to"], message["to_aid"]))
+	setEnvelopeValue(envelope, "group_id", message["group_id"])
+	setEnvelopeValue(envelope, "type", firstEnvelopeValue(body["type"], message["type"], message["message_type"], message["payload_type"]))
+	setEnvelopeValue(envelope, "kind", firstEnvelopeValue(body["kind"], message["kind"]))
+	setEnvelopeValue(envelope, "version", firstEnvelopeValue(body["version"], message["version"]))
+	setEnvelopeValue(envelope, "timestamp", firstEnvelopeValue(message["timestamp"], message["created_at"], message["t_server"]))
+	if value, exists := message["encrypted"]; exists {
+		envelope["encrypted"] = truthyBool(value)
+	}
+	if value := envelopeMapValue(message["context"]); len(value) > 0 {
+		envelope["context"] = value
+	}
+	protectedHeaders := envelopeMapValue(message["protected_headers"])
+	if len(protectedHeaders) == 0 {
+		protectedHeaders = envelopeMapValue(message["headers"])
+	}
+	if len(protectedHeaders) > 0 {
+		envelope["protected_headers"] = protectedHeaders
+	}
+	setEnvelopeValue(envelope, "payload_type", firstEnvelopeValue(message["payload_type"], protectedHeaders["payload_type"]))
 	return envelope
 }
 
@@ -116,6 +143,68 @@ func attachAppMessageEnvelope(payload any) any {
 	return result
 }
 
+func (d *messageDeliveryEngine) sendResultEnvelope(method string, params map[string]any, result any, encrypted bool) map[string]any {
+	if !appSendEnvelopeMethods[method] {
+		return map[string]any{}
+	}
+	body := map[string]any{}
+	if rawBody, ok := params["payload"].(map[string]any); ok {
+		body = rawBody
+	}
+	resultMap, _ := result.(map[string]any)
+	envelope := make(map[string]any)
+	d.runtime.client.mu.RLock()
+	selfAID := d.runtime.client.aid
+	d.runtime.client.mu.RUnlock()
+	setEnvelopeValue(envelope, "from", selfAID)
+	if strings.HasPrefix(method, "message.") {
+		setEnvelopeValue(envelope, "to", params["to"])
+	} else {
+		setEnvelopeValue(envelope, "group_id", params["group_id"])
+	}
+	setEnvelopeValue(envelope, "type", firstEnvelopeValue(body["type"], params["type"], params["message_type"], params["payload_type"]))
+	setEnvelopeValue(envelope, "kind", firstEnvelopeValue(body["kind"], params["kind"]))
+	setEnvelopeValue(envelope, "version", firstEnvelopeValue(body["version"], params["version"]))
+	setEnvelopeValue(envelope, "timestamp", firstEnvelopeValue(
+		params["timestamp"],
+		resultMap["timestamp"],
+		resultMap["created_at"],
+		resultMap["t_server"],
+		time.Now().UnixMilli(),
+	))
+	envelope["encrypted"] = encrypted
+	if value := envelopeMapValue(params["context"]); len(value) > 0 {
+		envelope["context"] = value
+	}
+	protectedHeaders := envelopeMapValue(params["protected_headers"])
+	if len(protectedHeaders) == 0 {
+		protectedHeaders = envelopeMapValue(params["headers"])
+	}
+	if len(protectedHeaders) > 0 {
+		envelope["protected_headers"] = protectedHeaders
+	}
+	setEnvelopeValue(envelope, "payload_type", firstEnvelopeValue(params["payload_type"], protectedHeaders["payload_type"], body["type"]))
+	return envelope
+}
+
+func (d *messageDeliveryEngine) attachSendResultEnvelope(method string, params map[string]any, result any, encrypted bool) any {
+	if !appSendEnvelopeMethods[method] {
+		return result
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return result
+	}
+	out := copyMapShallow(resultMap)
+	out["envelope"] = d.sendResultEnvelope(method, params, out, encrypted)
+	if payload, exists := params["payload"]; exists {
+		out["payload"] = payload
+	} else if content, exists := params["content"]; exists {
+		out["payload"] = content
+	}
+	return out
+}
+
 func attachAppGroupEventEnvelope(payload any) any {
 	event, ok := payload.(map[string]any)
 	if !ok {
@@ -125,6 +214,56 @@ func attachAppGroupEventEnvelope(payload any) any {
 	// 兼容期保留顶层群事件信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
 	result["envelope"] = appGroupEventEnvelope(result)
 	return result
+}
+
+func firstEnvelopeValue(values ...any) any {
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+			continue
+		}
+		return value
+	}
+	return nil
+}
+
+func setEnvelopeValue(envelope map[string]any, key string, value any) {
+	if value == nil {
+		return
+	}
+	if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+		return
+	}
+	envelope[key] = value
+}
+
+func envelopeMapValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, v := range typed {
+			if k != "_auth" {
+				out[k] = v
+			}
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]any, len(typed))
+		for k, v := range typed {
+			if k != "_auth" {
+				out[k] = v
+			}
+		}
+		return out
+	case *ProtectedHeaders:
+		return envelopeMapValue(typed.ToMap())
+	case ProtectedHeaders:
+		return envelopeMapValue(typed.ToMap())
+	default:
+		return nil
+	}
 }
 
 func stripInternalSenderDeviceFields(payload any) any {

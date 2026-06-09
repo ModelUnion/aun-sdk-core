@@ -120,10 +120,15 @@ func (p *rpcPipeline) call(ctx context.Context, method string, params map[string
 	params = preflight.params
 	pullGateLocked := truthyBool(params["_pull_gate_locked"])
 	delete(params, "_pull_gate_locked")
+	skipSendResultEnvelope := truthyBool(params["_skip_send_result_envelope"])
+	delete(params, "_skip_send_result_envelope")
 	pullGateKey := p.pullGateKeyForCall(method, params)
 	if pullGateKey != "" && !pullGateLocked {
 		lockedParams := copyRpcParams(params)
 		lockedParams["_pull_gate_locked"] = true
+		if skipSendResultEnvelope {
+			lockedParams["_skip_send_result_envelope"] = true
+		}
 		return p.runPullSerialized(ctx, pullGateKey, func() (any, error) {
 			return p.call(ctx, method, lockedParams)
 		})
@@ -256,7 +261,14 @@ func (p *rpcPipeline) call(ctx context.Context, method string, params map[string
 		}
 	}
 
-	return p.postprocessResult(ctx, method, params, result)
+	result, err = p.postprocessResult(ctx, method, params, result)
+	if err != nil {
+		return nil, err
+	}
+	if !skipSendResultEnvelope {
+		result = c.delivery().attachSendResultEnvelope(method, params, result, truthyBool(params["encrypted"]))
+	}
+	return result, nil
 }
 
 func (p *rpcPipeline) preflight(method string, params map[string]any) (*rpcPreflightResult, error) {
@@ -489,6 +501,10 @@ func protectedHeadersMap(value any) map[string]any {
 			copied[k] = v
 		}
 		return copied
+	case *ProtectedHeaders:
+		return protectedHeadersMap(headers.ToMap())
+	case ProtectedHeaders:
+		return protectedHeadersMap(headers.ToMap())
 	default:
 		return nil
 	}

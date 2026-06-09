@@ -409,8 +409,8 @@ sub.unsubscribe()
 | 领域 | 手册 | 关键方法 |
 |------|------|----------|
 | 消息 | [09-message-rpc-manual.md](09-message-rpc-manual.md) | `message.send` / `message.pull` / `message.ack` / `message.thought.*` |
-| 群组 | [09-group-rpc-manual.md](09-group-rpc-manual.md) | `group.create` / `group.invite` / `group.send` / `group.v2.*` |
-| 存储 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | `storage.upload` / `storage.download` / `storage.share` |
+| 群组 | [09-group-rpc-manual.md](09-group-rpc-manual.md) | `group.create` / `group.send` / `group.v2.*` / `group.resources.*` |
+| 存储 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | `storage.put_object` / `storage.create_upload_session` / `storage.create_folder` / `storage.create_share_link` |
 | 元信息 | [09-meta-rpc-manual.md](09-meta-rpc-manual.md) | `meta.ping` / `meta.status` / `meta.trust_roots` |
 | Stream | [09-stream-rpc-manual.md](09-stream-rpc-manual.md) | `stream.create` / `stream.close` / `stream.list_active` |
 | Service Proxy | [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) | `proxy.register_services` / `proxy.unregister_services` / `proxy.list_services` |

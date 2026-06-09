@@ -46,6 +46,34 @@ const _noopLogger: ModuleLogger = {
 };
 
 const AUN_SDK_LANG = 'typescript';
+const SENSITIVE_RPC_LOG_KEYS = new Set([
+  'access_token',
+  'refresh_token',
+  'kite_token',
+  'token',
+]);
+
+function _redactRpcLogPayload(value: unknown, key: string = '', depth: number = 0): unknown {
+  const keyLower = key.toLowerCase();
+  if (SENSITIVE_RPC_LOG_KEYS.has(keyLower) || keyLower.endsWith('_token')) {
+    const text = String(value ?? '');
+    if (!text) return '';
+    const digest = crypto.createHash('sha256').update(text).digest('hex').slice(0, 12);
+    return `<redacted len=${text.length} sha256=${digest}>`;
+  }
+  if (depth >= 6) return '<max-depth>';
+  if (Array.isArray(value)) {
+    return value.map((item) => _redactRpcLogPayload(item, '', depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+      out[childKey] = _redactRpcLogPayload(childValue, childKey, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
 
 // ── 签名验证辅助 ──────────────────────────────────────────────
 
@@ -532,17 +560,21 @@ export class AuthFlow {
     const refreshToken = String(identity.refresh_token || '');
     if (!refreshToken) {
       this._logger.error(`token refresh failed: missing refresh_token, aid=${identity.aid}`);
+      this._clearCachedTokens(identity, 'missing refresh_token');
       throw new AuthError('missing refresh_token');
     }
     this._logger.debug(`refreshCachedTokens enter: aid=${identity.aid}`);
     try {
-      const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
+      const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken, identity);
       AuthFlow._rememberTokens(identity, refreshed);
       await this._validateNewCert(identity, gatewayUrl);
       this._persistIdentity(identity);
       this._logger.debug(`refreshCachedTokens exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}`);
       return identity;
     } catch (err) {
+      if (this._refreshFailureRequiresRelogin(err)) {
+        this._clearCachedTokens(identity, err instanceof Error ? err.message : String(err));
+      }
       this._logger.debug(`refreshCachedTokens exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
@@ -705,6 +737,9 @@ export class AuthFlow {
           }
         } catch (exc) {
           if (!(exc instanceof AuthError)) throw exc;
+          if (this._refreshFailureRequiresRelogin(exc)) {
+            this._clearCachedTokens(identity, exc.message);
+          }
           this._logger.debug(`refresh_token auth failed, will re-login: ${exc.message}`);
         }
       }
@@ -821,13 +856,13 @@ export class AuthFlow {
         method,
         params,
       });
-      this._logger.debug(`short RPC request full: ${payload}`);
+      this._logger.debug(`short RPC request full: ${JSON.stringify(_redactRpcLogPayload(JSON.parse(payload)))}`);
       ws.send(payload);
 
       // 接收响应
       const raw = await this._wsRecv(ws);
       const message = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      this._logger.debug(`short RPC response full: method=${method} ${JSON.stringify(message)}`);
+      this._logger.debug(`short RPC response full: method=${method} ${JSON.stringify(_redactRpcLogPayload(message))}`);
 
       if (message.error) {
         throw mapRemoteError(message.error);
@@ -837,7 +872,7 @@ export class AuthFlow {
         throw new ValidationError(`invalid pre-auth response for ${method}`);
       }
       if (result.success === false) {
-        throw new AuthError(String(result.error || `${method} failed`));
+        throw new AuthError(String(result.error || `${method} failed`), { data: result });
       }
       return result;
     } finally {
@@ -929,15 +964,32 @@ export class AuthFlow {
   private async _refreshAccessToken(
     gatewayUrl: string,
     refreshToken: string,
+    identity?: IdentityRecord,
   ): Promise<JsonObject> {
     const tStart = Date.now();
     this._logger.debug(`_refreshAccessToken enter`);
     try {
-      const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
+      const params: JsonObject = {
         refresh_token: refreshToken,
-      });
+        sdk_lang: AUN_SDK_LANG,
+        sdk_version: AUN_SDK_VERSION,
+      };
+      if (identity) {
+        const aid = String(identity.aid ?? '').trim();
+        const deviceId = String((identity as JsonObject).device_id ?? '').trim();
+        const slotId = String((identity as JsonObject).slot_id ?? '').trim();
+        const accessToken = String(identity.access_token ?? '').trim();
+        if (aid) params.aid = aid;
+        if (deviceId) params.device_id = deviceId;
+        if (slotId) params.slot_id = slotId;
+        if (accessToken) params.access_token = accessToken;
+        if (typeof identity.access_token_expires_at === 'number') {
+          params.access_token_expires_at = identity.access_token_expires_at;
+        }
+      }
+      const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', params);
       if (!result.success) {
-        throw new AuthError(String(result.error || 'refresh failed'));
+        throw new AuthError(String(result.error || 'refresh failed'), { data: result });
       }
       this._logger.debug(`_refreshAccessToken exit: elapsed=${Date.now() - tStart}ms`);
       return result;
@@ -1974,6 +2026,41 @@ export class AuthFlow {
     const activeCert = authResult.active_cert;
     if (typeof activeCert === 'string' && activeCert) {
       identity._pending_active_cert = activeCert;
+    }
+  }
+
+  private _refreshFailureRequiresRelogin(err: unknown): boolean {
+    if (!(err instanceof AuthError)) return false;
+    const data = err.data;
+    if (isJsonObject(data)) {
+      if (data.relogin_required === true) return true;
+      const error = String(data.error ?? '').trim().toLowerCase();
+      return ['missing refresh_token', 'invalid_or_expired_refresh_token', 'refresh not supported'].includes(error);
+    }
+    const message = err.message.trim().toLowerCase();
+    return ['missing refresh_token', 'invalid_or_expired_refresh_token', 'refresh not supported'].includes(message);
+  }
+
+  private _clearCachedTokens(identity: IdentityRecord, reason: string = ''): void {
+    const aid = String(identity.aid ?? '');
+    const hadToken = Boolean(
+      identity.access_token ||
+      identity.refresh_token ||
+      identity.kite_token ||
+      identity.token ||
+      identity.access_token_expires_at,
+    );
+    if (!hadToken) return;
+    identity.access_token = '';
+    identity.refresh_token = '';
+    identity.kite_token = '';
+    identity.token = '';
+    identity.access_token_expires_at = 0;
+    try {
+      this._persistIdentity(identity);
+      this._logger.warn(`cleared cached tokens after refresh failure: aid=${aid} reason=${reason}`);
+    } catch (persistErr) {
+      this._logger.warn(`failed to persist token cleanup: aid=${aid} err=${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
     }
   }
 

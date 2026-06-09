@@ -251,6 +251,7 @@ func (v *v2E2EECoordinator) putMessageThoughtEncryptedV2(ctx context.Context, pa
 	if timestamp == 0 {
 		timestamp = time.Now().UnixMilli()
 	}
+	protectedHeaders := protectedHeadersFromParams(params)
 	c.logMessageDebugWithPayload("thought-send-plaintext", "message.thought.put.v2", "message.thought.put", map[string]any{
 		"to":         toAID,
 		"thought_id": thoughtID,
@@ -267,9 +268,10 @@ func (v *v2E2EECoordinator) putMessageThoughtEncryptedV2(ctx context.Context, pa
 			ctxMeta = cm
 		}
 		envelope, err := v.buildV2P2PEnvelope(ctx, state, toAID, payload, e2ee.EncryptOptions{
-			MessageID: thoughtID,
-			Timestamp: timestamp,
-			Context:   ctxMeta,
+			MessageID:        thoughtID,
+			Timestamp:        timestamp,
+			ProtectedHeaders: protectedHeaders,
+			Context:          ctxMeta,
 		}, useCache)
 		if err != nil {
 			return nil, err
@@ -302,12 +304,30 @@ func (v *v2E2EECoordinator) putMessageThoughtEncryptedV2(ctx context.Context, pa
 
 	resp, err := attempt(true)
 	if err == nil {
-		return resp, nil
+		return c.delivery().attachSendResultEnvelope("message.thought.put", map[string]any{
+			"to":                toAID,
+			"payload":           payload,
+			"thought_id":        thoughtID,
+			"timestamp":         timestamp,
+			"context":           params["context"],
+			"protected_headers": protectedHeaders,
+		}, resp, true), nil
 	}
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 P2P thought put speculative rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
 		v.deletePeerBootstrapCache(toAID)
-		return attempt(false)
+		resp, retryErr := attempt(false)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		return c.delivery().attachSendResultEnvelope("message.thought.put", map[string]any{
+			"to":                toAID,
+			"payload":           payload,
+			"thought_id":        thoughtID,
+			"timestamp":         timestamp,
+			"context":           params["context"],
+			"protected_headers": protectedHeaders,
+		}, resp, true), nil
 	}
 	return nil, err
 }
@@ -337,6 +357,7 @@ func (v *v2E2EECoordinator) putGroupThoughtEncryptedV2(ctx context.Context, para
 	if timestamp == 0 {
 		timestamp = time.Now().UnixMilli()
 	}
+	protectedHeaders := protectedHeadersFromParams(params)
 	c.logMessageDebugWithPayload("thought-send-plaintext", "group.thought.put.v2", "group.thought.put", map[string]any{
 		"group_id":   groupID,
 		"thought_id": thoughtID,
@@ -353,9 +374,10 @@ func (v *v2E2EECoordinator) putGroupThoughtEncryptedV2(ctx context.Context, para
 			ctxMeta = cm
 		}
 		envelope, err := v.buildV2GroupEnvelope(ctx, state, groupID, payload, e2ee.EncryptOptions{
-			MessageID: thoughtID,
-			Timestamp: timestamp,
-			Context:   ctxMeta,
+			MessageID:        thoughtID,
+			Timestamp:        timestamp,
+			ProtectedHeaders: protectedHeaders,
+			Context:          ctxMeta,
 		}, useCache)
 		if err != nil {
 			return nil, err
@@ -392,12 +414,30 @@ func (v *v2E2EECoordinator) putGroupThoughtEncryptedV2(ctx context.Context, para
 
 	resp, err := attempt(true)
 	if err == nil {
-		return resp, nil
+		return c.delivery().attachSendResultEnvelope("group.thought.put", map[string]any{
+			"group_id":          groupID,
+			"payload":           payload,
+			"thought_id":        thoughtID,
+			"timestamp":         timestamp,
+			"context":           params["context"],
+			"protected_headers": protectedHeaders,
+		}, resp, true), nil
 	}
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 group thought put speculative rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
 		v.deleteGroupBootstrapCache(groupID)
-		return attempt(false)
+		resp, retryErr := attempt(false)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		return c.delivery().attachSendResultEnvelope("group.thought.put", map[string]any{
+			"group_id":          groupID,
+			"payload":           payload,
+			"thought_id":        thoughtID,
+			"timestamp":         timestamp,
+			"context":           params["context"],
+			"protected_headers": protectedHeaders,
+		}, resp, true), nil
 	}
 	return nil, err
 }

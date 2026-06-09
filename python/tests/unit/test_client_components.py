@@ -87,8 +87,15 @@ def test_message_delivery_maps_recall_tombstone_to_app_event():
     assert payload["tombstone_message_id"] == "recall-1"
     assert payload["seq"] == 9
     published = engine.attach_app_message_envelope(payload)
-    assert published["envelope"]["message_id"] == "recall-1"
-    assert published["envelope"]["seq"] == 9
+    assert published["envelope"] == {
+        "from": "alice.agentid.pub",
+        "to": "bob.agentid.pub",
+        "type": "message.recalled",
+        "kind": "message.recalled",
+        "timestamp": 123,
+    }
+    assert "message_id" not in published["envelope"]
+    assert "seq" not in published["envelope"]
 
     group_payload = engine.recall_event_from_group_message({
         "module_id": "group",
@@ -108,10 +115,47 @@ def test_message_delivery_maps_recall_tombstone_to_app_event():
     assert group_payload["tombstone_message_id"] == "notice-1"
     assert group_payload["message_ids"] == ["gm-1"]
     group_published = engine.attach_app_message_envelope(group_payload)
-    assert group_published["envelope"]["module_id"] == "group"
-    assert group_published["envelope"]["group_id"] == "g1"
-    assert group_published["envelope"]["message_id"] == "notice-1"
-    assert group_published["envelope"]["seq"] == 43
+    assert group_published["envelope"] == {
+        "from": "alice.agentid.pub",
+        "group_id": "g1",
+        "type": "group.message_recalled",
+        "kind": "group.message_recalled",
+        "timestamp": 0,
+    }
+    assert "module_id" not in group_published["envelope"]
+    assert "message_id" not in group_published["envelope"]
+    assert "seq" not in group_published["envelope"]
+
+
+def test_message_delivery_envelope_keeps_only_forwardable_metadata():
+    class FakeClient:
+        _device_id = "dev-1"
+        _slot_id = "slot-a"
+
+    engine = MessageDeliveryEngine(FakeClient())
+    published = engine.attach_app_message_envelope({
+        "message_id": "m-1",
+        "seq": 9,
+        "from_aid": "alice.agentid.pub",
+        "to_aid": "bob.agentid.pub",
+        "created_at": 1234567890000,
+        "payload": {"type": "text", "text": "hello"},
+        "headers": {"trace_id": "trace-1", "_auth": "drop"},
+        "context": {"run_id": "run-1", "_auth": "drop"},
+        "device_id": "dev-1",
+        "slot_id": "slot-a",
+    })
+
+    assert published["envelope"] == {
+        "from": "alice.agentid.pub",
+        "to": "bob.agentid.pub",
+        "type": "text",
+        "timestamp": 1234567890000,
+        "context": {"run_id": "run-1"},
+        "protected_headers": {"trace_id": "trace-1"},
+    }
+    for key in ("message_id", "seq", "device_id", "slot_id", "headers", "from_aid", "to_aid", "created_at"):
+        assert key not in published["envelope"]
 
 
 def test_v2_e2ee_metadata_filters_auth_fields_and_attaches_public_fields():

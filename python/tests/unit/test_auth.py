@@ -693,3 +693,100 @@ def test_new_cert_rejected_key_mismatch():
     }
     asyncio.run(flow._validate_new_cert(identity))
     assert "cert" not in identity  # 被拒绝
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_clears_cached_tokens(tmp_path: Path):
+    flow = AuthFlow(
+        token_store=LocalTokenStore(tmp_path / "aun"),
+        crypto=CryptoProvider(),
+        device_id="dev-refresh",
+        slot_id="slot-refresh",
+        verify_ssl=False,
+    )
+    identity = {
+        "aid": "alice.test",
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "kite_token": "old-kite",
+        "access_token_expires_at": 123456,
+    }
+    flow._persist_identity(identity)
+
+    async def fail_refresh(*_args, **_kwargs):
+        raise AuthError(
+            "invalid_or_expired_refresh_token",
+            data={
+                "success": False,
+                "error": "invalid_or_expired_refresh_token",
+                "relogin_required": True,
+            },
+        )
+
+    flow._refresh_access_token = fail_refresh
+
+    with pytest.raises(AuthError):
+        await flow.refresh_cached_tokens("ws://gateway/aun", identity)
+
+    assert identity["access_token"] == ""
+    assert identity["refresh_token"] == ""
+    assert identity["kite_token"] == ""
+    assert identity["access_token_expires_at"] == 0
+    state = flow._token_store.load_instance_state("alice.test", flow._device_id, flow._slot_id)
+    assert state["access_token"] == ""
+    assert state["refresh_token"] == ""
+    assert state["kite_token"] == ""
+    assert state["access_token_expires_at"] == 0
+
+
+@pytest.mark.asyncio
+async def test_connect_session_relogins_after_refresh_failure(tmp_path: Path):
+    flow = AuthFlow(
+        token_store=LocalTokenStore(tmp_path / "aun"),
+        crypto=CryptoProvider(),
+        device_id="dev-refresh",
+        slot_id="slot-refresh",
+        verify_ssl=False,
+    )
+    identity = {
+        "aid": "alice.test",
+        "access_token": "expired-access",
+        "refresh_token": "expired-refresh",
+        "kite_token": "old-kite",
+        "access_token_expires_at": 1,
+    }
+    flow.load_identity = lambda aid=None: identity
+
+    async def fail_refresh(*_args, **_kwargs):
+        raise AuthError(
+            "invalid_or_expired_refresh_token",
+            data={
+                "success": False,
+                "error": "invalid_or_expired_refresh_token",
+                "relogin_required": True,
+            },
+        )
+
+    auth_calls = []
+
+    async def fake_authenticate(gateway_url: str, *, aid: str | None = None):
+        auth_calls.append((gateway_url, aid))
+        return {"access_token": "login-access"}
+
+    async def fake_initialize(*_args, **_kwargs):
+        return {"status": "ok"}
+
+    flow.refresh_cached_tokens = fail_refresh
+    flow.authenticate = fake_authenticate
+    flow._initialize_session = fake_initialize
+
+    result = await flow.connect_session(
+        object(),
+        {"params": {"nonce": "nonce-1"}},
+        "ws://gateway/aun",
+    )
+
+    assert result["token"] == "login-access"
+    assert auth_calls == [("ws://gateway/aun", "alice.test")]
+    assert identity["access_token"] == ""
+    assert identity["refresh_token"] == ""

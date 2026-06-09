@@ -656,18 +656,35 @@ export class V2E2EECoordinator {
         to: toAid,
         payload: envelope,
         encrypt: false,
+        _skip_send_result_envelope: true,
       });
       client._clientLog.debug(`message.v2.send ok: to=${toAid}, use_cache=${useCache}, seq=${String((isJsonObject(result as JsonValue | object | null | undefined) ? (result as Record<string, unknown>).seq : '') ?? '')}`);
       return result;
     };
     try {
-      return await attempt(true);
+      const result = await attempt(true);
+      return client._delivery.attachSendResultEnvelope('message.send', {
+        to: toAid,
+        payload,
+        message_id: opts?.messageId,
+        timestamp: opts?.timestamp,
+        protected_headers: opts?.protectedHeaders as JsonValue,
+        context: opts?.context as JsonValue,
+      }, result, true);
     } catch (exc) {
       const excCode = (exc as { code?: unknown })?.code;
       if (V2_RETRYABLE_CODES.has(Number(excCode))) {
         client._clientLog.debug(`V2 P2P speculative send rejected (code=${String(excCode)}), refreshing bootstrap`);
         this.deleteBootstrapCacheEntry(toAid);
-        return await attempt(false);
+        const result = await attempt(false);
+        return client._delivery.attachSendResultEnvelope('message.send', {
+          to: toAid,
+          payload,
+          message_id: opts?.messageId,
+          timestamp: opts?.timestamp,
+          protected_headers: opts?.protectedHeaders as JsonValue,
+          context: opts?.context as JsonValue,
+        }, result, true);
       }
       throw exc;
     }
@@ -907,7 +924,14 @@ export class V2E2EECoordinator {
     try {
       const result = await attempt(true);
       markSentSeq(result);
-      return result;
+      return client._delivery.attachSendResultEnvelope('group.send', {
+        group_id: gid,
+        payload,
+        message_id: opts?.messageId,
+        timestamp: opts?.timestamp,
+        protected_headers: opts?.protectedHeaders as JsonValue,
+        context: opts?.context as JsonValue,
+      }, result, true);
     } catch (exc) {
       const excCode = Number((exc as { code?: unknown })?.code);
       if (V2_RETRYABLE_CODES.has(excCode)) {
@@ -915,7 +939,14 @@ export class V2E2EECoordinator {
         this.deleteBootstrapCacheEntry(`group:${gid}`);
         const result = await attempt(false);
         markSentSeq(result);
-        return result;
+        return client._delivery.attachSendResultEnvelope('group.send', {
+          group_id: gid,
+          payload,
+          message_id: opts?.messageId,
+          timestamp: opts?.timestamp,
+          protected_headers: opts?.protectedHeaders as JsonValue,
+          context: opts?.context as JsonValue,
+        }, result, true);
       }
       throw exc;
     }
@@ -1295,13 +1326,27 @@ export class V2E2EECoordinator {
     };
 
     try {
-      return await attempt(true);
+      const result = await attempt(true);
+      return client._delivery.attachSendResultEnvelope('message.thought.put', {
+        ...params,
+        to: toAid,
+        payload,
+        thought_id: thoughtId,
+        timestamp,
+      }, result, true) as RpcResult;
     } catch (exc) {
       const excCode = Number((exc as { code?: unknown })?.code);
       if (V2_RETRYABLE_CODES.has(excCode)) {
         client._clientLog.debug(`V2 P2P thought put speculative rejected (code=${String(excCode)}), refreshing bootstrap`);
         this.deleteBootstrapCacheEntry(toAid);
-        return await attempt(false);
+        const result = await attempt(false);
+        return client._delivery.attachSendResultEnvelope('message.thought.put', {
+          ...params,
+          to: toAid,
+          payload,
+          thought_id: thoughtId,
+          timestamp,
+        }, result, true) as RpcResult;
       }
       throw exc;
     }
@@ -1354,13 +1399,27 @@ export class V2E2EECoordinator {
     };
 
     try {
-      return await attempt(true);
+      const result = await attempt(true);
+      return client._delivery.attachSendResultEnvelope('group.thought.put', {
+        ...params,
+        group_id: groupId,
+        payload,
+        thought_id: thoughtId,
+        timestamp,
+      }, result, true) as RpcResult;
     } catch (exc) {
       const excCode = Number((exc as { code?: unknown })?.code);
       if (V2_RETRYABLE_CODES.has(excCode)) {
         client._clientLog.debug(`V2 group thought put speculative rejected (code=${String(excCode)}), refreshing bootstrap`);
         this.deleteBootstrapCacheEntry(`group:${groupId}`);
-        return await attempt(false);
+        const result = await attempt(false);
+        return client._delivery.attachSendResultEnvelope('group.thought.put', {
+          ...params,
+          group_id: groupId,
+          payload,
+          thought_id: thoughtId,
+          timestamp,
+        }, result, true) as RpcResult;
       }
       throw exc;
     }

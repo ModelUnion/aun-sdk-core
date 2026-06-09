@@ -426,11 +426,15 @@ func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, i
 	refreshToken := authGetStr(identity, "refresh_token")
 	if refreshToken == "" {
 		pkgLogAuth().Error("token refresh failed: missing refresh_token: aid=%s", authGetStr(identity, "aid"))
+		a.clearCachedTokens(identity, "missing refresh_token")
 		return nil, NewAuthError("missing refresh_token")
 	}
 	pkgLogAuth().Debug("refreshing access_token: aid=%s", authGetStr(identity, "aid"))
-	refreshed, err := a.refreshAccessToken(ctx, gatewayURL, refreshToken)
+	refreshed, err := a.refreshAccessToken(ctx, gatewayURL, refreshToken, identity)
 	if err != nil {
+		if authRefreshFailureRequiresRelogin(err) {
+			a.clearCachedTokens(identity, err.Error())
+		}
 		pkgLogAuth().Error("token refresh failed: aid=%s err=%v", authGetStr(identity, "aid"), err)
 		return nil, err
 	}
@@ -550,6 +554,8 @@ func (a *AuthFlow) ConnectSession(
 					return map[string]any{"token": newToken, "identity": identity, "hello": hello}, nil
 				}
 			}
+		} else if authRefreshFailureRequiresRelogin(err) {
+			a.clearCachedTokens(identity, err.Error())
 		}
 		pkgLogAuth().Warn("refresh_token auth failed, will re-login")
 	}
@@ -655,7 +661,9 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	if err != nil {
 		return nil, NewSerializationError(fmt.Sprintf("shortRPC failed to serialize request: %v", err))
 	}
-	pkgLogAuth().Debug("short RPC request full: %s", string(data))
+	if logData, logErr := json.Marshal(authRedactRPCLogPayload(request, "", 0)); logErr == nil {
+		pkgLogAuth().Debug("short RPC request full: %s", string(logData))
+	}
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
 	if err := conn.Write(wCtx, websocket.MessageText, data); err != nil {
@@ -674,7 +682,9 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	if err := json.Unmarshal(respData, &message); err != nil {
 		return nil, NewSerializationError("shortRPC response is not valid JSON")
 	}
-	pkgLogAuth().Debug("short RPC response full: method=%s %s", method, string(respData))
+	if logData, logErr := json.Marshal(authRedactRPCLogPayload(message, "", 0)); logErr == nil {
+		pkgLogAuth().Debug("short RPC response full: method=%s %s", method, string(logData))
+	}
 
 	if errData, ok := message["error"]; ok {
 		if errMap, ok := errData.(map[string]any); ok {
@@ -691,7 +701,7 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 			if e, ok := result["error"].(string); ok {
 				errMsg = e
 			}
-			return nil, NewAuthError(errMsg)
+			return nil, NewAuthError(errMsg, WithData(result))
 		}
 	}
 	return result, nil
@@ -800,7 +810,7 @@ func (a *AuthFlow) login(ctx context.Context, gatewayURL string, identity map[st
 }
 
 // refreshAccessToken 通过 shortRPC 刷新 access_token
-func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, refreshToken string) (result map[string]any, err error) {
+func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, refreshToken string, identity map[string]any) (result map[string]any, err error) {
 	tStart := time.Now()
 	pkgLogAuth().Debug("refreshAccessToken enter: aid=%s", a.aid)
 	defer func() {
@@ -810,9 +820,33 @@ func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, re
 			pkgLogAuth().Debug("refreshAccessToken exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
 		}
 	}()
-	result, err = a.shortRPC(ctx, gatewayURL, "auth.refresh_token", map[string]any{
+	params := map[string]any{
 		"refresh_token": refreshToken,
-	})
+		"sdk_lang":      "go",
+		"sdk_version":   Version,
+	}
+	if aid := authGetStr(identity, "aid"); aid != "" {
+		params["aid"] = aid
+	} else if a.aid != "" {
+		params["aid"] = a.aid
+	}
+	if deviceID := authGetStr(identity, "device_id"); deviceID != "" {
+		params["device_id"] = deviceID
+	} else if a.deviceID != "" {
+		params["device_id"] = a.deviceID
+	}
+	if slotID := authGetStr(identity, "slot_id"); slotID != "" {
+		params["slot_id"] = slotID
+	} else if a.slotID != "" {
+		params["slot_id"] = a.slotID
+	}
+	if accessToken := authGetStr(identity, "access_token"); accessToken != "" {
+		params["access_token"] = accessToken
+	}
+	if expiresAt, ok := identity["access_token_expires_at"]; ok {
+		params["access_token_expires_at"] = expiresAt
+	}
+	result, err = a.shortRPC(ctx, gatewayURL, "auth.refresh_token", params)
 	if err != nil {
 		return nil, err
 	}
@@ -822,7 +856,7 @@ func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, re
 			if e, ok := result["error"].(string); ok {
 				errMsg = e
 			}
-			err = NewAuthError(errMsg)
+			err = NewAuthError(errMsg, WithData(result))
 			return nil, err
 		}
 	}
@@ -1776,6 +1810,32 @@ func (a *AuthFlow) persistIdentity(identity map[string]any) error {
 	return nil
 }
 
+func (a *AuthFlow) clearCachedTokens(identity map[string]any, reason string) {
+	if identity == nil {
+		return
+	}
+	aid := authGetStr(identity, "aid")
+	hadToken := authGetStr(identity, "access_token") != "" ||
+		authGetStr(identity, "refresh_token") != "" ||
+		authGetStr(identity, "kite_token") != "" ||
+		authGetStr(identity, "token") != "" ||
+		identity["access_token_expires_at"] != nil
+	if !hadToken {
+		return
+	}
+	identity["access_token"] = ""
+	identity["refresh_token"] = ""
+	identity["kite_token"] = ""
+	identity["token"] = ""
+	identity["access_token_expires_at"] = 0
+	if err := a.persistIdentity(identity); err != nil {
+		pkgLogAuth().Warn("failed to persist token cleanup: aid=%s err=%v", aid, err)
+		a.lastPersistErr = err
+		return
+	}
+	pkgLogAuth().Warn("cleared cached tokens after refresh failure: aid=%s reason=%s", aid, reason)
+}
+
 // ── Gateway URL 缓存（keystore metadata 持久化）────────────
 
 // LoadCachedGatewayURL 从 keystore metadata 读取 gateway_url 缓存。
@@ -1967,6 +2027,67 @@ func authGetStrDefault(m map[string]any, key string, defaultVal string) string {
 		return defaultVal
 	}
 	return v
+}
+
+func authRefreshFailureRequiresRelogin(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		return false
+	}
+	if data, ok := authErr.Data.(map[string]any); ok {
+		if relogin, ok := data["relogin_required"].(bool); ok && relogin {
+			return true
+		}
+		if errorText := strings.ToLower(strings.TrimSpace(authGetStr(data, "error"))); errorText != "" {
+			return authIsReloginRefreshError(errorText)
+		}
+	}
+	return authIsReloginRefreshError(strings.ToLower(strings.TrimSpace(authErr.Message)))
+}
+
+func authIsReloginRefreshError(errorText string) bool {
+	switch errorText {
+	case "missing refresh_token", "invalid_or_expired_refresh_token", "refresh not supported":
+		return true
+	default:
+		return false
+	}
+}
+
+func authRedactRPCLogPayload(value any, key string, depth int) any {
+	keyLower := strings.ToLower(key)
+	if keyLower == "access_token" || keyLower == "refresh_token" ||
+		keyLower == "kite_token" || keyLower == "token" ||
+		strings.HasSuffix(keyLower, "_token") {
+		text := fmt.Sprintf("%v", value)
+		if text == "" {
+			return ""
+		}
+		sum := sha256.Sum256([]byte(text))
+		return fmt.Sprintf("<redacted len=%d sha256=%x>", len(text), sum[:6])
+	}
+	if depth >= 6 {
+		return "<max-depth>"
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for childKey, childValue := range v {
+			out[childKey] = authRedactRPCLogPayload(childValue, childKey, depth+1)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = authRedactRPCLogPayload(item, "", depth+1)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // authBytesEqual 比较两个字节切片

@@ -76,10 +76,13 @@ class RpcPipeline:
         client = self.client
         t_call_start = started_at
         pull_gate_locked = bool(params.pop("_pull_gate_locked", False))
+        skip_send_result_envelope = bool(params.pop("_skip_send_result_envelope", False))
         pull_gate_key = self.pull_gate_key_for_call(method, params)
         if pull_gate_key and not pull_gate_locked:
             locked_params = dict(params)
             locked_params["_pull_gate_locked"] = True
+            if skip_send_result_envelope:
+                locked_params["_skip_send_result_envelope"] = True
 
             async def _gated_call():
                 return await self.call_after_pipeline(
@@ -224,6 +227,13 @@ class RpcPipeline:
             raise
 
         result = await self.postprocess_result(method, params, result)
+        if not skip_send_result_envelope:
+            result = client._delivery().attach_send_result_envelope(
+                method,
+                params,
+                result,
+                encrypted=bool(params.get("encrypted")),
+            )
         client._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - t_call_start, method)
         return result
 

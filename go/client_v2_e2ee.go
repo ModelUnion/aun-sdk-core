@@ -834,16 +834,29 @@ func (v *v2E2EECoordinator) SendV2WithOpts(ctx context.Context, to string, paylo
 		"to":      to,
 		"payload": payload,
 	}, payload, nil)
+	resultParams := map[string]any{
+		"to":                to,
+		"payload":           payload,
+		"protected_headers": opts.ProtectedHeaders,
+		"context":           opts.Context,
+	}
+	if opts.Timestamp > 0 {
+		resultParams["timestamp"] = opts.Timestamp
+	}
 
 	resp, err := v.v2SendOnce(ctx, state, to, payload, true, opts)
 	if err == nil {
-		return resp, nil
+		return c.delivery().attachSendResultEnvelope("message.send", resultParams, resp, true).(map[string]any), nil
 	}
 
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 P2P speculative send rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
 		v.deletePeerBootstrapCache(to)
-		return v.v2SendOnce(ctx, state, to, payload, false, opts)
+		resp, retryErr := v.v2SendOnce(ctx, state, to, payload, false, opts)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		return c.delivery().attachSendResultEnvelope("message.send", resultParams, resp, true).(map[string]any), nil
 	}
 	return nil, err
 }
@@ -938,9 +951,10 @@ func (v *v2E2EECoordinator) v2SendOnce(ctx context.Context, state *v2P2PState, t
 	})
 
 	raw, err := c.Call(ctx, "message.send", map[string]any{
-		"to":      to,
-		"payload": envelope,
-		"encrypt": false,
+		"to":                         to,
+		"payload":                    envelope,
+		"encrypt":                    false,
+		"_skip_send_result_envelope": true,
 	})
 	if err != nil {
 		return nil, err

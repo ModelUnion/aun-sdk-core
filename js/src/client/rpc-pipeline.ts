@@ -127,6 +127,8 @@ export class RpcPipeline {
   private async callImpl(method: string, params?: RpcParams): Promise<RpcResult> {
     const client = this.runtime.client;
     const p = this.preflight(method, params).params;
+    const skipSendResultEnvelope = Boolean((p as Record<string, unknown>)._skip_send_result_envelope);
+    delete (p as Record<string, unknown>)._skip_send_result_envelope;
 
     if (method === 'message.send') {
       const encrypt = p.encrypt !== undefined ? p.encrypt : true;
@@ -195,14 +197,14 @@ export class RpcPipeline {
     const pullGateKey = this.pullGateKeyForCall(method, p);
     if (pullGateKey) {
       return await this.runPullSerialized(pullGateKey, async () => {
-        return await this.callImplInner(method, p);
+        return await this.callImplInner(method, p, skipSendResultEnvelope);
       });
     }
 
-    return await this.callImplInner(method, p);
+    return await this.callImplInner(method, p, skipSendResultEnvelope);
   }
 
-  private async callImplInner(method: string, p: RpcParams): Promise<RpcResult> {
+  private async callImplInner(method: string, p: RpcParams, skipSendResultEnvelope = false): Promise<RpcResult> {
     const client = this.runtime.client;
     if (method === 'message.pull') {
       await client._ensureV2SessionReady('message.pull');
@@ -258,6 +260,14 @@ export class RpcPipeline {
       : await client._transport.call(method, p);
 
     result = await this.postprocessResult(method, p, result) as RpcResult;
+    if (!skipSendResultEnvelope) {
+      result = client._delivery.attachSendResultEnvelope(
+        method,
+        p,
+        result,
+        Boolean(p.encrypted),
+      ) as RpcResult;
+    }
     return result;
   }
 

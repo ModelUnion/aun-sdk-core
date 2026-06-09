@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun-browser",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "description": "AUN Protocol Core SDK for Browser",
   "type": "module",
   "main": "dist/index.js",

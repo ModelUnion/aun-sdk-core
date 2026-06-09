@@ -11,6 +11,32 @@ import { VERSION as AUN_SDK_VERSION } from './version.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 const AUN_SDK_LANG = 'javascript';
+const SENSITIVE_RPC_LOG_KEYS = new Set([
+  'access_token',
+  'refresh_token',
+  'kite_token',
+  'token',
+]);
+
+function redactRpcLogPayload(value: unknown, key: string = '', depth: number = 0): unknown {
+  const keyLower = key.toLowerCase();
+  if (SENSITIVE_RPC_LOG_KEYS.has(keyLower) || keyLower.endsWith('_token')) {
+    const text = String(value ?? '');
+    return text ? `<redacted len=${text.length}>` : '';
+  }
+  if (depth >= 6) return '<max-depth>';
+  if (Array.isArray(value)) {
+    return value.map((item) => redactRpcLogPayload(item, '', depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+      out[childKey] = redactRpcLogPayload(childValue, childKey, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
 
 import {
   isJsonObject,
@@ -820,6 +846,9 @@ export class AuthFlow {
           }
         } catch (e) {
           if (!(e instanceof AuthError)) throw e;
+          if (this._refreshFailureRequiresRelogin(e)) {
+            await this._clearCachedTokens(identity, e.message);
+          }
           // refresh 失败，重新登录
         }
       }
@@ -856,14 +885,20 @@ export class AuthFlow {
     this._log.debug(`refreshCachedTokens enter: aid=${identity.aid} gateway=${gatewayUrl}`);
     try {
       const refreshToken = String(identity.refresh_token ?? '');
-      if (!refreshToken) throw new AuthError('missing refresh_token');
-      const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
+      if (!refreshToken) {
+        await this._clearCachedTokens(identity, 'missing refresh_token');
+        throw new AuthError('missing refresh_token');
+      }
+      const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken, identity);
       this._rememberTokens(identity, refreshed);
       await this._validateNewCert(identity, gatewayUrl);
       await this._persistIdentity(identity);
       this._log.debug(`refreshCachedTokens exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}`);
       return identity;
     } catch (err) {
+      if (this._refreshFailureRequiresRelogin(err)) {
+        await this._clearCachedTokens(identity, err instanceof Error ? err.message : String(err));
+      }
       this._log.debug(`refreshCachedTokens exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
@@ -956,13 +991,13 @@ export class AuthFlow {
               method,
               params,
             });
-            this._log.debug(`short RPC request full: ${requestPayload}`);
+            this._log.debug(`short RPC request full: ${JSON.stringify(redactRpcLogPayload(JSON.parse(requestPayload)))}`);
             ws.send(requestPayload);
             return;
           }
           // 第二条消息是 RPC 响应
           globalThis.clearTimeout(timeout);
-          this._log.debug(`short RPC response full: method=${method} ${JSON.stringify(msg)}`);
+          this._log.debug(`short RPC response full: method=${method} ${JSON.stringify(redactRpcLogPayload(msg))}`);
           try { ws.close(); } catch { /* 忽略 */ }
 
           if (msg.error) {
@@ -975,7 +1010,7 @@ export class AuthFlow {
             return;
           }
           if (result.success === false) {
-            reject(new AuthError(String(result.error ?? `${method} failed`)));
+            reject(new AuthError(String(result.error ?? `${method} failed`), { data: result }));
             return;
           }
           resolve(result);
@@ -1141,12 +1176,29 @@ export class AuthFlow {
   private async _refreshAccessToken(
     gatewayUrl: string,
     refreshToken: string,
+    identity?: IdentityRecord,
   ): Promise<JsonObject> {
-    const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
+    const params: JsonObject = {
       refresh_token: refreshToken,
-    });
+      sdk_lang: AUN_SDK_LANG,
+      sdk_version: AUN_SDK_VERSION,
+    };
+    if (identity) {
+      const aid = String(identity.aid ?? '').trim();
+      const deviceId = String((identity as JsonObject).device_id ?? '').trim();
+      const slotId = String((identity as JsonObject).slot_id ?? '').trim();
+      const accessToken = String(identity.access_token ?? '').trim();
+      if (aid) params.aid = aid;
+      if (deviceId) params.device_id = deviceId;
+      if (slotId) params.slot_id = slotId;
+      if (accessToken) params.access_token = accessToken;
+      if (typeof identity.access_token_expires_at === 'number') {
+        params.access_token_expires_at = identity.access_token_expires_at;
+      }
+    }
+    const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', params);
     if (!result.success) {
-      throw new AuthError(String(result.error ?? 'refresh failed'));
+      throw new AuthError(String(result.error ?? 'refresh failed'), { data: result });
     }
     return result;
   }
@@ -1595,6 +1647,41 @@ export class AuthFlow {
     // 服务端返回 active_cert 用于同步本地 cert.pem
     const activeCert = authResult.active_cert;
     if (typeof activeCert === 'string' && activeCert) identity._pending_active_cert = activeCert;
+  }
+
+  private _refreshFailureRequiresRelogin(err: unknown): boolean {
+    if (!(err instanceof AuthError)) return false;
+    const data = err.data;
+    if (isJsonObject(data)) {
+      if (data.relogin_required === true) return true;
+      const error = String(data.error ?? '').trim().toLowerCase();
+      return ['missing refresh_token', 'invalid_or_expired_refresh_token', 'refresh not supported'].includes(error);
+    }
+    const message = err.message.trim().toLowerCase();
+    return ['missing refresh_token', 'invalid_or_expired_refresh_token', 'refresh not supported'].includes(message);
+  }
+
+  private async _clearCachedTokens(identity: IdentityRecord, reason: string = ''): Promise<void> {
+    const aid = String(identity.aid ?? '');
+    const hadToken = Boolean(
+      identity.access_token ||
+      identity.refresh_token ||
+      identity.kite_token ||
+      identity.token ||
+      identity.access_token_expires_at,
+    );
+    if (!hadToken) return;
+    identity.access_token = '';
+    identity.refresh_token = '';
+    identity.kite_token = '';
+    identity.token = '';
+    identity.access_token_expires_at = 0;
+    try {
+      await this._persistIdentity(identity);
+      this._log.warn(`cleared cached tokens after refresh failure: aid=${aid} reason=${reason}`);
+    } catch (persistErr) {
+      this._log.warn(`failed to persist token cleanup: aid=${aid} err=${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+    }
   }
 
   /** 验证服务端返回的 new_cert，通过后正式接受 */

@@ -8,6 +8,34 @@
 
 ---
 
+## 0.4.13 — 2026-06-09
+
+### 新功能
+- **发送结果回填 envelope**：`message.send` / `group.send` / `message.thought.put` / `group.thought.put` 的返回结果新增规范化 `envelope` 字段，使发送方回执与接收端信封元数据一致；新增 `appSendEnvelopeMethods` 与 `sendResultEnvelope()` / `attachSendResultEnvelope()`，rpc-pipeline 在 postprocess 后统一附加，V2 加密路径经 `_skipSendResultEnvelope` 标志跳过明文附加、由外层 V2 协调器在加密后补挂避免重复（四语言对齐）
+
+### 修复
+- **refresh_token 失效自愈**：新增需重登判定（命中 `relogin_required` 或 `missing refresh_token` / `invalid_or_expired_refresh_token` / `refresh not supported`）与清缓存逻辑；刷新失败需重登时清空本地 `access_token`/`refresh_token`/`kite_token` 并持久化，client 层 token 刷新循环检测到需重登时发布 `token.refresh_exhausted` 事件（带 `relogin_required: true`）、断连触发重连，下次 `connectSession` 因无可用 token 自动走两步登录；refresh RPC 补传 `aid`/`device_id`/`slot_id`/`access_token`/`sdk_lang`/`sdk_version`，`AuthError` 携带 `data` 透传服务端响应（四语言对齐）
+- **protected_headers 类型归一**：V2 发送方法的 envelope 元数据归一时用类型 switch 识别 `*ProtectedHeaders`/`ProtectedHeaders` 并转 dict，修复传入对象（非 map）时 protected_headers 被丢弃的问题（四语言对齐）
+- **V2 thought protected_headers 透传**：`v2_thought.go` 的 P2P/群组 thought 路径将 `protectedHeaders` 透传进 V2 envelope 构造（`buildV2P2PEnvelope`/`buildV2GroupEnvelope`），补齐与普通消息一致的受保护头处理
+
+### 优化
+- **app_message_envelope 字段收窄**：envelope 键收窄为可转发元数据（`from`/`to`/`group_id`/`type`/`kind`/`version`/`timestamp`/`encrypted`/`context`/`protected_headers`/`payload_type`），移除 `message_id`/`seq`/`device_id`/`slot_id` 等本地与传输层字段，不再向应用层泄漏内部字段并剔除 `_auth`（四语言对齐）
+- **RPC 日志 token 脱敏**：`authRedactRPCLogPayload` 对短 RPC 请求/响应 debug 日志中 `access_token`/`refresh_token`/`kite_token`/`token` 及 `_token` 结尾键递归脱敏（`<redacted len=.. sha256=..>`），避免明文 token 落日志（四语言对齐）
+- **V2 内部发送透传 message_id/timestamp**：`v2_routing.go` 将 `message_id`/`timestamp` 透传到 `EncryptOptions`，保证 V2 P2P/群组加密 envelope 携带稳定标识
+
+### 测试
+- `TestTokenGatewayReuse_RefreshFailureClearsCachedTokens`：验证刷新失败后本地 token 被清空
+- `TestTokenGatewayReuse_ReloginRequiredRefreshError`：验证需重登错误触发清缓存与重登流程
+- `TestAppMessageEnvelopeKeepsForwardableMetadata`：验证只保留可转发元数据
+- 改写 `TestP2PRecallTombstonePublishesRecalledEvent` / `TestGroupRecallTombstonePublishesNoticeEnvelope` / `TestPublishedMessageEventsFallbackCurrentInstanceContext` 断言 envelope 收窄
+
+### 服务端协同（本版本配套）
+- **`auth.refresh_token` 响应结构化**：新增 `relogin_required` / `retryable` / `diagnostic` / `aid` / `refresh_count` 字段，SDK 据 `relogin_required`/`retryable` 区分"重新登录"与"退避重试"，不再单纯按 `error` 字符串判断
+- **JWT 老 SDK 兼容与即时吊销**：`AUN_JWT_LEGACY_ACCESS_TOKEN_COMPAT`（默认开）放行合法 JWT 避免迁移期重连风暴；`auth.token.revoked` 事件携带 `jti`/`expires_at`，gateway 按真实 TTL 缓存吊销
+- **V2 P2P 写入幂等**：服务端 `v2_write_peer_message`/`v2_write_peer_wrap` 捕获唯一键冲突逐字段比对，重发相同 message_id 幂等返回、不再产生 seq 空洞；自发自收跳过重复 self-sync 推送
+
+---
+
 ## 0.4.12 — 2026-06-08
 
 ### 新功能

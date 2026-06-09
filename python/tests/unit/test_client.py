@@ -4241,26 +4241,23 @@ async def test_published_message_events_fallback_current_instance_context(tmp_pa
     assert p2p_events[0]["payload"] == {"type": "text"}
     assert p2p_events[0]["e2ee"] == {"payload_type": "text"}
     assert p2p_events[0]["envelope"] == {
-        "message_id": "m-1",
-        "seq": 1,
         "from": "bob.aid.com",
         "to": "alice.aid.com",
-        "device_id": "dev-1",
-        "slot_id": "slot-a",
+        "type": "text",
     }
+    for key in ("message_id", "seq", "device_id", "slot_id"):
+        assert key not in p2p_events[0]["envelope"]
     assert group_events[0]["device_id"] == "dev-1"
     assert group_events[0]["slot_id"] == "slot-a"
     assert group_events[0]["group_id"] == "g1"
     assert group_events[0]["payload"] == {"type": "text"}
     assert group_events[0]["envelope"] == {
-        "message_id": "gm-1",
-        "seq": 1,
-        "message_type": "group.message",
-        "sender_aid": "bob.aid.com",
+        "from": "bob.aid.com",
         "group_id": "g1",
-        "device_id": "dev-1",
-        "slot_id": "slot-a",
+        "type": "text",
     }
+    for key in ("message_id", "seq", "device_id", "slot_id", "message_type", "sender_aid"):
+        assert key not in group_events[0]["envelope"]
 
     await client._publish_app_event(
         "group.changed",

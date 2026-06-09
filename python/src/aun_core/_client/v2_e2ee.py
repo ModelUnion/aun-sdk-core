@@ -18,6 +18,15 @@ class V2E2EECoordinator:
         self.runtime = ClientRuntime.coerce(runtime)
         self.client = self.runtime.client
 
+    @staticmethod
+    def _protected_headers_dict(value: Any) -> dict[str, Any] | None:
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        if isinstance(value, dict):
+            return dict(value)
+        return None
+
     async def on_connected(self, *, background_sync: bool) -> None:
         """连接成功后的 V2 E2EE 初始化与后台协调。"""
         client = self.client
@@ -383,6 +392,7 @@ class V2E2EECoordinator:
             raise ValidationError("message.send requires 'to'")
         if not isinstance(payload, dict):
             raise ValidationError("message.send payload must be a dict for V2 encryption")
+        protected_headers = self._protected_headers_dict(client._protected_headers_from_params(params))
         client._log_message_debug(
             "send-plaintext",
             "message.send.v2",
@@ -506,7 +516,7 @@ class V2E2EECoordinator:
                 payload=payload,
                 message_id=params.get("message_id"),
                 timestamp=params.get("timestamp"),
-                protected_headers=params.get("protected_headers") if isinstance(params.get("protected_headers"), dict) else None,
+                protected_headers=protected_headers,
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
@@ -530,19 +540,22 @@ class V2E2EECoordinator:
                 "to": to,
                 "payload": envelope,
                 "encrypt": False,
+                "_skip_send_result_envelope": True,
             })
             client._log.debug("client", "message.v2.send ok: to=%s use_cache=%s seq=%s", to, use_cache, result.get("seq") if isinstance(result, dict) else "")
             return result
 
         try:
-            return await _attempt(use_cache=True)
+            result = await _attempt(use_cache=True)
         except Exception as exc:
             exc_code = getattr(exc, "code", None)
             if exc_code in (-33011, -33012, -33050, -33052, -33054):
                 client._log.debug("client", "V2 P2P speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
                 client._v2_bootstrap_cache.pop(to, None)
-                return await _attempt(use_cache=False)
-            raise
+                result = await _attempt(use_cache=False)
+            else:
+                raise
+        return client._delivery().attach_send_result_envelope("message.send", params, result, encrypted=True)
 
     async def pull_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 拉取并解密消息。内部方法，由 call("message.pull") 路由调用。"""
@@ -914,6 +927,7 @@ class V2E2EECoordinator:
             raise ValidationError("group.send requires 'group_id'")
         if not isinstance(payload, dict):
             raise ValidationError("group.send payload must be a dict for V2 encryption")
+        protected_headers = self._protected_headers_dict(client._protected_headers_from_params(params))
         client._log_message_debug(
             "send-plaintext",
             "group.send.v2",
@@ -1031,7 +1045,7 @@ class V2E2EECoordinator:
                 state_commitment=state_commitment,
                 message_id=params.get("message_id"),
                 timestamp=params.get("timestamp"),
-                protected_headers=params.get("protected_headers") if isinstance(params.get("protected_headers"), dict) else None,
+                protected_headers=protected_headers,
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
@@ -1076,7 +1090,7 @@ class V2E2EECoordinator:
             client._mark_published_seq(ns, seq)
             client._persist_seq(ns)
             client._log.debug("client", "group.v2.send marked own seq: group=%s ns=%s seq=%d", group_id, ns, seq)
-        return result
+        return client._delivery().attach_send_result_envelope("group.send", params, result, encrypted=True)
 
     async def build_v2_group_envelope(
         self,
@@ -1236,6 +1250,7 @@ class V2E2EECoordinator:
 
         thought_id = str(params.get("thought_id") or f"mt-{uuid.uuid4()}").strip()
         timestamp = int(params.get("timestamp") or time.time() * 1000)
+        protected_headers = self._protected_headers_dict(client._protected_headers_from_params(params))
         client._log_message_debug(
             "thought-send-plaintext",
             "message.thought.put.v2",
@@ -1252,6 +1267,7 @@ class V2E2EECoordinator:
                 message_id=thought_id,
                 timestamp=timestamp,
                 use_cache=use_cache,
+                protected_headers=protected_headers,
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
             send_params: dict[str, Any] = {
@@ -1277,14 +1293,23 @@ class V2E2EECoordinator:
             return result
 
         try:
-            return await _attempt(use_cache=True)
+            result = await _attempt(use_cache=True)
         except Exception as exc:
             err_msg = str(exc).lower()
             if "device" in err_msg or "prekey" in err_msg or "recipient" in err_msg or "stale" in err_msg:
                 client._log.debug("client", "V2 P2P thought put speculative rejected, refreshing bootstrap: %s", exc)
                 client._v2_bootstrap_cache.pop(to_aid, None)
-                return await _attempt(use_cache=False)
-            raise
+                result = await _attempt(use_cache=False)
+            else:
+                raise
+        return client._delivery().attach_send_result_envelope("message.thought.put", {
+            **params,
+            "to": to_aid,
+            "payload": payload,
+            "thought_id": thought_id,
+            "timestamp": timestamp,
+            "protected_headers": protected_headers,
+        }, result, encrypted=True)
 
     async def put_group_thought_encrypted_v2(self, params: dict[str, Any]) -> Any:
         """V2 Group thought.put：多设备 wrap envelope。"""
@@ -1299,6 +1324,7 @@ class V2E2EECoordinator:
             raise ValidationError("group.thought.put payload must be an object when encrypt=true")
         thought_id = str(params.get("thought_id") or f"gt-{uuid.uuid4()}").strip()
         timestamp = int(params.get("timestamp") or time.time() * 1000)
+        protected_headers = self._protected_headers_dict(client._protected_headers_from_params(params))
         client._log_message_debug(
             "thought-send-plaintext",
             "group.thought.put.v2",
@@ -1315,6 +1341,7 @@ class V2E2EECoordinator:
                 message_id=thought_id,
                 timestamp=timestamp,
                 use_cache=use_cache,
+                protected_headers=protected_headers,
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
             send_params: dict[str, Any] = {
@@ -1340,14 +1367,23 @@ class V2E2EECoordinator:
             return result
 
         try:
-            return await _attempt(use_cache=True)
+            result = await _attempt(use_cache=True)
         except Exception as exc:
             err_msg = str(exc).lower()
             if "member" in err_msg or "device" in err_msg or "recipient" in err_msg or "stale" in err_msg or "epoch" in err_msg:
                 client._log.debug("client", "V2 group thought put speculative rejected, refreshing bootstrap: %s", exc)
                 client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
-                return await _attempt(use_cache=False)
-            raise
+                result = await _attempt(use_cache=False)
+            else:
+                raise
+        return client._delivery().attach_send_result_envelope("group.thought.put", {
+            **params,
+            "group_id": group_id,
+            "payload": payload,
+            "thought_id": thought_id,
+            "timestamp": timestamp,
+            "protected_headers": protected_headers,
+        }, result, encrypted=True)
 
     async def decrypt_group_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
         return await self.decrypt_thought_get_result(result, group=True)

@@ -21,10 +21,10 @@ _ONLINE_UNREAD_HINT_INTERVAL = 0.05
 
 
 _APP_MESSAGE_ENVELOPE_KEYS = (
-    "module_id", "message_id", "id", "seq", "msg_seq", "message_type", "type", "kind", "version",
+    "module_id", "message_type", "type", "kind", "version",
     "from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
-    "timestamp", "created_at", "t_server", "encrypted", "status", "delivery_mode",
-    "dispatch_mode", "dispatch", "device_id", "slot_id",
+    "timestamp", "created_at", "encrypted",
+    "context", "protected_headers", "headers", "payload_type",
 )
 
 _APP_GROUP_EVENT_ENVELOPE_KEYS = (
@@ -32,6 +32,13 @@ _APP_GROUP_EVENT_ENVELOPE_KEYS = (
     "actor_aid", "sender_aid", "member_aid", "target_aid", "operator_aid",
     "created_at", "timestamp", "t_server", "status", "device_id", "slot_id",
 )
+
+_APP_SEND_ENVELOPE_METHODS = {
+    "message.send",
+    "group.send",
+    "message.thought.put",
+    "group.thought.put",
+}
 
 
 class MessageDeliveryEngine:
@@ -270,10 +277,55 @@ class MessageDeliveryEngine:
         return payload
 
     @staticmethod
-    def app_message_envelope(payload: Any) -> dict[str, Any]:
+    def envelope_metadata(value: Any) -> dict[str, Any] | None:
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        if not isinstance(value, dict):
+            return None
+        result = {key: item for key, item in value.items() if str(key) != "_auth"}
+        return result if result else None
+
+    @classmethod
+    def app_message_envelope(cls, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
             return {}
-        return {key: payload[key] for key in _APP_MESSAGE_ENVELOPE_KEYS if key in payload}
+        body = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        envelope: dict[str, Any] = {}
+
+        def first_value(*values: Any) -> Any:
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def set_if_present(key: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str) and not value.strip():
+                return
+            envelope[key] = value
+
+        set_if_present("from", first_value(payload.get("from"), payload.get("from_aid"), payload.get("sender_aid")))
+        set_if_present("to", first_value(payload.get("to"), payload.get("to_aid")))
+        set_if_present("group_id", payload.get("group_id"))
+        set_if_present("type", first_value(body.get("type"), payload.get("type"), payload.get("message_type"), payload.get("payload_type")))
+        set_if_present("kind", first_value(body.get("kind"), payload.get("kind")))
+        set_if_present("version", first_value(body.get("version"), payload.get("version")))
+        set_if_present("timestamp", first_value(payload.get("timestamp"), payload.get("created_at"), payload.get("t_server")))
+        if "encrypted" in payload:
+            envelope["encrypted"] = bool(payload.get("encrypted"))
+        context = cls.envelope_metadata(payload.get("context"))
+        if context:
+            envelope["context"] = context
+        protected_headers = cls.envelope_metadata(payload.get("protected_headers")) or cls.envelope_metadata(payload.get("headers"))
+        if protected_headers:
+            envelope["protected_headers"] = protected_headers
+        set_if_present("payload_type", first_value(payload.get("payload_type"), (protected_headers or {}).get("payload_type")))
+        return envelope
 
     @staticmethod
     def is_group_scoped_event(event: str) -> bool:
@@ -293,6 +345,68 @@ class MessageDeliveryEngine:
         # 兼容期保留顶层信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
         result["envelope"] = cls.app_message_envelope(result)
         return result
+
+    def send_result_envelope(self, method: str, params: dict[str, Any], result: Any, *, encrypted: bool) -> dict[str, Any]:
+        if method not in _APP_SEND_ENVELOPE_METHODS:
+            return {}
+        body = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+        result_map = result if isinstance(result, dict) else {}
+        envelope: dict[str, Any] = {}
+
+        def first_value(*values: Any) -> Any:
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def set_if_present(key: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str) and not value.strip():
+                return
+            envelope[key] = value
+
+        set_if_present("from", getattr(self.client, "_aid", ""))
+        if method.startswith("message."):
+            set_if_present("to", params.get("to"))
+        else:
+            set_if_present("group_id", params.get("group_id"))
+        set_if_present("type", first_value(body.get("type"), params.get("type"), params.get("message_type"), params.get("payload_type")))
+        set_if_present("kind", first_value(body.get("kind"), params.get("kind")))
+        set_if_present("version", first_value(body.get("version"), params.get("version")))
+        set_if_present(
+            "timestamp",
+            first_value(
+                params.get("timestamp"),
+                result_map.get("timestamp"),
+                result_map.get("created_at"),
+                result_map.get("t_server"),
+                int(time.time() * 1000),
+            ),
+        )
+        envelope["encrypted"] = bool(encrypted)
+        context = self.envelope_metadata(params.get("context"))
+        if context:
+            envelope["context"] = context
+        protected_headers = self.envelope_metadata(params.get("protected_headers")) or self.envelope_metadata(params.get("headers")) or {}
+        if protected_headers:
+            envelope["protected_headers"] = protected_headers
+        set_if_present("payload_type", first_value(params.get("payload_type"), protected_headers.get("payload_type"), body.get("type")))
+        return envelope
+
+    def attach_send_result_envelope(self, method: str, params: dict[str, Any], result: Any, *, encrypted: bool) -> Any:
+        if method not in _APP_SEND_ENVELOPE_METHODS or not isinstance(result, dict):
+            return result
+        out = dict(result)
+        out["envelope"] = self.send_result_envelope(method, params, out, encrypted=encrypted)
+        if "payload" in params:
+            out["payload"] = params.get("payload")
+        elif "content" in params:
+            out["payload"] = params.get("content")
+        return out
 
     @classmethod
     def attach_app_group_event_envelope(cls, payload: Any) -> Any:

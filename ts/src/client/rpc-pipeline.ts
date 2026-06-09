@@ -131,6 +131,8 @@ export class RpcPipeline {
 
       const pullGateLocked = Boolean((p as Record<string, unknown>)._pull_gate_locked);
       delete (p as Record<string, unknown>)._pull_gate_locked;
+      const skipSendResultEnvelope = Boolean((p as Record<string, unknown>)._skip_send_result_envelope);
+      delete (p as Record<string, unknown>)._skip_send_result_envelope;
       const pullGateKey = this.pullGateKeyForCall(method, p);
       if (pullGateKey && this.isPullResponseProcessing(pullGateKey)) {
         client._clientLog.debug(`pull skipped while processing pull response: method=${method} key=${pullGateKey}`);
@@ -139,6 +141,7 @@ export class RpcPipeline {
       if (pullGateKey && !pullGateLocked) {
         const lockedParams: RpcParams = { ...p, _pull_gate_locked: true };
         if (rpcBackground) (lockedParams as Record<string, unknown>)._rpc_background = true;
+        if (skipSendResultEnvelope) (lockedParams as Record<string, unknown>)._skip_send_result_envelope = true;
         return await this.runPullSerialized(pullGateKey, async () => this.call(method, lockedParams)) as RpcResult;
       }
 
@@ -276,6 +279,14 @@ export class RpcPipeline {
         );
 
       result = await this.postprocessResult(method, p, result) as RpcResult;
+      if (!skipSendResultEnvelope) {
+        result = client._delivery.attachSendResultEnvelope(
+          method,
+          p,
+          result,
+          Boolean(p.encrypted),
+        ) as RpcResult;
+      }
       client._clientLog.debug(`call exit: method=${method} elapsed=${Date.now() - tStart}ms`);
       return result;
     } catch (err) {

@@ -8,11 +8,17 @@ const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
 const GROUP_RECALL_SEEN_LIMIT = 10_000;
 const APP_MESSAGE_ENVELOPE_KEYS = [
-  'module_id', 'message_id', 'id', 'seq', 'msg_seq', 'message_type', 'type', 'kind', 'version',
+  'module_id', 'message_type', 'type', 'kind', 'version',
   'from', 'from_aid', 'sender_aid', 'to', 'to_aid', 'group_id',
-  'timestamp', 'created_at', 't_server', 'encrypted', 'status', 'delivery_mode',
-  'dispatch_mode', 'dispatch', 'device_id', 'slot_id',
+  'timestamp', 'created_at', 'encrypted',
+  'context', 'protected_headers', 'headers', 'payload_type',
 ];
+const APP_SEND_ENVELOPE_METHODS = new Set([
+  'message.send',
+  'group.send',
+  'message.thought.put',
+  'group.thought.put',
+]);
 const APP_GROUP_EVENT_ENVELOPE_KEYS = [
   'module_id', 'event_id', 'event_seq', 'seq', 'event_type', 'action', 'group_id',
   'actor_aid', 'sender_aid', 'member_aid', 'target_aid', 'operator_aid',
@@ -137,13 +143,55 @@ export class MessageDeliveryEngine {
     return payload;
   }
 
+  private envelopeMetadata(value: unknown): JsonObject | undefined {
+    let source = value;
+    if (source && typeof source === 'object') {
+      const maybeHeaders = source as { toObject?: () => unknown };
+      if (typeof maybeHeaders.toObject === 'function') source = maybeHeaders.toObject();
+    }
+    if (!isJsonObject(source as JsonValue | object | null | undefined)) return undefined;
+    const sourceObj = source as JsonObject;
+    const out: JsonObject = {};
+    for (const [key, item] of Object.entries(sourceObj)) {
+      if (key === '_auth') continue;
+      out[key] = item as JsonValue;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   appMessageEnvelope(payload: EventPayload): JsonObject {
     if (!isJsonObject(payload as JsonValue | object | null | undefined)) return {};
     const message = payload as JsonObject;
+    const body = isJsonObject(message.payload as JsonValue | object | null | undefined) ? message.payload as JsonObject : {};
     const envelope: JsonObject = {};
-    for (const key of APP_MESSAGE_ENVELOPE_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(message, key)) envelope[key] = message[key] as JsonValue;
-    }
+
+    const firstValue = (...values: unknown[]): unknown => {
+      for (const value of values) {
+        if (value === undefined || value === null) continue;
+        if (typeof value === 'string' && !value.trim()) continue;
+        return value;
+      }
+      return undefined;
+    };
+    const setIfPresent = (key: string, value: unknown): void => {
+      if (value === undefined || value === null) return;
+      if (typeof value === 'string' && !value.trim()) return;
+      envelope[key] = value as JsonValue;
+    };
+
+    setIfPresent('from', firstValue(message.from, message.from_aid, message.sender_aid));
+    setIfPresent('to', firstValue(message.to, message.to_aid));
+    setIfPresent('group_id', message.group_id);
+    setIfPresent('type', firstValue(body.type, message.type, message.message_type, message.payload_type));
+    setIfPresent('kind', firstValue(body.kind, message.kind));
+    setIfPresent('version', firstValue(body.version, message.version));
+    setIfPresent('timestamp', firstValue(message.timestamp, message.created_at, message.t_server));
+    if ('encrypted' in message) envelope.encrypted = Boolean(message.encrypted);
+    const context = this.envelopeMetadata(message.context);
+    if (context) envelope.context = context;
+    const protectedHeaders = this.envelopeMetadata(message.protected_headers) ?? this.envelopeMetadata(message.headers);
+    if (protectedHeaders) envelope.protected_headers = protectedHeaders;
+    setIfPresent('payload_type', firstValue(message.payload_type, protectedHeaders?.payload_type));
     return envelope;
   }
 
@@ -167,6 +215,56 @@ export class MessageDeliveryEngine {
     // 兼容期保留顶层信封字段；下一个大版本 0.5.* 将移除这些顶层别名，请通过 envelope.* 访问。
     result.envelope = this.appMessageEnvelope(result as EventPayload);
     return result as EventPayload;
+  }
+
+  sendResultEnvelope(method: string, params: RpcParams, result: unknown, encrypted: boolean): JsonObject {
+    if (!APP_SEND_ENVELOPE_METHODS.has(method)) return {};
+    const body = isJsonObject(params.payload as JsonValue | object | null | undefined) ? params.payload as JsonObject : {};
+    const resultObj = isJsonObject(result as JsonValue | object | null | undefined) ? result as JsonObject : {};
+    const envelope: JsonObject = {};
+    const firstValue = (...values: unknown[]): unknown => {
+      for (const value of values) {
+        if (value === undefined || value === null) continue;
+        if (typeof value === 'string' && !value.trim()) continue;
+        return value;
+      }
+      return undefined;
+    };
+    const setIfPresent = (key: string, value: unknown): void => {
+      if (value === undefined || value === null) return;
+      if (typeof value === 'string' && !value.trim()) return;
+      envelope[key] = value as JsonValue;
+    };
+
+    setIfPresent('from', this.runtime.client._aid);
+    if (method.startsWith('message.')) {
+      setIfPresent('to', params.to);
+    } else {
+      setIfPresent('group_id', params.group_id);
+    }
+    setIfPresent('type', firstValue(body.type, params.type, params.message_type, params.payload_type));
+    setIfPresent('kind', firstValue(body.kind, params.kind));
+    setIfPresent('version', firstValue(body.version, params.version));
+    setIfPresent('timestamp', firstValue(params.timestamp, resultObj.timestamp, resultObj.created_at, resultObj.t_server, Date.now()));
+    envelope.encrypted = Boolean(encrypted);
+    const context = this.envelopeMetadata(params.context);
+    if (context) envelope.context = context;
+    const protectedHeaders = this.envelopeMetadata(params.protected_headers) ?? this.envelopeMetadata(params.headers);
+    if (protectedHeaders) envelope.protected_headers = protectedHeaders;
+    setIfPresent('payload_type', firstValue(params.payload_type, protectedHeaders?.payload_type, body.type));
+    return envelope;
+  }
+
+  attachSendResultEnvelope(method: string, params: RpcParams, result: unknown, encrypted: boolean): unknown {
+    if (!APP_SEND_ENVELOPE_METHODS.has(method) || !isJsonObject(result as JsonValue | object | null | undefined)) return result;
+    const out: JsonObject = { ...(result as JsonObject) };
+    out.envelope = this.sendResultEnvelope(method, params, out, encrypted);
+    if ('payload' in params) {
+      out.payload = params.payload;
+    } else if ('content' in params) {
+      out.payload = params.content;
+    }
+    return out;
   }
 
   attachAppGroupEventEnvelope(payload: EventPayload): EventPayload {

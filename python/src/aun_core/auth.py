@@ -26,6 +26,12 @@ from .keystore.base import TokenStore
 from .version import __version__ as _AUN_SDK_VERSION
 
 _AUN_SDK_LANG = "python"
+_SENSITIVE_RPC_LOG_KEYS = {
+    "access_token",
+    "refresh_token",
+    "kite_token",
+    "token",
+}
 
 if TYPE_CHECKING:
     from .logger import AUNLogger, NullLogger
@@ -39,6 +45,23 @@ def _v2_only_capabilities() -> dict[str, Any]:
         "supported_p2p_e2ee": ["e2ee_v2"],
         "supported_group_e2ee": ["group_e2ee_v2"],
     }
+
+
+def _redact_rpc_log_payload(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    key_l = key.lower()
+    if key_l in _SENSITIVE_RPC_LOG_KEYS or key_l.endswith("_token"):
+        text = str(value or "")
+        if not text:
+            return ""
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        return f"<redacted len={len(text)} sha256={digest}>"
+    if depth >= 6:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        return {str(k): _redact_rpc_log_payload(v, key=str(k), depth=depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_rpc_log_payload(v, depth=depth + 1) for v in value]
+    return value
 
 
 def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
@@ -319,16 +342,19 @@ class AuthFlow:
         refresh_token = str(identity.get("refresh_token") or "")
         if not refresh_token:
             self._log.warn("auth", "token refresh failed: missing refresh_token aid=%s", identity.get("aid"))
+            self._clear_cached_tokens(identity, reason="missing refresh_token")
             raise AuthError("missing refresh_token")
         self._log.debug("auth", "refresh_cached_tokens enter: aid=%s gateway=%s", identity.get("aid"), gateway_url)
         try:
-            refreshed = await self._refresh_access_token(gateway_url, refresh_token)
+            refreshed = await self._refresh_access_token(gateway_url, refresh_token, identity)
             self._remember_tokens(identity, refreshed)
             await self._validate_new_cert(identity, gateway_url)
             self._persist_identity(identity)
             self._log.debug("auth", "refresh_cached_tokens exit: elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
             return identity
         except Exception as exc:
+            if self._refresh_failure_requires_relogin(exc):
+                self._clear_cached_tokens(identity, reason=str(exc))
             self._log.debug("auth", "refresh_cached_tokens exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, identity.get("aid"), exc)
             raise
 
@@ -486,6 +512,8 @@ class AuthFlow:
                     return {"token": cached_token, "identity": identity, "hello": hello}
             except (AuthError, ConnectionError, AUNError) as exc:
                 self._log.debug("auth", "refresh_token auth failed, will re-login: %s", exc)
+                if self._refresh_failure_requires_relogin(exc):
+                    self._clear_cached_tokens(identity, reason=str(exc))
                 if getattr(transport, "_closed", False):
                     self._log.debug("auth", "connect_session exit (transport closed): elapsed=%.3fs", time.time() - _t_start)
                     raise ConnectionError(
@@ -603,16 +631,36 @@ class AuthFlow:
             self._log.debug("auth", "_login exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, identity.get("aid"), exc)
             raise
 
-    async def _refresh_access_token(self, gateway_url: str, refresh_token: str) -> dict[str, Any]:
+    async def _refresh_access_token(self, gateway_url: str, refresh_token: str,
+                                    identity: dict[str, Any] | None = None) -> dict[str, Any]:
         _t_start = time.time()
         self._log.debug("auth", "_refresh_access_token enter: gateway=%s", gateway_url)
+        params: dict[str, Any] = {"refresh_token": refresh_token}
+        if isinstance(identity, dict):
+            aid = str(identity.get("aid") or self._aid or "").strip()
+            device_id = str(identity.get("device_id") or self._device_id or "").strip()
+            slot_id = str(identity.get("slot_id") or self._slot_id or "").strip()
+            access_token = str(identity.get("access_token") or "").strip()
+            if aid:
+                params["aid"] = aid
+            if device_id:
+                params["device_id"] = device_id
+            if slot_id:
+                params["slot_id"] = slot_id
+            if access_token:
+                params["access_token"] = access_token
+            expires_at = identity.get("access_token_expires_at")
+            if isinstance(expires_at, (int, float)):
+                params["access_token_expires_at"] = float(expires_at)
+        params["sdk_lang"] = _AUN_SDK_LANG
+        params["sdk_version"] = _AUN_SDK_VERSION
         try:
-            result = await self._short_rpc(gateway_url, "auth.refresh_token", {
-                "refresh_token": refresh_token,
-            })
+            result = await self._short_rpc(gateway_url, "auth.refresh_token", params)
             if not result.get("success"):
-                self._log.warn("auth", "_refresh_access_token exit (server-failed): elapsed=%.3fs err=%s", time.time() - _t_start, result.get("error", "refresh failed"))
-                raise AuthError(str(result.get("error", "refresh failed")))
+                err = AuthError(str(result.get("error", "refresh failed")), data=result)
+                self._log.warn("auth", "_refresh_access_token exit (server-failed): elapsed=%.3fs err=%s relogin_required=%s",
+                               time.time() - _t_start, result.get("error", "refresh failed"), result.get("relogin_required"))
+                raise err
             self._log.debug("auth", "_refresh_access_token exit: elapsed=%.3fs has_token=%s expires_in=%s",
                             time.time() - _t_start, bool(result.get("access_token")), result.get("expires_in"))
             return result
@@ -643,7 +691,7 @@ class AuthFlow:
                 "method": method,
                 "params": params,
             }
-            self._log.debug("auth", "short RPC request full: %s", json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":"), default=str))
+            self._log.debug("auth", "short RPC request full: %s", json.dumps(_redact_rpc_log_payload(request_envelope), ensure_ascii=False, separators=(",", ":"), default=str))
             await ws.send(json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":")))
             # RPC 响应接收
             try:
@@ -653,7 +701,7 @@ class AuthFlow:
                     f"gateway {gateway_url} RPC recv timeout for {method} ({_SHORT_RPC_TIMEOUT}s)"
                 )
             message = raw if isinstance(raw, dict) else json.loads(raw)
-            self._log.debug("auth", "short RPC response full: method=%s %s", method, json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str))
+            self._log.debug("auth", "short RPC response full: method=%s %s", method, json.dumps(_redact_rpc_log_payload(message), ensure_ascii=False, separators=(",", ":"), default=str))
         finally:
             await ws.close()
 
@@ -663,7 +711,7 @@ class AuthFlow:
         if not isinstance(result, dict):
             raise ValidationError(f"invalid pre-auth response for {method}")
         if result.get("success") is False:
-            raise AuthError(str(result.get("error", f"{method} failed")))
+            raise AuthError(str(result.get("error", f"{method} failed")), data=result)
         return result
 
     async def _verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
@@ -1178,6 +1226,41 @@ class AuthFlow:
         active_cert = auth_result.get("active_cert")
         if active_cert:
             identity["_pending_active_cert"] = active_cert
+
+    @staticmethod
+    def _refresh_failure_requires_relogin(exc: BaseException) -> bool:
+        if not isinstance(exc, AuthError):
+            return False
+        data = getattr(exc, "data", None)
+        if isinstance(data, dict):
+            if data.get("relogin_required") is True:
+                return True
+            error = str(data.get("error") or "")
+        else:
+            error = str(exc)
+        return error.strip().lower() in {
+            "missing refresh_token",
+            "invalid_or_expired_refresh_token",
+            "refresh not supported",
+        }
+
+    def _clear_cached_tokens(self, identity: dict[str, Any], *, reason: str = "") -> None:
+        if not isinstance(identity, dict):
+            return
+        aid = str(identity.get("aid") or "")
+        had_token = any(bool(identity.get(k)) for k in ("access_token", "refresh_token", "kite_token", "token"))
+        if not had_token and not identity.get("access_token_expires_at"):
+            return
+        identity["access_token"] = ""
+        identity["refresh_token"] = ""
+        identity["kite_token"] = ""
+        identity["token"] = ""
+        identity["access_token_expires_at"] = 0
+        try:
+            self._persist_identity(identity)
+            self._log.warn("auth", "cleared cached tokens after refresh failure: aid=%s reason=%s", aid, reason)
+        except Exception as persist_exc:
+            self._log.warn("auth", "failed to persist token cleanup: aid=%s err=%s", aid, persist_exc)
 
     async def _validate_new_cert(self, identity: dict[str, Any], gateway_url: str = "") -> None:
         """验证服务端返回的 new_cert，通过后才正式接受。
