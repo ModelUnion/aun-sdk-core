@@ -214,16 +214,23 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "storage.create_folder", "storage.rename_folder", "storage.move_folder",
     "storage.delete_folder", "storage.move_object", "storage.copy_object",
     "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
+    "storage.set_acl", "storage.remove_acl", "storage.set_visibility",
+    "storage.issue_token", "storage.revoke_token",
+    "storage.create_symlink", "storage.atomic_repoint",
+    "storage.rename_symlink", "storage.delete_symlink",
+    "storage.fs.mkdir", "storage.fs.remove", "storage.fs.rename", "storage.fs.copy",
+    "storage.fs.mount", "storage.fs.approve", "storage.fs.reject", "storage.fs.unmount",
+    "storage.fs.invalidate_membership",
+    "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
     "auth.create_aid", "auth.renew_cert", "auth.rekey",
     "message.thought.put", "group.thought.put",
-    "group.add_member",
+    "group.add_member", "group.bind_group_aid", "group.complete_transfer",
     "group.resources.put", "group.resources.create_folder",
     "group.resources.rename", "group.resources.move",
     "group.resources.mount_object", "group.resources.update",
-    "group.resources.delete", "group.resources.cleanup_by_storage_ref",
-    "group.resources.request_add", "group.resources.request_mount_object",
-    "group.resources.direct_add", "group.resources.approve_request",
-    "group.resources.reject_request",
+    "group.resources.delete",
+    "group.resources.namespace_ready", "group.resources.confirm",
+    "group.resources.confirm_mount", "group.resources.get_df",
     "group.resources.unmount",
     "group.resources.get_access",
     "group.resources.resolve_access_ticket",
@@ -600,6 +607,7 @@ class AUNClient:
         self._seq_tracker_context: tuple[str, str, str] | None = None
         self._gap_fill_done: dict[str, float] = {}  # 补洞去重：进行中的 key -> 开始时间戳
         self._gap_fill_active: bool = False  # 当前是否在补洞中（用于标记 pull 来源）
+        self._background_rpc_depth: int = 0  # SDK 内部后台任务 depth，不进入业务 RPC 参数
         # 已发布到应用层的 seq 集合（按命名空间），补洞/pull 路径 publish 前检查以避免重复分发。
         # 字段名保留 _pushed_seqs 以兼容既有测试和内部引用。
         self._pushed_seqs: dict[str, set[int]] = {}
@@ -614,6 +622,8 @@ class AUNClient:
         self._online_unread_hint_task: asyncio.Task | None = None
         self._online_unread_hint_initial_delay = _ONLINE_UNREAD_HINT_INITIAL_DELAY
         self._online_unread_hint_interval = _ONLINE_UNREAD_HINT_INTERVAL
+        self._background_ack_tasks: set[asyncio.Task] = set()
+        self._background_ack_drain_timeout = 1.0
 
         # V2 E2EE session（延迟初始化，connect 后才有 aid）
         self._v2_session: V2Session | None = None
@@ -629,6 +639,7 @@ class AUNClient:
         # 同一 group 的 V2 自动提案必须串行，避免 group.create 与后续成员变更抢同一 state_version。
         self._v2_auto_propose_locks: dict[str, asyncio.Lock] = {}
         self._v2_auto_propose_locks_guard = asyncio.Lock()
+        self._v2_auto_state_tasks: set[asyncio.Task] = set()
         self._v2_auto_propose_last_snapshot: dict[str, str] = {}
         self._v2_auto_state_management_enabled = True
         self._v2_lazy_propose_triggered: dict[str, float] = {}
@@ -669,6 +680,10 @@ class AUNClient:
         self._message_delivery = MessageDeliveryEngine(self._client_runtime)
         self._v2_e2ee = V2E2EECoordinator(self._client_runtime)
         self._group_state_coordinator = GroupStateCoordinator(self._client_runtime)
+        self._storage_vfs = None
+        self._message_facade = None
+        self._group_facade = None
+        self._stream_facade = None
 
     # ── 属性 ──────────────────────────────────────────────
 
@@ -687,6 +702,38 @@ class AUNClient:
     @property
     def slot_id(self) -> str:
         return self._slot_id
+
+    @property
+    def storage(self):
+        from .storage import StorageVFS
+
+        if self._storage_vfs is None:
+            self._storage_vfs = StorageVFS(self)
+        return self._storage_vfs
+
+    @property
+    def message(self):
+        from .facades import MessageFacade
+
+        if self._message_facade is None:
+            self._message_facade = MessageFacade(self)
+        return self._message_facade
+
+    @property
+    def group(self):
+        from .facades import GroupFacade
+
+        if self._group_facade is None:
+            self._group_facade = GroupFacade(self)
+        return self._group_facade
+
+    @property
+    def stream(self):
+        from .facades import StreamFacade
+
+        if self._stream_facade is None:
+            self._stream_facade = StreamFacade(self)
+        return self._stream_facade
 
     @property
     def gateway_url(self) -> str | None:
@@ -947,7 +994,8 @@ class AUNClient:
         "group.leave", "group.remove_member", "group.update_rules",
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
-        "group.transfer_owner", "group.review_join_request",
+        "group.transfer_owner", "group.bind_group_aid", "group.complete_transfer",
+        "group.review_join_request",
         "group.batch_review_join_request",
         "group.request_join", "group.use_invite_code",
         "group.thought.put",
@@ -964,13 +1012,21 @@ class AUNClient:
         "storage.create_folder", "storage.rename_folder", "storage.move_folder",
         "storage.delete_folder", "storage.move_object", "storage.copy_object",
         "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
+        "storage.set_acl", "storage.remove_acl", "storage.set_visibility",
+        "storage.check_access",
+        "storage.issue_token", "storage.revoke_token",
+        "storage.create_symlink", "storage.atomic_repoint",
+        "storage.rename_symlink", "storage.delete_symlink",
+        "storage.fs.mkdir", "storage.fs.remove", "storage.fs.rename", "storage.fs.copy",
+        "storage.fs.mount", "storage.fs.approve", "storage.fs.reject", "storage.fs.unmount",
+        "storage.fs.invalidate_membership",
+        "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
         "group.resources.put", "group.resources.create_folder",
         "group.resources.rename", "group.resources.move",
         "group.resources.mount_object", "group.resources.update",
-        "group.resources.delete", "group.resources.cleanup_by_storage_ref",
-        "group.resources.request_add", "group.resources.request_mount_object",
-        "group.resources.direct_add", "group.resources.approve_request",
-        "group.resources.reject_request",
+        "group.resources.delete",
+        "group.resources.namespace_ready", "group.resources.confirm",
+        "group.resources.confirm_mount", "group.resources.get_df",
         "group.resources.unmount",
         "group.resources.get_access",
         "group.resources.resolve_access_ticket",
@@ -989,6 +1045,260 @@ class AUNClient:
 
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         return await self._rpc().call(method, params, trace=trace)
+
+    async def create_group(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        aid_store: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """创建群组；命名群自动生成并落盘 group_aid 身份。
+
+        命名群必须传入 `aid_store=`，因为 AUNClient 不持有 keystore seed。
+        匿名群不生成 group_aid 密钥，保持原有 `group.create` 转发语义。
+        """
+        merged: dict[str, Any] = {}
+        if params is not None:
+            if not isinstance(params, dict):
+                raise TypeError("params must be a dict")
+            merged.update(params)
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+        group_name = str(merged.get("group_name") or "").strip()
+        if not group_name:
+            return await self.call("group.create", merged)
+
+        store = aid_store or getattr(self, "_aid_store", None)
+        if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity"):
+            raise ValueError("create_group named flow requires aid_store with import_group_identity")
+
+        identity = store._register_flow.generate_identity()
+        public_key = str(identity.get("public_key_der_b64") or "").strip()
+        private_key = str(identity.get("private_key_pem") or "").strip()
+        curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+        if not public_key or not private_key:
+            raise ValueError("create_group generated incomplete group identity")
+        merged["public_key"] = public_key
+        merged["curve"] = curve
+
+        result = await self.call("group.create", merged)
+        group = result.get("group") if isinstance(result, dict) else None
+        aid_cert = result.get("aid_cert") if isinstance(result, dict) else None
+        group_aid = str((group or {}).get("group_aid") or "").strip()
+        cert_pem = str((aid_cert or {}).get("cert") or (aid_cert or {}).get("cert_pem") or "").strip()
+        if not group_aid or not cert_pem:
+            raise ValueError("create_group response missing group.group_aid or aid_cert.cert")
+
+        imported = store.import_group_identity(
+            group_aid,
+            private_key_pem=private_key,
+            public_key_der_b64=public_key,
+            curve=curve,
+            cert_pem=cert_pem,
+        )
+        if not imported.ok:
+            message = imported.error.message if imported.error else "unknown error"
+            raise ValueError(f"create_group failed to persist group identity: {message}")
+        return result
+
+    async def bind_group_aid(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        aid_store: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """为匿名群补齐 group_aid 身份材料并落盘本地 AIDs。"""
+        merged: dict[str, Any] = {}
+        if params is not None:
+            if not isinstance(params, dict):
+                raise TypeError("params must be a dict")
+            merged.update(params)
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+
+        store = aid_store or getattr(self, "_aid_store", None)
+        if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity"):
+            raise ValueError("bind_group_aid requires aid_store with import_group_identity")
+
+        identity = store._register_flow.generate_identity()
+        public_key = str(identity.get("public_key_der_b64") or "").strip()
+        private_key = str(identity.get("private_key_pem") or "").strip()
+        curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+        if not public_key or not private_key:
+            raise ValueError("bind_group_aid generated incomplete group identity")
+        merged["public_key"] = public_key
+        merged["curve"] = curve
+
+        result = await self.call("group.bind_group_aid", merged)
+        group = result.get("group") if isinstance(result, dict) else None
+        aid_cert = result.get("aid_cert") if isinstance(result, dict) else None
+        group_aid = str((group or {}).get("group_aid") or "").strip()
+        cert_pem = str((aid_cert or {}).get("cert") or (aid_cert or {}).get("cert_pem") or "").strip()
+        if not group_aid or not cert_pem:
+            raise ValueError("bind_group_aid response missing group.group_aid or aid_cert.cert")
+
+        imported = store.import_group_identity(
+            group_aid,
+            private_key_pem=private_key,
+            public_key_der_b64=public_key,
+            curve=curve,
+            cert_pem=cert_pem,
+        )
+        if not imported.ok:
+            message = imported.error.message if imported.error else "unknown error"
+            raise ValueError(f"bind_group_aid failed to persist group identity: {message}")
+        return result
+
+    async def start_group_transfer(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        aid_store: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """发起 group-storage 群主转让：旧群主用旧 group_aid 私钥签名授权，传入 transfer_auth。
+
+        aid_store 必须包含当前 group_aid 私钥（建命名群时落盘）。
+        返回服务端的 pending_rekey 响应。
+        """
+        merged: dict[str, Any] = {}
+        if params is not None:
+            if not isinstance(params, dict):
+                raise TypeError("params must be a dict")
+            merged.update(params)
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+
+        group_id = str(merged.get("group_id") or "").strip()
+        new_owner = str(merged.get("new_owner") or "").strip()
+        if not group_id or not new_owner:
+            raise ValueError("start_group_transfer requires group_id and new_owner")
+        store = aid_store or getattr(self, "_aid_store", None)
+        if store is None or not hasattr(store, "load"):
+            raise ValueError("start_group_transfer requires aid_store with group_aid private key")
+
+        group_aid = str(merged.get("group_aid") or "").strip()
+        if not group_aid:
+            info = await self.call("group.get", {"group_id": group_id})
+            group_aid = str((info.get("group") or info or {}).get("group_aid") or "").strip()
+        if not group_aid:
+            raise ValueError("start_group_transfer: unable to determine group_aid")
+
+        loaded = store.load(group_aid)
+        if not getattr(loaded, "ok", False) or not getattr(loaded, "data", None):
+            raise ValueError(f"start_group_transfer: group_aid identity not found: {group_aid}")
+        aid_obj = loaded.data.get("aid") if isinstance(loaded.data, dict) else None
+        if aid_obj is None or not getattr(aid_obj, "private_key_pem", None):
+            raise ValueError(f"start_group_transfer: group_aid has no private key: {group_aid}")
+
+        nonce = uuid.uuid4().hex
+        issued_ms = int(time.time() * 1000)
+        canonical = "|".join([
+            "aun-group-owner-transfer-v1",
+            group_id.strip().lower(),
+            group_aid.strip().lower(),
+            new_owner.strip().lower(),
+            nonce,
+            str(issued_ms),
+        ])
+        signed = aid_obj.sign(canonical)
+        if not signed.ok:
+            raise ValueError(f"start_group_transfer: sign failed: {signed.error}")
+        # AID.sign 返回标准 base64，服务端验签用 urlsafe base64；两者仅 +/- _ 差异，后端已 urlsafe_b64decode 且 pad_base64 处理，直接传
+        sig_b64 = signed.data["signature"]
+
+        merged["group_aid"] = group_aid
+        merged["transfer_auth"] = {"nonce": nonce, "issued_ms": issued_ms, "signature": sig_b64}
+        return await self.call("group.transfer_owner", merged)
+
+    async def complete_group_transfer(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        aid_store: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """完成 group-storage 群主转让 rekey，并落盘新的 group_aid 身份。"""
+        merged: dict[str, Any] = {}
+        if params is not None:
+            if not isinstance(params, dict):
+                raise TypeError("params must be a dict")
+            merged.update(params)
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+
+        store = aid_store or getattr(self, "_aid_store", None)
+        if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity"):
+            raise ValueError("complete_group_transfer requires aid_store with import_group_identity")
+
+        identity = store._register_flow.generate_identity()
+        public_key = str(identity.get("public_key_der_b64") or "").strip()
+        private_key = str(identity.get("private_key_pem") or "").strip()
+        curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+        if not public_key or not private_key:
+            raise ValueError("complete_group_transfer generated incomplete group identity")
+        group_id = str(merged.get("group_id") or "").strip()
+        if not group_id:
+            raise ValueError("complete_group_transfer requires group_id")
+        group_aid = str(merged.get("group_aid") or "").strip()
+        if not group_aid:
+            info = await self.call("group.get", {"group_id": group_id})
+            group_info = info.get("group") if isinstance(info, dict) else {}
+            group_aid = str(group_info.get("group_aid") or "").strip() if isinstance(group_info, dict) else ""
+        if not group_aid:
+            raise ValueError("complete_group_transfer: unable to determine group_aid")
+        current = self.current_aid
+        new_owner = str(getattr(current, "aid", "") or "").strip()
+        if current is None or not new_owner or not current.is_private_key_valid():
+            raise ValueError("complete_group_transfer requires current new-owner AID with private key")
+        nonce = uuid.uuid4().hex
+        issued_ms = int(time.time() * 1000)
+        public_key_hash = hashlib.sha256(public_key.encode("utf-8")).hexdigest()
+        canonical = "|".join([
+            "aun-group-owner-transfer-accept-v1",
+            group_id.strip().lower(),
+            group_aid.strip().lower(),
+            new_owner.strip().lower(),
+            public_key_hash,
+            nonce,
+            str(issued_ms),
+        ])
+        signed = current.sign(canonical)
+        if not signed.ok:
+            raise ValueError(f"complete_group_transfer: accept sign failed: {signed.error}")
+        merged["group_aid"] = group_aid
+        merged["public_key"] = public_key
+        merged["curve"] = curve
+        merged["transfer_accept"] = {
+            "nonce": nonce,
+            "issued_ms": issued_ms,
+            "signature": signed.data["signature"],
+        }
+
+        result = await self.call("group.complete_transfer", merged)
+        result_map = result if isinstance(result, dict) else {}
+        group = result_map.get("group") if isinstance(result_map.get("group"), dict) else {}
+        aid_cert = result_map.get("aid_cert") if isinstance(result_map.get("aid_cert"), dict) else {}
+        group_aid = str(group.get("group_aid") or result_map.get("group_aid") or "").strip()
+        cert_pem = str(
+            aid_cert.get("cert")
+            or aid_cert.get("cert_pem")
+            or result_map.get("cert")
+            or result_map.get("cert_pem")
+            or ""
+        ).strip()
+        if not group_aid or not cert_pem:
+            raise ValueError("complete_group_transfer response missing group.group_aid or aid_cert.cert")
+
+        imported = store.import_group_identity(
+            group_aid,
+            private_key_pem=private_key,
+            public_key_der_b64=public_key,
+            curve=curve,
+            cert_pem=cert_pem,
+        )
+        if not imported.ok:
+            message = imported.error.message if imported.error else "unknown error"
+            raise ValueError(f"complete_group_transfer failed to persist group identity: {message}")
+        return result
 
     @staticmethod
     def _notify_params_size_ok(params: dict[str, Any]) -> bool:

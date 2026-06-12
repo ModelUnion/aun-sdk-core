@@ -38,6 +38,10 @@ function createCoordinator(): { coordinator: V2E2EECoordinator; client: Record<s
     }),
     _publishOrderedMessage: vi.fn(async () => true),
     _publishAppEvent: vi.fn(async () => true),
+    // 源码发送后调 _delivery.attachSendResultEnvelope 回填 envelope
+    _delivery: {
+      attachSendResultEnvelope: vi.fn((_method: string, _params: unknown, result: unknown) => result),
+    },
   };
   return { client, coordinator: new V2E2EECoordinator(new ClientRuntime(client)) };
 }

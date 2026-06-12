@@ -597,10 +597,11 @@ func (c *AUNClient) onRawGroupMessageRecalled(data any) {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
 			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-				"group_id":  groupID,
-				"msg_seq":   ackSeq,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
+				"group_id":        groupID,
+				"msg_seq":         ackSeq,
+				"device_id":       c.deviceID,
+				"slot_id":         c.slotID,
+				"_rpc_background": true,
 			}); ackErr != nil {
 				c.logEG.Warn("group recall push auto-ack failed: group=%s %v", groupID, ackErr)
 			}
@@ -716,9 +717,10 @@ func (d *messageDeliveryEngine) processAndPublishMessage(data any) {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-					"seq":       ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
+					"seq":             ackSeq,
+					"device_id":       c.deviceID,
+					"slot_id":         c.slotID,
+					"_rpc_background": true,
 				}); ackErr != nil {
 					c.log.Warn("P2P auto-ack failed: %v", ackErr)
 				} else {
@@ -840,10 +842,11 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer ackCancel()
 						if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-							"group_id":  groupID,
-							"msg_seq":   ackSeq,
-							"device_id": c.deviceID,
-							"slot_id":   c.slotID,
+							"group_id":        groupID,
+							"msg_seq":         ackSeq,
+							"device_id":       c.deviceID,
+							"slot_id":         c.slotID,
+							"_rpc_background": true,
 						}); ackErr != nil {
 							c.logEG.Warn("group recall auto-ack failed: group=%s %v", groupID, ackErr)
 						}
@@ -882,10 +885,11 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-					"group_id":  groupID,
-					"msg_seq":   ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
+					"group_id":        groupID,
+					"msg_seq":         ackSeq,
+					"device_id":       c.deviceID,
+					"slot_id":         c.slotID,
+					"_rpc_background": true,
 				}); ackErr != nil {
 					c.logEG.Warn("group message auto-ack failed: group=%s %v", groupID, ackErr)
 				} else {
@@ -932,9 +936,10 @@ func (d *messageDeliveryEngine) autoPullGroupMessages(notification map[string]an
 	v2State := c.v2GetState()
 	if v2State != nil && v2State.session != nil {
 		_, err := c.pullGroupV2Internal(ctx, map[string]any{
-			"group_id":  groupID,
-			"after_seq": afterSeq,
-			"limit":     50,
+			"group_id":        groupID,
+			"after_seq":       afterSeq,
+			"limit":           50,
+			"_rpc_background": true,
 		})
 		if err != nil {
 			c.logEG.Warn("auto pull group messages (v2) failed: %v", err)
@@ -944,9 +949,10 @@ func (d *messageDeliveryEngine) autoPullGroupMessages(notification map[string]an
 	}
 
 	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": afterSeq,
-		"limit":     50,
+		"group_id":        groupID,
+		"after_seq":       afterSeq,
+		"limit":           50,
+		"_rpc_background": true,
 	})
 	if err != nil {
 		c.logEG.Warn("auto pull group messages failed: %v", err)
@@ -1001,9 +1007,10 @@ func (d *messageDeliveryEngine) fillGroupGap(groupID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": afterSeq,
-		"limit":     50,
+		"group_id":        groupID,
+		"after_seq":       afterSeq,
+		"limit":           50,
+		"_rpc_background": true,
 	})
 	if err != nil {
 		c.logEG.Warn("background gap fill failed (fillGroupGap group=%s): %v", groupID, err)
@@ -1033,10 +1040,11 @@ func (d *messageDeliveryEngine) fillGroupGap(groupID string) {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
 			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-				"group_id":  groupID,
-				"msg_seq":   ackSeq,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
+				"group_id":        groupID,
+				"msg_seq":         ackSeq,
+				"device_id":       c.deviceID,
+				"slot_id":         c.slotID,
+				"_rpc_background": true,
 			}); ackErr != nil {
 				c.logEG.Warn("fillGroupGap auto-ack failed: group=%s %v", groupID, ackErr)
 			}
@@ -1122,6 +1130,7 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 			"after_event_seq": nextAfterSeq,
 			"device_id":       c.deviceID,
 			"limit":           50,
+			"_rpc_background": true,
 		})
 		if err != nil {
 			c.logEG.Warn("background gap fill failed (fillGroupEventGap group=%s): %v", groupID, err)
@@ -1195,10 +1204,11 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
-					"group_id":  groupID,
-					"event_seq": ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
+					"group_id":        groupID,
+					"event_seq":       ackSeq,
+					"device_id":       c.deviceID,
+					"slot_id":         c.slotID,
+					"_rpc_background": true,
 				}); ackErr != nil {
 					c.logEG.Warn("group event auto-ack failed: group=%s %v", groupID, ackErr)
 				}
@@ -1238,6 +1248,7 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
 	if es <= contigBefore || c.isPushedSeq(ns, es) {
 		c.logEG.Debug("group.changed skipped duplicate/stale: group=%s event_seq=%d contiguous=%d", groupID, es, contigBefore)
+		d.ackCoveredGroupEvent(groupID, ns, es)
 		return
 	}
 
@@ -1255,10 +1266,11 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
-					"group_id":  groupID,
-					"event_seq": ackSeq,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
+					"group_id":        groupID,
+					"event_seq":       ackSeq,
+					"device_id":       c.deviceID,
+					"slot_id":         c.slotID,
+					"_rpc_background": true,
 				}); ackErr != nil {
 					c.logEG.Warn("group event push auto-ack failed: group=%s %v", groupID, ackErr)
 				}
@@ -1270,6 +1282,30 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 		c.logEG.Debug("group.changed event_seq gap detected, triggering gap fill: group=%s", groupID)
 		go d.fillGroupEventGap(groupID)
 	}
+}
+
+func (d *messageDeliveryEngine) ackCoveredGroupEvent(groupID, ns string, eventSeq int) {
+	c := d.runtime.client
+	if c.transport == nil || groupID == "" || eventSeq <= 0 {
+		return
+	}
+	ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(eventSeq))
+	if ackSeq <= 0 {
+		return
+	}
+	go func() {
+		ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer ackCancel()
+		if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
+			"group_id":        groupID,
+			"event_seq":       ackSeq,
+			"device_id":       c.deviceID,
+			"slot_id":         c.slotID,
+			"_rpc_background": true,
+		}); ackErr != nil {
+			c.logEG.Warn("group event covered push auto-ack failed: group=%s %v", groupID, ackErr)
+		}
+	}()
 }
 
 func (d *messageDeliveryEngine) isSelfJoinGroupChanged(data map[string]any) bool {
@@ -1360,6 +1396,7 @@ func (d *messageDeliveryEngine) onV2PushNotification(data any) {
 					ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer ackCancel()
 					c.signClientOperation("message.v2.ack", ackParams)
+					ackParams["_rpc_background"] = true
 					if _, ackErr := c.transport.Call(ackCtx, "message.v2.ack", ackParams); ackErr != nil {
 						c.logE2.Debug("V2 P2P push-ack failed: %v", ackErr)
 					}
@@ -1404,7 +1441,7 @@ func (d *messageDeliveryEngine) onV2PushNotification(data any) {
 		for {
 			c.v2PushPullPending.Store(false)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_, err := c.pullV2Internal(ctx, map[string]any{})
+			_, err := c.pullV2Internal(ctx, map[string]any{"_rpc_background": true})
 			cancel()
 			newContig := c.seqTracker.GetContiguousSeq(ns)
 			if err != nil {
@@ -1450,9 +1487,10 @@ func (d *messageDeliveryEngine) onV2GroupPushNotification(data any) {
 	ns := "group:" + groupID
 	c.seqTracker.UpdateMaxSeen(ns, seq)
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
-	if contigBefore == seq {
+	if contigBefore == seq || (eventKind == "group.online_unread_hint" && contigBefore > seq) {
 		c.logEG.Debug("onV2GroupPushNotification: push seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
 			seq, contigBefore)
+		d.ackCoveredGroupV2(groupID, ns, seq)
 		return
 	}
 	if contigBefore > seq {
@@ -1483,9 +1521,10 @@ func (d *messageDeliveryEngine) onV2GroupPushNotification(data any) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_, err := c.pullGroupV2Internal(ctx, map[string]any{
-			"group_id":  groupID,
-			"after_seq": afterSeq,
-			"limit":     50,
+			"group_id":        groupID,
+			"after_seq":       afterSeq,
+			"limit":           50,
+			"_rpc_background": true,
 		})
 		if err != nil {
 			c.logEG.Warn("V2 group push auto-pull failed: group=%s err=%v", groupID, err)
@@ -1496,6 +1535,33 @@ func (d *messageDeliveryEngine) onV2GroupPushNotification(data any) {
 	} else {
 		go pull()
 	}
+}
+
+func (d *messageDeliveryEngine) ackCoveredGroupV2(groupID, ns string, seq int) {
+	c := d.runtime.client
+	if c.transport == nil || groupID == "" || seq <= 0 {
+		return
+	}
+	ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(seq))
+	if ackSeq <= 0 {
+		return
+	}
+	ackParams := map[string]any{
+		"group_id":  groupID,
+		"up_to_seq": ackSeq,
+	}
+	go func() {
+		ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer ackCancel()
+		if err := c.signClientOperation("group.v2.ack", ackParams); err != nil {
+			c.logEG.Debug("V2 group covered push ack sign failed: group=%s %v", groupID, err)
+			return
+		}
+		ackParams["_rpc_background"] = true
+		if _, ackErr := c.transport.Call(ackCtx, "group.v2.ack", ackParams); ackErr != nil {
+			c.logEG.Debug("V2 group covered push auto-ack failed: group=%s %v", groupID, ackErr)
+		}
+	}()
 }
 
 func (d *messageDeliveryEngine) backgroundSyncEnabled() bool {
@@ -1617,8 +1683,9 @@ func (d *messageDeliveryEngine) fillP2pGap() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "message.pull", map[string]any{
-		"after_seq": afterSeq,
-		"limit":     50,
+		"after_seq":       afterSeq,
+		"limit":           50,
+		"_rpc_background": true,
 	})
 	if err != nil {
 		c.log.Warn("P2P message gap fill failed: after_seq=%d error=%v", afterSeq, err)
@@ -1647,9 +1714,10 @@ func (d *messageDeliveryEngine) fillP2pGap() {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
 			if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-				"seq":       ackSeq,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
+				"seq":             ackSeq,
+				"device_id":       c.deviceID,
+				"slot_id":         c.slotID,
+				"_rpc_background": true,
 			}); ackErr != nil {
 				c.log.Debug("P2P gap fill auto-ack failed: %v", ackErr)
 			}

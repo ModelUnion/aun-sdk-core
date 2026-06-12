@@ -199,7 +199,16 @@ async def test_group_state_lazy_propose_is_deduplicated():
     class FakeClient:
         _v2_auto_state_management_enabled = True
         _v2_lazy_propose_triggered = {}
+        _public_state = "ready"
+        _closing = False
         _loop = None
+
+        class _FakeDelivery:
+            async def run_background_rpc(self, coro_factory):
+                return await coro_factory()
+
+        def _delivery(self):
+            return self._FakeDelivery()
 
         async def _v2_auto_propose_state(self, group_id, *, leader_delay=False):
             calls.append((group_id, leader_delay))
@@ -221,7 +230,17 @@ async def test_group_state_membership_change_updates_cache_and_spk_path():
         _aid = "alice.agentid.pub"
         _v2_session = object()
         _v2_bootstrap_cache = {"group:group.agentid.pub/g1": ("cached",)}
+        _v2_auto_state_management_enabled = True
+        _public_state = "ready"
+        _closing = False
         _loop = None
+
+        class _FakeDelivery:
+            async def run_background_rpc(self, coro_factory):
+                return await coro_factory()
+
+        def _delivery(self):
+            return self._FakeDelivery()
 
         def _schedule_group_spk_registration(self, group_id, *, reason):
             events.append(("register", group_id, reason))

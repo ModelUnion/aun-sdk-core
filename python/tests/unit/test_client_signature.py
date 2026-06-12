@@ -94,20 +94,32 @@ class TestSignedMethodsCoverage:
         "storage.create_folder", "storage.rename_folder", "storage.move_folder",
         "storage.delete_folder", "storage.move_object", "storage.copy_object",
         "storage.batch_delete", "storage.set_object_meta", "storage.append_object",
+        "storage.set_acl", "storage.remove_acl", "storage.set_visibility",
+        "storage.issue_token", "storage.revoke_token",
+        "storage.create_symlink", "storage.atomic_repoint",
+        "storage.rename_symlink", "storage.delete_symlink",
+        "storage.fs.mkdir", "storage.fs.remove", "storage.fs.rename", "storage.fs.copy",
+        "storage.fs.mount", "storage.fs.approve", "storage.fs.reject", "storage.fs.unmount",
+        "storage.fs.invalidate_membership",
+        "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
+    ]
+
+    STORAGE_SIGNED_PROBE_METHODS = [
+        "storage.check_access",
     ]
 
     GROUP_RESOURCE_SIGNED_METHODS = [
         "group.resources.put", "group.resources.create_folder",
         "group.resources.rename", "group.resources.move",
         "group.resources.mount_object", "group.resources.update",
-        "group.resources.delete", "group.resources.cleanup_by_storage_ref",
-        "group.resources.request_add", "group.resources.request_mount_object",
-        "group.resources.direct_add", "group.resources.approve_request",
-        "group.resources.reject_request", "group.resources.unmount",
+        "group.resources.delete",
+        "group.resources.namespace_ready", "group.resources.confirm",
+        "group.resources.confirm_mount", "group.resources.get_df",
+        "group.resources.unmount",
         "group.resources.get_access", "group.resources.resolve_access_ticket",
     ]
 
-    GROUP_RESOURCE_NON_IDEMPOTENT_METHODS = GROUP_RESOURCE_SIGNED_METHODS
+    GROUP_RESOURCE_NON_IDEMPOTENT_METHODS = list(GROUP_RESOURCE_SIGNED_METHODS)
 
     EXPECTED_METHODS = [
         # P2P / V2 入口
@@ -125,7 +137,8 @@ class TestSignedMethodsCoverage:
         "group.leave", "group.remove_member", "group.recall", "group.update_rules",
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
-        "group.transfer_owner", "group.review_join_request",
+        "group.transfer_owner", "group.complete_transfer", "group.bind_group_aid",
+        "group.review_join_request",
         "group.batch_review_join_request",
         "group.request_join", "group.use_invite_code",
         "group.thought.put",
@@ -139,7 +152,7 @@ class TestSignedMethodsCoverage:
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
         # 群资源
-    ] + GROUP_RESOURCE_SIGNED_METHODS + STORAGE_MUTATION_METHODS
+    ] + GROUP_RESOURCE_SIGNED_METHODS + STORAGE_SIGNED_PROBE_METHODS + STORAGE_MUTATION_METHODS
 
     # 服务端通过 _require_actor_aid_verified 强制要求签名的方法
     # 如果服务端新增了签名要求，必须同步加入 SDK _SIGNED_METHODS
@@ -159,6 +172,8 @@ class TestSignedMethodsCoverage:
         "group.transfer_owner",
         "group.review_join_request",
         "group.batch_review_join_request",
+        "group.bind_group_aid",
+        "group.complete_transfer",
     ]
 
     @pytest.mark.parametrize("method", EXPECTED_METHODS)

@@ -24,6 +24,10 @@ function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: Rp
     _schedulePendingP2pPullIfNeeded: vi.fn(),
     _sleep: vi.fn(async () => undefined),
     _withBackgroundRpc: vi.fn(async (operation: () => unknown) => await operation()),
+    // 源码 call() 在发送后调 _delivery.attachSendResultEnvelope 回填 envelope
+    _delivery: {
+      attachSendResultEnvelope: vi.fn((_method: string, _params: unknown, result: unknown) => result),
+    },
     ...overrides,
   };
   return { client, pipeline: new RpcPipeline(new ClientRuntime(client)) };

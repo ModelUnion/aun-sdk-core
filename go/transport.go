@@ -102,6 +102,7 @@ type RPCTransport struct {
 	verifySSL     bool
 	dnsNet        *DnsResilientNet
 	ws            *websocket.Conn
+	writeMu       sync.Mutex
 	pending       map[string]chan map[string]any
 	pendingMu     sync.Mutex
 	closed        bool
@@ -129,6 +130,26 @@ type RPCTransport struct {
 	// RPC inflight 限制信号量（buffered channel 实现）
 	rpcSem        chan struct{} // 全局并发上限 = maxRPCInflight
 	backgroundSem chan struct{} // 后台 RPC 并发上限 = maxBackgroundRPCInflight
+
+	// 前台 RPC 等待计数；后台 RPC 在发送前让路，避免 pull/ack 挤占业务调用。
+	foregroundWaiters atomic.Int64
+}
+
+type rpcBackgroundContextKey struct{}
+
+func contextWithRPCBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, rpcBackgroundContextKey{}, true)
+}
+
+func rpcBackgroundFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(rpcBackgroundContextKey{}).(bool)
+	return v
 }
 
 // NewRPCTransport 创建 RPC 传输层
@@ -462,10 +483,29 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		}
 	}
 
+	if background {
+		if waitErr := t.waitForegroundAdmission(ctx, method); waitErr != nil {
+			return nil, waitErr
+		}
+	}
+
+	foregroundTracked := false
+	if !background {
+		t.foregroundWaiters.Add(1)
+		foregroundTracked = true
+	}
+
 	// RPC inflight 限制：全局信号量
 	select {
 	case t.rpcSem <- struct{}{}:
+		if foregroundTracked {
+			t.foregroundWaiters.Add(-1)
+			foregroundTracked = false
+		}
 	case <-ctx.Done():
+		if foregroundTracked {
+			t.foregroundWaiters.Add(-1)
+		}
 		return nil, NewTimeoutError(fmt.Sprintf("rpc queue timeout before send: %s", method), WithRetryable(true))
 	}
 	defer func() { <-t.rpcSem }()
@@ -557,12 +597,15 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
-	if err := ws.Write(writeCtx, websocket.MessageText, data); err != nil {
+	t.writeMu.Lock()
+	writeErr := ws.Write(writeCtx, websocket.MessageText, data)
+	t.writeMu.Unlock()
+	if writeErr != nil {
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
-		pkgLogTransport().Error("failed to send RPC request: method=%s id=%s err=%v", method, rpcID, err)
-		return nil, NewConnectionError(fmt.Sprintf("failed to send RPC %s: %v", method, err))
+		pkgLogTransport().Error("failed to send RPC request: method=%s id=%s err=%v", method, rpcID, writeErr)
+		return nil, NewConnectionError(fmt.Sprintf("failed to send RPC %s: %v", method, writeErr))
 	}
 
 	// 等待响应（带超时）
@@ -657,9 +700,12 @@ func (t *RPCTransport) Notify(ctx context.Context, method string, params map[str
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
-	if err := ws.Write(writeCtx, websocket.MessageText, data); err != nil {
-		pkgLogTransport().Error("failed to send notification: method=%s err=%v", method, err)
-		return NewConnectionError(fmt.Sprintf("failed to send notification %s: %v", method, err))
+	t.writeMu.Lock()
+	writeErr := ws.Write(writeCtx, websocket.MessageText, data)
+	t.writeMu.Unlock()
+	if writeErr != nil {
+		pkgLogTransport().Error("failed to send notification: method=%s err=%v", method, writeErr)
+		return NewConnectionError(fmt.Sprintf("failed to send notification %s: %v", method, writeErr))
 	}
 	pkgLogTransport().Debug("notification sent: method=%s size=%d", method, len(data))
 	return nil
@@ -715,10 +761,16 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		}
 		t.closedMu.Unlock()
 
-		if unexpectedDisconnect && !wasClosed && t.onDisconnect != nil {
-			pkgLogTransport().Warn("unexpected disconnect: err=%v", disconnectErr)
-			// 从 nhooyr.io/websocket 错误中提取 close code（-1 表示无 close frame）
-			t.onDisconnect(disconnectErr, int(websocket.CloseStatus(disconnectErr)))
+		if unexpectedDisconnect && !wasClosed {
+			pendingCount := t.failPending()
+			if pendingCount > 0 {
+				pkgLogTransport().Warn("unexpected disconnect failed pending RPC calls: count=%d err=%v", pendingCount, disconnectErr)
+			}
+			if t.onDisconnect != nil {
+				pkgLogTransport().Warn("unexpected disconnect: err=%v", disconnectErr)
+				// 从 nhooyr.io/websocket 错误中提取 close code（-1 表示无 close frame）
+				t.onDisconnect(disconnectErr, int(websocket.CloseStatus(disconnectErr)))
+			}
 		}
 	}()
 
@@ -763,6 +815,28 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		}
 		t.routeMessage(message)
 	}
+}
+
+func (t *RPCTransport) waitForegroundAdmission(ctx context.Context, method string) error {
+	for t.foregroundWaiters.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return NewTimeoutError(fmt.Sprintf("rpc background admission timeout before send: %s", method), WithRetryable(true))
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+func (t *RPCTransport) failPending() int {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	count := len(t.pending)
+	for id, ch := range t.pending {
+		close(ch)
+		delete(t.pending, id)
+	}
+	return count
 }
 
 func (t *RPCTransport) lastDisconnectErrorLocked() error {

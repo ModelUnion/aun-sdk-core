@@ -177,17 +177,25 @@ describe('RPCTransport 后台 RPC 调度', () => {
     return ws.sent.map((raw) => JSON.parse(raw));
   }
 
+  // 源码 _enqueueSend 把 ws.send 推迟到微任务串行执行，
+  // 读取 ws.sent 前需 flush 微任务队列（真实计时器）。
+  async function flushSends(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
   it('后台 RPC 不能占满全部 in-flight，普通 RPC 应优先发送', async () => {
     const { transport, ws } = createReadyTransport();
     const calls = Array.from({ length: 16 }, (_, i) =>
       transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
     );
 
+    await flushSends();
     expect(parseSent(ws).filter((msg) => msg.method.startsWith('background.'))).toHaveLength(8);
     expect((transport as any)._backgroundRpcQueue).toHaveLength(8);
     expect((transport as any)._pendingBackground.size).toBe(8);
 
     const normalCall = transport.call('meta.ping', {}).catch((err) => err);
+    await flushSends();
     const sent = parseSent(ws);
     expect(sent).toHaveLength(9);
     expect(sent[8].method).toBe('meta.ping');
@@ -201,6 +209,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
       transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
     );
+    await flushSends();
     expect(ws.sent).toHaveLength(8);
 
     const first = parseSent(ws)[0];
@@ -209,6 +218,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
     expect(firstMeta.pendingSince).toBeGreaterThanOrEqual(firstMeta.queuedAt);
     expect(firstMeta.deadlineAt).toBeGreaterThan(firstMeta.pendingSince);
     (transport as any)._routeMessage({ jsonrpc: '2.0', id: first.id, result: { ok: true } });
+    await flushSends();
     expect(ws.sent).toHaveLength(9);
     expect((transport as any)._pendingBackground.size).toBe(8);
     expect((transport as any)._pendingMeta.has(first.id)).toBe(false);
@@ -219,6 +229,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
       id: second.id,
       error: { code: -32000, message: 'unit-error' },
     });
+    await flushSends();
     expect(ws.sent).toHaveLength(10);
     expect((transport as any)._pendingBackground.size).toBe(8);
 
@@ -232,6 +243,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
       transport.call(`background.${i}`, { _rpc_background: true }, 100).catch((err) => err),
     );
+    await vi.advanceTimersByTimeAsync(0);
     expect(ws.sent).toHaveLength(8);
 
     vi.advanceTimersByTime(100);
@@ -242,6 +254,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
     expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
 
     const normalCall = transport.call('meta.ping', {}, 100).catch((err) => err);
+    await vi.advanceTimersByTimeAsync(0);
     expect(parseSent(ws).at(-1)?.method).toBe('meta.ping');
     await transport.close();
     await Promise.allSettled([normalCall]);

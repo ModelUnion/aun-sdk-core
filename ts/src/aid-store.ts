@@ -51,6 +51,17 @@ export type UploadAgentMdResult = Record<string, unknown>;
 export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
 export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type ImportGroupIdentityOptions = {
+  private_key_pem?: string;
+  privateKeyPem?: string;
+  public_key_der_b64?: string;
+  publicKeyDerB64?: string;
+  curve?: string;
+  cert_pem?: string;
+  certPem?: string;
+  cert?: string;
+};
+export type ImportGroupIdentityResult = { imported: true; aid: string };
 export type ChangeSeedResult = { changed: boolean; count: number };
 export type ListResult = { identities: AIDInfo[] };
 
@@ -263,6 +274,10 @@ export class AIDStore {
     });
   }
 
+  loadAsync(aid: string): Promise<Result<{ aid: AID }>> {
+    return Promise.resolve(this.load(aid));
+  }
+
   list(): Result<ListResult> {
     try {
       const aids = this._keystore.listIdentities?.() ?? [];
@@ -285,6 +300,10 @@ export class AIDStore {
     }
   }
 
+  listAsync(): Promise<Result<ListResult>> {
+    return Promise.resolve(this.list());
+  }
+
   changeSeed(oldSeed: string, newSeed: string): Result<ChangeSeedResult> {
     if (!oldSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty oldSeed');
     if (!newSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty newSeed');
@@ -296,6 +315,10 @@ export class AIDStore {
     } catch (exc) {
       return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, String(exc), exc);
     }
+  }
+
+  changeSeedAsync(oldSeed: string, newSeed: string): Promise<Result<ChangeSeedResult>> {
+    return Promise.resolve(this.changeSeed(oldSeed, newSeed));
   }
 
   // ── 联网方法 ──────────────────────────────────────────────────
@@ -561,6 +584,84 @@ export class AIDStore {
     } catch (exc) {
       return resultErr(codes.REKEY_FAILED, String(exc), exc);
     }
+  }
+
+  importGroupIdentity(
+    aidOrOptions: string | (ImportGroupIdentityOptions & { aid?: string }),
+    options: ImportGroupIdentityOptions = {},
+  ): Result<ImportGroupIdentityResult> {
+    const fromObject = typeof aidOrOptions === 'object' && aidOrOptions !== null ? aidOrOptions : {};
+    const target = String(typeof aidOrOptions === 'string' ? aidOrOptions : fromObject.aid ?? '').trim();
+    const privateKeyPem = String(options.private_key_pem ?? options.privateKeyPem ?? fromObject.private_key_pem ?? fromObject.privateKeyPem ?? '').trim();
+    const publicKeyDerB64 = String(options.public_key_der_b64 ?? options.publicKeyDerB64 ?? fromObject.public_key_der_b64 ?? fromObject.publicKeyDerB64 ?? '').trim();
+    const curve = String(options.curve ?? fromObject.curve ?? 'P-256').trim() || 'P-256';
+    const certPem = String(options.cert_pem ?? options.certPem ?? options.cert ?? fromObject.cert_pem ?? fromObject.certPem ?? fromObject.cert ?? '').trim();
+
+    if (!target) return resultErr(codes.INVALID_AID_FORMAT, 'importGroupIdentity requires a non-empty aid');
+    if (!privateKeyPem) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'importGroupIdentity requires private_key_pem');
+    if (!publicKeyDerB64) return resultErr(codes.KEYPAIR_MISMATCH, 'importGroupIdentity requires public_key_der_b64');
+    if (!certPem) return resultErr(codes.CERT_PARSE_ERROR, 'importGroupIdentity requires cert_pem');
+
+    try {
+      const cert = new X509Certificate(certPem);
+      const timeErr = certTimeError(certPem);
+      if (timeErr) return resultErr(codes.CERT_CHAIN_BROKEN, `importGroupIdentity returned certificate is ${timeErr}`);
+
+      const cn = certCommonName(certPem);
+      if (cn !== target) {
+        return resultErr(codes.CERT_CHAIN_BROKEN, `importGroupIdentity returned certificate CN mismatch: expected ${target}, got ${cn}`);
+      }
+
+      let expectedDer: Buffer;
+      try {
+        expectedDer = Buffer.from(publicKeyDerB64, 'base64');
+      } catch (exc) {
+        return resultErr(codes.KEYPAIR_MISMATCH, 'importGroupIdentity public_key_der_b64 is not valid base64', exc);
+      }
+      const certPubDer = cert.publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+      if (!expectedDer.length || !certPubDer.equals(expectedDer)) {
+        return resultErr(codes.KEYPAIR_MISMATCH, 'importGroupIdentity returned certificate public key mismatch');
+      }
+
+      let privKey: ReturnType<typeof createPrivateKey>;
+      try {
+        privKey = createPrivateKey(privateKeyPem);
+      } catch (exc) {
+        return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, `private key parse failed for aid: ${target}`, exc);
+      }
+      const privPubDer = createPublicKey(privKey).export({ type: 'spki', format: 'der' }) as Buffer;
+      if (!privPubDer.equals(certPubDer)) {
+        return resultErr(codes.KEYPAIR_MISMATCH, `private key does not match certificate for aid: ${target}`);
+      }
+
+      this._keystore.saveIdentity(target, {
+        aid: target,
+        private_key_pem: privateKeyPem,
+        public_key_der_b64: publicKeyDerB64,
+        curve,
+        cert: certPem,
+      });
+
+      const loaded = this.load(target);
+      if (!loaded.ok || !loaded.data) {
+        const err = resultError(loaded);
+        return resultErr(err?.code ?? codes.KEYPAIR_MISMATCH, err?.message ?? 'imported group identity reload failed');
+      }
+      const signProbe = loaded.data.aid.sign('aun-group-identity-import-self-test');
+      if (!signProbe.ok) {
+        return resultErr(codes.KEYPAIR_MISMATCH, resultError(signProbe)?.message ?? 'imported group identity private key self-test failed');
+      }
+      return resultOk({ imported: true, aid: target });
+    } catch (exc) {
+      return resultErr(codes.CERT_PARSE_ERROR, String(exc), exc);
+    }
+  }
+
+  importGroupIdentityAsync(
+    aidOrOptions: string | (ImportGroupIdentityOptions & { aid?: string }),
+    options: ImportGroupIdentityOptions = {},
+  ): Promise<Result<ImportGroupIdentityResult>> {
+    return Promise.resolve(this.importGroupIdentity(aidOrOptions, options));
   }
 
   // ── 内部辅助 ──────────────────────────────────────────────────

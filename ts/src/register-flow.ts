@@ -145,6 +145,10 @@ export class RegisterFlow {
     return this._crypto.generateIdentity() as unknown as KeyPairRecord;
   }
 
+  generateIdentityAsync(): Promise<KeyPairRecord> {
+    return Promise.resolve(this.generateIdentity());
+  }
+
   newClientNonce(): string {
     return this._crypto.newClientNonce();
   }

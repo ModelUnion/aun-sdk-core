@@ -67,6 +67,9 @@ func (c *AUNClient) sendV2Internal(ctx context.Context, params map[string]any) (
 // {"messages": [...]} 形态返回。PullV2 内部会消费服务端 server_ack_seq，
 // 即使空 pull 也会推进 SeqTracker 的 contiguous_seq。
 func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (any, error) {
+	if truthyBool(params["_rpc_background"]) {
+		ctx = contextWithRPCBackground(ctx)
+	}
 	afterSeq := toInt64(params["after_seq"])
 	limit := int(toInt64(params["limit"]))
 	if limit <= 0 {
@@ -123,6 +126,7 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 				ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				c.signClientOperation("message.v2.ack", ackParams)
+				ackParams["_rpc_background"] = true
 				if _, ackErr := c.transport.Call(ackCtx, "message.v2.ack", ackParams); ackErr != nil {
 					c.log.Debug("V2 P2P auto-ack failed: %v", ackErr)
 				}
@@ -135,6 +139,9 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 // ackV2Internal 适配 client.Call("message.ack", params) → AckV2。
 // 兼容 seq / up_to_seq 两种入参。
 func (c *AUNClient) ackV2Internal(ctx context.Context, params map[string]any) (any, error) {
+	if truthyBool(params["_rpc_background"]) {
+		ctx = contextWithRPCBackground(ctx)
+	}
 	upTo := toInt64(params["seq"])
 	if upTo == 0 {
 		upTo = toInt64(params["up_to_seq"])
@@ -184,6 +191,9 @@ func (c *AUNClient) sendGroupV2Internal(ctx context.Context, params map[string]a
 // pullGroupV2Internal 适配 client.Call("group.pull", params) → PullGroupV2，按
 // {"messages": [...]} 形态返回；同时 publish 到应用层 + auto-ack。
 func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]any) (any, error) {
+	if truthyBool(params["_rpc_background"]) {
+		ctx = contextWithRPCBackground(ctx)
+	}
 	groupID := strings.TrimSpace(getStr(params, "group_id", ""))
 	if groupID == "" {
 		return nil, NewValidationError("group.pull requires 'group_id'")
@@ -244,6 +254,7 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 			ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			c.signClientOperation("group.v2.ack", ackParams)
+			ackParams["_rpc_background"] = true
 			if _, ackErr := c.transport.Call(ackCtx, "group.v2.ack", ackParams); ackErr != nil {
 				c.logEG.Debug("V2 group auto-ack failed: group=%s %v", groupID, ackErr)
 			}
@@ -275,6 +286,9 @@ func (c *AUNClient) groupCursorTargetsCurrentInstance(params map[string]any) boo
 
 // ackGroupV2Internal 适配 client.Call("group.ack_messages", params) → AckGroupV2。
 func (c *AUNClient) ackGroupV2Internal(ctx context.Context, params map[string]any) (any, error) {
+	if truthyBool(params["_rpc_background"]) {
+		ctx = contextWithRPCBackground(ctx)
+	}
 	groupID := strings.TrimSpace(getStr(params, "group_id", ""))
 	if groupID == "" {
 		return nil, errors.New("group.ack_messages requires 'group_id'")

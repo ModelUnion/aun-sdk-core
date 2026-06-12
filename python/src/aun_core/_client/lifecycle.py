@@ -420,6 +420,9 @@ class LifecycleController:
     async def stop_background_tasks(self) -> None:
         client = self.client
         current_task = asyncio.current_task()
+        cancel_event_tasks = getattr(client._transport, "cancel_event_tasks", None)
+        if callable(cancel_event_tasks):
+            await cancel_event_tasks()
         for attr in (
             "_heartbeat_task",
             "_token_refresh_task",
@@ -439,6 +442,33 @@ class LifecycleController:
             setattr(client, attr, None)
         if hasattr(client, "_online_unread_hint_queue"):
             client._online_unread_hint_queue.clear()
+        auto_state_tasks = set(getattr(client, "_v2_auto_state_tasks", set()) or set())
+        if auto_state_tasks:
+            for task in auto_state_tasks:
+                if task is not current_task:
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in auto_state_tasks if task is not current_task),
+                return_exceptions=True,
+            )
+            client._v2_auto_state_tasks.difference_update(auto_state_tasks)
+        ack_tasks = set(getattr(client, "_background_ack_tasks", set()) or set())
+        if ack_tasks:
+            timeout = max(0.0, float(getattr(client, "_background_ack_drain_timeout", 1.0) or 0.0))
+            done, pending = await asyncio.wait(ack_tasks, timeout=timeout)
+            for task in done:
+                try:
+                    task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            client._background_ack_tasks.difference_update(done)
+            client._background_ack_tasks.difference_update(pending)
 
     def start_heartbeat_task(self) -> None:
         from ..client import _clamp_heartbeat_interval

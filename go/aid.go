@@ -36,10 +36,11 @@ type AID struct {
 	PrivateKeyPem string
 
 	// 私有字段
-	certObj    *x509.Certificate
-	privateKey crypto.PrivateKey // 可为 nil
-	certValid  bool
-	pkValid    bool
+	certObj        *x509.Certificate
+	privateKey     crypto.PrivateKey // 可为 nil
+	certValid      bool
+	pkValid        bool
+	encryptionSeed string // AIDStore 本地加密上下文，仅供 SDK 内部重开同一 keystore
 }
 
 // newAID 内部构造函数，由 AIDStore.Load 调用。

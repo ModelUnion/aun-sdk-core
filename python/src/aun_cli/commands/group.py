@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import mimetypes
+from pathlib import Path
+from typing import Any
 from typing import Optional
+import uuid
 
 import typer
 
-from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
+from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config, make_aid_store
 from aun_cli.config import get_profile, set_profile
-from aun_cli.output import output_json, output_success, output_table, output_dict, is_json_mode, set_json_mode
+from aun_cli.output import output_json, output_success, output_table, output_dict, output_error, is_json_mode, set_json_mode
 
 group_app = typer.Typer(name="group", help="群组管理", no_args_is_help=True)
+resources_app = typer.Typer(name="resources", help="群存储资源", no_args_is_help=True)
 
 
 def _current_profile_name(ctx: typer.Context) -> str:
@@ -91,7 +98,13 @@ def _group_info_display(result: dict) -> dict[str, object]:
 
 def _is_canonical_group_id(value: str) -> bool:
     text = str(value or "").strip().lower()
-    return text.startswith("group.") or text.startswith("g-") or text.startswith("grp-")
+    if text.startswith("group.") or text.startswith("g-") or text.startswith("grp-"):
+        return True
+    try:
+        uuid.UUID(text)
+        return True
+    except ValueError:
+        return False
 
 
 def _resolve_group_id(ctx: typer.Context, group_id: str | None) -> str:
@@ -104,11 +117,83 @@ def _resolve_group_id(ctx: typer.Context, group_id: str | None) -> str:
     raise typer.BadParameter("No group_id specified and no active group set. Run 'aun group use <group_id>' first.")
 
 
+def _normalize_resource_path(value: str) -> str:
+    path = str(value or "").strip().replace("\\", "/").strip("/")
+    if not path:
+        raise typer.BadParameter("resource path cannot be empty")
+    return path
+
+
+def _split_resource_parent_name(path: str) -> tuple[str, str]:
+    normalized = _normalize_resource_path(path)
+    if "/" in normalized:
+        parent, name = normalized.rsplit("/", 1)
+    else:
+        parent, name = "", normalized
+    if not name:
+        raise typer.BadParameter("destination name cannot be empty")
+    return parent, name
+
+
+def _is_pending_ops_result(value: Any) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("pending_ops"), list)
+
+
+def _json_ready(value: Any) -> Any:
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _with_group_identity_store(ctx: typer.Context):
+    resolved = resolve_profile_config(ctx)
+    return make_aid_store(resolved)
+
+
+def _resolve_group_and_resource_path(
+    ctx: typer.Context,
+    group_id_or_path: str | None,
+    resource_path: str | None,
+) -> tuple[str, str]:
+    if resource_path is not None:
+        return _resolve_group_id(ctx, group_id_or_path), _normalize_resource_path(resource_path)
+    value = str(group_id_or_path or "").strip()
+    if not value:
+        return _resolve_group_id(ctx, None), ""
+    if _is_canonical_group_id(value):
+        return _resolve_group_id(ctx, value), ""
+    return _resolve_group_id(ctx, None), _normalize_resource_path(value)
+
+
+def _extract_group_aid(result: object) -> str:
+    if isinstance(result, dict):
+        group = result.get("group")
+        if isinstance(group, dict):
+            value = str(group.get("group_aid") or "").strip()
+            if value:
+                return value
+        return str(result.get("group_aid") or "").strip()
+    return ""
+
+
+def _is_named_group_aid(group_aid: str) -> bool:
+    value = str(group_aid or "").strip().lower()
+    if not value or "." not in value:
+        return False
+    prefix = value.split(".", 1)[0]
+    return not prefix.isdigit()
+
+
 @group_app.command("create")
 def group_create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="群组名称"),
     members: Optional[str] = typer.Option(None, "--members", help="初始成员 AID（逗号分隔）"),
+    group_name: Optional[str] = typer.Option(None, "--group-name", help="命名群短名；设置后创建 group_aid 身份"),
 ) -> None:
     """创建群组"""
     set_json_mode(ctx.obj.get("json", False))
@@ -118,6 +203,15 @@ def group_create(
             params: dict = {"name": name}
             if members:
                 params["members"] = [m.strip() for m in members.split(",")]
+            if group_name:
+                params["group_name"] = group_name
+                store = _with_group_identity_store(ctx)
+                try:
+                    return await client.create_group(params, aid_store=store)
+                finally:
+                    close = getattr(store, "close", None)
+                    if callable(close):
+                        close()
             return await client.call("group.create", params)
 
     try:
@@ -135,6 +229,643 @@ def group_create(
     else:
         gid = _extract_group_id(result)
         output_success(f"Created group: {name} (id: {gid})")
+
+
+@group_app.command("bind")
+@group_app.command("bind-aid")
+def group_bind(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(None, help="群组 ID，省略时使用当前 active group"),
+    group_name: Optional[str] = typer.Option(None, "--group-name", help="匿名群升级时指定命名 group_aid 短名"),
+) -> None:
+    """为匿名群补齐可签名 group_aid 身份"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            info = await client.call("group.info", {"group_id": resolved_group_id})
+            group = info.get("group") if isinstance(info, dict) else None
+            if not isinstance(group, dict):
+                raise ValueError(f"group not found or unavailable: {resolved_group_id}")
+            existing_group_aid = str(group.get("group_aid") or "").strip()
+            if _is_named_group_aid(existing_group_aid):
+                raise ValueError(f"group already has group_aid: {existing_group_aid}")
+            params: dict[str, Any] = {"group_id": resolved_group_id}
+            if group_name:
+                params["group_name"] = group_name
+            store = _with_group_identity_store(ctx)
+            try:
+                return await client.bind_group_aid(params, aid_store=store)
+            finally:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(result)
+    else:
+        group_aid = _first_value(result, "group_aid")
+        output_success(f"Bound group AID for {resolved_group_id}: {group_aid}")
+
+
+@group_app.command("transfer")
+def group_transfer(
+    ctx: typer.Context,
+    group_id_or_new_owner: str = typer.Argument(..., help="群组 ID 或新群主 AID"),
+    new_owner: str | None = typer.Argument(None, help="新群主 AID；省略群组 ID 时使用当前 active group"),
+) -> None:
+    """转移群主"""
+    set_json_mode(ctx.obj.get("json", False))
+    if new_owner is None:
+        resolved_group_id = _resolve_group_id(ctx, None)
+        target = group_id_or_new_owner
+    else:
+        resolved_group_id = _resolve_group_id(ctx, group_id_or_new_owner)
+        target = new_owner
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            # group-storage 转让需旧群主用 group_aid 私钥签名授权。
+            store = _with_group_identity_store(ctx)
+            try:
+                return await client.start_group_transfer(
+                    {"group_id": resolved_group_id, "new_owner": target},
+                    aid_store=store,
+                )
+            finally:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(result)
+    else:
+        status = result.get("status", "transferred") if isinstance(result, dict) else "transferred"
+        output_success(f"Transfer {resolved_group_id} to {target}: {status}")
+
+
+@group_app.command("complete-transfer")
+@group_app.command("transfer-complete", hidden=True)
+def group_transfer_complete(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(None, help="群组 ID，省略时使用当前 active group"),
+) -> None:
+    """完成 group-storage 群主转让 rekey"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            store = _with_group_identity_store(ctx)
+            try:
+                return await client.complete_group_transfer({"group_id": resolved_group_id}, aid_store=store)
+            finally:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(result)
+    else:
+        output_success(f"Completed group-storage transfer for {resolved_group_id}")
+
+
+@resources_app.command("init")
+def group_resources_init(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(None, help="群组 ID，省略时使用当前 active group"),
+    group_aid: Optional[str] = typer.Option(None, "--group-aid", help="群 group_aid；省略时先读取 group.info"),
+) -> None:
+    """初始化群 storage 命名空间"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            resolved_group_aid = str(group_aid or "").strip()
+            if not resolved_group_aid:
+                info = await client.call("group.info", {"group_id": resolved_group_id})
+                resolved_group_aid = _extract_group_aid(info)
+            if not resolved_group_aid:
+                raise ValueError("group_aid is required; pass --group-aid or ensure group.info returns it")
+            store = _with_group_identity_store(ctx)
+            try:
+                return await client.group.resources.initialize_namespace(
+                    group_id=resolved_group_id,
+                    group_aid=resolved_group_aid,
+                    aid_store=store,
+                )
+            finally:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(result) if is_json_mode() else output_success(f"Initialized group resources for {resolved_group_id}")
+
+
+@resources_app.command("ls")
+def group_resources_ls(
+    ctx: typer.Context,
+    group_id_or_prefix: str = typer.Argument(None, help="群组 ID 或资源前缀"),
+    prefix: str | None = typer.Argument(None, help="资源前缀；省略群组 ID 时使用 active group"),
+    page: int = typer.Option(1, "--page", help="页码"),
+    size: int = typer.Option(100, "--size", help="每页数量"),
+    include_status: bool = typer.Option(False, "--include-status", help="附带 storage 状态抽查"),
+) -> None:
+    """列出群存储镜像资源"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_prefix = _resolve_group_and_resource_path(ctx, group_id_or_prefix, prefix)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            params: dict[str, Any] = {
+                "group_id": resolved_group_id,
+                "prefix": resolved_prefix,
+                "page": page,
+                "size": size,
+                "include_status": include_status,
+            }
+            return await client.group.resources.list(**params)
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(_json_ready(result))
+    else:
+        data = result if isinstance(result, dict) else {"items": result}
+        items = data.get("items") or data.get("resources") or []
+        rows = [
+            [
+                item.get("resource_type", item.get("type", "")),
+                item.get("resource_path", item.get("path", "")),
+                item.get("status", ""),
+            ]
+            for item in items
+            if isinstance(item, dict)
+        ]
+        output_table(["type", "path", "status"], rows)
+
+
+@resources_app.command("get")
+def group_resources_get(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或资源路径"),
+    resource_path: str | None = typer.Argument(None, help="资源路径；省略群组 ID 时使用 active group"),
+    include_status: bool = typer.Option(False, "--include-status", help="附带 storage 状态抽查"),
+) -> None:
+    """查看群存储镜像资源详情"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.group.resources.get(
+                group_id=resolved_group_id,
+                resource_path=resolved_path,
+                include_status=include_status,
+            )
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_dict(_json_ready(result))
+
+
+@resources_app.command("df")
+def group_resources_df(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(None, help="群组 ID，省略时使用当前 active group"),
+) -> None:
+    """查看群存储用量视图"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.group.resources.get_df(group_id=resolved_group_id)
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_dict(_json_ready(result))
+
+
+@resources_app.command("put")
+def group_resources_put(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    local_path: str = typer.Argument(..., help="本地文件路径"),
+    resource_path: str = typer.Argument(..., help="群自有区资源路径，如 announce/a.txt"),
+    content_type: Optional[str] = typer.Option(None, "--content-type", help="内容类型"),
+    title: Optional[str] = typer.Option(None, "--title", help="资源标题"),
+    expected_version: Optional[int] = typer.Option(None, "--expected-version", help="CAS 期望版本"),
+) -> None:
+    """写入群自有区文件并确认 group.resources 镜像"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    resolved_path = _normalize_resource_path(resource_path)
+    file_path = Path(local_path)
+
+    async def _make(client):
+        data = file_path.read_bytes()
+        guessed_type = content_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        params: dict[str, Any] = {
+            "group_id": resolved_group_id,
+            "resource_path": resolved_path,
+            "content": base64.b64encode(data).decode("ascii"),
+            "content_encoding": "base64",
+            "content_type": guessed_type,
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        if title:
+            params["title"] = title
+        if expected_version is not None:
+            params["expected_version"] = expected_version
+        return await client.group.resources.put(**params)
+
+    try:
+        result = run_async(_run_pending(ctx, _make, default_sign_as_from_pending=True))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Put {resolved_path} into {resolved_group_id}")
+
+
+async def _run_pending(ctx: typer.Context, make_pending, *, default_sign_as_from_pending: bool = False) -> Any:
+    """通用 group-storage 写编排：facade 取 pending_ops，再以对应身份 execute_pending_ops。
+
+    群自有区写（put/delete/mkdir/rename/move）以 group_aid 签名，成员挂载（mount）以成员
+    自己 AID 签名——签名身份由服务端 pending_ops 的 sign_as 决定，这里只负责加载本地身份。
+    """
+    async with CLISession(ctx) as client:
+        pending = await make_pending(client)
+        if not _is_pending_ops_result(pending):
+            return pending
+        store = _with_group_identity_store(ctx)
+        try:
+            kwargs: dict[str, Any] = {"aid_store": store}
+            if default_sign_as_from_pending:
+                group_aid = str(pending.get("group_aid") or pending.get("groupAid") or "").strip()
+                if group_aid:
+                    kwargs["sign_as"] = group_aid
+            return await client.group.resources.execute_pending_ops(pending, **kwargs)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+
+@resources_app.command("rm")
+@resources_app.command("delete")
+def group_resources_rm(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或资源路径"),
+    resource_path: str | None = typer.Argument(None, help="资源路径；省略群组 ID 时使用 active group"),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="递归删除目录"),
+) -> None:
+    """删除群自有区资源（群主以 group_aid 身份执行）"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+
+    async def _make(client):
+        return await client.group.resources.delete(
+            group_id=resolved_group_id, resource_path=resolved_path,
+            recursive=recursive,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Removed {resolved_path} from {resolved_group_id}")
+
+
+@resources_app.command("mkdir")
+def group_resources_mkdir(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或目录路径"),
+    resource_path: str | None = typer.Argument(None, help="目录路径；省略群组 ID 时使用 active group"),
+) -> None:
+    """在群自有区创建目录（群主以 group_aid 身份执行）"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+
+    async def _make(client):
+        return await client.group.resources.create_folder(
+            group_id=resolved_group_id, resource_path=resolved_path,
+            resource_type="folder",
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Created dir {resolved_path} in {resolved_group_id}")
+
+
+@resources_app.command("mv")
+@resources_app.command("move")
+def group_resources_mv(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    resource_path: str = typer.Argument(..., help="源资源路径"),
+    dst_path: str = typer.Argument(..., help="目标资源路径"),
+) -> None:
+    """移动群自有区资源（群主以 group_aid 身份执行）"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    resolved_src = _normalize_resource_path(resource_path)
+    resolved_dst = _normalize_resource_path(dst_path)
+    dst_parent_path, new_name = _split_resource_parent_name(resolved_dst)
+
+    async def _make(client):
+        return await client.group.resources.move(
+            group_id=resolved_group_id, resource_path=resolved_src,
+            dst_parent_path=dst_parent_path, new_name=new_name,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Moved {resolved_src} → {resolved_dst} in {resolved_group_id}")
+
+
+@resources_app.command("ren")
+@resources_app.command("rename")
+def group_resources_rename(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    resource_path: str = typer.Argument(..., help="资源路径"),
+    new_name: str = typer.Argument(..., help="新名称"),
+) -> None:
+    """重命名群自有区资源（群主以 group_aid 身份执行）"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    resolved_path = _normalize_resource_path(resource_path)
+    resolved_name = str(new_name or "").strip()
+    if not resolved_name or "/" in resolved_name or "\\" in resolved_name:
+        raise typer.BadParameter("new_name must be a non-empty file or folder name")
+
+    async def _make(client):
+        return await client.group.resources.rename(
+            group_id=resolved_group_id,
+            resource_path=resolved_path,
+            new_name=resolved_name,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Renamed {resolved_path} to {resolved_name} in {resolved_group_id}")
+
+
+@resources_app.command("download")
+@resources_app.command("dl")
+def group_resources_download(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或资源路径"),
+    resource_path: str | None = typer.Argument(None, help="资源路径；省略群组 ID 时使用 active group"),
+    output_path: Optional[str] = typer.Option(None, "--output", "-o", help="保存路径"),
+) -> None:
+    """下载群资源（经 group.resources.get_access 校验群成员身份后下载）"""
+    from aun_cli import storage_core
+    from aun_core.config import resolve_verify_ssl_from_env
+
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await storage_core.download_group_resource(
+                client, group_id=resolved_group_id, resource_path=resolved_path,
+                verify_ssl=resolve_verify_ssl_from_env(),
+            )
+
+    try:
+        download, data = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    file_name = download.get("file_name") or resolved_path.rsplit("/", 1)[-1]
+    save_path = Path(output_path) if output_path else Path(file_name)
+    save_path.write_bytes(data)
+
+    if is_json_mode():
+        output_json({
+            "group_id": resolved_group_id,
+            "resource_path": resolved_path,
+            "saved_to": str(save_path),
+            "size_bytes": len(data),
+            "content_type": download.get("content_type", ""),
+        })
+    else:
+        output_success(f"Downloaded: {save_path} ({len(data)} bytes)")
+
+
+@resources_app.command("mount")
+def group_resources_mount(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    source_path: str = typer.Option(
+        "", "--source-path",
+        help="群目录 {aid}/{group_aid} 下的子路径（可留空挂整个群目录）；协议固定源根，不能挂群目录外的路径",
+    ),
+    member_aid: Optional[str] = typer.Option(None, "--member-aid", help="成员 AID；省略时使用当前 profile 身份"),
+    readonly: bool = typer.Option(False, "--readonly", help="只读挂载"),
+) -> None:
+    """成员自助挂载自己的卷到 memberdata/{aid}（成员以自己 AID 身份执行）"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    resolved_member = str(member_aid or "").strip() or resolve_profile_config(ctx).get("aid", "")
+    if not resolved_member:
+        output_error("member_aid is required; pass --member-aid or set profile aid")
+        raise typer.Exit(1)
+    mount_path = f"memberdata/{resolved_member}"
+
+    async def _make(client):
+        source = str(source_path or "").strip()
+        return await client.group.resources.mount_object(
+            group_id=resolved_group_id, mount_path=mount_path,
+            source_aid=resolved_member,
+            source_path=_normalize_resource_path(source) if source else "",
+            readonly=readonly,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Mounted {mount_path} in {resolved_group_id}")
+
+
+@resources_app.command("umount")
+@resources_app.command("unmount")
+def group_resources_umount(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    member_aid: Optional[str] = typer.Option(None, "--member-aid", help="成员 AID；省略时使用当前 profile 身份"),
+) -> None:
+    """卸载成员挂载区 memberdata/{aid}"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    resolved_member = str(member_aid or "").strip() or resolve_profile_config(ctx).get("aid", "")
+    if not resolved_member:
+        output_error("member_aid is required; pass --member-aid or set profile aid")
+        raise typer.Exit(1)
+    mount_path = f"memberdata/{resolved_member}"
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.group.resources.unmount(
+                group_id=resolved_group_id, resource_path=mount_path,
+            )
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Unmounted {mount_path} from {resolved_group_id}")
+
+
+@resources_app.command("setfacl")
+def group_resources_setfacl(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    member_aid: str = typer.Argument(..., help="要授权的成员 AID"),
+    perms: str = typer.Option("rwx", "--perms", help="群自有区 storage ACL 权限"),
+) -> None:
+    """把成员提升为 admin，并同步群自有区 storage ACL"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    target_aid = str(member_aid or "").strip()
+
+    async def _make(client):
+        return await client.group.set_role(
+            group_id=resolved_group_id,
+            aid=target_aid,
+            role="admin",
+            perms=perms,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Granted group storage ACL to {target_aid} in {resolved_group_id}")
+
+
+@resources_app.command("remove_acl")
+@resources_app.command("remove-acl")
+def group_resources_remove_acl(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    member_aid: str = typer.Argument(..., help="要移除授权的成员 AID"),
+) -> None:
+    """把成员降为 member，并移除群自有区 storage ACL"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    target_aid = str(member_aid or "").strip()
+
+    async def _make(client):
+        return await client.group.set_role(
+            group_id=resolved_group_id,
+            aid=target_aid,
+            role="member",
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Removed group storage ACL from {target_aid} in {resolved_group_id}")
+
+
+@resources_app.command("adopt")
+def group_resources_adopt(
+    ctx: typer.Context,
+    group_id: str = typer.Argument(..., help="群组 ID"),
+    member_aid: str = typer.Argument(..., help="要接管为群自有区管理员的成员 AID"),
+    perms: str = typer.Option("rwx", "--perms", help="群自有区 storage ACL 权限"),
+) -> None:
+    """接纳成员为群自有区 admin，并同步 storage ACL"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id = _resolve_group_id(ctx, group_id)
+    target_aid = str(member_aid or "").strip()
+
+    async def _make(client):
+        return await client.group.set_role(
+            group_id=resolved_group_id,
+            aid=target_aid,
+            role="admin",
+            perms=perms,
+        )
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Adopted {target_aid} for group storage in {resolved_group_id}")
+
+
+group_app.add_typer(resources_app)
 
 
 @group_app.command("use")

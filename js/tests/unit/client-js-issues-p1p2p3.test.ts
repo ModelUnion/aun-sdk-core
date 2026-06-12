@@ -52,11 +52,11 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
       group_id: 'g1',
       payload: { type: 'text', text: 'plain' },
       encrypt: false,
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
     expect(transportCall).toHaveBeenCalledWith('group.send', expect.objectContaining({
       group_id: 'g1',
       payload: { type: 'text', text: 'plain' },
-    }), expect.any(Number));
+    }), expect.any(Number), undefined, false);
     expect(transportCall.mock.calls.map(([method]) => method)).not.toContain('group.e2ee.get_epoch');
   });
 });

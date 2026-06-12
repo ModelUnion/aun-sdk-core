@@ -9,6 +9,7 @@ import { createConfig, getDeviceId, normalizeSlotId, type AUNConfig } from './co
 import { EventDispatcher, type EventPayload, type EventHandler, type Subscription } from './events.js';
 import { normalizeGroupId } from './group-id.js';
 import { GatewayDiscovery } from './discovery.js';
+import { AIDStore } from './aid-store.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
@@ -18,6 +19,8 @@ import { IdentityRuntimeManager } from './client/identity.js';
 import { LifecycleController } from './client/lifecycle.js';
 import { PeerDirectory } from './client/peers.js';
 import { RpcPipeline } from './client/rpc-pipeline.js';
+import { GroupFacade, MessageFacade, StreamFacade } from './facades.js';
+import { StorageVFS } from './storage/vfs.js';
 import { V2E2EECoordinator } from './client/v2-e2ee.js';
 import { GroupStateCoordinator } from './client/group-state.js';
 import {
@@ -155,6 +158,14 @@ export interface NotifyOptions {
   ttlMs?: number;
 }
 
+export interface BindGroupAidOptions {
+  aidStore?: AIDStore;
+}
+
+export interface CompleteGroupTransferOptions {
+  aidStore?: AIDStore;
+}
+
 interface ConnectParams extends RpcParams {
   access_token?: string;
   gateway?: string;
@@ -229,16 +240,24 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
-  'group.add_member',
+  'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access',
   'group.resources.resolve_access_ticket',
 ]);
@@ -258,7 +277,8 @@ const SIGNED_METHODS = new Set([
   'group.leave', 'group.remove_member', 'group.update_rules',
   'group.update', 'group.update_announcement',
   'group.update_join_requirements', 'group.set_role',
-  'group.transfer_owner', 'group.review_join_request',
+  'group.transfer_owner', 'group.bind_group_aid', 'group.complete_transfer',
+  'group.review_join_request',
   'group.batch_review_join_request',
   'group.request_join', 'group.use_invite_code',
   'group.thought.put',
@@ -267,10 +287,10 @@ const SIGNED_METHODS = new Set([
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access', 'group.resources.resolve_access_ticket',
   'storage.put_object', 'storage.delete_object',
   'storage.create_share_link', 'storage.revoke_share_link',
@@ -279,6 +299,15 @@ const SIGNED_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.check_access',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -738,6 +767,7 @@ export class AUNClient {
   private _onlineUnreadHintIntervalMs = 50;
   /** gap fill 来源标记：true 表示当前正在补洞（pull 触发），false 表示非补洞 */
   private _gapFillActive = false;
+  private _backgroundRpcDepth = 0;
   // Pull Gate：序列化同一 key 的并发 pull 操作，防止重复拉取
   private _pullGates: Map<string, { inflight: boolean; startedAt: number; token: number }> = new Map();
   // 重连相关
@@ -773,6 +803,10 @@ export class AUNClient {
   private _delivery!: MessageDeliveryEngine;
   private _v2E2EE!: V2E2EECoordinator;
   private _groupState!: GroupStateCoordinator;
+  private _storage?: StorageVFS;
+  private _messageFacade?: MessageFacade;
+  private _groupFacade?: GroupFacade;
+  private _streamFacade?: StreamFacade;
 
   constructor(aid?: AID) {
     if (aid !== null && aid !== undefined && !isAIDObject(aid)) {
@@ -935,6 +969,30 @@ export class AUNClient {
 
   get aid(): string | null {
     return this._aid;
+  }
+
+  /** AUN Storage VFS 入口 */
+  get storage(): StorageVFS {
+    if (!this._storage) this._storage = new StorageVFS(this);
+    return this._storage;
+  }
+
+  /** Message RPC facade 入口 */
+  get message(): MessageFacade {
+    if (!this._messageFacade) this._messageFacade = new MessageFacade(this);
+    return this._messageFacade;
+  }
+
+  /** Group RPC facade 入口 */
+  get group(): GroupFacade {
+    if (!this._groupFacade) this._groupFacade = new GroupFacade(this);
+    return this._groupFacade;
+  }
+
+  /** Stream RPC facade 入口 */
+  get stream(): StreamFacade {
+    if (!this._streamFacade) this._streamFacade = new StreamFacade(this);
+    return this._streamFacade;
   }
 
   private async _observeAgentMdFromEnvelope(envelope: unknown): Promise<void> {
@@ -1216,6 +1274,217 @@ export class AUNClient {
     return await this._rpcPipeline.call(method, params);
   }
 
+  async createGroup(params: RpcParams = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('createGroup params must be an object');
+    }
+    const payload: RpcParams = { ...params };
+    const groupName = String(payload.group_name ?? payload.groupName ?? '').trim();
+    if (!groupName) {
+      return await this.call('group.create', payload);
+    }
+
+    const keyPair = await new CryptoProvider().generateIdentity();
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    const result = await this.call('group.create', payload);
+
+    const resultMap = isJsonObject(result) ? result : {};
+    const group = isJsonObject(resultMap.group) ? resultMap.group : {};
+    const aidCert = isJsonObject(resultMap.aid_cert) ? resultMap.aid_cert : {};
+    const groupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!groupAid || !certPem) {
+      throw new ValidationError('group.create named group response missing group.group_aid or aid_cert.cert');
+    }
+
+    const store = new AIDStore({
+      aunPath: this.configModel.aunPath,
+      encryptionSeed: this.configModel.seedPassword ?? '',
+      slotId: this._slotId,
+      rootCaPem: this.configModel.rootCaPem,
+      verifySsl: this.configModel.verifySsl,
+    });
+    try {
+      const imported = await store.importGroupIdentity(groupAid, {
+        private_key_pem: keyPair.private_key_pem,
+        public_key_der_b64: keyPair.public_key_der_b64,
+        curve: keyPair.curve,
+        cert_pem: certPem,
+      });
+      if (!imported.ok) {
+        throw new ValidationError(imported.error.message);
+      }
+    } finally {
+      store.close();
+    }
+    return result;
+  }
+
+  async bindGroupAid(params: RpcParams = {}, options: BindGroupAidOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('bindGroupAid params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('bindGroupAid requires aidStore');
+    }
+
+    const keyPair = await new CryptoProvider().generateIdentity();
+    const payload: RpcParams = { ...params };
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    const result = await this.call('group.bind_group_aid', payload);
+
+    const resultMap = isJsonObject(result) ? result : {};
+    const group = isJsonObject(resultMap.group) ? resultMap.group : {};
+    const aidCert = isJsonObject(resultMap.aid_cert) ? resultMap.aid_cert : {};
+    const groupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!groupAid || !certPem) {
+      throw new ValidationError('group.bind_group_aid response missing group.group_aid or aid_cert.cert');
+    }
+
+    const imported = await store.importGroupIdentity(groupAid, {
+      private_key_pem: keyPair.private_key_pem,
+      public_key_der_b64: keyPair.public_key_der_b64,
+      curve: keyPair.curve,
+      cert_pem: certPem,
+    });
+    if (!imported.ok) {
+      throw new ValidationError(imported.error.message);
+    }
+    return result;
+  }
+
+  async startGroupTransfer(params: RpcParams = {}, options: CompleteGroupTransferOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('startGroupTransfer params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('startGroupTransfer requires aidStore');
+    }
+    const groupId = String(params.group_id ?? '').trim();
+    const newOwner = String(params.new_owner ?? '').trim();
+    if (!groupId || !newOwner) {
+      throw new ValidationError('startGroupTransfer requires group_id and new_owner');
+    }
+    let groupAid = String(params.group_aid ?? '').trim();
+    if (!groupAid) {
+      const info = await this.call('group.get', { group_id: groupId });
+      const infoMap = isJsonObject(info) ? info : {};
+      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
+      groupAid = String(grp.group_aid ?? '').trim();
+    }
+    if (!groupAid) {
+      throw new ValidationError('startGroupTransfer: unable to determine group_aid');
+    }
+    const loaded = await store.load(groupAid);
+    if (!loaded.ok || !loaded.data) {
+      throw new ValidationError(`startGroupTransfer: group_aid identity not found: ${groupAid}`);
+    }
+    const aidObj = loaded.data.aid;
+    if (!aidObj.isPrivateKeyValid() || !aidObj.privateKeyPem) {
+      throw new ValidationError(`startGroupTransfer: group_aid private key not found: ${groupAid}`);
+    }
+    const nonce = globalThis.crypto.randomUUID().replace(/-/g, '');
+    const issuedMs = Date.now();
+    const canonical = [
+      'aun-group-owner-transfer-v1',
+      groupId.toLowerCase(),
+      groupAid.toLowerCase(),
+      newOwner.toLowerCase(),
+      nonce,
+      String(issuedMs),
+    ].join('|');
+    const signed = await aidObj.sign(canonical);
+    if (!signed.ok) {
+      throw new ValidationError(`startGroupTransfer: sign failed: ${signed.error.message}`);
+    }
+    const payload: RpcParams = { ...params, group_aid: groupAid };
+    payload.transfer_auth = { nonce, issued_ms: issuedMs, signature: signed.data.signature };
+    return await this.call('group.transfer_owner', payload);
+  }
+
+  async completeGroupTransfer(params: RpcParams = {}, options: CompleteGroupTransferOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('completeGroupTransfer params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('completeGroupTransfer requires aidStore');
+    }
+
+    const keyPair = await new CryptoProvider().generateIdentity();
+    const payload: RpcParams = { ...params };
+    const groupId = String(params.group_id ?? '').trim();
+    if (!groupId) {
+      throw new ValidationError('completeGroupTransfer requires group_id');
+    }
+    let groupAid = String(params.group_aid ?? '').trim();
+    if (!groupAid) {
+      const info = await this.call('group.get', { group_id: groupId });
+      const infoMap = isJsonObject(info) ? info : {};
+      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
+      groupAid = String(grp.group_aid ?? '').trim();
+    }
+    if (!groupAid) {
+      throw new ValidationError('completeGroupTransfer: unable to determine group_aid');
+    }
+    const current = this.currentAid;
+    const newOwner = String(current?.aid ?? '').trim();
+    if (!current || !newOwner || !current.isPrivateKeyValid()) {
+      throw new ValidationError('completeGroupTransfer requires current new-owner AID with private key');
+    }
+    const nonce = globalThis.crypto.randomUUID().replace(/-/g, '');
+    const issuedMs = Date.now();
+    const publicKeyHash = bytesToHex(new Uint8Array(
+      await globalThis.crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(keyPair.public_key_der_b64),
+      ),
+    ));
+    const canonical = [
+      'aun-group-owner-transfer-accept-v1',
+      groupId.toLowerCase(),
+      groupAid.toLowerCase(),
+      newOwner.toLowerCase(),
+      publicKeyHash,
+      nonce,
+      String(issuedMs),
+    ].join('|');
+    const signed = await current.sign(canonical);
+    if (!signed.ok) {
+      throw new ValidationError(`completeGroupTransfer: accept sign failed: ${signed.error.message}`);
+    }
+    payload.group_aid = groupAid;
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    payload.transfer_accept = { nonce, issued_ms: issuedMs, signature: signed.data.signature };
+    const result = await this.call('group.complete_transfer', payload);
+
+    const resultMap = isJsonObject(result) ? result : {};
+    const group = isJsonObject(resultMap.group) ? resultMap.group : {};
+    const aidCert = isJsonObject(resultMap.aid_cert) ? resultMap.aid_cert : {};
+    const returnedGroupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!returnedGroupAid || !certPem) {
+      throw new ValidationError('group.complete_transfer response missing group.group_aid or aid_cert.cert');
+    }
+
+    const imported = await store.importGroupIdentity(returnedGroupAid, {
+      private_key_pem: keyPair.private_key_pem,
+      public_key_der_b64: keyPair.public_key_der_b64,
+      curve: keyPair.curve,
+      cert_pem: certPem,
+    });
+    if (!imported.ok) {
+      throw new ValidationError(imported.error.message);
+    }
+    return result;
+  }
+
   private static _notifyParamsSizeOk(params: RpcParams): boolean {
     return new TextEncoder().encode(JSON.stringify(params)).length <= MAX_NOTIFY_PAYLOAD_SIZE;
   }
@@ -1306,6 +1575,8 @@ export class AUNClient {
 
   private async _callRawV2Rpc(method: string, params?: RpcParams): Promise<RpcResult> {
     const p: RpcParams = { ...(params ?? {}) };
+    const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || this._backgroundRpcDepth > 0;
+    delete (p as Record<string, unknown>)._rpc_background;
     delete (p as Record<string, unknown>)._pull_gate_locked;
     delete (p as Record<string, unknown>)._skip_auto_ack;
     delete (p as Record<string, unknown>).skip_auto_ack;
@@ -1319,7 +1590,7 @@ export class AUNClient {
     if (method.startsWith('group.') && p.slot_id === undefined) {
       p.slot_id = this._slotId;
     }
-    return await this._rpcPipeline.rawCall(method, p) as RpcResult;
+    return await this._rpcPipeline.rawCall(method, p, { background: rpcBackground }) as RpcResult;
   }
 
   // ── 事件 ──────────────────────────────────────────
@@ -3081,6 +3352,15 @@ export class AUNClient {
   }
 
   // ── Pull Gate（序列化同一 key 的并发 pull）──────────────────
+
+  private async _withBackgroundRpc<T>(operation: () => Promise<T> | T): Promise<T> {
+    this._backgroundRpcDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this._backgroundRpcDepth = Math.max(0, this._backgroundRpcDepth - 1);
+    }
+  }
 
   private async _runPullSerialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
     return await this._rpcPipeline.runPullSerialized(key, operation);

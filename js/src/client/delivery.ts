@@ -60,6 +60,34 @@ export class MessageDeliveryEngine {
     }
   }
 
+  fireGroupEventAck(groupId: string, ns: string, eventSeq: number, label: string): void {
+    const client = this.runtime.client;
+    const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, eventSeq);
+    if (ackSeq <= 0) return;
+    void client.call('group.ack_events', {
+      group_id: groupId,
+      event_seq: ackSeq,
+      device_id: client._deviceId,
+      slot_id: client._slotId,
+      _rpc_background: true,
+    }).catch((e: unknown) => {
+      client._clientLog.warn(`${label} failed: group=${groupId}`, e);
+    });
+  }
+
+  fireGroupV2Ack(groupId: string, ns: string, seq: number, label: string): void {
+    const client = this.runtime.client;
+    const ackSeq = this.clampAckSeq('group.v2.ack', 'up_to_seq', ns, seq);
+    if (ackSeq <= 0) return;
+    void client._callRawV2Rpc('group.v2.ack', {
+      group_id: groupId,
+      up_to_seq: ackSeq,
+      _rpc_background: true,
+    }).catch((e: unknown) => {
+      client._clientLog.debug(`${label} failed: group=${groupId} seq=${ackSeq} err=${String(e)}`);
+    });
+  }
+
   enqueueOrderedMessage(ns: string, event: string, seq: number, payload: EventPayload): void {
     const client = this.runtime.client;
     let queue = client._pendingOrderedMsgs.get(ns) as Map<number, { event: string; payload: EventPayload }> | undefined;
@@ -461,6 +489,7 @@ export class MessageDeliveryEngine {
         msg_seq: ackSeq,
         device_id: client._deviceId,
         slot_id: client._slotId,
+        _rpc_background: true,
       }).catch((e: unknown) => { client._clientLog.warn('group recall auto-ack failed: group=' + groupId, e); });
     }
     if (contig !== contigBefore) this.saveSeqTrackerState();
@@ -548,6 +577,7 @@ export class MessageDeliveryEngine {
             seq: ackSeq,
             device_id: client._deviceId,
             slot_id: client._slotId,
+            _rpc_background: true,
           }).catch((e: unknown) => { client._clientLog.warn(`P2P auto-ack failed:${String(e)}`); });
         }
         if (contigAfter !== contigBefore) this.saveSeqTrackerState();
@@ -625,6 +655,7 @@ export class MessageDeliveryEngine {
               msg_seq: ackSeq,
               device_id: client._deviceId,
               slot_id: client._slotId,
+              _rpc_background: true,
             }).catch((e: unknown) => { client._clientLog.warn('group recall auto-ack failed: group=' + groupId, e); });
           }
           if (contigAfter !== contigBefore) this.saveSeqTrackerState();
@@ -646,6 +677,7 @@ export class MessageDeliveryEngine {
             msg_seq: ackSeq,
             device_id: client._deviceId,
             slot_id: client._slotId,
+            _rpc_background: true,
           }).catch((e: unknown) => { client._clientLog.warn('group message auto-ack failed: group=' + groupId, e); });
         }
         if (contigAfter !== contigBefore) this.saveSeqTrackerState();
@@ -686,7 +718,7 @@ export class MessageDeliveryEngine {
     const afterSeq = client._seqTracker.getContiguousSeq(ns);
     try {
       if (client._v2Session) {
-        await client._pullGroupV2Internal({ group_id: groupId, after_seq: afterSeq, limit: 50 });
+        await client._withBackgroundRpc(() => client._pullGroupV2Internal({ group_id: groupId, after_seq: afterSeq, limit: 50 }));
         return;
       }
       const result = await client.call('group.pull', {
@@ -694,6 +726,7 @@ export class MessageDeliveryEngine {
         after_message_seq: afterSeq,
         device_id: client._deviceId,
         limit: 50,
+        _rpc_background: true,
       });
       if (isJsonObject(result)) {
         const messages = result.messages;
@@ -743,7 +776,7 @@ export class MessageDeliveryEngine {
     this.runtime.delivery.setGapFillActive(true);
     let filled = 0;
     try {
-      const messages = await client._pullV2(afterSeq, 50);
+      const messages = await client._withBackgroundRpc(() => client._pullV2(afterSeq, 50));
       filled = messages.length;
       this.prunePushedSeqs(ns);
     } catch (exc) {
@@ -770,7 +803,7 @@ export class MessageDeliveryEngine {
     this.runtime.delivery.setGapFillActive(true);
     let filled = 0;
     try {
-      const messages = await client._pullGroupV2(groupId, afterSeq, 50);
+      const messages = await client._withBackgroundRpc(() => client._pullGroupV2(groupId, afterSeq, 50));
       filled = messages.length;
       this.prunePushedSeqs(ns);
     } catch (exc) {
@@ -804,6 +837,7 @@ export class MessageDeliveryEngine {
           after_event_seq: nextAfterSeq,
           device_id: client._deviceId,
           limit: 50,
+          _rpc_background: true,
         });
         if (!isJsonObject(result)) return;
         const events = result.events;
@@ -856,6 +890,7 @@ export class MessageDeliveryEngine {
             event_seq: ackSeq,
             device_id: client._deviceId,
             slot_id: client._slotId,
+            _rpc_background: true,
           }).catch((e: unknown) => { client._clientLog.warn('group event auto-ack failed: group=' + groupId, e); });
         }
         const nextAfter = Math.max(eventSeqs.length > 0 ? Math.max(...eventSeqs) : nextAfterSeq, nextAfterSeq);
@@ -893,8 +928,14 @@ export class MessageDeliveryEngine {
       }
     }
     const contigBefore = client._seqTracker.getContiguousSeq(ns);
-    if (eventSeq <= contigBefore || client._pushedSeqs.get(ns)?.has(eventSeq)) {
+    const publishedDuplicate = client._pushedSeqs.get(ns)?.has(eventSeq) === true;
+    if (eventSeq <= contigBefore || publishedDuplicate) {
       client._clientLog.debug(`group.changed skipped duplicate/stale: group=${groupId}, event_seq=${eventSeq}, contiguous=${contigBefore}`);
+      if (eventSeq <= contigBefore) {
+        this.fireGroupEventAck(groupId, ns, eventSeq, 'group event covered push ack');
+      } else if (contigBefore > 0) {
+        this.fireGroupEventAck(groupId, ns, contigBefore, 'group event covered push ack');
+      }
       return;
     }
 
@@ -911,6 +952,7 @@ export class MessageDeliveryEngine {
         event_seq: ackSeq,
         device_id: client._deviceId,
         slot_id: client._slotId,
+        _rpc_background: true,
       }).catch((e: unknown) => {
         client._clientLog.warn('group event push auto-ack failed: group=' + groupId, e);
       });
@@ -1007,8 +1049,9 @@ export class MessageDeliveryEngine {
       const ns = `group:${groupId}`;
       client._seqTracker.updateMaxSeen(ns, seq);
       const contigBefore = client._seqTracker.getContiguousSeq(ns);
-      if (contigBefore === seq) {
+      if (contigBefore === seq || (eventKind === 'group.online_unread_hint' && contigBefore > seq)) {
         client._clientLog.debug(`_onRawGroupV2MessageCreated duplicate push already covered: group=${groupId} seq=${seq}`);
+        this.fireGroupV2Ack(groupId, ns, seq, 'group v2 covered push ack');
         return;
       }
       const afterSeq = client._repairPushContiguousBound(
@@ -1025,7 +1068,7 @@ export class MessageDeliveryEngine {
       client._gapFillDone.add(dedupKey);
       try {
         client._clientLog.debug(`_onRawGroupV2MessageCreated -> group.v2.pull group=${groupId} after_seq=${afterSeq}`);
-        const messages = await client._pullGroupV2(groupId, afterSeq, 50);
+        const messages = await client._withBackgroundRpc(() => client._pullGroupV2(groupId, afterSeq, 50));
         client._clientLog.debug(`_onRawGroupV2MessageCreated pulled ${messages.length} msgs for group=${groupId}`);
       } finally {
         client._gapFillDone.delete(dedupKey);
@@ -1083,7 +1126,7 @@ export class MessageDeliveryEngine {
           if (newContig > 0 && newContig !== contigBefore) {
             const ackSeq = this.clampAckSeq('message.v2.ack', 'up_to_seq', ns, newContig);
             try {
-              await client._callRawV2Rpc('message.v2.ack', { up_to_seq: ackSeq });
+              await client._callRawV2Rpc('message.v2.ack', { up_to_seq: ackSeq, _rpc_background: true });
             } catch (e) {
               client._clientLog.debug(`V2 P2P push-ack failed: ${e}`);
             }
@@ -1119,7 +1162,7 @@ export class MessageDeliveryEngine {
     try {
       do {
         this.runtime.delivery.setV2PullPending(false);
-        await client._pullV2();
+        await client._withBackgroundRpc(() => client._pullV2());
         const newContig = ns ? client._seqTracker.getContiguousSeq(ns) : -1;
         client._clientLog.debug(
           `_onV2PushNotification pull done: contiguous_seq=${contigBefore}->${newContig} (push_seq=${pushSeq || 'null'})`

@@ -230,7 +230,7 @@ describe('ISSUE-SDK-TS-004: _gapFillDone 按时间过期', () => {
 // ══════════════════════════════════════════════════════════════
 
 describe('ISSUE-SDK-TS-005: RPC ID 使用随机值', () => {
-  it('连续两次 call 的 RPC ID 不同且非递增', () => {
+  it('连续两次 call 的 RPC ID 不同且非递增', async () => {
     const dispatcher = new EventDispatcher();
     const transport = new RPCTransport({
       eventDispatcher: dispatcher,
@@ -241,12 +241,16 @@ describe('ISSUE-SDK-TS-005: RPC ID 使用随机值', () => {
     (transport as any)._closed = false;
     const mockWs = new MockWebSocket();
     const sentMessages: string[] = [];
-    mockWs.send = (data: string) => { sentMessages.push(data); };
+    // 源码 _sendText 依赖 send 回调驱动串行发送链，必须回调
+    mockWs.send = (data: string, cb?: (err?: Error) => void) => { sentMessages.push(data); cb?.(); };
     (transport as any)._ws = mockWs;
 
     // 发两个请求（不等结果）
     transport.call('meta.ping').catch(() => {});
     transport.call('meta.status').catch(() => {});
+
+    // 源码把 ws.send 推迟到微任务串行执行，需 flush 后再断言
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     expect(sentMessages.length).toBe(2);
     const id1 = JSON.parse(sentMessages[0]).id;

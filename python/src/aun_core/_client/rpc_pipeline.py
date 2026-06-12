@@ -32,6 +32,8 @@ class RpcPipeline:
         t_call_start = time.time()
         if not isinstance(method, str) or not method.strip():
             raise ValidationError("call() requires a non-empty method string")
+        if getattr(client, "_closing", False):
+            raise ConnectionError("client is closing")
         if client._public_state != ConnectionState.READY:
             raise ConnectionError("client is not connected")
         if client._is_internal_only_method(method):
@@ -77,12 +79,18 @@ class RpcPipeline:
         t_call_start = started_at
         pull_gate_locked = bool(params.pop("_pull_gate_locked", False))
         skip_send_result_envelope = bool(params.pop("_skip_send_result_envelope", False))
+        background_rpc = bool(
+            params.pop("_rpc_background", False)
+            or getattr(client, "_background_rpc_depth", 0) > 0
+        )
         pull_gate_key = self.pull_gate_key_for_call(method, params)
         if pull_gate_key and not pull_gate_locked:
             locked_params = dict(params)
             locked_params["_pull_gate_locked"] = True
             if skip_send_result_envelope:
                 locked_params["_skip_send_result_envelope"] = True
+            if background_rpc:
+                locked_params["_rpc_background"] = True
 
             async def _gated_call():
                 return await self.call_after_pipeline(
@@ -149,19 +157,27 @@ class RpcPipeline:
 
         if method == "message.pull" and getattr(client, "_v2_session", None):
             client._log.debug("client", "call route: message.pull -> V2 pull")
+            if background_rpc:
+                params["_rpc_background"] = True
             return await client._pull_v2_internal(params)
 
         if method == "message.ack" and getattr(client, "_v2_session", None):
             client._log.debug("client", "call route: message.ack -> V2 ack")
+            if background_rpc:
+                params["_rpc_background"] = True
             return await client._ack_v2_internal(params)
 
         if method == "group.pull" and client._v2_session and params.get("group_id"):
             client._log.debug("client", "call route: group.pull -> V2 pull")
+            if background_rpc:
+                params["_rpc_background"] = True
             return await client._pull_group_v2_internal(params)
 
         if method == "group.ack_messages" and client._v2_session and params.get("group_id"):
             if client._group_cursor_targets_current_instance(params):
                 client._log.debug("client", "call route: group.ack_messages -> V2 ack")
+                if background_rpc:
+                    params["_rpc_background"] = True
                 return await client._ack_group_v2_internal(params)
             client._log.debug(
                 "client",
@@ -209,6 +225,8 @@ class RpcPipeline:
             call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
         if trace:
             call_kwargs["trace"] = trace
+        if background_rpc:
+            call_kwargs["background"] = True
 
         if method in ("group.thought.get", "message.thought.get"):
             client._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
@@ -218,6 +236,7 @@ class RpcPipeline:
             if call_kwargs and "unexpected keyword argument" in str(exc):
                 call_kwargs.pop("timeout", None)
                 call_kwargs.pop("trace", None)
+                call_kwargs.pop("background", None)
                 result = await client._transport.call(method, params, **call_kwargs) if call_kwargs else await client._transport.call(method, params)
             else:
                 client._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - t_call_start, method, exc)
@@ -441,10 +460,14 @@ class RpcPipeline:
         timeout: float | None = None,
         trace: str | None = None,
         signed: bool = True,
+        background: bool = False,
     ) -> Any:
         """内部裸 RPC 入口；默认仍执行客户端签名策略。"""
         client = self.client
         payload = dict(params) if params else {}
+        background_rpc = bool(background or payload.pop("_rpc_background", False))
+        if getattr(client, "_closing", False) and background_rpc:
+            raise ConnectionError("client is closing")
         if signed and method in client._SIGNED_METHODS:
             if client._should_skip_client_signature(method, payload):
                 payload.pop("client_signature", None)
@@ -455,11 +478,14 @@ class RpcPipeline:
             call_kwargs["timeout"] = timeout
         if trace:
             call_kwargs["trace"] = trace
+        if background_rpc:
+            call_kwargs["background"] = True
         try:
             return await client._transport.call(method, payload, **call_kwargs)
         except TypeError as exc:
             if call_kwargs and "unexpected keyword argument" in str(exc):
                 call_kwargs.pop("timeout", None)
                 call_kwargs.pop("trace", None)
+                call_kwargs.pop("background", None)
                 return await client._transport.call(method, payload, **call_kwargs) if call_kwargs else await client._transport.call(method, payload)
             raise

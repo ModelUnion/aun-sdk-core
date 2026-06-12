@@ -46,7 +46,8 @@ const SIGNED_METHODS = new Set([
   'group.leave', 'group.remove_member', 'group.update_rules',
   'group.update', 'group.update_announcement',
   'group.update_join_requirements', 'group.set_role',
-  'group.transfer_owner', 'group.review_join_request',
+  'group.transfer_owner', 'group.bind_group_aid', 'group.complete_transfer',
+  'group.review_join_request',
   'group.batch_review_join_request',
   'group.request_join', 'group.use_invite_code',
   'group.thought.put',
@@ -55,10 +56,10 @@ const SIGNED_METHODS = new Set([
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access', 'group.resources.resolve_access_ticket',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
@@ -66,6 +67,15 @@ const SIGNED_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.check_access',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -85,22 +95,31 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
-  'group.add_member',
+  'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access',
   'group.resources.resolve_access_ticket',
 ]);
 
 export interface RpcPreflightResult {
   params: RpcParams;
+  rpcBackground: boolean;
 }
 
 export class RpcPipeline {
@@ -126,7 +145,13 @@ export class RpcPipeline {
 
   private async callImpl(method: string, params?: RpcParams): Promise<RpcResult> {
     const client = this.runtime.client;
-    const p = this.preflight(method, params).params;
+    const preflight = this.preflight(method, params);
+    const p = preflight.params;
+    const rpcBackground = preflight.rpcBackground;
+    const runWithRpcPriority = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+      if (!rpcBackground) return await operation();
+      return await client._withBackgroundRpc(operation);
+    };
     const skipSendResultEnvelope = Boolean((p as Record<string, unknown>)._skip_send_result_envelope);
     delete (p as Record<string, unknown>)._skip_send_result_envelope;
 
@@ -197,11 +222,11 @@ export class RpcPipeline {
     const pullGateKey = this.pullGateKeyForCall(method, p);
     if (pullGateKey) {
       return await this.runPullSerialized(pullGateKey, async () => {
-        return await this.callImplInner(method, p, skipSendResultEnvelope);
+        return await runWithRpcPriority(() => this.callImplInner(method, p, skipSendResultEnvelope));
       });
     }
 
-    return await this.callImplInner(method, p, skipSendResultEnvelope);
+    return await runWithRpcPriority(() => this.callImplInner(method, p, skipSendResultEnvelope));
   }
 
   private async callImplInner(method: string, p: RpcParams, skipSendResultEnvelope = false): Promise<RpcResult> {
@@ -255,9 +280,10 @@ export class RpcPipeline {
     await this.applyClientSignature(method, p);
 
     const callTimeout = NON_IDEMPOTENT_METHODS.has(method) ? NON_IDEMPOTENT_TIMEOUT : undefined;
+    const rpcBackground = client._backgroundRpcDepth > 0;
     let result = callTimeout
-      ? await client._transport.call(method, p, callTimeout)
-      : await client._transport.call(method, p);
+      ? await client._transport.call(method, p, callTimeout, undefined, rpcBackground)
+      : await client._transport.call(method, p, undefined, undefined, rpcBackground);
 
     result = await this.postprocessResult(method, p, result) as RpcResult;
     if (!skipSendResultEnvelope) {
@@ -285,6 +311,8 @@ export class RpcPipeline {
 
     const p: RpcParams = { ...(params ?? {}) };
     this.mergeInstanceProtectedHeaders(method, p);
+    const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || client._backgroundRpcDepth > 0;
+    delete (p as Record<string, unknown>)._rpc_background;
     if (method === 'message.send' || method === 'group.send') {
       this.normalizeOutboundMessagePayload(p, method);
     }
@@ -296,7 +324,7 @@ export class RpcPipeline {
       ? client._clampAckParams(method, p) as RpcParams
       : p;
 
-    return { params: clampedParams };
+    return { params: clampedParams, rpcBackground };
   }
 
   mergeInstanceProtectedHeaders(method: string, params: RpcParams): void {
@@ -523,12 +551,14 @@ export class RpcPipeline {
   ): Promise<unknown> {
     const client = this.runtime.client;
     const payload: RpcParams = { ...(params ?? {}) };
+    const rpcBackground = Boolean((payload as Record<string, unknown>)._rpc_background) || client._backgroundRpcDepth > 0 || options?.background === true;
+    delete (payload as Record<string, unknown>)._rpc_background;
     const signed = options?.signed ?? true;
     if (signed) {
       await this.applyClientSignature(method, payload);
     }
     const timeout = options?.timeout;
-    if (options?.background) {
+    if (rpcBackground) {
       return await client._transport.call(method, payload, timeout, options?.trace, true);
     }
     if (options?.trace !== undefined) {

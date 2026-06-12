@@ -100,6 +100,20 @@ type AIDStoreRekeyResult struct {
 	NewFingerprint  string
 }
 
+// AIDStoreImportGroupIdentityOptions 承载本地生成的群 AID 身份材料。
+type AIDStoreImportGroupIdentityOptions struct {
+	PrivateKeyPEM   string
+	PublicKeyDerB64 string
+	Curve           string
+	CertPEM         string
+}
+
+// AIDStoreImportGroupIdentityResult 描述群身份导入结果。
+type AIDStoreImportGroupIdentityResult struct {
+	Imported bool
+	AID      string
+}
+
 // AIDStore 管理本地 AID 身份，提供离线加载和联网注册/解析能力。
 // 与 Python SDK aid_store.py 的 AIDStore 对应。
 type AIDStore struct {
@@ -236,7 +250,9 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 
 	// 无私钥：仅证书有效
 	if keyPair == nil || authGetStr(keyPair, "private_key_pem") == "" {
-		return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, "")})
+		aidObj := newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, "")
+		aidObj.encryptionSeed = s.encryptionSeed
+		return ResultOk(LoadResult{AID: aidObj})
 	}
 
 	// 解析私钥
@@ -277,7 +293,9 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 		return ResultErr[LoadResult](ErrCodeKeypairMismatch, fmt.Sprintf("keypair self-test failed for aid: %s: %v", target, verifyErr))
 	}
 
-	return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, privKey, true, true, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, privPEM)})
+	aidObj := newAID(target, s.aunPath, certPEM, certObj, privKey, true, true, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, privPEM)
+	aidObj.encryptionSeed = s.encryptionSeed
+	return ResultOk(LoadResult{AID: aidObj})
 }
 
 // List 列出本地所有具有有效私钥的身份摘要（离线操作）。
@@ -578,7 +596,9 @@ func (s *AIDStore) publicAIDFromCert(aid, certPEM string) (*AID, error) {
 	if cn := strings.TrimSpace(certObj.Subject.CommonName); cn != "" && cn != target {
 		return nil, fmt.Errorf("certificate CN mismatch: expected %s, got %s", target, cn)
 	}
-	return newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, ""), nil
+	aidObj := newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, "")
+	aidObj.encryptionSeed = s.encryptionSeed
+	return aidObj, nil
 }
 
 func (s *AIDStore) resolveAgentMDPeer(ctx context.Context, aid string, certFingerprint ...string) (*AID, error) {
@@ -1106,6 +1126,90 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 		NewCertNotAfter: refreshed.CertNotAfter,
 		NewFingerprint:  refreshed.CertFingerprint,
 	})
+}
+
+// ImportGroupIdentity 导入外部生成的 group_aid 私钥与服务端签发证书。
+func (s *AIDStore) ImportGroupIdentity(aid string, opts AIDStoreImportGroupIdentityOptions) Result[AIDStoreImportGroupIdentityResult] {
+	target := strings.TrimSpace(aid)
+	privateKeyPEM := strings.TrimSpace(opts.PrivateKeyPEM)
+	publicKeyDerB64 := strings.TrimSpace(opts.PublicKeyDerB64)
+	curve := strings.TrimSpace(opts.Curve)
+	if curve == "" {
+		curve = "P-256"
+	}
+	certPEM := strings.TrimSpace(opts.CertPEM)
+
+	if target == "" {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeInvalidAIDFormat, "ImportGroupIdentity requires a non-empty aid")
+	}
+	if privateKeyPEM == "" {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodePrivateKeyParseError, "ImportGroupIdentity requires PrivateKeyPEM")
+	}
+	if publicKeyDerB64 == "" {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, "ImportGroupIdentity requires PublicKeyDerB64")
+	}
+	if certPEM == "" {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeCertParseError, "ImportGroupIdentity requires CertPEM")
+	}
+
+	certObj, err := parsePEMCertificate(certPEM)
+	if err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeCertParseError, fmt.Sprintf("certificate parse failed for aid: %s", target), err)
+	}
+	if tErr := certTimeError(certObj); tErr != "" {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeCertChainBroken, fmt.Sprintf("ImportGroupIdentity returned certificate is %s", tErr))
+	}
+	if cn := strings.TrimSpace(certObj.Subject.CommonName); cn != target {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeCertChainBroken, fmt.Sprintf("ImportGroupIdentity returned certificate CN mismatch: expected %s, got %s", target, cn))
+	}
+	expectedDER, err := base64.StdEncoding.DecodeString(publicKeyDerB64)
+	if err != nil || len(expectedDER) == 0 {
+		if err == nil {
+			err = fmt.Errorf("empty public key")
+		}
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, "ImportGroupIdentity PublicKeyDerB64 is not valid base64", err)
+	}
+	certPubDER, err := x509.MarshalPKIXPublicKey(certObj.PublicKey)
+	if err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, fmt.Sprintf("failed to marshal cert public key for aid: %s", target), err)
+	}
+	if !authBytesEqual(expectedDER, certPubDER) {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, "ImportGroupIdentity returned certificate public key mismatch")
+	}
+
+	privKey, err := parseECPrivateKeyPEM(privateKeyPEM)
+	if err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodePrivateKeyParseError, fmt.Sprintf("private key parse failed for aid: %s", target), err)
+	}
+	privPubDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, fmt.Sprintf("failed to marshal private key public key for aid: %s", target), err)
+	}
+	if !authBytesEqual(privPubDER, certPubDER) {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, fmt.Sprintf("private key does not match certificate for aid: %s", target))
+	}
+
+	if err := s.keyStore.SaveIdentity(target, map[string]any{
+		"aid":                target,
+		"private_key_pem":    privateKeyPEM,
+		"public_key_der_b64": publicKeyDerB64,
+		"curve":              curve,
+		"cert":               certPEM,
+	}); err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeSaveIdentityFailed, err.Error(), err)
+	}
+	loaded := s.Load(target)
+	if !loaded.Ok || loaded.Data.AID == nil || !loaded.Data.AID.IsPrivateKeyValid() {
+		message := "imported group identity reload failed"
+		if !loaded.Ok {
+			message = loaded.Error.Message
+		}
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, message)
+	}
+	if _, err := loaded.Data.AID.Sign([]byte("aun-group-identity-import-self-test")); err != nil {
+		return ResultErr[AIDStoreImportGroupIdentityResult](ErrCodeKeypairMismatch, "imported group identity private key self-test failed", err)
+	}
+	return ResultOk(AIDStoreImportGroupIdentityResult{Imported: true, AID: target})
 }
 
 func (s *AIDStore) httpClient() *http.Client {

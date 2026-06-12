@@ -37,6 +37,17 @@ export type UploadAgentMdResult = Record<string, unknown>;
 export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
 export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type ImportGroupIdentityOptions = {
+  private_key_pem?: string;
+  privateKeyPem?: string;
+  public_key_der_b64?: string;
+  publicKeyDerB64?: string;
+  curve?: string;
+  cert_pem?: string;
+  certPem?: string;
+  cert?: string;
+};
+export type ImportGroupIdentityResult = { imported: true; aid: string };
 export type ChangeSeedResult = { changed: boolean; count: number };
 export type ListResult = { identities: AIDInfo[] };
 
@@ -332,14 +343,15 @@ export class AIDStore {
 
     // 有效期检查（对齐 Python cert_time_error）
     const validity = parseCertValidity(certPem);
-    if (validity) {
-      const now = Date.now();
-      if (now > validity.notAfter) {
-        return resultErr(codes.CERT_EXPIRED, `certificate expired for aid: ${target}`);
-      }
-      if (now < validity.notBefore) {
-        return resultErr(codes.CERT_NOT_YET_VALID, `certificate not yet valid for aid: ${target}`);
-      }
+    if (!validity) {
+      return resultErr(codes.CERT_PARSE_ERROR, `certificate validity parse failed for aid: ${target}`);
+    }
+    const now = Date.now();
+    if (now > validity.notAfter) {
+      return resultErr(codes.CERT_EXPIRED, `certificate expired for aid: ${target}`);
+    }
+    if (now < validity.notBefore) {
+      return resultErr(codes.CERT_NOT_YET_VALID, `certificate not yet valid for aid: ${target}`);
     }
 
     // CN 校验（对齐 Python cert_common_name 检查）
@@ -410,6 +422,10 @@ export class AIDStore {
     });
   }
 
+  loadAsync(aid: string): Promise<Result<{ aid: AID }>> {
+    return this.load(aid);
+  }
+
   async list(): Promise<Result<ListResult>> {
     try {
       const aids = await this._keystore.listIdentities();
@@ -431,6 +447,10 @@ export class AIDStore {
     }
   }
 
+  listAsync(): Promise<Result<ListResult>> {
+    return this.list();
+  }
+
   async changeSeed(oldSeed: string, newSeed: string): Promise<Result<ChangeSeedResult>> {
     try {
       const changed = await this._keystore.changeSeed?.(oldSeed, newSeed);
@@ -439,6 +459,10 @@ export class AIDStore {
     } catch (exc) {
       return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, String(exc), exc);
     }
+  }
+
+  changeSeedAsync(oldSeed: string, newSeed: string): Promise<Result<ChangeSeedResult>> {
+    return this.changeSeed(oldSeed, newSeed);
   }
 
   async register(aid: string): Promise<Result<{ registered: true }>> {
@@ -712,6 +736,82 @@ export class AIDStore {
     } catch (exc) {
       return resultErr(codes.REKEY_FAILED, String(exc), exc);
     }
+  }
+
+  async importGroupIdentity(
+    aidOrOptions: string | (ImportGroupIdentityOptions & { aid?: string }),
+    options: ImportGroupIdentityOptions = {},
+  ): Promise<Result<ImportGroupIdentityResult>> {
+    const fromObject = typeof aidOrOptions === 'object' && aidOrOptions !== null ? aidOrOptions : {};
+    const target = String(typeof aidOrOptions === 'string' ? aidOrOptions : fromObject.aid ?? '').trim();
+    const privateKeyPem = String(options.private_key_pem ?? options.privateKeyPem ?? fromObject.private_key_pem ?? fromObject.privateKeyPem ?? '').trim();
+    const declaredPublicKeyDerB64 = String(options.public_key_der_b64 ?? options.publicKeyDerB64 ?? fromObject.public_key_der_b64 ?? fromObject.publicKeyDerB64 ?? '').trim();
+    const curve = String(options.curve ?? fromObject.curve ?? 'P-256').trim() || 'P-256';
+    const certPem = String(options.cert_pem ?? options.certPem ?? options.cert ?? fromObject.cert_pem ?? fromObject.certPem ?? fromObject.cert ?? '').trim();
+
+    if (!target) return resultErr(codes.INVALID_AID_FORMAT, 'importGroupIdentity requires a non-empty aid');
+    if (!privateKeyPem) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'importGroupIdentity requires private_key_pem');
+    if (!declaredPublicKeyDerB64) return resultErr(codes.KEYPAIR_MISMATCH, 'importGroupIdentity requires public_key_der_b64');
+    if (!certPem) return resultErr(codes.CERT_PARSE_ERROR, 'importGroupIdentity requires cert_pem');
+
+    try {
+      const certPub = publicKeyDerB64(certPem);
+      if (!certPub) return resultErr(codes.CERT_PARSE_ERROR, `certificate parse failed for aid: ${target}`);
+
+      const validity = parseCertValidity(certPem);
+      if (!validity) return resultErr(codes.CERT_PARSE_ERROR, `certificate validity parse failed for aid: ${target}`);
+      const now = Date.now();
+      if (now > validity.notAfter) return resultErr(codes.CERT_CHAIN_BROKEN, `importGroupIdentity returned certificate is expired`);
+      if (now < validity.notBefore) return resultErr(codes.CERT_CHAIN_BROKEN, `importGroupIdentity returned certificate is not_yet_valid`);
+
+      const cn = parseCertCN(certPem);
+      if (cn !== target) {
+        return resultErr(codes.CERT_CHAIN_BROKEN, `importGroupIdentity returned certificate CN mismatch: expected ${target}, got ${cn ?? ''}`);
+      }
+      if (certPub !== declaredPublicKeyDerB64) {
+        return resultErr(codes.KEYPAIR_MISMATCH, 'importGroupIdentity returned certificate public key mismatch');
+      }
+
+      try {
+        const privateKey = await importPrivateKeyEcdsa(privateKeyPem);
+        const probe = new TextEncoder().encode('aun-group-identity-import-self-test');
+        const sig = await ecdsaSignDer(privateKey, probe);
+        const pubKey = await importCertPublicKeyEcdsa(certPem);
+        const ok = await ecdsaVerifyDer(pubKey, sig, probe);
+        if (!ok) {
+          return resultErr(codes.KEYPAIR_MISMATCH, `private key does not match certificate for aid: ${target}`);
+        }
+      } catch (exc) {
+        return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, `private key parse failed for aid: ${target}`, exc);
+      }
+
+      await this._keystore.saveIdentity(target, {
+        aid: target,
+        private_key_pem: privateKeyPem,
+        public_key_der_b64: declaredPublicKeyDerB64,
+        curve,
+        cert: certPem,
+      });
+
+      const loaded = await this.load(target);
+      if (!loaded.ok) {
+        return resultErr(loaded.error.code, loaded.error.message);
+      }
+      const signProbe = await loaded.data.aid.sign('aun-group-identity-import-self-test');
+      if (!signProbe.ok) {
+        return resultErr(codes.KEYPAIR_MISMATCH, signProbe.error.message);
+      }
+      return resultOk({ imported: true, aid: target });
+    } catch (exc) {
+      return resultErr(codes.CERT_PARSE_ERROR, String(exc), exc);
+    }
+  }
+
+  importGroupIdentityAsync(
+    aidOrOptions: string | (ImportGroupIdentityOptions & { aid?: string }),
+    options: ImportGroupIdentityOptions = {},
+  ): Promise<Result<ImportGroupIdentityResult>> {
+    return this.importGroupIdentity(aidOrOptions, options);
   }
 
   private async _beginAidOperation(gatewayUrl: string, aidObj: AID): Promise<{ request_id: string; nonce: string }> {

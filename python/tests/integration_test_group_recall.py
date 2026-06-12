@@ -173,7 +173,7 @@ async def test_group_recall_plaintext():
 
         # 验证服务端双 tombstone：用 raw_call 直查 group.v2.pull 原始消息
         # （V2-only SDK 的规范读取路径，会合并 group_messages 的 V1 明文行）
-        raw = await bob._rpc().raw_call("group.v2.pull", {
+        raw = await bob.call("group.v2.pull", {
             "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
             "device_id": bob.device_id, "slot_id": bob.slot_id,
         })
@@ -353,7 +353,7 @@ async def test_group_recall_encrypted():
         await asyncio.sleep(0.5)
 
         # 服务端 raw 校验：密文已删，占位 tombstone 顶替
-        raw = await bob._rpc().raw_call("group.v2.pull", {
+        raw = await bob.call("group.v2.pull", {
             "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
         })
         raw_msgs = raw.get("messages", []) if isinstance(raw, dict) else []
@@ -441,7 +441,7 @@ async def test_group_recall_push_pull_recalled_at_consistency():
             if msg_id in (ev.get("message_ids") or []):
                 push_recalled_at = ev.get("recalled_at")
                 break
-        raw = await bob._rpc().raw_call("group.v2.pull", {
+        raw = await bob.call("group.v2.pull", {
             "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
             "device_id": bob.device_id, "slot_id": bob.slot_id,
         })
@@ -518,7 +518,7 @@ async def test_group_recall_late_joiner_not_notified():
                   f"late joiner saw recall of pre-join msg: {leaked}")
 
         # pull 兜底也不应把该撤回 tombstone 投给 bob
-        raw = await bob._rpc().raw_call("group.v2.pull", {
+        raw = await bob.call("group.v2.pull", {
             "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
             "device_id": bob.device_id, "slot_id": bob.slot_id,
         })

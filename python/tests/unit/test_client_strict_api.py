@@ -217,7 +217,6 @@ def test_client_does_not_expose_test_or_diagnostic_helpers():
         "get_remote_agent_md_etag",
         "publish_agent_md",
         "create_named_group",
-        "bind_group_aid",
         "_set_agent_md_path",
     ):
         assert not hasattr(client, name)
@@ -285,7 +284,6 @@ def test_migrated_integration_tests_do_not_call_removed_client_methods():
         "v2_session_info",
         "get_remote_agent_md_etag",
         "create_named_group",
-        "bind_group_aid",
     }
 
     violations: list[str] = []
@@ -404,7 +402,6 @@ def test_client_does_not_expose_removed_convenience_methods():
         "call_raw",
         "get_remote_agent_md_etag",
         "create_named_group",
-        "bind_group_aid",
     ):
         assert not hasattr(client, name)
 

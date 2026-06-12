@@ -1,6 +1,6 @@
 package aun
 
-// 错误码常量，与 Python SDK error_codes.py 完全对应。
+// 错误码常量，与 Python SDK error_codes.py 对齐；Go SDK 可补充本地实现需要的细分错误码。
 
 // 加载阶段（AIDStore.Load）
 const (
@@ -11,6 +11,7 @@ const (
 	ErrCodeCertChainBroken      = "CERT_CHAIN_BROKEN"
 	ErrCodeKeypairMismatch      = "KEYPAIR_MISMATCH"
 	ErrCodePrivateKeyParseError = "PRIVATE_KEY_PARSE_ERROR"
+	ErrCodeSaveIdentityFailed   = "SAVE_IDENTITY_FAILED"
 )
 
 // 注册阶段（AIDStore.Register）

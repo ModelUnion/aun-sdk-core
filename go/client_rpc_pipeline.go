@@ -42,6 +42,8 @@ var signedMethods = map[string]bool{
 	"group.update_join_requirements":         true,
 	"group.set_role":                         true,
 	"group.transfer_owner":                   true,
+	"group.bind_group_aid":                   true,
+	"group.complete_transfer":                true,
 	"group.review_join_request":              true,
 	"group.batch_review_join_request":        true,
 	"group.request_join":                     true,
@@ -56,12 +58,10 @@ var signedMethods = map[string]bool{
 	"group.resources.mount_object":           true,
 	"group.resources.update":                 true,
 	"group.resources.delete":                 true,
-	"group.resources.cleanup_by_storage_ref": true,
-	"group.resources.request_add":            true,
-	"group.resources.request_mount_object":   true,
-	"group.resources.direct_add":             true,
-	"group.resources.approve_request":        true,
-	"group.resources.reject_request":         true,
+	"group.resources.namespace_ready":        true,
+	"group.resources.confirm":                true,
+	"group.resources.confirm_mount":          true,
+	"group.resources.get_df":                 true,
 	"group.resources.unmount":                true,
 	"group.resources.get_access":             true,
 	"group.resources.resolve_access_ticket":  true,
@@ -81,6 +81,28 @@ var signedMethods = map[string]bool{
 	"storage.batch_delete":                   true,
 	"storage.set_object_meta":                true,
 	"storage.append_object":                  true,
+	"storage.set_acl":                        true,
+	"storage.remove_acl":                     true,
+	"storage.set_visibility":                 true,
+	"storage.check_access":                   true,
+	"storage.issue_token":                    true,
+	"storage.revoke_token":                   true,
+	"storage.create_symlink":                 true,
+	"storage.atomic_repoint":                 true,
+	"storage.rename_symlink":                 true,
+	"storage.delete_symlink":                 true,
+	"storage.fs.mkdir":                       true,
+	"storage.fs.remove":                      true,
+	"storage.fs.rename":                      true,
+	"storage.fs.copy":                        true,
+	"storage.fs.mount":                       true,
+	"storage.fs.approve":                     true,
+	"storage.fs.reject":                      true,
+	"storage.fs.unmount":                     true,
+	"storage.fs.invalidate_membership":       true,
+	"storage.volume.create":                  true,
+	"storage.volume.renew":                   true,
+	"storage.volume.expire_due":              true,
 	"group.commit_state":                     true,
 	"group.ban":                              true,
 	"group.unban":                            true,
@@ -118,6 +140,10 @@ func (p *rpcPipeline) call(ctx context.Context, method string, params map[string
 		return nil, err
 	}
 	params = preflight.params
+	rpcBackground := truthyBool(params["_rpc_background"]) || rpcBackgroundFromContext(ctx)
+	if rpcBackground {
+		ctx = contextWithRPCBackground(ctx)
+	}
 	pullGateLocked := truthyBool(params["_pull_gate_locked"])
 	delete(params, "_pull_gate_locked")
 	skipSendResultEnvelope := truthyBool(params["_skip_send_result_envelope"])
@@ -691,6 +717,7 @@ func (p *rpcPipeline) runPullSerialized(ctx context.Context, key string, operati
 func (p *rpcPipeline) rawCall(ctx context.Context, method string, params map[string]any, signed bool) (any, error) {
 	c := p.runtime.client
 	payload := copyRpcParams(params)
+	rpcBackground := truthyBool(payload["_rpc_background"]) || rpcBackgroundFromContext(ctx)
 	if signed && signedMethods[method] {
 		if p.shouldSkipClientSignature(method, payload) {
 			delete(payload, "client_signature")
@@ -699,6 +726,9 @@ func (p *rpcPipeline) rawCall(ctx context.Context, method string, params map[str
 				return nil, err
 			}
 		}
+	}
+	if rpcBackground {
+		payload["_rpc_background"] = true
 	}
 	return c.transport.Call(ctx, method, payload)
 }

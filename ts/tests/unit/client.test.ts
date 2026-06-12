@@ -2610,6 +2610,18 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
     expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.pull')).toBe(false);
+    expect(transportCall).toHaveBeenCalledWith(
+      'group.v2.ack',
+      expect.objectContaining({
+        group_id: groupId,
+        up_to_seq: 3,
+        device_id: 'device-001',
+        slot_id: 'slot-a',
+      }),
+      undefined,
+      undefined,
+      true,
+    );
   });
   it('message.v2.pull 返回值不应因 seq 已投递而去重', async () => {
     const client = makeV2Client();

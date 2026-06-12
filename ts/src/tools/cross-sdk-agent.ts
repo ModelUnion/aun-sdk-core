@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import * as http from 'node:http';
+import * as https from 'node:https';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { URL } from 'node:url';
@@ -327,6 +328,26 @@ class CrossSdkTsAgent {
         await this.groupAck(req, res);
         return;
       }
+      if (req.method === 'POST' && url.pathname === '/group/resources/init') {
+        await this.groupResourcesInit(req, res);
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/group/resources/put') {
+        await this.groupResourcesPut(req, res);
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/group/resources/mkdir') {
+        await this.groupResourcesMkdir(req, res);
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/group/resources/mount') {
+        await this.groupResourcesMount(req, res);
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/group/resources/read') {
+        await this.groupResourcesRead(req, res);
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/inbox') {
         const traceId = textOf(url.searchParams.get('trace_id') ?? '');
         const fromAid = textOf(url.searchParams.get('from') ?? '');
@@ -479,11 +500,16 @@ class CrossSdkTsAgent {
       name,
       visibility: textOf(body.visibility || 'private'),
     };
+    const groupName = textOf(body.group_name ?? body.groupName ?? '').trim();
+    if (groupName) params.group_name = groupName;
     const joinMode = textOf(body.join_mode || '').trim();
     if (joinMode) params.join_mode = joinMode;
     try {
-      const createResult = await this.client.call('group.create', params);
+      const createResult = groupName
+        ? await this.client.createGroup(params)
+        : await this.client.call('group.create', params);
       const groupId = this.extractGroupId(createResult);
+      const groupAid = this.extractGroupAid(createResult);
       if (!groupId) throw new Error(`group.create did not return group_id: ${JSON.stringify(jsonSafe(createResult))}`);
       const addResults: unknown[] = [];
       for (const aid of members) {
@@ -499,6 +525,7 @@ class CrossSdkTsAgent {
         ok: true,
         trace_id: traceId,
         group_id: groupId,
+        group_aid: groupAid,
         create_result: jsonSafe(createResult) as any,
         add_results: addResults as any,
       };
@@ -512,6 +539,163 @@ class CrossSdkTsAgent {
         error_message: err instanceof Error ? err.message : String(err),
       };
       this.recordTrace(traceId, { stage: 'group_create_error', error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async groupResourcesInit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    try {
+      const store = this.aidStore();
+      try {
+        const result = await this.client.group.resources.initializeNamespace(body, {
+          aidStore: store,
+          connectOptions: { heartbeat_interval: 0 },
+        });
+        const response: JsonObject = { ok: true, trace_id: traceId, result: jsonSafe(result) as any };
+        this.recordTrace(traceId, { stage: 'group_resources_init', result: response });
+        sendJson(res, 200, response);
+      } finally {
+        store.close();
+      }
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_init_error', error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async groupResourcesPut(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    try {
+      const store = this.aidStore();
+      try {
+        const pending = await this.client.group.resources.put(body);
+        const pendingObj = jsonObjectOf(pending);
+        const confirmed = Array.isArray(pendingObj?.pending_ops)
+          ? await this.client.group.resources.executePendingOps(pendingObj, {
+              aidStore: store,
+              connectOptions: { heartbeat_interval: 0 },
+            })
+          : null;
+        const response: JsonObject = {
+          ok: true,
+          trace_id: traceId,
+          pending: jsonSafe(pending) as any,
+          confirmed: jsonSafe(confirmed) as any,
+        };
+        this.recordTrace(traceId, { stage: 'group_resources_put', result: response });
+        sendJson(res, 200, response);
+      } finally {
+        store.close();
+      }
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_put_error', error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async groupResourcesMkdir(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    try {
+      const result = await this.client.group.resources.createFolder(body);
+      const response: JsonObject = {
+        ok: true,
+        trace_id: traceId,
+        result: jsonSafe(result) as any,
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_mkdir', result: response });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_mkdir_error', error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async groupResourcesMount(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    try {
+      const store = this.aidStore();
+      try {
+        const pending = await this.client.group.resources.mountObject(body);
+        const pendingObj = jsonObjectOf(pending);
+        if (!Array.isArray(pendingObj?.pending_ops)) {
+          throw new Error(`group.resources.mount_object did not return pending_ops: ${JSON.stringify(jsonSafe(pending))}`);
+        }
+        const confirmed = await this.client.group.resources.executePendingOps(pendingObj, {
+          aidStore: store,
+          connectOptions: { heartbeat_interval: 0 },
+        });
+        const response: JsonObject = {
+          ok: true,
+          trace_id: traceId,
+          pending: jsonSafe(pending) as any,
+          confirmed: jsonSafe(confirmed) as any,
+        };
+        this.recordTrace(traceId, { stage: 'group_resources_mount', result: response });
+        sendJson(res, 200, response);
+      } finally {
+        store.close();
+      }
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_mount_error', error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async groupResourcesRead(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    try {
+      const access = await this.client.group.resources.getAccess(body);
+      const accessObj = jsonObjectOf(access) ?? {};
+      const download = jsonObjectOf(accessObj.download) ?? {};
+      const downloadUrl = textOf(download.download_url ?? download.downloadUrl).trim();
+      if (!downloadUrl) throw new Error(`group.resources.get_access did not return download_url: ${JSON.stringify(jsonSafe(access))}`);
+      const content = await downloadText(downloadUrl);
+      const response: JsonObject = {
+        ok: true,
+        trace_id: traceId,
+        content,
+        access: jsonSafe(access) as any,
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_read', result: { ok: true, content_len: content.length } });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_resources_read_error', error });
       sendJson(res, 500, error);
     }
   }
@@ -669,6 +853,62 @@ class CrossSdkTsAgent {
     }
     return '';
   }
+
+  extractGroupAid(result: unknown): string {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return '';
+    const obj = result as JsonObject;
+    const group = jsonObjectOf(obj.group);
+    return textOf(group?.group_aid ?? obj.group_aid).trim();
+  }
+
+  aidStore(): AIDStore {
+    return new AIDStore({
+      aunPath: this.aunPath,
+      encryptionSeed: '',
+      slotId: this.slotId,
+      debug: this.debug,
+    });
+  }
+}
+
+function downloadText(url: string, redirects = 0): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'https:' ? https : http;
+    const options: https.RequestOptions = parsed.protocol === 'https:' ? { rejectUnauthorized: false } : {};
+    const req = client.get(parsed, options, (resp) => {
+      const status = resp.statusCode ?? 0;
+      const location = typeof resp.headers.location === 'string' ? resp.headers.location : '';
+      if ([301, 302, 303, 307, 308].includes(status) && location) {
+        resp.resume();
+        if (redirects >= 5) {
+          reject(new Error(`download redirect limit exceeded url=${url}`));
+          return;
+        }
+        const nextUrl = new URL(location, parsed).toString();
+        downloadText(nextUrl, redirects + 1).then(resolve, reject);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      resp.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      resp.on('end', () => {
+        if (status < 200 || status >= 300) {
+          reject(new Error(`download failed status=${status} url=${url}`));
+          return;
+        }
+        const content = Buffer.concat(chunks).toString('utf-8');
+        if (!content) {
+          reject(new Error(`download returned empty body status=${status} url=${url}`));
+          return;
+        }
+        resolve(content);
+      });
+    });
+    req.setTimeout(20000, () => {
+      req.destroy(new Error('download timeout'));
+    });
+    req.on('error', reject);
+  });
 }
 
 async function main(): Promise<void> {

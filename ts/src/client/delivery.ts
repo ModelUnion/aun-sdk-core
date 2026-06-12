@@ -882,6 +882,7 @@ export class MessageDeliveryEngine {
           device_id: client._deviceId,
           limit: 50,
           _pull_gate_locked: true,
+          _rpc_background: true,
         });
         if (!isJsonObject(result as JsonValue | object | null | undefined)) return;
         const events = (result as JsonObject).events;
@@ -986,6 +987,7 @@ export class MessageDeliveryEngine {
     const contigBefore = client._seqTracker.getContiguousSeq(ns);
     if (eventSeq <= contigBefore || client._pushedSeqs.get(ns)?.has(eventSeq)) {
       client._clientLog.debug(`group.changed skipped duplicate/stale: group=${groupId}, event_seq=${eventSeq}, contiguous=${contigBefore}`);
+      this.fireGroupEventAck(groupId, Math.min(eventSeq, contigBefore > 0 ? contigBefore : eventSeq), 'covered push');
       return;
     }
 
@@ -1011,6 +1013,49 @@ export class MessageDeliveryEngine {
       this.fillGroupEventGap(groupId).catch((exc) => {
         client._clientLog.warn(`background gap fill trigger failed: ${formatDeliveryError(exc)}`);
       });
+    }
+  }
+
+  private fireGroupEventAck(groupId: string, eventSeq: number, reason: string): void {
+    const client = this.runtime.client;
+    const gid = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    if (!gid) return;
+    const ns = `group_event:${gid}`;
+    const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, Number(eventSeq) || 0);
+    if (ackSeq <= 0) return;
+    const params: RpcParams = {
+      group_id: gid,
+      event_seq: ackSeq,
+      device_id: client._deviceId,
+      slot_id: client._slotId,
+      _rpc_background: true,
+    };
+    try {
+      Promise.resolve(client.call('group.ack_events', params)).catch((e: unknown) => {
+        client._clientLog.debug(`group event ${reason} ack failed: group=${gid} ${formatDeliveryError(e)}`);
+      });
+    } catch (e) {
+      client._clientLog.debug(`group event ${reason} ack failed: group=${gid} ${formatDeliveryError(e)}`);
+    }
+  }
+
+  private fireGroupV2Ack(groupId: string, upToSeq: number, reason: string): void {
+    const client = this.runtime.client;
+    const gid = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    if (!gid) return;
+    const ns = `group:${gid}`;
+    const ackSeq = this.clampAckSeq('group.v2.ack', 'up_to_seq', ns, Number(upToSeq) || 0);
+    if (ackSeq <= 0) return;
+    try {
+      Promise.resolve(client.call('group.v2.ack', {
+        group_id: gid,
+        up_to_seq: ackSeq,
+        _rpc_background: true,
+      })).catch((e: unknown) => {
+        client._clientLog.debug(`group.v2 ${reason} ack failed: group=${gid} ${formatDeliveryError(e)}`);
+      });
+    } catch (e) {
+      client._clientLog.debug(`group.v2 ${reason} ack failed: group=${gid} ${formatDeliveryError(e)}`);
     }
   }
 
@@ -1191,10 +1236,11 @@ export class MessageDeliveryEngine {
     client._seqTracker.updateMaxSeen(ns, seq);
     const contigBefore = client._seqTracker.getContiguousSeq(ns);
     client._clientLog.debug(`_onRawGroupV2MessageCreated enter: group=${groupId}, seq=${seq}, contiguous=${contigBefore}, max_seen=${client._seqTracker.getMaxSeenSeq(ns)}`);
-    if (contigBefore === seq) {
+    if (contigBefore === seq || (eventKind === 'group.online_unread_hint' && contigBefore > seq)) {
       client._clientLog.debug(
         `_onRawGroupV2MessageCreated duplicate push already covered: group=${groupId} seq=${seq}`,
       );
+      this.fireGroupV2Ack(groupId, seq, 'covered push');
       return;
     }
     const afterSeq = client._repairPushContiguousBound(

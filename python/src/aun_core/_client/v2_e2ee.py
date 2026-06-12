@@ -35,8 +35,7 @@ class V2E2EECoordinator:
         except Exception as exc:
             client._log.warn("client", "V2 session init failed (non-fatal): %s", exc)
         if background_sync and getattr(client, "_v2_session", None):
-            loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-            loop.create_task(client._v2_auto_confirm_pending_proposals())
+            client._group_state().schedule_auto_confirm_pending_proposals()
 
     async def init_v2_session(self) -> None:
         """connect 成功后初始化 V2 session 并注册设备 SPK。IK = AID 长期密钥。"""
@@ -93,7 +92,9 @@ class V2E2EECoordinator:
             try:
                 if client._state != "connected" or not client._v2_session:
                     return
-                await client._v2_session.ensure_group_registered(group_id, client.call)
+                await client._delivery().run_background_rpc(
+                    lambda: client._v2_session.ensure_group_registered(group_id, client.call)
+                )
                 client._log.debug("client", "group SPK registered: group=%s reason=%s", group_id, reason)
             except Exception as exc:
                 client._log.debug(
@@ -107,7 +108,7 @@ class V2E2EECoordinator:
                 inflight.discard(group_id)
 
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(_run())
+        client._group_state().track_auto_state_task(loop.create_task(_run()))
 
     def schedule_group_spk_rotation(self, group_id: str, *, reason: str) -> None:
         client = self.client
@@ -133,7 +134,9 @@ class V2E2EECoordinator:
                 except Exception:
                     pass  # session 不支持这些方法时跳过回滚准备
                 try:
-                    await session.rotate_group_spk(group_id, client.call)
+                    await client._delivery().run_background_rpc(
+                        lambda: session.rotate_group_spk(group_id, client.call)
+                    )
                     client._log.debug("client", "group SPK rotated: group=%s reason=%s", group_id, reason)
                 except Exception as exc:
                     # 上传失败：回滚本地新 SPK，避免本地/服务端 spk_id 不一致
@@ -167,7 +170,7 @@ class V2E2EECoordinator:
                 inflight.discard(group_id)
 
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(_run())
+        client._group_state().track_auto_state_task(loop.create_task(_run()))
 
     def schedule_group_spk_registration_after_peer_fallback(self, group_id: str) -> None:
         client = self.client
@@ -200,6 +203,8 @@ class V2E2EECoordinator:
     ) -> None:
         client = self.client
         if not from_aid:
+            return
+        if getattr(client, "_closing", False):
             return
         message_key = client._v2_pending_sender_ik_message_key(msg, group_id)
         # 队列上限保护：超限时丢弃最旧的条目
@@ -234,18 +239,30 @@ class V2E2EECoordinator:
             return
         client._v2_sender_ik_fetching.add(fetch_key)
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(client._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key))
+        async def _run() -> None:
+            await client._delivery().run_background_rpc(
+                lambda: client._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key)
+            )
+
+        client._group_state().track_auto_state_task(loop.create_task(_run()))
 
     def schedule_sender_ik_fetch(self, from_aid: str, sender_device_id: str, group_id: str) -> None:
         client = self.client
         if not from_aid:
+            return
+        if getattr(client, "_closing", False):
             return
         fetch_key = client._v2_pending_sender_ik_fetch_key(from_aid, sender_device_id, group_id)
         if fetch_key in client._v2_sender_ik_fetching:
             return
         client._v2_sender_ik_fetching.add(fetch_key)
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(client._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key))
+        async def _run() -> None:
+            await client._delivery().run_background_rpc(
+                lambda: client._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key)
+            )
+
+        client._group_state().track_auto_state_task(loop.create_task(_run()))
 
     async def resolve_sender_ik_pending(
         self,
@@ -383,6 +400,7 @@ class V2E2EECoordinator:
         from ..v2.e2ee.encrypt_p2p import encrypt_p2p_message
 
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False) or getattr(client, "_background_rpc_depth", 0) > 0)
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
@@ -562,6 +580,7 @@ class V2E2EECoordinator:
         from ..errors import StateError
 
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False) or getattr(client, "_background_rpc_depth", 0) > 0)
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
         after_seq = int(params.get("after_seq", 0) or 0)
@@ -589,7 +608,7 @@ class V2E2EECoordinator:
             pull_params = {"after_seq": next_after_seq, "limit": limit}
             if force:
                 pull_params["force"] = True
-            result = await client._rpc().raw_call("message.v2.pull", pull_params)
+            result = await client._rpc().raw_call("message.v2.pull", pull_params, background=background_rpc)
             if isinstance(result, dict):
                 response.update(result)
             else:
@@ -742,6 +761,7 @@ class V2E2EECoordinator:
     async def ack_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 确认消费 + 自检销毁旧 SPK。内部方法，由 call("message.ack") 路由调用。"""
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False) or getattr(client, "_background_rpc_depth", 0) > 0)
         ns = f"p2p:{client._aid}" if client._aid else ""
         up_to_seq = int(params.get("seq", 0) or params.get("up_to_seq", 0) or 0)
         seq = up_to_seq or (client._seq_tracker.get_contiguous_seq(ns) if ns else 0)
@@ -758,7 +778,10 @@ class V2E2EECoordinator:
                 )
                 seq = max_seen
         client._log.debug("client", "message.v2.ack send: ns=%s up_to_seq=%d", ns or "<none>", seq)
-        result = await client.call("message.v2.ack", {"up_to_seq": seq})
+        ack_params: dict[str, Any] = {"up_to_seq": seq}
+        if background_rpc:
+            ack_params["_rpc_background"] = True
+        result = await client.call("message.v2.ack", ack_params)
         actual_ack_seq = seq
         if isinstance(result, dict):
             try:
@@ -918,6 +941,7 @@ class V2E2EECoordinator:
         from ..v2.e2ee.encrypt_group import encrypt_group_message
 
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False))
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
@@ -936,6 +960,21 @@ class V2E2EECoordinator:
             payload_override=payload,
             extra={"group_id": group_id},
         )
+
+        def _text_set(raw: Any) -> set[str]:
+            if not isinstance(raw, (list, tuple, set)):
+                return set()
+            return {str(item).strip() for item in raw if str(item or "").strip()}
+
+        def _expected_peer_aids(
+            *,
+            member_aids: set[str],
+            committed_aids: set[str],
+        ) -> set[str]:
+            candidates: set[str] = set()
+            candidates.update(member_aids)
+            candidates.update(committed_aids)
+            return {aid for aid in candidates if aid and aid != client._aid}
 
         async def _attempt(use_cache: bool) -> dict[str, Any]:
             client._log.debug("client", "group.v2.send attempt: group=%s use_cache=%s", group_id, use_cache)
@@ -962,8 +1001,9 @@ class V2E2EECoordinator:
                 all_devices = bootstrap.get("devices", [])
                 epoch = int(bootstrap.get("epoch", 0))
                 wrap_policy = _v2_normalize_wrap_policy(bootstrap.get("e2ee_wrap_policy"))
-                pending_adds = set(bootstrap.get("pending_adds", []))
-                committed_aids = set(bootstrap.get("committed_member_aids", []))
+                pending_adds = _text_set(bootstrap.get("pending_adds", []))
+                committed_aids = _text_set(bootstrap.get("committed_member_aids", []))
+                member_aids = _text_set(bootstrap.get("member_aids", []))
                 server_chain = str(bootstrap.get("state_chain", "") or "")
                 await client._v2_check_fork(group_id, server_chain)
                 await client._v2_verify_state_signature(group_id, bootstrap)
@@ -989,7 +1029,7 @@ class V2E2EECoordinator:
                 if all_devices:
                     client._v2_bootstrap_cache[cache_key] = (
                         all_devices, time.time(), epoch, pending_adds, committed_aids,
-                        state_commitment, audit_recipients_raw, wrap_policy,
+                        state_commitment, audit_recipients_raw, wrap_policy, member_aids,
                     )
                 if pending_adds and client._v2_session:
                     client._v2_maybe_trigger_auto_propose(group_id)
@@ -999,13 +1039,14 @@ class V2E2EECoordinator:
                 state_commitment = cached[5] if len(cached) > 5 else {"state_version": 0, "state_hash": "", "state_chain": ""}
                 audit_recipients_raw = cached[6] if len(cached) > 6 else []
                 wrap_policy = cached[7] if len(cached) > 7 else None
+                member_aids = cached[8] if len(cached) > 8 else set()
 
             if not all_devices:
                 raise E2EEError(f"V2 group bootstrap: no devices found for group {group_id}")
 
             targets = []
             for dev in all_devices:
-                dev_aid = dev.get("aid", "")
+                dev_aid = str(dev.get("aid", "") or "").strip()
                 has_dev_id, dev_id = _v2_device_id_from_device(dev)
                 if dev_aid == client._aid and has_dev_id and dev_id == client._device_id:
                     continue
@@ -1021,6 +1062,16 @@ class V2E2EECoordinator:
                     targets.append(target)
 
             if not targets:
+                expected_peer_aids = _expected_peer_aids(
+                    member_aids=member_aids,
+                    committed_aids=committed_aids,
+                )
+                if expected_peer_aids:
+                    raise E2EEError(
+                        f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
+                        code=-33054,
+                        data={"expected_peer_aids": sorted(expected_peer_aids)},
+                    )
                 raise E2EEError(f"V2 group: no target devices for group {group_id}")
 
             for dev in audit_recipients_raw:
@@ -1072,16 +1123,25 @@ class V2E2EECoordinator:
             client._log.debug("client", "group.v2.send ok: group=%s use_cache=%s seq=%s", group_id, use_cache, result.get("seq") if isinstance(result, dict) else "")
             return result
 
-        try:
-            result = await _attempt(use_cache=True)
-        except Exception as exc:
-            exc_code = getattr(exc, "code", None)
-            if exc_code in (-33011, -33012, -33050, -33052, -33054):
+        retries = 0
+        use_cache = True
+        while True:
+            try:
+                result = await _attempt(use_cache=use_cache)
+                break
+            except Exception as exc:
+                exc_code = getattr(exc, "code", None)
+                if exc_code not in (-33011, -33012, -33050, -33052, -33054):
+                    raise
+                max_retries = 2 if exc_code == -33054 else 1
+                if retries >= max_retries:
+                    raise
+                retries += 1
                 client._log.debug("client", "group V2 speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
                 client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
-                result = await _attempt(use_cache=False)
-            else:
-                raise
+                use_cache = False
+                if exc_code == -33054 and retries > 1:
+                    await asyncio.sleep(0.25 * (retries - 1))
 
         if isinstance(result, dict) and result.get("seq"):
             ns = f"group:{group_id}"
@@ -1828,6 +1888,7 @@ class V2E2EECoordinator:
         from ..errors import StateError
 
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False) or getattr(client, "_background_rpc_depth", 0) > 0)
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
@@ -1881,7 +1942,7 @@ class V2E2EECoordinator:
                 pull_params["device_id"] = client._device_id
             if "slot_id" not in pull_params:
                 pull_params["slot_id"] = client._slot_id
-            result = await client._rpc().raw_call("group.v2.pull", pull_params)
+            result = await client._rpc().raw_call("group.v2.pull", pull_params, background=background_rpc)
             if isinstance(result, dict):
                 response.update(result)
             else:
@@ -2033,6 +2094,7 @@ class V2E2EECoordinator:
     async def ack_group_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 Group 确认消费。内部方法，由 call("group.ack_messages") 路由调用。"""
         client = self.client
+        background_rpc = bool(params.pop("_rpc_background", False))
         group_id = str(params.get("group_id") or "").strip()
         up_to_seq = int(params.get("msg_seq", 0) or params.get("up_to_seq", 0) or 0)
         ns = f"group:{group_id}"
@@ -2054,7 +2116,10 @@ class V2E2EECoordinator:
             for key in ("device_id", "slot_id")
             if key in params and params[key] is not None
         }
-        result = await client.call("group.v2.ack", {"group_id": group_id, "up_to_seq": seq, **cursor_params})
+        ack_params = {"group_id": group_id, "up_to_seq": seq, **cursor_params}
+        if background_rpc:
+            ack_params["_rpc_background"] = True
+        result = await client.call("group.v2.ack", ack_params)
         client._log.debug("client", "group.v2.ack ok: group=%s ns=%s requested=%d result=%s", group_id, ns, seq, result)
         return result
 

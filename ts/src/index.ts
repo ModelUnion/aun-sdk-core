@@ -9,7 +9,7 @@ export { VERSION } from './version.js';
 // ── 主客户端 ─────────────────────────────────────────────────
 export { AUNClient, type ConnectionOptions, type NotifyOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
-export { AIDStore, type AIDInfo, type ResolveOpts } from './aid-store.js';
+export { AIDStore, type AIDInfo, type ResolveOpts, type ImportGroupIdentityOptions, type ImportGroupIdentityResult } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
 
 // ── 配置 ─────────────────────────────────────────────────────
@@ -92,6 +92,36 @@ export {
   type ServiceProxyClientOptions,
   type ServiceSummary,
 } from './service-proxy.js';
+
+// ── Storage VFS ─────────────────────────────────────────────
+export {
+  StorageVFS,
+  StorageLowLevel,
+  StorageError,
+  StorageNotFoundError,
+  StorageAccessDeniedError,
+  StorageConflictError,
+  StorageLoopError,
+  StorageDanglingSymlinkError,
+  type NodeView,
+  type UsageView,
+  type DownloadResult,
+  type RemoveResult,
+  type UnmountResult,
+} from './storage/index.js';
+
+// ── Service plane facades ───────────────────────────────────
+export {
+  MessageFacade,
+  MessageThoughtFacade,
+  GroupFacade,
+  GroupThoughtFacade,
+  GroupResourcesFacade,
+  GroupPendingOpsPartialFailure,
+  StreamFacade,
+  type FacadeParams,
+  type FacadeRpcClient,
+} from './facades.js';
 
 // ── Gateway 发现 ─────────────────────────────────────────────
 export { GatewayDiscovery } from './discovery.js';

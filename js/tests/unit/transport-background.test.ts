@@ -24,6 +24,12 @@ function parseSent(ws: MockWebSocket): Array<{ id: string; method: string; param
   return ws.sent.map((raw) => JSON.parse(raw));
 }
 
+// 源码 _sendText 经由 _sendChain 把 ws.send 推迟到微任务执行，
+// 读取 ws.sent 前需 flush 微任务队列（真实计时器场景）。
+function flushSend(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 describe('RPCTransport 后台 RPC 调度', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -46,11 +52,13 @@ describe('RPCTransport 后台 RPC 调度', () => {
       transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
     );
 
+    await flushSend();
     expect(parseSent(ws).filter((msg) => msg.method.startsWith('background.'))).toHaveLength(8);
     expect((transport as any)._backgroundRpcQueue).toHaveLength(8);
     expect((transport as any)._pendingBackground.size).toBe(8);
 
     const normalCall = transport.call('meta.ping', {}).catch((err) => err);
+    await flushSend();
     const sent = parseSent(ws);
     expect(sent).toHaveLength(9);
     expect(sent[8].method).toBe('meta.ping');
@@ -64,10 +72,12 @@ describe('RPCTransport 后台 RPC 调度', () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
       transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
     );
+    await flushSend();
     expect(ws.sent).toHaveLength(8);
 
     const first = parseSent(ws)[0];
     (transport as any)._routeMessage({ jsonrpc: '2.0', id: first.id, result: { ok: true } });
+    await flushSend();
     expect(ws.sent).toHaveLength(9);
     expect((transport as any)._pendingBackground.size).toBe(8);
 
@@ -77,6 +87,7 @@ describe('RPCTransport 后台 RPC 调度', () => {
       id: second.id,
       error: { code: -32000, message: 'unit-error' },
     });
+    await flushSend();
     expect(ws.sent).toHaveLength(10);
     expect((transport as any)._pendingBackground.size).toBe(8);
 
@@ -90,15 +101,17 @@ describe('RPCTransport 后台 RPC 调度', () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
       transport.call(`background.${i}`, { _rpc_background: true }, 0.1).catch((err) => err),
     );
+    await vi.advanceTimersByTimeAsync(0);
     expect(ws.sent).toHaveLength(8);
 
-    vi.advanceTimersByTime(100);
+    await vi.advanceTimersByTimeAsync(100);
     await Promise.allSettled(calls);
     expect((transport as any)._pending.size).toBe(0);
     expect((transport as any)._pendingBackground.size).toBe(0);
     expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
 
     const normalCall = transport.call('meta.ping', {}, 0.1).catch((err) => err);
+    await vi.advanceTimersByTimeAsync(0);
     expect(parseSent(ws).at(-1)?.method).toBe('meta.ping');
     await transport.close();
     await Promise.allSettled([normalCall]);

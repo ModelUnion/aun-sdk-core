@@ -13,6 +13,7 @@ import pytest_asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 from aun_core.transport import RPCTransport
 from aun_core.events import EventDispatcher
+from aun_core.errors import ConnectionError as AUNConnectionError
 
 
 class FakeWS:
@@ -32,6 +33,24 @@ class FakeWS:
 
     async def recv(self):
         return json.dumps(await self.response_queue.get())
+
+    async def close(self):
+        pass
+
+
+class ClosingWS:
+    """发送后 reader 立刻断开，用于验证 pending RPC 不等待 timeout。"""
+    def __init__(self):
+        self.sent: list[str] = []
+        self.sent_event = asyncio.Event()
+
+    async def send(self, data: str):
+        self.sent.append(data)
+        self.sent_event.set()
+
+    async def recv(self):
+        await self.sent_event.wait()
+        raise RuntimeError("gateway aborted")
 
     async def close(self):
         pass
@@ -65,6 +84,24 @@ async def transport():
         await t._reader_task
     except (asyncio.CancelledError, Exception):
         pass
+
+
+@pytest.mark.asyncio
+async def test_reader_disconnect_fails_pending_rpc_immediately():
+    dispatcher = EventDispatcher()
+    t = RPCTransport(event_dispatcher=dispatcher, connection_factory=AsyncMock(), logger=MagicMock())
+    ws = ClosingWS()
+    t._ws = ws
+    t._closed = False
+    t._reader_task = asyncio.create_task(t._reader_loop())
+
+    call_task = asyncio.create_task(t.call("group.add_member", {"group_id": "g"}, timeout=10))
+    await asyncio.wait_for(ws.sent_event.wait(), timeout=1)
+
+    with pytest.raises(AUNConnectionError, match="transport closed"):
+        await asyncio.wait_for(call_task, timeout=1)
+    assert t._pending == {}
+    assert t._pending_meta == {}
 
 
 @pytest.mark.asyncio

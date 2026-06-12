@@ -253,6 +253,7 @@ class AsyncQueue<T> {
 class TunnelSocket {
   private readonly _ws: WebSocket;
   private readonly _queue = new AsyncQueue<string>();
+  private _sendChain: Promise<void> = Promise.resolve();
 
   constructor(ws: WebSocket) {
     this._ws = ws;
@@ -273,9 +274,16 @@ class TunnelSocket {
 
   async send(message: Dict): Promise<void> {
     const payload = JSON.stringify(message);
-    await new Promise<void>((resolve, reject) => {
-      this._ws.send(payload, (err) => (err ? reject(err) : resolve()));
-    });
+    const run = this._sendChain.then(
+      () => new Promise<void>((resolve, reject) => {
+        this._ws.send(payload, (err) => (err ? reject(err) : resolve()));
+      }),
+      () => new Promise<void>((resolve, reject) => {
+        this._ws.send(payload, (err) => (err ? reject(err) : resolve()));
+      }),
+    );
+    this._sendChain = run.catch(() => {});
+    await run;
   }
 
   recv(timeoutMs?: number): Promise<string | null> {

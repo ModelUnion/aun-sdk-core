@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -282,9 +283,14 @@ def test_construct_no_args():
     assert not hasattr(client, "auth")
     assert not hasattr(client, "meta")
     assert not hasattr(client, "custody")
-    assert not hasattr(client, "message")
-    assert not hasattr(client, "group")
-    assert not hasattr(client, "storage")
+    assert client.message is client.message
+    assert client.group is client.group
+    assert client.storage is client.storage
+    from aun_core.facades import GroupFacade, MessageFacade
+    from aun_core.storage import StorageVFS
+    assert isinstance(client.message, MessageFacade)
+    assert isinstance(client.group, GroupFacade)
+    assert isinstance(client.storage, StorageVFS)
 
 
 def test_construct_with_aid(tmp_path):
@@ -1422,6 +1428,149 @@ def test_group_send_content_alias_reaches_encrypted_payload():
     assert len(captured) == 1
     assert "content" not in captured[0]
     assert captured[0]["payload"] == {"type": "text", "text": "群密文"}
+
+
+@pytest.mark.asyncio
+async def test_v2_group_send_refreshes_bootstrap_when_targets_temporarily_empty(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from aun_core.logger import NullLogger
+    from aun_core.seq_tracker import SeqTracker
+    import aun_core.v2.e2ee.encrypt_group as encrypt_group_module
+
+    class FakeV2Session:
+        def get_sender_identity(self):
+            return {"aid": "alice.aid.com", "device_id": "alice-dev"}
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.aid.com"
+    client._device_id = "alice-dev"
+    client._slot_id = "slot-a"
+    client._v2_session = FakeV2Session()
+    client._v2_bootstrap_cache = {}
+    client._seq_tracker = SeqTracker()
+    client._log = NullLogger()
+    client._log_message_debug = lambda *args, **kwargs: None
+    client._v2_check_fork = AsyncMock()
+    client._v2_verify_state_signature = AsyncMock()
+    client._v2_maybe_trigger_auto_propose = lambda group_id: None
+    client._persist_seq = lambda ns: None
+    client._mark_published_seq = lambda ns, seq: None
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(method, params, *, trace=None):
+        calls.append((method, dict(params)))
+        if method == "group.v2.bootstrap":
+            devices = [{
+                "aid": "alice.aid.com",
+                "device_id": "alice-dev",
+            }]
+            if len([m for m, _ in calls if m == "group.v2.bootstrap"]) >= 2:
+                devices.append({
+                    "aid": "bob.aid.net",
+                    "device_id": "bob-dev",
+                })
+            return {
+                "devices": devices,
+                "epoch": 1,
+                "member_aids": ["alice.aid.com", "bob.aid.net"],
+                "committed_member_aids": ["alice.aid.com", "bob.aid.net"],
+                "pending_adds": [],
+            }
+        if method == "group.v2.send":
+            envelope = params["envelope"]
+            assert envelope["targets"][0]["aid"] == "bob.aid.net"
+            return {"seq": 7, "message_id": envelope["message_id"]}
+        raise AssertionError(f"unexpected method: {method}")
+
+    async def fake_build_target(dev, *, aid, device_id, role, default_key_source):
+        return {
+            "aid": aid,
+            "device_id": device_id,
+            "role": role,
+            "key_source": default_key_source,
+        }
+
+    def fake_encrypt_group_message(**kwargs):
+        return {
+            "type": "e2ee.group_encrypted",
+            "version": "v2",
+            "message_id": kwargs.get("message_id") or "m-test",
+            "targets": kwargs["targets"],
+        }
+
+    client.call = fake_call
+    client._v2_build_target_from_device = fake_build_target
+    monkeypatch.setattr(encrypt_group_module, "encrypt_group_message", fake_encrypt_group_message)
+
+    result = await client._send_group_encrypted_v2({
+        "group_id": "group.aid.com/g1",
+        "payload": {"type": "text", "text": "hello"},
+    })
+
+    assert result["seq"] == 7
+    assert [method for method, _ in calls].count("group.v2.bootstrap") == 2
+    assert [method for method, _ in calls].count("group.v2.send") == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_group_send_does_not_refresh_single_member_group(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from aun_core.errors import E2EEError
+    from aun_core.logger import NullLogger
+    from aun_core.seq_tracker import SeqTracker
+    import aun_core.v2.e2ee.encrypt_group as encrypt_group_module
+
+    class FakeV2Session:
+        def get_sender_identity(self):
+            return {"aid": "alice.aid.com", "device_id": "alice-dev"}
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.aid.com"
+    client._device_id = "alice-dev"
+    client._slot_id = "slot-a"
+    client._v2_session = FakeV2Session()
+    client._v2_bootstrap_cache = {}
+    client._seq_tracker = SeqTracker()
+    client._log = NullLogger()
+    client._log_message_debug = lambda *args, **kwargs: None
+    client._v2_check_fork = AsyncMock()
+    client._v2_verify_state_signature = AsyncMock()
+    client._v2_maybe_trigger_auto_propose = lambda group_id: None
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(method, params, *, trace=None):
+        calls.append((method, dict(params)))
+        if method == "group.v2.bootstrap":
+            return {
+                "devices": [{"aid": "alice.aid.com", "device_id": "alice-dev"}],
+                "epoch": 1,
+                "member_aids": ["alice.aid.com"],
+                "committed_member_aids": ["alice.aid.com"],
+                "pending_adds": [],
+            }
+        raise AssertionError(f"unexpected method: {method}")
+
+    async def fake_build_target(dev, *, aid, device_id, role, default_key_source):
+        return {"aid": aid, "device_id": device_id, "role": role}
+
+    client.call = fake_call
+    client._v2_build_target_from_device = fake_build_target
+    monkeypatch.setattr(encrypt_group_module, "encrypt_group_message", lambda **kwargs: {"targets": kwargs["targets"]})
+
+    with pytest.raises(E2EEError, match="no target devices"):
+        await client._send_group_encrypted_v2({
+            "group_id": "group.aid.com/solo",
+            "payload": {"type": "text", "text": "hello"},
+        })
+
+    assert [method for method, _ in calls].count("group.v2.bootstrap") == 1
+    assert all(method != "group.v2.send" for method, _ in calls)
 
 
 def test_protected_headers_from_params_accepts_wrapper():
@@ -2880,7 +3029,14 @@ async def test_v2_group_notification_push_equal_contiguous_is_idempotent():
         pull_calls.append(dict(params))
         return {"messages": []}
 
+    ack_calls: list[tuple[str, dict]] = []
+
+    async def fake_safe_ack(method, params, label=""):
+        ack_calls.append((method, dict(params)))
+
     client._pull_group_v2_internal = fake_pull
+    client._safe_ack = fake_safe_ack
+    client._transport = object()
 
     await client._on_raw_group_v2_message_created({
         "group_id": group_id,
@@ -2893,6 +3049,10 @@ async def test_v2_group_notification_push_equal_contiguous_is_idempotent():
     await asyncio.sleep(0)
 
     assert pull_calls == []
+    assert ack_calls == [("group.v2.ack", {
+        "group_id": group_id,
+        "up_to_seq": 3,
+    })]
     assert client._seq_tracker.get_contiguous_seq(ns) == 3
     assert client._seq_tracker.get_max_seen_seq(ns) == 3
 
@@ -2968,6 +3128,157 @@ async def test_v2_group_online_unread_hint_is_low_priority_when_background_sync_
 
     assert pull_calls == [{"group_id": group_id, "after_seq": 0, "limit": 50}]
     await client._stop_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_fire_ack_tasks_are_drained_before_background_stop():
+    client = AUNClient()
+    client._loop = asyncio.get_running_loop()
+    calls: list[tuple[str, dict, bool]] = []
+    finished = asyncio.Event()
+
+    class FakeTransport:
+        async def call(self, method, params, *, background=False):
+            calls.append((method, dict(params), bool(background)))
+            await asyncio.sleep(0.02)
+            finished.set()
+            return {"ok": True}
+
+    client._transport = FakeTransport()
+    client._fire_ack("group.ack_events", {"group_id": "g1", "event_seq": 3}, "unit")
+
+    tasks = getattr(client, "_background_ack_tasks", set())
+    assert len(tasks) == 1
+
+    await client._stop_background_tasks()
+
+    assert finished.is_set()
+    assert calls == [("group.ack_events", {"group_id": "g1", "event_seq": 3}, True)]
+    assert not client._background_ack_tasks
+
+
+@pytest.mark.asyncio
+async def test_background_rpc_depth_marks_public_calls_background():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    calls: list[tuple[str, dict, bool]] = []
+
+    class FakeTransport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params), bool(kwargs.get("background"))))
+            return {"ok": True}
+
+    client._transport = FakeTransport()
+
+    await client._delivery().run_background_rpc(
+        lambda: client.call("group.get_state", {"group_id": "g1"})
+    )
+
+    assert calls == [
+        ("group.get_state", {"group_id": "g1", "device_id": "device-1", "slot_id": "slot-a"}, True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_auto_state_tasks_are_cancelled_on_background_stop():
+    client = AUNClient()
+    client._loop = asyncio.get_running_loop()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_auto_propose(group_id, *, leader_delay=False):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    client._v2_auto_propose_state = fake_auto_propose
+
+    client._group_state().handle_group_changed_v2_membership({
+        "group_id": "g1",
+        "action": "upsert",
+    })
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert len(client._v2_auto_state_tasks) == 1
+
+    await client._stop_background_tasks()
+
+    assert cancelled.is_set()
+    assert not client._v2_auto_state_tasks
+
+
+@pytest.mark.asyncio
+async def test_transport_raw_event_tasks_are_cancelled_before_background_stop():
+    from aun_core.events import EventDispatcher
+    from aun_core.transport import RPCTransport
+
+    dispatcher = EventDispatcher()
+    transport = RPCTransport(
+        event_dispatcher=dispatcher,
+        connection_factory=AsyncMock(),
+    )
+    transport._closed = False
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handler(_payload):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    dispatcher.subscribe("_raw.group.v2.state_proposed", handler)
+
+    await transport._route_message({
+        "method": "event/group.v2.state_proposed",
+        "params": {"group_id": "group.agentid.pub/g1"},
+    })
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert len(transport._event_tasks) == 1
+
+    await transport.cancel_event_tasks()
+
+    assert cancelled.is_set()
+    assert not transport._event_tasks
+
+
+@pytest.mark.asyncio
+async def test_background_rpc_does_not_call_transport_when_client_is_closing():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._closing = True
+    calls: list[str] = []
+
+    class FakeTransport:
+        async def call(self, method, params, **kwargs):
+            calls.append(method)
+            return {"ok": True}
+
+    client._transport = FakeTransport()
+
+    with pytest.raises(Exception):
+        await client._delivery().run_background_rpc(
+            lambda: client.call("group.v2.get_proposal", {"group_id": "group.agentid.pub/g1"})
+        )
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -3292,6 +3603,50 @@ async def test_group_changed_push_persists_and_acks_contiguous_event_seq():
     })]
     assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 6
     client._fill_group_event_gap.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_changed_covered_event_reconciles_server_cursor_without_fill():
+    """本地已覆盖的 group.changed 仍应补发 ack，避免服务端 cursor 落后导致上线重复提示。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker.restore_state({"group_event:G1": 6})
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    client._fill_group_event_gap = AsyncMock()
+    client._group_state_coordinator = MagicMock()
+    client._group_state_coordinator.handle_group_changed_v2_membership = MagicMock()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_safe_ack(method, params, label=""):
+        calls.append((method, dict(params)))
+
+    client._safe_ack = fake_safe_ack
+    client._transport = object()
+
+    await client._on_raw_group_changed({"group_id": "G1", "event_seq": 6, "action": "foo"})
+    await asyncio.sleep(0)
+
+    assert calls == [("group.ack_events", {
+        "group_id": "G1",
+        "event_seq": 6,
+        "device_id": "device-1",
+        "slot_id": "slot-a",
+    })]
+    client._fill_group_event_gap.assert_not_awaited()
+    client._dispatcher.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio

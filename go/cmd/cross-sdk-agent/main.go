@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -286,6 +288,16 @@ func (a *CrossSdkGoAgent) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		a.handleGroupPull(res, req)
 	case req.Method == http.MethodPost && path == "/group/ack":
 		a.handleGroupAck(res, req)
+	case req.Method == http.MethodPost && path == "/group/resources/init":
+		a.handleGroupResourcesInit(res, req)
+	case req.Method == http.MethodPost && path == "/group/resources/put":
+		a.handleGroupResourcesPut(res, req)
+	case req.Method == http.MethodPost && path == "/group/resources/mkdir":
+		a.handleGroupResourcesMkdir(res, req)
+	case req.Method == http.MethodPost && path == "/group/resources/mount":
+		a.handleGroupResourcesMount(res, req)
+	case req.Method == http.MethodPost && path == "/group/resources/read":
+		a.handleGroupResourcesRead(res, req)
 	case req.Method == http.MethodGet && path == "/group/inbox":
 		a.handleGroupInbox(res, req)
 	case req.Method == http.MethodGet && strings.HasPrefix(path, "/traces/"):
@@ -456,12 +468,22 @@ func (a *CrossSdkGoAgent) handleGroupCreate(res http.ResponseWriter, req *http.R
 		"name":       name,
 		"visibility": firstNonEmpty(stringValue(body["visibility"]), "private"),
 	}
+	groupName := strings.TrimSpace(firstNonEmpty(stringValue(body["group_name"]), stringValue(body["groupName"])))
+	if groupName != "" {
+		params["group_name"] = groupName
+	}
 	if joinMode := strings.TrimSpace(stringValue(body["join_mode"])); joinMode != "" {
 		params["join_mode"] = joinMode
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), 35*time.Second)
 	defer cancel()
-	createResult, err := a.client.Call(ctx, "group.create", params)
+	var createResult any
+	var err error
+	if groupName != "" {
+		createResult, err = a.client.CreateGroup(ctx, params)
+	} else {
+		createResult, err = a.client.Call(ctx, "group.create", params)
+	}
 	if err != nil {
 		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
 		a.recordTrace(traceID, map[string]any{"stage": "group_create_error", "error": out})
@@ -491,8 +513,142 @@ func (a *CrossSdkGoAgent) handleGroupCreate(res http.ResponseWriter, req *http.R
 		}
 		addResults = append(addResults, jsonSafe(addResult))
 	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "group_id": groupID, "create_result": jsonSafe(createResult), "add_results": addResults}
+	out := map[string]any{"ok": true, "trace_id": traceID, "group_id": groupID, "group_aid": extractGroupAID(createResult), "create_result": jsonSafe(createResult), "add_results": addResults}
 	a.recordTrace(traceID, map[string]any{"stage": "group_create", "group_id": groupID, "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupResourcesInit(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	store := a.aidStore()
+	defer store.Close()
+	body["aid_store"] = store
+	result, err := a.client.Group().Resources().InitializeNamespace(ctx, body)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_init_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_resources_init", "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupResourcesPut(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	pending, err := a.client.Group().Resources().Put(ctx, body)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_put_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	plan := asMap(pending)
+	var confirmed any
+	if plan != nil && pendingOpsLen(plan["pending_ops"]) > 0 {
+		store := a.aidStore()
+		defer store.Close()
+		plan["aid_store"] = store
+		confirmed, err = a.client.Group().Resources().ExecutePendingOps(ctx, plan)
+		if err != nil {
+			out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error(), "pending": jsonSafe(pending)}
+			a.recordTrace(traceID, map[string]any{"stage": "group_resources_put_error", "error": out})
+			writeJSON(res, http.StatusInternalServerError, out)
+			return
+		}
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "pending": jsonSafe(pending), "confirmed": jsonSafe(confirmed)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_resources_put", "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupResourcesMkdir(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	result, err := a.client.Group().Resources().CreateFolder(ctx, body)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mkdir_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_resources_mkdir", "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupResourcesMount(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	pending, err := a.client.Group().Resources().MountObject(ctx, body)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	plan := asMap(pending)
+	if plan == nil || pendingOpsLen(plan["pending_ops"]) == 0 {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": "bad_pending", "error_message": fmt.Sprintf("group.resources.mount_object returned non-pending result: %v", jsonSafe(pending))}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	store := a.aidStore()
+	defer store.Close()
+	plan["aid_store"] = store
+	confirmed, err := a.client.Group().Resources().ExecutePendingOps(ctx, plan)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error(), "pending": jsonSafe(pending)}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "pending": jsonSafe(pending), "confirmed": jsonSafe(confirmed)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount", "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupResourcesRead(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	ctx, cancel := context.WithTimeout(req.Context(), 45*time.Second)
+	defer cancel()
+	access, err := a.client.Group().Resources().GetAccess(ctx, body)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	download := asMap(asMap(access)["download"])
+	downloadURL := strings.TrimSpace(firstNonEmpty(stringValue(download["download_url"]), stringValue(download["downloadUrl"])))
+	if downloadURL == "" {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": "missing_download_url", "error_message": fmt.Sprintf("group.resources.get_access did not return download_url: %v", jsonSafe(access))}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	content, err := downloadText(ctx, downloadURL)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "content": content, "access": jsonSafe(access)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_resources_read", "result": map[string]any{"ok": true, "content_len": len(content)}})
 	writeJSON(res, http.StatusOK, out)
 }
 
@@ -768,6 +924,17 @@ func mapList(value any) []map[string]any {
 	}
 }
 
+func pendingOpsLen(value any) int {
+	switch v := value.(type) {
+	case []any:
+		return len(v)
+	case []map[string]any:
+		return len(v)
+	default:
+		return 0
+	}
+}
+
 func stringValue(value any) string {
 	switch v := value.(type) {
 	case nil:
@@ -878,6 +1045,10 @@ func publicKeyFingerprint(certPEM string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func (a *CrossSdkGoAgent) aidStore() *aun.AIDStore {
+	return aun.NewAIDStore(a.aunPath, "", aun.AIDStoreOptions{SlotID: a.slotID, Debug: a.debug})
+}
+
 func errorCode(err error) string {
 	if err == nil {
 		return ""
@@ -963,6 +1134,41 @@ func extractGroupID(result any) string {
 		}
 	}
 	return ""
+}
+
+func extractGroupAID(result any) string {
+	obj := asMap(result)
+	if obj == nil {
+		return ""
+	}
+	if group := asMap(obj["group"]); group != nil {
+		if groupAID := stringValue(group["group_aid"]); groupAID != "" {
+			return groupAID
+		}
+	}
+	return stringValue(obj["group_aid"])
+}
+
+func downloadText(ctx context.Context, url string) (string, error) {
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("download failed status=%d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 func filterByTrace(items []map[string]any, traceID string, keepMatch bool) []map[string]any {

@@ -23,7 +23,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
-from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
+from aun_refactor_helpers import _store_for_client, ensure_connected_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -175,101 +175,87 @@ async def test_unsigned_group_resources_tree_methods() -> None:
     rid = uuid.uuid4().hex[:10]
     alice = _make_client()
     bob = _make_client()
-    bucket = f"unsigned-group-res-{rid}"
-    object_key = f"group/{rid}/note.txt"
+    alice_store = _store_for_client(alice)
     group_id = ""
-    object_id = ""
     resource_id = ""
+    folder_path = f"announce/unsigned/{rid}"
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOBB_AID)
 
-        put = await _unsigned_call(alice, "storage.put_object", {
-            "owner_aid": _ALICE_AID,
-            "bucket": bucket,
-            "object_key": object_key,
-            "content": _b64(f"unsigned-group-resource-{rid}".encode("utf-8")),
-            "content_type": "text/plain",
-            "is_private": False,
-        })
-        object_id = str(put.get("object_id") or "").strip()
-        if not object_id:
-            raise AssertionError(f"storage.put_object 未返回 object_id: {put}")
-
-        created = await alice.call("group.create", {"name": f"unsigned-res-{rid}"})
+        created = await alice.create_group(
+            {"name": f"unsigned-res-{rid}", "group_name": f"unsigned{rid}"},
+            aid_store=alice_store,
+        )
         group_id = str((created.get("group") or {}).get("group_id") or "").strip()
-        if not group_id:
-            raise AssertionError(f"group.create 未返回 group_id: {created}")
+        group_aid = str((created.get("group") or {}).get("group_aid") or "").strip()
+        if not group_id or not group_aid:
+            raise AssertionError(f"group.create 未返回 group_id/group_aid: {created}")
         await alice.call("group.add_member", {"group_id": group_id, "aid": _BOBB_AID})
 
-        folder = await _unsigned_call(alice, "group.resources.create_folder", {
+        pending = await _unsigned_call(alice, "group.resources.create_folder", {
             "group_id": group_id,
-            "path": f"unsigned/{rid}",
+            "path": folder_path,
             "mkdirs": True,
         })
-        folder_id = _resource_id(folder, "group.resources.create_folder")
+        if pending.get("mode") != "pending_ops" or pending.get("operation") != "create_folder":
+            raise AssertionError(f"group.resources.create_folder 未返回 group-storage pending_ops: {pending}")
+        ops = pending.get("pending_ops") or []
+        if not ops or ops[0].get("rpc") != "storage.fs.mkdir":
+            raise AssertionError(f"group.resources.create_folder pending op 异常: {pending}")
+        if (ops[0].get("params") or {}).get("path") != folder_path:
+            raise AssertionError(f"group.resources.create_folder pending path 异常: {pending}")
 
-        mounted = await _unsigned_call(alice, "group.resources.mount_object", {
+        confirm_params = dict(pending.get("confirm_params") or {})
+        confirm_params["storage_results"] = {
+            "mkdir": {"status": "active", "path": folder_path},
+        }
+        confirm_params["storage_result"] = {"status": "active", "path": folder_path}
+        confirm_params.setdefault("confirm_key", "mkdir")
+        try:
+            await _unsigned_call(alice, "group.resources.confirm", confirm_params)
+        except Exception as exc:
+            if "group_identity" not in str(exc) and "signature" not in str(exc).lower():
+                raise AssertionError(f"裸 group.resources.confirm 应因 group_identity 签名被拒绝，实际错误: {exc}") from exc
+        else:
+            raise AssertionError("裸 group.resources.confirm 不应在强制 group_identity 签名策略下成功")
+
+        confirmed_plan = await alice.group.resources.execute_pending_ops(pending, aid_store=alice_store)
+        confirmed = confirmed_plan.get("confirmed") if isinstance(confirmed_plan, dict) else None
+        if not isinstance(confirmed, dict) or confirmed.get("confirmed") is not True:
+            raise AssertionError(f"group.resources.execute_pending_ops confirm 返回异常: {confirmed_plan}")
+        resource_id = _resource_id(confirmed, "group.resources.confirm")
+        if (confirmed.get("resource") or {}).get("resource_path") != folder_path:
+            raise AssertionError(f"group.resources.confirm resource_path 异常: {confirmed}")
+
+        listed = await bob.call("group.resources.list", {
             "group_id": group_id,
-            "parent_resource_id": folder_id,
-            "name": "note.txt",
-            "storage_ref": {
-                "owner_aid": _ALICE_AID,
-                "bucket": bucket,
-                "object_id": object_id,
-                "object_key": object_key,
-                "filename": "note.txt",
-            },
+            "prefix": "announce/unsigned/",
         })
-        resource_id = _resource_id(mounted, "group.resources.mount_object")
+        items = listed.get("items") if isinstance(listed, dict) else []
+        if not any(item.get("resource_id") == resource_id for item in items or []):
+            raise AssertionError(f"成员未看到无签名 confirm 后的 group-storage 目录: {listed}")
 
-        renamed = await _unsigned_call(alice, "group.resources.rename", {
+        delete_pending = await _unsigned_call(alice, "group.resources.delete", {
             "group_id": group_id,
             "resource_id": resource_id,
-            "new_name": "note-renamed.txt",
+            "recursive": True,
         })
-        if _resource_id(renamed, "group.resources.rename") != resource_id:
-            raise AssertionError(f"group.resources.rename 后 resource_id 不稳定: {renamed}")
-
-        access = await _unsigned_call(bob, "group.resources.get_access", {
-            "group_id": group_id,
-            "resource_id": resource_id,
-        })
-        download_url = str((access.get("download") or {}).get("download_url") or "").strip()
-        if not download_url:
-            raise AssertionError(f"group.resources.get_access 未返回 download_url: {access}")
-
-        unmounted = await _unsigned_call(alice, "group.resources.unmount", {
-            "group_id": group_id,
-            "resource_id": resource_id,
-        })
-        if unmounted.get("deleted") is not True and unmounted.get("unmounted") is not True:
-            raise AssertionError(f"group.resources.unmount 返回异常: {unmounted}")
+        if delete_pending.get("mode") != "pending_ops" or delete_pending.get("operation") != "delete":
+            raise AssertionError(f"group.resources.delete 未返回 pending_ops: {delete_pending}")
+        deleted_plan = await alice.group.resources.execute_pending_ops(delete_pending, aid_store=alice_store)
+        deleted = deleted_plan.get("confirmed") if isinstance(deleted_plan, dict) else None
+        if not isinstance(deleted, dict) or deleted.get("deleted") is not True:
+            raise AssertionError(f"group.resources.execute_pending_ops delete 返回异常: {deleted_plan}")
         resource_id = ""
     finally:
-        if resource_id:
-            try:
-                await alice.call("group.resources.unmount", {
-                    "group_id": group_id,
-                    "resource_id": resource_id,
-                })
-            except Exception:
-                pass
         if group_id:
             try:
                 await alice.call("group.dissolve", {"group_id": group_id})
             except Exception:
                 pass
-        if object_id:
-            try:
-                await alice.call("storage.delete_object", {
-                    "owner_aid": _ALICE_AID,
-                    "bucket": bucket,
-                    "object_id": object_id,
-                })
-            except Exception:
-                pass
+        alice_store.close()
         await bob.close()
         await alice.close()
 

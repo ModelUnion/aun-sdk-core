@@ -5,7 +5,7 @@ export { VERSION as __version__ } from './version.js';
 // 客户端
 export { AUNClient, type ConnectionOptions, type NotifyOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
-export { AIDStore, type AIDInfo } from './aid-store.js';
+export { AIDStore, type AIDInfo, type ImportGroupIdentityOptions, type ImportGroupIdentityResult } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
 
 // 配置
@@ -88,6 +88,36 @@ export {
   type WebSocketFactoryOptions,
   type WebSocketLike,
 } from './service-proxy.js';
+
+// Storage VFS
+export {
+  StorageVFS,
+  StorageLowLevel,
+  StorageError,
+  StorageNotFoundError,
+  StorageAccessDeniedError,
+  StorageConflictError,
+  StorageLoopError,
+  StorageDanglingSymlinkError,
+  type NodeView,
+  type UsageView,
+  type DownloadResult,
+  type RemoveResult,
+  type UnmountResult,
+} from './storage/index.js';
+
+// Facade API
+export {
+  MessageFacade,
+  MessageThoughtFacade,
+  GroupFacade,
+  GroupThoughtFacade,
+  GroupResourcesFacade,
+  GroupPendingOpsPartialFailure,
+  StreamFacade,
+  type FacadeParams,
+  type FacadeRpcClient,
+} from './facades.js';
 
 // 发现
 export { GatewayDiscovery } from './discovery.js';

@@ -5,6 +5,8 @@ from .config import get_device_id
 from .e2ee import ProtectedHeaders
 from .result import ErrorInfo, Result, result_err, result_ok
 from .types import ConnectionOptions, ConnectionState
+from .facades import GroupFacade, GroupPendingOpsPartialFailure, GroupResourcesFacade, MessageFacade, StreamFacade, ThoughtFacade
+from .storage import StorageLowLevel, StorageVFS
 from .errors import (
     AUNError,
     AuthError,
@@ -42,6 +44,14 @@ __all__ = [
     "ProtectedHeaders",
     "ConnectionOptions",
     "ConnectionState",
+    "GroupFacade",
+    "GroupPendingOpsPartialFailure",
+    "GroupResourcesFacade",
+    "MessageFacade",
+    "StreamFacade",
+    "ThoughtFacade",
+    "StorageLowLevel",
+    "StorageVFS",
     "get_device_id",
     "AUNError",
     "AuthError",

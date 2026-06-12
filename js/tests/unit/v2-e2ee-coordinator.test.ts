@@ -29,6 +29,7 @@ function createCoordinator(): { coordinator: V2E2EECoordinator; client: Record<s
     _transport: {
       call: vi.fn(async () => ({ ok: true })),
     },
+    _delivery: { attachSendResultEnvelope: vi.fn((_method: string, _params: unknown, result: unknown) => result) },
     _decryptV2EnvelopeForThought: vi.fn(async () => null),
     _publishOrderedMessage: vi.fn(async () => true),
     _publishAppEvent: vi.fn(async () => true),

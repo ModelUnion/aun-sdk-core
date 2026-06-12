@@ -89,6 +89,14 @@ export class CryptoProvider {
     };
   }
 
+  generateIdentityAsync(): Promise<{
+    private_key_pem: string;
+    public_key_der_b64: string;
+    curve: string;
+  }> {
+    return this.generateIdentity();
+  }
+
   /**
    * 签名登录 nonce（异步）。
    * 返回 [signatureBase64, clientTime]
@@ -124,6 +132,14 @@ export class CryptoProvider {
     // 将 P1363 格式转为 DER 格式（与 Python SDK 兼容）
     const derSignature = p1363ToDer(new Uint8Array(signature));
     return [uint8ToBase64(derSignature), usedTime];
+  }
+
+  signLoginNonceAsync(
+    privateKeyPem: string,
+    nonce: string,
+    clientTime?: string,
+  ): Promise<[string, string]> {
+    return this.signLoginNonce(privateKeyPem, nonce, clientTime);
   }
 
   /** 生成客户端 nonce（12 字节随机数的 base64 编码） */

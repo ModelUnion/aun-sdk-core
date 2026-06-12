@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from ..config import slot_isolation_key
+from ..errors import ConnectionError
 from ..group_id import normalize_group_id as _normalize_group_id
 from ..seq_tracker import SeqTracker
 from ..types import ConnectionState
@@ -200,6 +201,15 @@ class MessageDeliveryEngine:
                 "group.changed skipped duplicate/stale: group=%s event_seq=%d contiguous=%d",
                 group_id, event_seq, contig_before,
             )
+            if getattr(client, "_transport", None) is not None:
+                ack_seq = min(event_seq, contig_before) if contig_before > 0 else event_seq
+                if ack_seq > 0:
+                    client._fire_ack("group.ack_events", {
+                        "group_id": group_id,
+                        "event_seq": ack_seq,
+                        "device_id": getattr(client, "_device_id", ""),
+                        "slot_id": getattr(client, "_slot_id", ""),
+                    }, "group event covered push")
             return
 
         client._enqueue_ordered_message(ns, "group.changed", event_seq, data)
@@ -812,7 +822,23 @@ class MessageDeliveryEngine:
         client = self.client
         params = client._clamp_ack_params(method, params) if isinstance(params, dict) else params
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(client._safe_ack(method, params, label))
+        task = loop.create_task(client._safe_ack(method, params, label))
+        tasks = getattr(client, "_background_ack_tasks", None)
+        if tasks is None:
+            tasks = set()
+            client._background_ack_tasks = tasks
+        tasks.add(task)
+
+        def _discard(done_task: asyncio.Task) -> None:
+            tasks.discard(done_task)
+            try:
+                done_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        task.add_done_callback(_discard)
 
     async def await_ack(self, method: str, params: dict[str, Any], label: str = "") -> None:
         """等待 ack RPC 完成，用于显式 pull 返回前收敛服务端游标。"""
@@ -873,10 +899,30 @@ class MessageDeliveryEngine:
             if method in client._SIGNED_METHODS:
                 client._sign_client_operation(method, params)
             client._log.debug("client", "%s auto-ack send: method=%s params=%s", label or method, method, params)
-            result = await client._transport.call(method, params)
+            result = await self.transport_call_background(method, params)
             client._log.debug("client", "%s auto-ack ok: method=%s result=%s", label or method, method, result)
         except Exception as exc:
             client._log.debug("client", "%s auto-ack failed: %s", label or method, exc)
+
+    async def transport_call_background(self, method: str, params: dict[str, Any]) -> Any:
+        """调用支持 background 的 transport；兼容旧测试替身。"""
+        try:
+            return await self.client._transport.call(method, params, background=True)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return await self.client._transport.call(method, params)
+
+    async def run_background_rpc(self, coro_factory) -> Any:
+        client = self.client
+        if getattr(client, "_closing", False) or client._public_state != ConnectionState.READY:
+            raise ConnectionError("client is closing or not connected")
+        previous = int(getattr(client, "_background_rpc_depth", 0) or 0)
+        client._background_rpc_depth = previous + 1
+        try:
+            return await coro_factory()
+        finally:
+            client._background_rpc_depth = previous
 
     async def on_raw_message_received(self, data: Any) -> None:
         """处理 transport 层推送的原始消息：解密后 re-publish 给用户。"""
@@ -1163,7 +1209,9 @@ class MessageDeliveryEngine:
                         try:
                             contig = client._seq_tracker.get_contiguous_seq(ns)
                             after_seq = max(0, contig)
-                            await client._pull_group_v2_internal({"group_id": group_id, "after_seq": after_seq, "limit": 50})
+                            await self.run_background_rpc(
+                                lambda: client._pull_group_v2_internal({"group_id": group_id, "after_seq": after_seq, "limit": 50})
+                            )
                         finally:
                             client._gap_fill_done.pop(dedup_key, None)
                     except Exception as exc:
@@ -1246,12 +1294,18 @@ class MessageDeliveryEngine:
 
         ns_for_max = f"group:{group_id}"
         client._seq_tracker.update_max_seen(ns_for_max, seq)
-        if client._seq_tracker.get_contiguous_seq(ns_for_max) == seq:
+        contig_for_group = client._seq_tracker.get_contiguous_seq(ns_for_max)
+        if contig_for_group == seq or (event_kind == "group.online_unread_hint" and contig_for_group > seq):
             client._log.debug(
                 "client",
                 "_on_raw_group_v2_message_created duplicate push already covered: group=%s seq=%d",
                 group_id, seq,
             )
+            if getattr(client, "_transport", None) is not None:
+                client._fire_ack("group.v2.ack", {
+                    "group_id": group_id,
+                    "up_to_seq": seq,
+                }, "group v2 covered push")
             return
         client._repair_push_contiguous_bound(
             ns_for_max, seq, has_payload=False, label="_raw.group.v2.message_created",
@@ -1268,13 +1322,17 @@ class MessageDeliveryEngine:
                     try:
                         contig = client._seq_tracker.get_contiguous_seq(ns)
                         after_seq = max(0, contig)
-                        pull_params = {"group_id": group_id, "after_seq": after_seq, "limit": 50}
+                        pull_params = {
+                            "group_id": group_id,
+                            "after_seq": after_seq,
+                            "limit": 50,
+                        }
                         client._log.debug(
                             "client",
                             "_on_raw_group_v2_message_created -> group.v2.pull group=%s after_seq=%d",
                             group_id, after_seq,
                         )
-                        pulled = await client._pull_group_v2_internal(pull_params)
+                        pulled = await self.run_background_rpc(lambda: client._pull_group_v2_internal(pull_params))
                         msgs = pulled.get("messages", []) if isinstance(pulled, dict) else []
                         client._log.debug(
                             "client",
@@ -1363,6 +1421,7 @@ class MessageDeliveryEngine:
                 result = await client.call("message.pull", {
                     "after_seq": after_seq,
                     "limit": 50,
+                    "_rpc_background": True,
                 })
             finally:
                 self.runtime.delivery.set_gap_fill_active(False)
@@ -1398,7 +1457,7 @@ class MessageDeliveryEngine:
                     contig = client._seq_tracker.get_contiguous_seq(ns_key)
                     if contig > 0 and contig != contig_before:
                         try:
-                            await client._transport.call("message.ack", {
+                            await self.transport_call_background("message.ack", {
                                 "seq": contig, "device_id": client._device_id, "slot_id": client._slot_id,
                             })
                         except Exception as ack_exc:
@@ -1440,6 +1499,7 @@ class MessageDeliveryEngine:
                     "after_event_seq": next_after_seq,
                     "device_id": client._device_id,
                     "limit": 50,
+                    "_rpc_background": True,
                 })
                 if not isinstance(result, dict):
                     return
@@ -1502,7 +1562,7 @@ class MessageDeliveryEngine:
                 if events and ack_contig > 0 and ack_contig != page_contig_before:
                     ack_seq = min(ack_contig, ack_max_seen) if ack_max_seen > 0 else ack_contig
                     try:
-                        await client._transport.call("group.ack_events", {
+                        await self.transport_call_background("group.ack_events", {
                             "group_id": group_id, "event_seq": ack_seq,
                             "device_id": client._device_id,
                             "slot_id": client._slot_id,
@@ -1860,7 +1920,7 @@ class MessageDeliveryEngine:
         client._gap_fill_done[dedup_key] = time.time()
 
         try:
-            await client._pull_v2_internal({})
+            await self.run_background_rpc(lambda: client._pull_v2_internal({}))
             new_contig = client._seq_tracker.get_contiguous_seq(ns) if ns else -1
             client._log.debug(
                 "client",

@@ -18,6 +18,7 @@ import { URL } from 'node:url';
 
 import { configFromMap, getDeviceId, normalizeSlotId, type AUNConfig } from './config.js';
 import { CryptoProvider } from './crypto.js';
+import { AIDStore } from './aid-store.js';
 import { GatewayDiscovery } from './discovery.js';
 import { DnsResilientNet } from './net.js';
 import type { ProtectedHeadersInput } from './protected-headers.js';
@@ -48,6 +49,8 @@ import { IdentityRuntimeManager } from './client/identity.js';
 import { LifecycleController } from './client/lifecycle.js';
 import { PeerDirectory } from './client/peers.js';
 import { RpcPipeline } from './client/rpc-pipeline.js';
+import { GroupFacade, MessageFacade, StreamFacade } from './facades.js';
+import { StorageVFS } from './storage/vfs.js';
 import { V2E2EECoordinator } from './client/v2-e2ee.js';
 import { GroupStateCoordinator } from './client/group-state.js';
 import { V2Session, V2KeyStore, type CallFn } from './v2/session/index.js';
@@ -183,6 +186,14 @@ export interface NotifyOptions {
   ttlMs?: number;
 }
 
+export interface BindGroupAidOptions {
+  aidStore?: AIDStore;
+}
+
+export interface CompleteGroupTransferOptions {
+  aidStore?: AIDStore;
+}
+
 interface ConnectParams extends RpcParams {
   access_token?: string;
   gateway?: string;
@@ -256,16 +267,24 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
-  'group.add_member',
+  'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access',
   'group.resources.resolve_access_ticket',
 ]);
@@ -285,7 +304,8 @@ const SIGNED_METHODS = new Set([
   'group.leave', 'group.remove_member', 'group.update_rules',
   'group.update', 'group.update_announcement',
   'group.update_join_requirements', 'group.set_role',
-  'group.transfer_owner', 'group.review_join_request',
+  'group.transfer_owner', 'group.bind_group_aid', 'group.complete_transfer',
+  'group.review_join_request',
   'group.batch_review_join_request',
   'group.request_join', 'group.use_invite_code',
   'group.thought.put',
@@ -294,10 +314,10 @@ const SIGNED_METHODS = new Set([
   'group.resources.put', 'group.resources.create_folder',
   'group.resources.rename', 'group.resources.move',
   'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete', 'group.resources.cleanup_by_storage_ref',
-  'group.resources.request_add', 'group.resources.request_mount_object',
-  'group.resources.direct_add', 'group.resources.approve_request',
-  'group.resources.reject_request', 'group.resources.unmount',
+  'group.resources.delete',
+  'group.resources.namespace_ready', 'group.resources.confirm',
+  'group.resources.confirm_mount', 'group.resources.get_df',
+  'group.resources.unmount',
   'group.resources.get_access', 'group.resources.resolve_access_ticket',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
@@ -305,6 +325,15 @@ const SIGNED_METHODS = new Set([
   'storage.create_folder', 'storage.rename_folder', 'storage.move_folder',
   'storage.delete_folder', 'storage.move_object', 'storage.copy_object',
   'storage.batch_delete', 'storage.set_object_meta', 'storage.append_object',
+  'storage.set_acl', 'storage.remove_acl', 'storage.set_visibility',
+  'storage.check_access',
+  'storage.issue_token', 'storage.revoke_token',
+  'storage.create_symlink', 'storage.atomic_repoint',
+  'storage.rename_symlink', 'storage.delete_symlink',
+  'storage.fs.mkdir', 'storage.fs.remove', 'storage.fs.rename', 'storage.fs.copy',
+  'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
+  'storage.fs.invalidate_membership',
+  'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -715,6 +744,10 @@ export class AUNClient {
   private _delivery!: MessageDeliveryEngine;
   private _v2E2EE!: V2E2EECoordinator;
   private _groupState!: GroupStateCoordinator;
+  private _storage?: StorageVFS;
+  private _message?: MessageFacade;
+  private _group?: GroupFacade;
+  private _stream?: StreamFacade;
 
   constructor(aid?: AID) {
     if (aid !== null && aid !== undefined && !isAIDObject(aid)) {
@@ -864,6 +897,30 @@ export class AUNClient {
   /** 当前 AID */
   get aid(): string | null {
     return this._aid;
+  }
+
+  /** AUN Storage VFS 入口 */
+  get storage(): StorageVFS {
+    if (!this._storage) this._storage = new StorageVFS(this);
+    return this._storage;
+  }
+
+  /** Message facade 入口 */
+  get message(): MessageFacade {
+    if (!this._message) this._message = new MessageFacade(this);
+    return this._message;
+  }
+
+  /** Group facade 入口 */
+  get group(): GroupFacade {
+    if (!this._group) this._group = new GroupFacade(this);
+    return this._group;
+  }
+
+  /** Stream facade 入口 */
+  get stream(): StreamFacade {
+    if (!this._stream) this._stream = new StreamFacade(this);
+    return this._stream;
   }
 
   /** 当前 AID 值对象 */
@@ -1148,6 +1205,213 @@ export class AUNClient {
    */
   async call(method: string, params?: RpcParams): Promise<RpcResult> {
     return await this._rpcPipeline.call(method, params);
+  }
+
+  async createGroup(params: RpcParams = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('createGroup params must be an object');
+    }
+    const payload: RpcParams = { ...params };
+    const groupName = String(payload.group_name ?? payload.groupName ?? '').trim();
+    if (!groupName) {
+      return await this.call('group.create', payload);
+    }
+
+    const keyPair = new CryptoProvider().generateIdentity();
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    const result = await this.call('group.create', payload);
+
+    const resultMap = isJsonObject(result as JsonValue | object | null | undefined) ? result as JsonObject : {};
+    const group = isJsonObject(resultMap.group as JsonValue | object | null | undefined) ? resultMap.group as JsonObject : {};
+    const aidCert = isJsonObject(resultMap.aid_cert as JsonValue | object | null | undefined) ? resultMap.aid_cert as JsonObject : {};
+    const groupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!groupAid || !certPem) {
+      throw new ValidationError('group.create named group response missing group.group_aid or aid_cert.cert');
+    }
+
+    const store = new AIDStore({
+      aunPath: this._configModel.aunPath,
+      encryptionSeed: this._configModel.seedPassword ?? '',
+      slotId: this._slotId,
+      verifySsl: this._configModel.verifySsl,
+      rootCaPath: this._configModel.rootCaPath,
+      debug: this._configModel.debug,
+    });
+    try {
+      const imported = store.importGroupIdentity(groupAid, {
+        private_key_pem: keyPair.private_key_pem,
+        public_key_der_b64: keyPair.public_key_der_b64,
+        curve: keyPair.curve,
+        cert_pem: certPem,
+      });
+      if (!imported.ok) {
+        throw new ValidationError(imported.error.message);
+      }
+    } finally {
+      store.close();
+    }
+    return result;
+  }
+
+  async bindGroupAid(params: RpcParams = {}, options: BindGroupAidOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('bindGroupAid params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('bindGroupAid requires aidStore');
+    }
+
+    const keyPair = new CryptoProvider().generateIdentity();
+    const payload: RpcParams = { ...params };
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    const result = await this.call('group.bind_group_aid', payload);
+
+    const resultMap = isJsonObject(result as JsonValue | object | null | undefined) ? result as JsonObject : {};
+    const group = isJsonObject(resultMap.group as JsonValue | object | null | undefined) ? resultMap.group as JsonObject : {};
+    const aidCert = isJsonObject(resultMap.aid_cert as JsonValue | object | null | undefined) ? resultMap.aid_cert as JsonObject : {};
+    const groupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!groupAid || !certPem) {
+      throw new ValidationError('group.bind_group_aid response missing group.group_aid or aid_cert.cert');
+    }
+
+    const imported = store.importGroupIdentity(groupAid, {
+      private_key_pem: keyPair.private_key_pem,
+      public_key_der_b64: keyPair.public_key_der_b64,
+      curve: keyPair.curve,
+      cert_pem: certPem,
+    });
+    if (!imported.ok) {
+      throw new ValidationError(imported.error.message);
+    }
+    return result;
+  }
+
+  async startGroupTransfer(params: RpcParams = {}, options: CompleteGroupTransferOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('startGroupTransfer params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('startGroupTransfer requires aidStore');
+    }
+    const groupId = String(params.group_id ?? '').trim();
+    const newOwner = String(params.new_owner ?? '').trim();
+    if (!groupId || !newOwner) {
+      throw new ValidationError('startGroupTransfer requires group_id and new_owner');
+    }
+    let groupAid = String(params.group_aid ?? '').trim();
+    if (!groupAid) {
+      const info = await this.call('group.get', { group_id: groupId });
+      const infoMap = isJsonObject(info as JsonValue | object | null | undefined) ? info as JsonObject : {};
+      const grp = isJsonObject(infoMap.group as JsonValue | object | null | undefined) ? infoMap.group as JsonObject : infoMap;
+      groupAid = String(grp.group_aid ?? '').trim();
+    }
+    if (!groupAid) {
+      throw new ValidationError('startGroupTransfer: unable to determine group_aid');
+    }
+    const loaded = store.load(groupAid);
+    if (!loaded.ok || !loaded.data) {
+      throw new ValidationError(`startGroupTransfer: group_aid identity not found: ${groupAid}`);
+    }
+    const aidObj = loaded.data.aid;
+    if (!aidObj.isPrivateKeyValid() || !aidObj.privateKeyPem) {
+      throw new ValidationError(`startGroupTransfer: group_aid private key not found: ${groupAid}`);
+    }
+    const nonce = crypto.randomUUID().replace(/-/g, '');
+    const issuedMs = Date.now();
+    const canonical = [
+      'aun-group-owner-transfer-v1',
+      groupId.toLowerCase(),
+      groupAid.toLowerCase(),
+      newOwner.toLowerCase(),
+      nonce,
+      String(issuedMs),
+    ].join('|');
+    const signed = aidObj.sign(canonical);
+    if (!signed.ok) {
+      throw new ValidationError(`startGroupTransfer: sign failed: ${signed.error.message}`);
+    }
+    const payload: RpcParams = { ...params, group_aid: groupAid };
+    payload.transfer_auth = { nonce, issued_ms: issuedMs, signature: signed.data.signature };
+    return await this.call('group.transfer_owner', payload);
+  }
+
+  async completeGroupTransfer(params: RpcParams = {}, options: CompleteGroupTransferOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('completeGroupTransfer params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('completeGroupTransfer requires aidStore');
+    }
+
+    const keyPair = new CryptoProvider().generateIdentity();
+    const payload: RpcParams = { ...params };
+    const groupId = String(params.group_id ?? '').trim();
+    if (!groupId) {
+      throw new ValidationError('completeGroupTransfer requires group_id');
+    }
+    let groupAid = String(params.group_aid ?? '').trim();
+    if (!groupAid) {
+      const info = await this.call('group.get', { group_id: groupId });
+      const infoMap = isJsonObject(info as JsonValue | object | null | undefined) ? info as JsonObject : {};
+      const grp = isJsonObject(infoMap.group as JsonValue | object | null | undefined) ? infoMap.group as JsonObject : infoMap;
+      groupAid = String(grp.group_aid ?? '').trim();
+    }
+    if (!groupAid) {
+      throw new ValidationError('completeGroupTransfer: unable to determine group_aid');
+    }
+    const current = this.currentAid;
+    const newOwner = String(current?.aid ?? '').trim();
+    if (!current || !newOwner || !current.isPrivateKeyValid()) {
+      throw new ValidationError('completeGroupTransfer requires current new-owner AID with private key');
+    }
+    const nonce = crypto.randomUUID().replace(/-/g, '');
+    const issuedMs = Date.now();
+    const publicKeyHash = crypto.createHash('sha256').update(keyPair.public_key_der_b64, 'utf8').digest('hex');
+    const canonical = [
+      'aun-group-owner-transfer-accept-v1',
+      groupId.toLowerCase(),
+      groupAid.toLowerCase(),
+      newOwner.toLowerCase(),
+      publicKeyHash,
+      nonce,
+      String(issuedMs),
+    ].join('|');
+    const signed = current.sign(canonical);
+    if (!signed.ok) {
+      throw new ValidationError(`completeGroupTransfer: accept sign failed: ${signed.error.message}`);
+    }
+    payload.group_aid = groupAid;
+    payload.public_key = keyPair.public_key_der_b64;
+    payload.curve = keyPair.curve;
+    payload.transfer_accept = { nonce, issued_ms: issuedMs, signature: signed.data.signature };
+    const result = await this.call('group.complete_transfer', payload);
+
+    const resultMap = isJsonObject(result as JsonValue | object | null | undefined) ? result as JsonObject : {};
+    const group = isJsonObject(resultMap.group as JsonValue | object | null | undefined) ? resultMap.group as JsonObject : {};
+    const aidCert = isJsonObject(resultMap.aid_cert as JsonValue | object | null | undefined) ? resultMap.aid_cert as JsonObject : {};
+    const returnedGroupAid = String(group.group_aid ?? resultMap.group_aid ?? '').trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!returnedGroupAid || !certPem) {
+      throw new ValidationError('group.complete_transfer response missing group.group_aid or aid_cert.cert');
+    }
+
+    const imported = store.importGroupIdentity(returnedGroupAid, {
+      private_key_pem: keyPair.private_key_pem,
+      public_key_der_b64: keyPair.public_key_der_b64,
+      curve: keyPair.curve,
+      cert_pem: certPem,
+    });
+    if (!imported.ok) {
+      throw new ValidationError(imported.error.message);
+    }
+    return result;
   }
 
   private static _notifyParamsSizeOk(params: RpcParams): boolean {

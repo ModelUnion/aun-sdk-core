@@ -223,8 +223,9 @@ func TestIntegration_GroupRolesAndTransfer(t *testing.T) {
 	defer cancel()
 
 	// ---- 创建群组 ----
-	createResult, err := alice.Call(ctx, "group.create", map[string]any{
+	createResult, err := alice.CreateGroup(ctx, map[string]any{
 		"name":       fmt.Sprintf("roles-%s", rid),
+		"group_name": fmt.Sprintf("roles%s", rid),
 		"visibility": "private",
 	})
 	skipIfNotImplemented(t, err, "group.create")
@@ -290,7 +291,7 @@ func TestIntegration_GroupRolesAndTransfer(t *testing.T) {
 	t.Logf("admin 不能踢 owner（符合预期）")
 
 	// ---- 转让群主给 Bob ----
-	transferResult, err := alice.Call(ctx, "group.transfer_owner", map[string]any{
+	transferResult, err := alice.StartGroupTransfer(ctx, map[string]any{
 		"group_id":  groupID,
 		"new_owner": bobAID,
 	})
@@ -298,11 +299,21 @@ func TestIntegration_GroupRolesAndTransfer(t *testing.T) {
 		t.Fatalf("群主转让失败: %v", err)
 	}
 	transferMap, _ := transferResult.(map[string]any)
-	if oldOwner, _ := transferMap["old_owner"].(string); oldOwner != aliceAID {
-		t.Logf("transfer 返回 old_owner=%s (期望 %s)", oldOwner, aliceAID)
+	if status := stringFromAny(transferMap["status"]); status != "pending_rekey" {
+		t.Fatalf("group-storage 转让应进入 pending_rekey，实际 status=%q result=%#v", status, transferResult)
 	}
-	if newOwner, _ := transferMap["new_owner"].(string); newOwner != bobAID {
+	if newOwner := stringFromAny(transferMap["new_owner"]); newOwner != bobAID {
 		t.Logf("transfer 返回 new_owner=%s (期望 %s)", newOwner, bobAID)
+	}
+	completeResult, err := bob.CompleteGroupTransfer(ctx, map[string]any{
+		"group_id": groupID,
+	})
+	if err != nil {
+		t.Fatalf("群主转让 complete 失败: %v", err)
+	}
+	completeMap, _ := completeResult.(map[string]any)
+	if status := stringFromAny(completeMap["status"]); status != "transferred" {
+		t.Fatalf("complete_transfer 应返回 transferred，实际 status=%q result=%#v", status, completeResult)
 	}
 	cleanupOwner = bob
 	t.Logf("群主转让给 Bob")
@@ -648,7 +659,7 @@ func TestIntegration_GroupInviteCode(t *testing.T) {
 	ownerAID := fmt.Sprintf("grp%s-o.%s", rid, testIssuer())
 	bobAID := fmt.Sprintf("grp%s-b.%s", rid, testIssuer())
 	charlieAID := fmt.Sprintf("grp%s-c.%s", rid, testIssuer())
-	_ = bobAID    // Bob 通过邀请码加入
+	_ = bobAID     // Bob 通过邀请码加入
 	_ = charlieAID // Charlie 尝试使用耗尽/撤销的码
 
 	ensureConnected(t, owner, ownerAID)

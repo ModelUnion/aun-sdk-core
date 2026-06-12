@@ -42,6 +42,10 @@ export class CryptoProvider {
     };
   }
 
+  generateIdentityAsync(): Promise<IdentityKeyPair> {
+    return Promise.resolve(this.generateIdentity());
+  }
+
   /**
    * 使用私钥签名登录 nonce。
    * 签名数据格式："nonce:timestamp"
@@ -64,6 +68,14 @@ export class CryptoProvider {
     const signature = signer.sign(privateKeyPem);
 
     return [signature.toString('base64'), usedTime];
+  }
+
+  signLoginNonceAsync(
+    privateKeyPem: string,
+    nonce: string,
+    clientTime?: string,
+  ): Promise<[string, string]> {
+    return Promise.resolve(this.signLoginNonce(privateKeyPem, nonce, clientTime));
   }
 
   /**

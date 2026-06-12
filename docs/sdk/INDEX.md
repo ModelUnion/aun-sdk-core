@@ -21,6 +21,7 @@
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
 | [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC |
+| [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 与关键时序 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
 | [09-proxy-rpc-manual](09-proxy-rpc-manual.md) | Service Proxy 控制面 RPC 和数据面隧道注册 |
@@ -60,6 +61,7 @@
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
 - Group RPC → [09-group-rpc-manual](09-group-rpc-manual.md)
+- Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
 - Storage RPC → [09-storage-rpc-manual](09-storage-rpc-manual.md)
 - Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)
@@ -111,7 +113,11 @@
 
 ### 09-*-rpc-manual
 
-各业务服务的 RPC 参数、响应和错误语义。SDK 不为每个 RPC 提供一层业务 wrapper，应用直接通过 `client.call()` 调用。
+各业务服务的 RPC 参数、响应和错误语义。除 Storage VFS、Service Proxy 等明确提供高层门面的能力外，应用通常通过 `client.call()` 调用业务 RPC。
+
+### AUN Storage架构设计
+
+定义 AUN Storage 的 SDK VFS、low-level storage client、Storage Service、Storage Core、Metadata Engine 和 Blob Backend 分层。文档明确主数据流量直连 backend、控制面走 `storage.*` RPC，底层 session/ticket/complete RPC 继续保留，但普通应用通过 SDK VFS 获得类 POSIX 文件操作语义；同时定义类 Linux mode/ACL、目录 `x` 位、mount/unmount、symlink/readlink/lstat、share link 与 direct backend ticket 的授权边界，并给出上传、下载、rename/move、delete/GC、路径解析和鉴权的 Mermaid 时序图。
 
 ### 09-proxy-rpc-manual
 

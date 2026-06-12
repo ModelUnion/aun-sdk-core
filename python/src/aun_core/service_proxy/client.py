@@ -55,6 +55,22 @@ class _RequestBodyStreamError(Exception):
         self.message = str(message or "request body stream is invalid")
 
 
+class _SendLockedWebSocket:
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self._send_lock = asyncio.Lock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)
+
+    def __aiter__(self):
+        return self._ws.__aiter__()
+
+    async def send(self, data: Any) -> Any:
+        async with self._send_lock:
+            return await self._ws.send(data)
+
+
 class ServiceProxyClient:
     def __init__(
         self,
@@ -388,7 +404,8 @@ class ServiceProxyClient:
         self._running = True
         try:
             await self._auto_register_services_with_gateway()
-            async with await self._connect_proxy_ws() as ws:
+            async with await self._connect_proxy_ws() as raw_ws:
+                ws = _SendLockedWebSocket(raw_ws)
                 await ws.send(json.dumps({
                     "type": "service_proxy_auth",
                     "request_id": auth_request_id,
@@ -431,7 +448,8 @@ class ServiceProxyClient:
         self._running = True
         try:
             await self._auto_register_services_with_gateway()
-            async with await self._connect_proxy_ws() as ws:
+            async with await self._connect_proxy_ws() as raw_ws:
+                ws = _SendLockedWebSocket(raw_ws)
                 result = await self._serve_tunnel(
                     ws,
                     auth_request_id=auth_request_id,
@@ -470,7 +488,8 @@ class ServiceProxyClient:
                 while self._running:
                     try:
                         await self._auto_register_services_with_gateway()
-                        async with await self._connect_proxy_ws() as ws:
+                        async with await self._connect_proxy_ws() as raw_ws:
+                            ws = _SendLockedWebSocket(raw_ws)
                             result = await self._serve_tunnel(
                                 ws,
                                 auth_request_id=auth_request_id,
@@ -545,7 +564,8 @@ class ServiceProxyClient:
                 stats["wakeup_count"] += 1
                 try:
                     await self._auto_register_services_with_gateway()
-                    async with await self._connect_proxy_ws() as ws:
+                    async with await self._connect_proxy_ws() as raw_ws:
+                        ws = _SendLockedWebSocket(raw_ws)
                         result = await self._serve_tunnel(
                             ws,
                             auth_request_id=auth_request_id,

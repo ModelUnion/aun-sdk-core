@@ -21,6 +21,12 @@
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
+| [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、服务端分层和 direct backend 上传下载 |
+| [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>) | Python SDK StorageVFS / StorageLowLevel 接口契约、返回类型、错误映射和跨语言对齐要求 |
+| [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>) | `aun fs` 命令语义、寻址规则、输出格式、CLI 工程改造和端到端场景 |
+| [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>) | AUN Storage VFS + CLI 的 6 阶段 TDD 实施计划、P1-P6 实际执行记录和验收口径 |
+| [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>) | `group.resources.*` 从旧 `storage_ref` 引用树迁移到 group_aid storage 命名空间、成员 `memberdata` 挂载和 group-storage 门面编排的终态设计 |
+| [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>) | group-storage 0-10 阶段 TDD 实施计划、阶段 IPO/测试矩阵、实际执行记录、四语言 SDK/CLI/服务端验收与 Docker 单域/双域 E2E 通过记录 |
 | [Notify 通知方案](sdk/Notify通知方案.md) | `client.notify()` 在线轻量通知、跨域 federation 和可靠消息分工 |
 | [Service Proxy RPC 手册](sdk/09-proxy-rpc-manual.md) | `proxy.*` 控制面、proxy-server 数据面注册、服务列表一致性和 wakeup 路由语义 |
 | [协议文档目录](protocol/) | AUN 协议相关文档 |
@@ -37,13 +43,19 @@
 - 本轮 SDK 重构阶段进度、修改点和测试结果 → [AUN SDK 重构修改清单](AUN_SDK_重构修改清单.md)
 - AUNClient 巨类拆分、内部组件边界、逐步迁移和验收矩阵 → [AUNClient 拆分重构执行方案](design/AUNClient拆分重构执行方案.md)
 - AUNClient 完全门面化、Runtime 状态归属、状态写入收口和四端分批实施 → [AUNClient 门面化与 Runtime 状态迁移细化方案](design/AUNClient门面化与Runtime状态迁移细化方案.md)
-- Python / TypeScript / Go 跨语言容器 E2E、test-runner、test-control API、用例矩阵 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
+- Python / TypeScript / Go / JavaScript 跨语言容器 E2E、test-runner、test-control API、用例矩阵 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 - 多语言 SDK 测试缺口与补测清单 → [审查与路线图目录](audit/)
 
 ### SDK 使用与协议
 
 - Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制 → [SDK 文档索引](sdk/INDEX.md)
 - 按主题和行区间查 SDK 文档 → [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md)
+- Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、direct backend 上传下载和服务端分层 → [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>)
+- StorageVFS / StorageLowLevel 接口契约、NodeView/ObjectView、错误映射和跨语言对齐 → [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>)
+- `aun fs` 命令语义、AID 路径解析、输出格式和 CLI 到 SDK 的调用边界 → [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>)
+- AUN Storage 6 阶段 TDD 计划、P1/P2/P3/P4/P5/P6 实际执行记录、阶段实施前详细计划和 Docker 验证纪律 → [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>)
+- `group.resources.*` 替代旧 `storage_ref` 引用树、group_aid 命名空间、群自有区、`memberdata` 成员挂载区、签名者切换和下载 ticket → [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>)
+- group-storage 0-10 阶段 TDD 推进记录、CLI 收口、四语言 SDK pending-op signer、服务端回归和 Docker 单域/双域 E2E 通过记录 → [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>)
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
 - agent.md 远程缓存、`remote_etag` / `local_etag`、消息信封 ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
@@ -67,7 +79,7 @@
 
 - SDK E2EE API、会话管理、ProtectedHeaders → [SDK 文档索引](sdk/INDEX.md)
 - E2EE V2 1DH/per-AID wrap、bootstrap 能力声明、服务端 fanout → [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md)
-- 共享测试向量、transcript 回放、Python / TS / Go E2EE 互通 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
+- 共享测试向量、transcript 回放、Python / TS / Go / JS 互通 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 
 ---
 
@@ -75,7 +87,7 @@
 
 ### aun测试运行指南
 
-记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go 跨语言容器 E2E 的 42 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE，以及三语言 agent 同群的明文/E2EE 矩阵，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口和数据保护规则。
+记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 43 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三语言 agent 同群的明文/E2EE 矩阵，以及 `group_storage_matrix_python_ts_go_js` 四语言 group-storage 互操作，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口和数据保护规则。
 
 ### AUN SDK 重构修改清单
 
@@ -91,7 +103,7 @@
 
 ### 跨语言容器E2E测试方案
 
-定义多语言 SDK 同时作为真实客户端运行的目标测试体系。核心模型是每个语言一个客户端容器，全连接同一 AUN server / gateway；业务消息走 AUN，test-runner 通过每个客户端暴露的 test-control HTTP API 编排动作和断言结果。当前单域落地覆盖 Python / TypeScript / Go，浏览器 JavaScript 仍按宿主机 Playwright 运行。
+定义多语言 SDK 同时作为真实客户端运行的目标测试体系。核心模型是每个语言一个客户端容器，全连接同一 AUN server / gateway；业务消息走 AUN，test-runner 通过每个客户端暴露的 test-control HTTP API 编排动作和断言结果。当前单域落地覆盖 Python / TypeScript / Go / JavaScript 容器互操作；浏览器 JavaScript 网络 E2E 仍按宿主机 Playwright 运行。
 
 ### E2EE V2 简化为 1DH + Per-AID Wrap 方案
 
@@ -128,6 +140,30 @@
 ### SDK 查阅指南
 
 `docs/sdk/AUN_DOCS_GUIDE.md` 说明如何按行区间渐进式读取 SDK 文档，避免一次性加载过多文档内容。
+
+### AUN Storage 架构设计
+
+定义 AUN Storage 的 SDK VFS、low-level storage client、Storage Service、Storage Core、Metadata Engine 和 Blob Backend 分层。文档明确大文件主数据流量直连 localfs/OSS/S3/COS backend，控制面通过 `storage.*` RPC 管理权限、配额、session/ticket、元数据提交和事件；普通应用通过 SDK VFS 使用类 POSIX 文件操作，底层 session/ticket/complete RPC 保留给 SDK 和高级客户端。文档还定义类 Linux mode/ACL、目录 `x` 位、mount/unmount、symlink/readlink/lstat、share link 与 direct backend ticket 的授权边界。
+
+### AUN Storage SDK 存储分层设计
+
+定义 Python SDK 中 `StorageVFS` 与 `StorageLowLevel` 的分层职责。文档给出应用默认入口、low-level RPC 一对一封装、`NodeView/ObjectView/QuotaView` 返回类型、上传下载编排、路径规范化、P1 list 兼容实现、服务端 code 到 SDK 异常的映射，以及后续 TS/Go/JS 对齐要求。
+
+### AUN Storage CLI-fs 命令设计
+
+定义 `aun fs` 命令组的用户语义和工程落地方式。文档覆盖 `ls/stat/cat/cp/mv/rm/mkdir/ln/df` 等命令、`<AID>:<path>` 寻址规则、操作者身份来源、Typer 命令组注册、路径解析工具、现有 `storage_core.py` 迁移、端到端场景和输出格式规范。
+
+### AUN Storage 分阶段实施计划
+
+把 AUN Storage 架构、SDK 分层和 CLI 设计落地为 6 个 TDD 阶段。文档记录 P1 VFS 基础读写层、P2 symlink 原语、P3 `storage.fs.*` 统一 RPC、P4 ACL/token、P5 四语言 SDK/CLI 对齐和 P6 mount/umount 的实际修改范围、执行顺序、单元/集成/E2E 覆盖内容、Docker 内 Python/TS/Go 实测结果、JS 浏览器 Playwright Storage VFS P6 E2E 补跑结果、公网验证口径修正，以及 P6 退群自动失效和完整虚拟卷生命周期等遗留边界；并在每阶段开始前展开服务端表/RPC 变更、任务依赖图、可并行工作包、TDD 执行步骤和 Docker 验证纪律。
+
+### 群存储 group.resources.* 重构设计
+
+定义 `group.resources.*` 从旧的独立群资源树与 `storage_ref` 引用模型切换为 group_aid storage 命名空间封装层。文档明确 group 服务不持群私钥、不代签，群自有区由群主以 group_aid 身份签名直调 storage，成员 `memberdata/<aid>/` 区由成员自助挂载，storage 通过 CA `aid_type=group` 与 `group.check_membership` 实时校验成员身份。文档还给出目录基线、身份生成与匿名群 bind、群主转让 rekey、鉴权矩阵、pending ops、`group.resources.*` 门面重映射、列表/下载/df/生命周期和服务端改造边界。
+
+### 群存储 group-storage 重构实施计划
+
+把 group-storage 重构拆为 0-10 个 TDD 阶段，覆盖契约脚手架、命名群身份、匿名群 bind、命名空间初始化、自有区写、ACL 映射、读路径、成员挂载、生命周期/df、群主转让 rekey、四语言 SDK 对齐、CLI/E2E/文档收口。文档记录每阶段 IPO、阶段计划、测试矩阵、实际执行记录和命令结果；当前阶段 0-10 的代码与文档收口已完成，Python/TS/JS/Go 单元、服务端 group/CA/storage 回归、Docker 镜像重建、单域 `named_group_storage_full_flow` 与双域 `cross_domain_memberdata_mount_read` E2E 均已通过。
 
 ### Notify 通知方案
 

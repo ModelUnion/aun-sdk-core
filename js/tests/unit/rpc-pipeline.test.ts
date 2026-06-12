@@ -20,6 +20,7 @@ function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: Rp
     }),
     _transport: { call: vi.fn(async () => ({ ok: true })) },
     _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
+    _delivery: { attachSendResultEnvelope: vi.fn((_method: string, _params: unknown, result: unknown) => result) },
     ...overrides,
   };
   return { client, pipeline: new RpcPipeline(new ClientRuntime(client)) };
@@ -108,6 +109,8 @@ describe('RpcPipeline 组件边界', () => {
       'storage.get_by_share',
       expect.objectContaining({ share_id: 'share-1', client_signature: { signed: true } }),
       35,
+      undefined,
+      false,
     );
 
     client._signClientOperation.mockClear();
@@ -121,6 +124,8 @@ describe('RpcPipeline 组件边界', () => {
       'group.resources.resolve_access_ticket',
       expect.objectContaining({ ticket: 'ticket-1', client_signature: { signed: true }, device_id: 'device-a', slot_id: 'slot-a' }),
       35,
+      undefined,
+      false,
     );
   });
 });

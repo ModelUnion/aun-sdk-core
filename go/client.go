@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -463,12 +464,35 @@ var nonIdempotentMethods = map[string]bool{
 	"storage.batch_delete":                   true,
 	"storage.set_object_meta":                true,
 	"storage.append_object":                  true,
+	"storage.set_acl":                        true,
+	"storage.remove_acl":                     true,
+	"storage.set_visibility":                 true,
+	"storage.issue_token":                    true,
+	"storage.revoke_token":                   true,
+	"storage.create_symlink":                 true,
+	"storage.atomic_repoint":                 true,
+	"storage.rename_symlink":                 true,
+	"storage.delete_symlink":                 true,
+	"storage.fs.mkdir":                       true,
+	"storage.fs.remove":                      true,
+	"storage.fs.rename":                      true,
+	"storage.fs.copy":                        true,
+	"storage.fs.mount":                       true,
+	"storage.fs.approve":                     true,
+	"storage.fs.reject":                      true,
+	"storage.fs.unmount":                     true,
+	"storage.fs.invalidate_membership":       true,
+	"storage.volume.create":                  true,
+	"storage.volume.renew":                   true,
+	"storage.volume.expire_due":              true,
 	"auth.create_aid":                        true,
 	"auth.renew_cert":                        true,
 	"auth.rekey":                             true,
 	"message.thought.put":                    true,
 	"group.thought.put":                      true,
 	"group.add_member":                       true,
+	"group.bind_group_aid":                   true,
+	"group.complete_transfer":                true,
 	"group.resources.put":                    true,
 	"group.resources.create_folder":          true,
 	"group.resources.rename":                 true,
@@ -476,12 +500,10 @@ var nonIdempotentMethods = map[string]bool{
 	"group.resources.mount_object":           true,
 	"group.resources.update":                 true,
 	"group.resources.delete":                 true,
-	"group.resources.cleanup_by_storage_ref": true,
-	"group.resources.request_add":            true,
-	"group.resources.request_mount_object":   true,
-	"group.resources.direct_add":             true,
-	"group.resources.approve_request":        true,
-	"group.resources.reject_request":         true,
+	"group.resources.namespace_ready":        true,
+	"group.resources.confirm":                true,
+	"group.resources.confirm_mount":          true,
+	"group.resources.get_df":                 true,
 	"group.resources.unmount":                true,
 	"group.resources.get_access":             true,
 	"group.resources.resolve_access_ticket":  true,
@@ -538,6 +560,10 @@ type AUNClient struct {
 	deliveryEngine  *messageDeliveryEngine
 	v2E2EE          *v2E2EECoordinator
 	groupState      *groupStateCoordinator
+	messageFacade   *MessageFacade
+	groupFacade     *GroupFacade
+	streamFacade    *StreamFacade
+	storage         *StorageVFS
 	crypto          *CryptoProvider
 	tokenStore      keystore.TokenStore
 	auth            *AuthFlow
@@ -862,6 +888,46 @@ func (c *AUNClient) GetAID() string {
 	return c.AID()
 }
 
+// Storage 返回 AUN Storage VFS 入口。
+func (c *AUNClient) Storage() *StorageVFS {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.storage == nil {
+		c.storage = NewStorageVFS(c)
+	}
+	return c.storage
+}
+
+// Message 返回 message.* facade 入口。
+func (c *AUNClient) Message() *MessageFacade {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.messageFacade == nil {
+		c.messageFacade = newMessageFacade(c)
+	}
+	return c.messageFacade
+}
+
+// Group 返回 group.* facade 入口。
+func (c *AUNClient) Group() *GroupFacade {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.groupFacade == nil {
+		c.groupFacade = newGroupFacade(c)
+	}
+	return c.groupFacade
+}
+
+// Stream 返回 stream.* facade 入口。
+func (c *AUNClient) Stream() *StreamFacade {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.streamFacade == nil {
+		c.streamFacade = newStreamFacade(c)
+	}
+	return c.streamFacade
+}
+
 // SetAID 设置当前 AID
 func (c *AUNClient) SetAID(aid string) {
 	c.mu.Lock()
@@ -1180,6 +1246,347 @@ func (c *AUNClient) Close() (err error) {
 // Call 发送 RPC 调用（自动 E2EE 加解密）
 func (c *AUNClient) Call(ctx context.Context, method string, params map[string]any) (result any, err error) {
 	return c.getRpcPipeline().call(ctx, method, params)
+}
+
+// CreateGroup 是 group.create 的高层编排：命名群自动生成 group_aid 密钥并导入本地身份。
+func (c *AUNClient) CreateGroup(ctx context.Context, params map[string]any) (any, error) {
+	payload := copyRpcParams(params)
+	groupName := strings.TrimSpace(stringFromAny(payload["group_name"]))
+	if groupName == "" {
+		groupName = strings.TrimSpace(stringFromAny(payload["groupName"]))
+	}
+	if groupName == "" {
+		return c.Call(ctx, "group.create", payload)
+	}
+
+	keyPair, err := (&CryptoProvider{}).GenerateIdentity()
+	if err != nil {
+		return nil, err
+	}
+	publicKey := strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64"))
+	curve := strings.TrimSpace(authGetStrDefault(keyPair, "curve", "P-256"))
+	if publicKey == "" {
+		return nil, NewValidationError("generated group identity missing public key")
+	}
+	payload["public_key"] = publicKey
+	payload["curve"] = curve
+
+	result, err := c.Call(ctx, "group.create", payload)
+	if err != nil {
+		return nil, err
+	}
+	resultMap := rpcResultMap(result)
+	groupMap := rpcResultMap(resultMap["group"])
+	aidCertMap := rpcResultMap(resultMap["aid_cert"])
+	groupAID := strings.TrimSpace(stringFromAny(groupMap["group_aid"]))
+	if groupAID == "" {
+		groupAID = strings.TrimSpace(stringFromAny(resultMap["group_aid"]))
+	}
+	certPEM := strings.TrimSpace(stringFromAny(aidCertMap["cert"]))
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(aidCertMap["cert_pem"]))
+	}
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(resultMap["cert"]))
+	}
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(resultMap["cert_pem"]))
+	}
+	if groupAID == "" || certPEM == "" {
+		return nil, NewValidationError("group.create named group response missing group.group_aid or aid_cert.cert")
+	}
+
+	c.mu.RLock()
+	aunPath := c.configModel.AUNPath
+	seed := c.configModel.SeedPassword
+	verifySSL := c.configModel.VerifySSL
+	rootCAPath := c.configModel.RootCAPath
+	slotID := c.slotID
+	debug := c.logger != nil && c.logger.Debug()
+	c.mu.RUnlock()
+	store := NewAIDStore(aunPath, seed, AIDStoreOptions{
+		SlotID:     slotID,
+		VerifySSL:  &verifySSL,
+		RootCaPath: rootCAPath,
+		Debug:      debug,
+	})
+	defer store.Close()
+	imported := store.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   strings.TrimSpace(authGetStr(keyPair, "private_key_pem")),
+		PublicKeyDerB64: publicKey,
+		Curve:           curve,
+		CertPEM:         certPEM,
+	})
+	if !imported.Ok {
+		return nil, NewValidationError(imported.Error.Message)
+	}
+	return result, nil
+}
+
+// BindGroupAID 是 group.bind_group_aid 的高层编排：为匿名群升级生成 group_aid 密钥并导入本地身份。
+func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (any, error) {
+	store, err := c.openGroupIdentityAIDStore("BindGroupAID")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	payload := copyRpcParams(params)
+	keyPair, err := (&CryptoProvider{}).GenerateIdentity()
+	if err != nil {
+		return nil, err
+	}
+	publicKey := strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64"))
+	curve := strings.TrimSpace(authGetStrDefault(keyPair, "curve", "P-256"))
+	if publicKey == "" {
+		return nil, NewValidationError("generated group identity missing public key")
+	}
+	payload["public_key"] = publicKey
+	payload["curve"] = curve
+
+	result, err := c.Call(ctx, "group.bind_group_aid", payload)
+	if err != nil {
+		return nil, err
+	}
+	groupAID, certPEM, err := extractGroupIdentityRPCMaterial("group.bind_group_aid", result)
+	if err != nil {
+		return nil, err
+	}
+	imported := store.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   strings.TrimSpace(authGetStr(keyPair, "private_key_pem")),
+		PublicKeyDerB64: publicKey,
+		Curve:           curve,
+		CertPEM:         certPEM,
+	})
+	if !imported.Ok {
+		return nil, NewValidationError(imported.Error.Message)
+	}
+	return result, nil
+}
+
+// CompleteGroupTransfer 是 group.complete_transfer 的高层编排：新群主生成 group_aid 新密钥并导入本地身份。
+// StartGroupTransfer 发起 group-storage 群主转让：旧群主用旧 group_aid 私钥签名授权，附带 transfer_auth。
+func (c *AUNClient) StartGroupTransfer(ctx context.Context, params map[string]any) (any, error) {
+	store, err := c.openGroupIdentityAIDStore("StartGroupTransfer")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	payload := copyRpcParams(params)
+	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+	newOwner := strings.TrimSpace(authGetStr(payload, "new_owner"))
+	if groupID == "" || newOwner == "" {
+		return nil, NewValidationError("StartGroupTransfer requires group_id and new_owner")
+	}
+	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
+	if groupAID == "" {
+		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		if infoErr != nil {
+			return nil, infoErr
+		}
+		if infoMap, ok := info.(map[string]any); ok {
+			grp := infoMap
+			if inner, ok := infoMap["group"].(map[string]any); ok {
+				grp = inner
+			}
+			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+		}
+	}
+	if groupAID == "" {
+		return nil, NewValidationError("StartGroupTransfer: unable to determine group_aid")
+	}
+
+	loaded := store.Load(groupAID)
+	if !loaded.Ok || loaded.Data.AID == nil {
+		return nil, NewValidationError(fmt.Sprintf("StartGroupTransfer: group_aid identity not found: %s", groupAID))
+	}
+	aidObj := loaded.Data.AID
+	if !aidObj.IsPrivateKeyValid() || strings.TrimSpace(aidObj.PrivateKeyPem) == "" {
+		return nil, NewValidationError(fmt.Sprintf("StartGroupTransfer: group_aid private key not available: %s", groupAID))
+	}
+
+	nonceBytes := make([]byte, 16)
+	if _, rerr := cryptorand.Read(nonceBytes); rerr != nil {
+		return nil, fmt.Errorf("StartGroupTransfer: nonce generation failed: %w", rerr)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	issuedMs := time.Now().UnixMilli()
+	canonical := strings.Join([]string{
+		"aun-group-owner-transfer-v1",
+		strings.ToLower(groupID),
+		strings.ToLower(groupAID),
+		strings.ToLower(newOwner),
+		nonce,
+		fmt.Sprintf("%d", issuedMs),
+	}, "|")
+	signature, serr := aidObj.Sign([]byte(canonical))
+	if serr != nil {
+		return nil, fmt.Errorf("StartGroupTransfer: sign failed: %w", serr)
+	}
+
+	payload["group_aid"] = groupAID
+	payload["transfer_auth"] = map[string]any{
+		"nonce":     nonce,
+		"issued_ms": issuedMs,
+		"signature": signature,
+	}
+	return c.Call(ctx, "group.transfer_owner", payload)
+}
+
+func (c *AUNClient) CompleteGroupTransfer(ctx context.Context, params map[string]any) (any, error) {
+	store, err := c.openGroupIdentityAIDStore("CompleteGroupTransfer")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	payload := copyRpcParams(params)
+	keyPair, err := (&CryptoProvider{}).GenerateIdentity()
+	if err != nil {
+		return nil, err
+	}
+	publicKey := strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64"))
+	curve := strings.TrimSpace(authGetStrDefault(keyPair, "curve", "P-256"))
+	if publicKey == "" {
+		return nil, NewValidationError("generated group identity missing public key")
+	}
+	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+	if groupID == "" {
+		return nil, NewValidationError("CompleteGroupTransfer requires group_id")
+	}
+	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
+	if groupAID == "" {
+		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		if infoErr != nil {
+			return nil, infoErr
+		}
+		if infoMap, ok := info.(map[string]any); ok {
+			grp := infoMap
+			if inner, ok := infoMap["group"].(map[string]any); ok {
+				grp = inner
+			}
+			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+		}
+	}
+	if groupAID == "" {
+		return nil, NewValidationError("CompleteGroupTransfer: unable to determine group_aid")
+	}
+	currentAID := c.CurrentAID()
+	if currentAID == nil || !currentAID.IsPrivateKeyValid() || strings.TrimSpace(currentAID.Aid) == "" {
+		return nil, NewValidationError("CompleteGroupTransfer requires current new-owner AID with private key")
+	}
+	nonceBytes := make([]byte, 16)
+	if _, rerr := cryptorand.Read(nonceBytes); rerr != nil {
+		return nil, fmt.Errorf("CompleteGroupTransfer: nonce generation failed: %w", rerr)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	issuedMs := time.Now().UnixMilli()
+	publicKeyHash := sha256.Sum256([]byte(publicKey))
+	canonical := strings.Join([]string{
+		"aun-group-owner-transfer-accept-v1",
+		strings.ToLower(groupID),
+		strings.ToLower(groupAID),
+		strings.ToLower(strings.TrimSpace(currentAID.Aid)),
+		fmt.Sprintf("%x", publicKeyHash),
+		nonce,
+		fmt.Sprintf("%d", issuedMs),
+	}, "|")
+	signature, serr := currentAID.Sign([]byte(canonical))
+	if serr != nil {
+		return nil, fmt.Errorf("CompleteGroupTransfer: accept sign failed: %w", serr)
+	}
+	payload["group_aid"] = groupAID
+	payload["public_key"] = publicKey
+	payload["curve"] = curve
+	payload["transfer_accept"] = map[string]any{
+		"nonce":     nonce,
+		"issued_ms": issuedMs,
+		"signature": signature,
+	}
+
+	result, err := c.Call(ctx, "group.complete_transfer", payload)
+	if err != nil {
+		return nil, err
+	}
+	groupAID, certPEM, err := extractGroupIdentityRPCMaterial("group.complete_transfer", result)
+	if err != nil {
+		return nil, err
+	}
+	imported := store.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   strings.TrimSpace(authGetStr(keyPair, "private_key_pem")),
+		PublicKeyDerB64: publicKey,
+		Curve:           curve,
+		CertPEM:         certPEM,
+	})
+	if !imported.Ok {
+		return nil, NewValidationError(imported.Error.Message)
+	}
+	return result, nil
+}
+
+func (c *AUNClient) openGroupIdentityAIDStore(operation string) (*AIDStore, error) {
+	if c == nil {
+		return nil, NewStateError(operation + " requires AIDStore local path capability")
+	}
+	var (
+		aunPath    string
+		seed       string
+		verifySSL  bool
+		rootCAPath string
+		slotID     string
+		debug      bool
+	)
+	c.mu.RLock()
+	if c.configModel != nil {
+		aunPath = strings.TrimSpace(c.configModel.AUNPath)
+		seed = c.configModel.SeedPassword
+		verifySSL = c.configModel.VerifySSL
+		rootCAPath = c.configModel.RootCAPath
+	}
+	slotID = c.slotID
+	debug = c.logger != nil && c.logger.Debug()
+	c.mu.RUnlock()
+	if aunPath == "" {
+		return nil, NewStateError(operation + " requires AIDStore local path capability")
+	}
+	return NewAIDStore(aunPath, seed, AIDStoreOptions{
+		SlotID:     slotID,
+		VerifySSL:  &verifySSL,
+		RootCaPath: rootCAPath,
+		Debug:      debug,
+	}), nil
+}
+
+func extractGroupIdentityRPCMaterial(operation string, result any) (string, string, error) {
+	resultMap := rpcResultMap(result)
+	groupMap := rpcResultMap(resultMap["group"])
+	aidCertMap := rpcResultMap(resultMap["aid_cert"])
+	groupAID := strings.TrimSpace(stringFromAny(groupMap["group_aid"]))
+	if groupAID == "" {
+		groupAID = strings.TrimSpace(stringFromAny(resultMap["group_aid"]))
+	}
+	certPEM := strings.TrimSpace(stringFromAny(aidCertMap["cert"]))
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(aidCertMap["cert_pem"]))
+	}
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(resultMap["cert"]))
+	}
+	if certPEM == "" {
+		certPEM = strings.TrimSpace(stringFromAny(resultMap["cert_pem"]))
+	}
+	if groupAID == "" || certPEM == "" {
+		return "", "", NewValidationError(operation + " response missing group.group_aid or aid_cert.cert")
+	}
+	return groupAID, certPEM, nil
+}
+
+func rpcResultMap(value any) map[string]any {
+	if typed, ok := value.(map[string]any); ok && typed != nil {
+		return typed
+	}
+	return map[string]any{}
 }
 
 func notifyParamsSizeOK(params map[string]any) bool {
@@ -2798,6 +3205,9 @@ func newAUNClientWithAID(aid *AID) *AUNClient {
 		"aun_path":   aid.AunPath,
 		"verify_ssl": aid.VerifySSL,
 	}
+	if aid.encryptionSeed != "" {
+		cfg["seed_password"] = aid.encryptionSeed
+	}
 	if aid.RootCaPath != "" {
 		cfg["root_ca_path"] = aid.RootCaPath
 	}
@@ -3079,6 +3489,11 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 	nextRaw := map[string]any{
 		"aun_path":   aid.AunPath,
 		"verify_ssl": aid.VerifySSL,
+	}
+	if aid.encryptionSeed != "" {
+		nextRaw["seed_password"] = aid.encryptionSeed
+	} else if c.configModel != nil && c.configModel.SeedPassword != "" {
+		nextRaw["seed_password"] = c.configModel.SeedPassword
 	}
 	if aid.RootCaPath != "" {
 		nextRaw["root_ca_path"] = aid.RootCaPath

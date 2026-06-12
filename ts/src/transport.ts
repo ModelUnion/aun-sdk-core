@@ -296,6 +296,7 @@ export class RPCTransport {
   private _rpcQueue: QueuedRpc[] = [];
   private _backgroundRpcQueue: QueuedRpc[] = [];
   private _drainingRpcQueue = false;
+  private _sendChain: Promise<void> = Promise.resolve();
   private _idCounter = 0;
   // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
   // observer 抛异常会被吞掉，不影响 RPC result 返回。
@@ -713,19 +714,43 @@ export class RPCTransport {
       throw new ValidationError('payload is too large');
     }
 
-    await new Promise<void>((resolve, reject) => {
-      try {
-        this._ws!.send(payload, (err) => {
-          if (err) {
-            reject(new ConnectionError(`failed to send notification ${normalizedMethod}: ${err.message}`));
-            return;
-          }
-          this._logger.debug(`notification sent: method=${normalizedMethod}, size=${payloadSize}`);
-          resolve();
-        });
-      } catch (err) {
-        reject(new ConnectionError(`failed to send notification ${normalizedMethod}: ${err instanceof Error ? err.message : String(err)}`));
+    await this._sendText(
+      payload,
+      `notification ${normalizedMethod}`,
+    );
+    this._logger.debug(`notification sent: method=${normalizedMethod}, size=${payloadSize}`);
+  }
+
+  private _enqueueSend(task: () => Promise<void>): Promise<void> {
+    const run = this._sendChain.then(task, task);
+    this._sendChain = run.catch(() => {});
+    return run;
+  }
+
+  private _sendText(payload: string, context: string, beforeSend?: () => boolean): Promise<void> {
+    return this._enqueueSend(async () => {
+      if (beforeSend && !beforeSend()) {
+        throw new ConnectionError(`send cancelled before write: ${context}`);
       }
+      if (this._closed || !this._ws) {
+        const suffix = this._lastCloseCode !== null ? `: close code ${this._lastCloseCode}` : '';
+        throw new ConnectionError(`transport not connected${suffix}`, {
+          ...(this._lastCloseCode !== null ? { code: this._lastCloseCode } : {}),
+        });
+      }
+      await new Promise<void>((resolve, reject) => {
+        try {
+          this._ws!.send(payload, (err) => {
+            if (err) {
+              reject(new ConnectionError(`failed to send ${context}: ${err.message}`));
+              return;
+            }
+            resolve();
+          });
+        } catch (err) {
+          reject(new ConnectionError(`failed to send ${context}: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      });
     });
   }
 
@@ -776,18 +801,25 @@ export class RPCTransport {
         if (entry.background) {
           this._pendingBackground.add(entry.rpcId);
         }
-        try {
-          this._ws.send(entry.payload);
+        this._sendText(
+          entry.payload,
+          `rpc ${entry.method}`,
+          () => this._pending.get(entry.rpcId) === entry.pending,
+        ).then(() => {
           this._logger.debug(`RPC request sent: method=${entry.method}, id=${entry.rpcId}, background=${entry.background}`);
-        } catch (err) {
+        }).catch((err) => {
+          if (this._pending.get(entry.rpcId) !== entry.pending) return;
           this._removeRpc(entry.rpcId, entry.pending);
           this._logger.error(`RPC send failed: method=${entry.method}, id=${entry.rpcId}, error=${err instanceof Error ? err.message : String(err)}`);
           entry.pending.reject(
-            new ConnectionError(
-              `failed to send rpc ${entry.method}: ${err instanceof Error ? err.message : String(err)}`,
-            ),
+            err instanceof ConnectionError
+              ? err
+              : new ConnectionError(
+                `failed to send rpc ${entry.method}: ${err instanceof Error ? err.message : String(err)}`,
+              ),
           );
-        }
+          this._drainRpcQueue();
+        });
       }
     } finally {
       this._drainingRpcQueue = false;

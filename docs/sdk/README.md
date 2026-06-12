@@ -111,6 +111,7 @@ Layer 1: 安全层   TLS + AUN E2EE
 | [06-API手册](06-API手册.md) | AIDStore / AID / AUNClient / ServiceProxyClient / 事件 / RPC 索引 |
 | [07-错误处理](07-错误处理.md) | Result、异常层级、错误码、重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等连接、多 AID、资源清理、测试数据保护 |
+| [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 和关键时序 |
 | [Notify通知方案](Notify通知方案.md) | `client.notify()` 在线轻量通知、跨域 federation 和可靠消息分工 |
 
 RPC 专项手册：

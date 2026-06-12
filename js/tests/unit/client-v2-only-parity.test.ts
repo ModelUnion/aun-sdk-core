@@ -871,6 +871,9 @@ describe('AUNClient V2-only parity', () => {
     expect((client as any)._transport.call).toHaveBeenCalledWith(
       'message.v2.pull',
       expect.objectContaining({ after_seq: 0 }),
+      undefined,
+      undefined,
+      true,
     );
     expect(published).toHaveLength(1);
     expect(published[0]).toMatchObject({
@@ -907,7 +910,13 @@ describe('AUNClient V2-only parity', () => {
       envelope_json: '{}',
     });
 
-    expect(transportCall).toHaveBeenCalledWith('message.v2.pull', expect.objectContaining({ after_seq: 1 }));
+    expect(transportCall).toHaveBeenCalledWith(
+      'message.v2.pull',
+      expect.objectContaining({ after_seq: 1 }),
+      undefined,
+      undefined,
+      true,
+    );
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(1);
     expect((client as any)._seqTracker.getMaxSeenSeq(ns)).toBe(3);
     expect((client as any)._pendingOrderedMsgs.get(ns)?.has(3)).toBe(true);
@@ -939,7 +948,7 @@ describe('AUNClient V2-only parity', () => {
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
     expect(transportCall.mock.calls.some(([method]) => method === 'message.v2.pull')).toBe(false);
-    expect(transportCall).toHaveBeenCalledWith('message.v2.ack', { up_to_seq: 3 });
+    expect(transportCall).toHaveBeenCalledWith('message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true);
   });
 
   it('V2 P2P payload push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
@@ -1013,6 +1022,9 @@ describe('AUNClient V2-only parity', () => {
     expect(transportCall).toHaveBeenCalledWith(
       'group.v2.pull',
       expect.objectContaining({ group_id: groupId, after_seq: 2 }),
+      undefined,
+      undefined,
+      true,
     );
   });
 
@@ -1041,6 +1053,9 @@ describe('AUNClient V2-only parity', () => {
     expect(transportCall).toHaveBeenCalledWith(
       'group.v2.pull',
       expect.objectContaining({ group_id: 'g1', after_seq: 0 }),
+      undefined,
+      undefined,
+      true,
     );
   });
 
@@ -1063,7 +1078,7 @@ describe('AUNClient V2-only parity', () => {
     expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.pull')).toBe(false);
   });
 
-  it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
+  it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等不 pull 但补 ack', async () => {
     const client = connectedV2Client();
     const groupId = 'g1';
     const ns = `group:${groupId}`;
@@ -1080,6 +1095,15 @@ describe('AUNClient V2-only parity', () => {
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
     expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.pull')).toBe(false);
+    const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
+    expect(ackCalls).toEqual([
+      ['group.v2.ack', {
+        group_id: groupId,
+        up_to_seq: 3,
+        device_id: 'dev-alice',
+        slot_id: 'slot-a',
+      }, undefined, undefined, true],
+    ]);
   });
   it('message.v2.pull 返回值不应因 push 已发布 seq 而丢失', async () => {
     const client = connectedV2Client();

@@ -13,6 +13,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -77,6 +79,45 @@ func saveTestIdentity(t *testing.T, s *AIDStore, aid, certPEM, privPEM, pubB64 s
 	}
 }
 
+// genAIDCertForPublicKey 使用指定公钥签发测试证书，模拟服务端为 group_aid 返回的证书。
+func genAIDCertForPublicKey(t *testing.T, aid, publicKeyDerB64 string) string {
+	t.Helper()
+	publicKeyDER, err := base64.StdEncoding.DecodeString(publicKeyDerB64)
+	if err != nil {
+		t.Fatalf("测试公钥不是有效 base64: %v", err)
+	}
+	publicKey, err := x509.ParsePKIXPublicKey(publicKeyDER)
+	if err != nil {
+		t.Fatalf("测试公钥 DER 解析失败: %v", err)
+	}
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("生成测试 CA 密钥失败: %v", err)
+	}
+	now := time.Now()
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(now.Add(time.Nanosecond).UnixNano()),
+		Subject:      pkix.Name{CommonName: aid},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	certDER, err := x509.CreateCertificate(cryptorand.Reader, tmpl, caTmpl, publicKey, caKey)
+	if err != nil {
+		t.Fatalf("签发测试证书失败: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+}
+
 func TestAIDStoreRegisterPersistenceKeepsPrivateKeyMaterial(t *testing.T) {
 	s := newTestAIDStore(t)
 	aid := "register-persist.aid.com"
@@ -101,6 +142,97 @@ func TestAIDStoreRegisterPersistenceKeepsPrivateKeyMaterial(t *testing.T) {
 	}
 	if !r.Data.AID.IsPrivateKeyValid() {
 		t.Fatal("AIDStore 注册路径必须保留私钥材料，供 AUNClient(AID) 后续连接使用")
+	}
+}
+
+func TestAIDStoreImportGroupIdentitySuccess(t *testing.T) {
+	s := newTestAIDStore(t)
+	groupAID := "team-import.aid.com"
+	certPEM, privPEM, pubB64 := genAIDIdentity(t, groupAID, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	result := s.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   privPEM,
+		PublicKeyDerB64: pubB64,
+		Curve:           "P-256",
+		CertPEM:         certPEM,
+	})
+	if !result.Ok {
+		t.Fatalf("导入群身份失败: %s", result.Error.Message)
+	}
+	if !result.Data.Imported || result.Data.AID != groupAID {
+		t.Fatalf("导入结果不正确: %#v", result.Data)
+	}
+
+	loaded := s.Load(groupAID)
+	if !loaded.Ok {
+		t.Fatalf("导入后 Load 失败: %s", loaded.Error.Message)
+	}
+	if _, err := loaded.Data.AID.Sign([]byte("group identity self-test")); err != nil {
+		t.Fatalf("导入后的群身份必须能签名: %v", err)
+	}
+}
+
+func TestAIDStoreImportGroupIdentityRejectsCNMismatch(t *testing.T) {
+	s := newTestAIDStore(t)
+	groupAID := "team-cn.aid.com"
+	certPEM, privPEM, pubB64 := genAIDIdentity(t, "other-team.aid.com", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	result := s.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   privPEM,
+		PublicKeyDerB64: pubB64,
+		CertPEM:         certPEM,
+	})
+	if result.Ok {
+		t.Fatal("证书 CN 与 aid 不一致时应拒绝导入")
+	}
+	if result.Error.Code != ErrCodeCertChainBroken {
+		t.Fatalf("错误码应为 %s，实际: %s", ErrCodeCertChainBroken, result.Error.Code)
+	}
+}
+
+func TestAIDStoreImportGroupIdentityRejectsPublicKeyMismatch(t *testing.T) {
+	s := newTestAIDStore(t)
+	groupAID := "team-key.aid.com"
+	certPEM, privPEM, _ := genAIDIdentity(t, groupAID, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	_, _, otherPubB64 := genAIDIdentity(t, "other-key.aid.com", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	result := s.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   privPEM,
+		PublicKeyDerB64: otherPubB64,
+		CertPEM:         certPEM,
+	})
+	if result.Ok {
+		t.Fatal("证书公钥与 public_key_der_b64 不一致时应拒绝导入")
+	}
+	if result.Error.Code != ErrCodeKeypairMismatch {
+		t.Fatalf("错误码应为 %s，实际: %s", ErrCodeKeypairMismatch, result.Error.Code)
+	}
+}
+
+func TestAIDStoreImportGroupIdentitySaveIdentityFailureUsesDedicatedErrorCode(t *testing.T) {
+	s := newTestAIDStore(t)
+	groupAID := "team-save-fail.aid.com"
+	certPEM, privPEM, pubB64 := genAIDIdentity(t, groupAID, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	s.keyStore.Close()
+	aidsRoot := filepath.Join(s.aunPath, "AIDs")
+	if err := os.RemoveAll(aidsRoot); err != nil {
+		t.Fatalf("清理 AIDs 目录失败: %v", err)
+	}
+	if err := os.WriteFile(aidsRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("创建阻塞文件失败: %v", err)
+	}
+
+	result := s.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   privPEM,
+		PublicKeyDerB64: pubB64,
+		CertPEM:         certPEM,
+	})
+	if result.Ok {
+		t.Fatal("SaveIdentity 失败时不应导入成功")
+	}
+	if result.Error.Code != ErrCodeSaveIdentityFailed {
+		t.Fatalf("错误码应为 %s，实际: %s", ErrCodeSaveIdentityFailed, result.Error.Code)
 	}
 }
 

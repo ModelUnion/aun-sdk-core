@@ -376,12 +376,13 @@ describe('P2-6.6: group.changed 事件补洞链路', () => {
     expect(internalConsumed).toEqual([2, 4, 5]);
     expect(appPublished).toEqual([2, 4, 5]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
-    expect(ackCalls).toEqual([{
+    expect(ackCalls).toEqual([expect.objectContaining({
       group_id: groupId,
       event_seq: 5,
       device_id: 'device-1',
       slot_id: 'slot-a',
-    }]);
+      _rpc_background: true,
+    })]);
 
     await delivery.handleGroupChangedEventSeq({
       group_id: groupId,

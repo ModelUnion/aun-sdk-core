@@ -799,6 +799,384 @@ func connectWithTestAuth(t *testing.T, c *AUNClient, ctx context.Context, params
 	return c.connectWithParams(ctx, params, opt, false, true)
 }
 
+func connectClientToTestRPCServer(t *testing.T, c *AUNClient, wsURL string) {
+	t.Helper()
+	c.mu.Lock()
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+}
+
+func TestCreateGroupNamedImportsGroupIdentity(t *testing.T) {
+	groupAID := "team-created.aid.com"
+	aunPath := t.TempDir()
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method != "group.create" {
+			return map[string]any{"ok": false, "error": "unexpected method"}
+		}
+		publicKey := strings.TrimSpace(stringFromAny(params["public_key"]))
+		if publicKey == "" {
+			return map[string]any{"ok": false, "error": "missing public_key"}
+		}
+		return map[string]any{
+			"group": map[string]any{
+				"group_id":  "g-created",
+				"group_aid": groupAID,
+			},
+			"aid_cert": map[string]any{
+				"cert": genAIDCertForPublicKey(t, groupAID, publicKey),
+			},
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{
+		"aun_path":      aunPath,
+		"seed_password": "group-create-seed",
+	})
+	defer func() { _ = c.Close() }()
+	connectClientToTestRPCServer(t, c, wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := c.CreateGroup(ctx, map[string]any{
+		"group_name": "named-team",
+		"visibility": "private",
+	})
+	if err != nil {
+		t.Fatalf("CreateGroup 命名群失败: %v", err)
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("CreateGroup 应返回 map，实际: %T", result)
+	}
+	if got := stringFromAny(rpcResultMap(resultMap["group"])["group_aid"]); got != groupAID {
+		t.Fatalf("返回 group_aid 不正确: got=%q want=%q", got, groupAID)
+	}
+
+	calls := getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应只调用一次 group.create，实际调用数: %d", len(calls))
+	}
+	call := calls[0]
+	if call.Method != "group.create" {
+		t.Fatalf("方法不正确: %s", call.Method)
+	}
+	if got := stringFromAny(call.Params["group_name"]); got != "named-team" {
+		t.Fatalf("group_name 未透传: %q", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["public_key"])); got == "" {
+		t.Fatal("命名群创建必须携带 public_key")
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["curve"])); got != "P-256" {
+		t.Fatalf("curve 应为 P-256，实际: %q", got)
+	}
+
+	store := NewAIDStore(aunPath, "group-create-seed")
+	defer store.Close()
+	loaded := store.Load(groupAID)
+	if !loaded.Ok {
+		t.Fatalf("CreateGroup 后本地群身份未导入: %s", loaded.Error.Message)
+	}
+	if _, err := loaded.Data.AID.Sign([]byte("created group identity")); err != nil {
+		t.Fatalf("导入后的群身份必须能签名: %v", err)
+	}
+}
+
+func TestCreateGroupWithoutGroupNamePassesThrough(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method != "group.create" {
+			return map[string]any{"ok": false, "error": "unexpected method"}
+		}
+		return map[string]any{
+			"group": map[string]any{
+				"group_id": "plain-created",
+			},
+			"ok": true,
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	connectClientToTestRPCServer(t, c, wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := c.CreateGroup(ctx, map[string]any{"name": "plain-team"})
+	if err != nil {
+		t.Fatalf("CreateGroup 无 group_name 时应原样透传: %v", err)
+	}
+	if stringFromAny(rpcResultMap(rpcResultMap(result)["group"])["group_id"]) != "plain-created" {
+		t.Fatalf("返回结果不正确: %#v", result)
+	}
+
+	calls := getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应只调用一次 group.create，实际调用数: %d", len(calls))
+	}
+	params := calls[0].Params
+	if _, exists := params["public_key"]; exists {
+		t.Fatal("无 group_name 时不应生成 public_key")
+	}
+	if _, exists := params["curve"]; exists {
+		t.Fatal("无 group_name 时不应注入 curve")
+	}
+	if got := stringFromAny(params["name"]); got != "plain-team" {
+		t.Fatalf("原始参数未透传: %q", got)
+	}
+}
+
+func TestBindGroupAIDImportsServerReturnedGroupIdentity(t *testing.T) {
+	groupAID := "team-bound.aid.com"
+	aunPath := t.TempDir()
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method != "group.bind_group_aid" {
+			return map[string]any{"ok": false, "error": "unexpected method"}
+		}
+		publicKey := strings.TrimSpace(stringFromAny(params["public_key"]))
+		if publicKey == "" {
+			return map[string]any{"ok": false, "error": "missing public_key"}
+		}
+		return map[string]any{
+			"group": map[string]any{
+				"group_id":  "anon-upgraded",
+				"group_aid": groupAID,
+			},
+			"aid_cert": map[string]any{
+				"cert": genAIDCertForPublicKey(t, groupAID, publicKey),
+			},
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{
+		"aun_path":      aunPath,
+		"seed_password": "group-bind-seed",
+	})
+	defer func() { _ = c.Close() }()
+	connectClientToTestRPCServer(t, c, wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := c.BindGroupAID(ctx, map[string]any{
+		"group_id":   "anonymous-group",
+		"group_name": "friendly-name.aid.com",
+	})
+	if err != nil {
+		t.Fatalf("BindGroupAID 失败: %v", err)
+	}
+	if got := stringFromAny(rpcResultMap(rpcResultMap(result)["group"])["group_aid"]); got != groupAID {
+		t.Fatalf("返回 group_aid 不正确: got=%q want=%q", got, groupAID)
+	}
+
+	calls := getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应只调用一次 group.bind_group_aid，实际调用数: %d", len(calls))
+	}
+	call := calls[0]
+	if call.Method != "group.bind_group_aid" {
+		t.Fatalf("方法不正确: %s", call.Method)
+	}
+	if got := stringFromAny(call.Params["group_name"]); got != "friendly-name.aid.com" {
+		t.Fatalf("group_name 应原样透传: %q", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["public_key"])); got == "" {
+		t.Fatal("BindGroupAID 必须携带 public_key")
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["curve"])); got != "P-256" {
+		t.Fatalf("curve 应为 P-256，实际: %q", got)
+	}
+
+	store := NewAIDStore(aunPath, "group-bind-seed")
+	defer store.Close()
+	loaded := store.Load(groupAID)
+	if !loaded.Ok {
+		t.Fatalf("BindGroupAID 后本地群身份未按服务端 group_aid 导入: %s", loaded.Error.Message)
+	}
+	if _, err := loaded.Data.AID.Sign([]byte("bound group identity")); err != nil {
+		t.Fatalf("导入后的群身份必须能签名: %v", err)
+	}
+	if wrong := store.Load("friendly-name.aid.com"); wrong.Ok {
+		t.Fatal("BindGroupAID 不应按 group_name 推导落盘 AID")
+	}
+}
+
+func TestBindGroupAIDRequiresLocalPathCapability(t *testing.T) {
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.configModel.AUNPath = ""
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.BindGroupAID(ctx, map[string]any{"group_id": "anonymous-group"})
+	if err == nil {
+		t.Fatal("缺少本地 AIDStore 路径能力时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "requires AIDStore local path capability") {
+		t.Fatalf("错误信息应说明本地路径能力缺失，实际: %v", err)
+	}
+}
+
+func TestBindGroupAIDWithoutGroupNameStillCallsBind(t *testing.T) {
+	groupAID := "team-bound-no-name.aid.com"
+	aunPath := t.TempDir()
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method != "group.bind_group_aid" {
+			return map[string]any{"ok": false, "error": "unexpected method"}
+		}
+		publicKey := strings.TrimSpace(stringFromAny(params["public_key"]))
+		return map[string]any{
+			"group": map[string]any{
+				"group_id":  "anon-upgraded-no-name",
+				"group_aid": groupAID,
+			},
+			"aid_cert": map[string]any{
+				"cert": genAIDCertForPublicKey(t, groupAID, publicKey),
+			},
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{
+		"aun_path":      aunPath,
+		"seed_password": "group-bind-no-name-seed",
+	})
+	defer func() { _ = c.Close() }()
+	connectClientToTestRPCServer(t, c, wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.BindGroupAID(ctx, map[string]any{"group_id": "anonymous-group"}); err != nil {
+		t.Fatalf("BindGroupAID 无 group_name 时仍应成功调用 bind: %v", err)
+	}
+
+	calls := getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应只调用一次 group.bind_group_aid，实际调用数: %d", len(calls))
+	}
+	if calls[0].Method != "group.bind_group_aid" {
+		t.Fatalf("方法不正确: %s", calls[0].Method)
+	}
+	if _, exists := calls[0].Params["group_name"]; exists {
+		t.Fatalf("未传 group_name 时不应由 SDK 补写: %#v", calls[0].Params)
+	}
+	if got := strings.TrimSpace(stringFromAny(calls[0].Params["public_key"])); got == "" {
+		t.Fatal("无 group_name 时也必须携带 public_key")
+	}
+	if got := strings.TrimSpace(stringFromAny(calls[0].Params["curve"])); got != "P-256" {
+		t.Fatalf("curve 应为 P-256，实际: %q", got)
+	}
+}
+
+func TestCompleteGroupTransferImportsServerReturnedGroupIdentity(t *testing.T) {
+	groupAID := "team-transferred.aid.com"
+	aunPath := t.TempDir()
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "group.get" {
+			return map[string]any{"group": map[string]any{"group_id": "transferred-group", "group_aid": groupAID}}
+		}
+		if method != "group.complete_transfer" {
+			return map[string]any{"ok": false, "error": "unexpected method"}
+		}
+		publicKey := strings.TrimSpace(stringFromAny(params["public_key"]))
+		if publicKey == "" {
+			return map[string]any{"ok": false, "error": "missing public_key"}
+		}
+		accept, _ := params["transfer_accept"].(map[string]any)
+		if strings.TrimSpace(stringFromAny(accept["signature"])) == "" {
+			return map[string]any{"ok": false, "error": "missing transfer_accept"}
+		}
+		return map[string]any{
+			"status": "transferred",
+			"group": map[string]any{
+				"group_id":  "transferred-group",
+				"group_aid": groupAID,
+			},
+			"aid_cert": map[string]any{
+				"cert":        genAIDCertForPublicKey(t, groupAID, publicKey),
+				"key_purpose": "group_identity",
+			},
+		}
+	})
+	defer closeServer()
+
+	ownerCert, ownerPriv, ownerPub := genAIDIdentity(t, "new-owner-transfer.aid.com", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	store := NewAIDStore(aunPath, "group-transfer-seed")
+	saveTestIdentity(t, store, "new-owner-transfer.aid.com", ownerCert, ownerPriv, ownerPub)
+	loadedOwner := store.Load("new-owner-transfer.aid.com")
+	if !loadedOwner.Ok {
+		t.Fatalf("加载测试新群主身份失败: %s", loadedOwner.Error.Message)
+	}
+	store.Close()
+	c := NewAUNClient(loadedOwner.Data.AID)
+	c.configModel.AUNPath = aunPath
+	c.config["aun_path"] = aunPath
+	c.config["seed_password"] = "group-transfer-seed"
+	c.rebuildRuntimeForIdentity(loadedOwner.Data.AID)
+	defer func() { _ = c.Close() }()
+	connectClientToTestRPCServer(t, c, wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := c.CompleteGroupTransfer(ctx, map[string]any{
+		"group_id": "transferred-group",
+	})
+	if err != nil {
+		t.Fatalf("CompleteGroupTransfer 失败: %v", err)
+	}
+	if got := stringFromAny(rpcResultMap(rpcResultMap(result)["group"])["group_aid"]); got != groupAID {
+		t.Fatalf("返回 group_aid 不正确: got=%q want=%q", got, groupAID)
+	}
+
+	calls := getCalls()
+	if len(calls) != 2 {
+		t.Fatalf("应调用 group.get + group.complete_transfer，实际调用数: %d", len(calls))
+	}
+	if calls[0].Method != "group.get" {
+		t.Fatalf("第一调用应为 group.get，实际: %s", calls[0].Method)
+	}
+	call := calls[1]
+	if call.Method != "group.complete_transfer" {
+		t.Fatalf("方法不正确: %s", call.Method)
+	}
+	if got := stringFromAny(call.Params["group_id"]); got != "transferred-group" {
+		t.Fatalf("group_id 未透传: %q", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["public_key"])); got == "" {
+		t.Fatal("CompleteGroupTransfer 必须携带 public_key")
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["curve"])); got != "P-256" {
+		t.Fatalf("curve 应为 P-256，实际: %q", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(call.Params["group_aid"])); got != groupAID {
+		t.Fatalf("group_aid 未补齐: %q", got)
+	}
+	accept, ok := call.Params["transfer_accept"].(map[string]any)
+	if !ok || strings.TrimSpace(stringFromAny(accept["signature"])) == "" {
+		t.Fatalf("CompleteGroupTransfer 必须携带 transfer_accept: %#v", call.Params["transfer_accept"])
+	}
+
+	store = NewAIDStore(aunPath, "group-transfer-seed")
+	defer store.Close()
+	loaded := store.Load(groupAID)
+	if !loaded.Ok {
+		t.Fatalf("CompleteGroupTransfer 后本地群身份未按服务端 group_aid 导入: %s", loaded.Error.Message)
+	}
+	if _, err := loaded.Data.AID.Sign([]byte("transferred group identity")); err != nil {
+		t.Fatalf("导入后的群身份必须能签名: %v", err)
+	}
+}
+
 // ── 客户端构造测试 ───────────────────────────────────────
 
 // TestConstructNoArgs 验证使用空配置创建客户端
@@ -1651,6 +2029,73 @@ func TestOnRawGroupChangedPushPersistsAndAcksContiguousEventSeq(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("group.changed 连续 push 未触发 group.ack_events: %#v", getCalls())
+}
+
+func TestOnRawGroupChangedCoveredEventReconcilesServerCursorWithoutFill(t *testing.T) {
+	groupID := "g-covered.example.com"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	published := make(chan any, 1)
+	sub := c.On("group.changed", func(payload any) {
+		published <- payload
+	})
+	defer sub.Unsubscribe()
+
+	ns := "group_event:" + groupID
+	c.seqTracker.ForceContiguousSeq(ns, 6)
+	c.onRawGroupChanged(map[string]any{
+		"group_id":  groupID,
+		"event_seq": 6,
+		"action":    "foo",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, call := range getCalls() {
+			if call.Method == "group.pull_events" {
+				t.Fatalf("covered group.changed 不应触发 group.pull_events: %#v", getCalls())
+			}
+			if call.Method == "group.ack_events" &&
+				toInt64(call.Params["event_seq"]) == 6 &&
+				call.Params["device_id"] == c.deviceID &&
+				call.Params["slot_id"] == "slot-a" {
+				select {
+				case payload := <-published:
+					t.Fatalf("covered group.changed 不应发布到应用层: %#v", payload)
+				default:
+				}
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("covered group.changed 未补发 group.ack_events: %#v", getCalls())
 }
 
 func TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline(t *testing.T) {

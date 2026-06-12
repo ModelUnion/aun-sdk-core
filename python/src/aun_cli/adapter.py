@@ -116,6 +116,10 @@ def run_async(coro) -> Any:
     return asyncio.run(coro)
 
 
+def _print_debug(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
     """从 ctx.obj + 环境变量 + cli.toml 解析最终配置"""
     from aun_cli.config import load_config
@@ -228,12 +232,12 @@ class CLISession:
 
         if self._need_auth and self._resolved["aid"]:
             if debug:
-                print(f"[DEBUG][cli] authenticate: aid={self._resolved['aid']}")
+                _print_debug(f"[DEBUG][cli] authenticate: aid={self._resolved['aid']}")
             phase_started = time.perf_counter()
             auth_result = await self._client.authenticate()
             record_cli_phase("authenticate", int((time.perf_counter() - phase_started) * 1000))
             if debug:
-                print(f"[DEBUG][cli] authenticate done: gateway={auth_result.get('gateway')}")
+                _print_debug(f"[DEBUG][cli] authenticate done: gateway={auth_result.get('gateway')}")
             connect_options = {
                 "auto_reconnect": self._background_sync,
                 "background_sync": self._background_sync,
@@ -247,7 +251,7 @@ class CLISession:
             )
             record_cli_phase("connect", int((time.perf_counter() - phase_started) * 1000))
             if debug:
-                print(f"[DEBUG][cli] connect done: state={self._client.state}")
+                _print_debug(f"[DEBUG][cli] connect done: state={self._client.state}")
         return self._client
 
     def _install_rpc_stats_hooks(self, client: Any) -> None:

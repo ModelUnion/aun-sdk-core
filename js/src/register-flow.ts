@@ -125,6 +125,10 @@ export class RegisterFlow {
     return await this._crypto.generateIdentity() as KeyPairRecord;
   }
 
+  generateIdentityAsync(): Promise<KeyPairRecord> {
+    return this.generateIdentity();
+  }
+
   newClientNonce(): string {
     return this._crypto.newClientNonce();
   }

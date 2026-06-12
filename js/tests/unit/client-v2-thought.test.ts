@@ -140,7 +140,7 @@ describe('AUNClient V2 thought', () => {
       context: { type: 'run', id: 'run-1' },
     });
 
-    expect(result).toEqual({ stored_count: 1 });
+    expect(result).toMatchObject({ stored_count: 1 });
     expect(lastSendParams).toBeTruthy();
     expect(lastSendParams.to).toBe(bobAid);
     expect(lastSendParams.thought_id).toBe('mt-test-1');
@@ -209,7 +209,7 @@ describe('AUNClient V2 thought', () => {
       payload: { type: 'thought', text: 'group hello' },
       context: { type: 'run', id: 'g-run-1' },
     });
-    expect(result).toEqual({ ok: true });
+    expect(result).toMatchObject({ ok: true });
     expect(lastSendParams.group_id).toBe(groupId);
     expect(lastSendParams.thought_id).toBe('gt-test-1');
     expect(lastSendParams.encrypted).toBe(true);

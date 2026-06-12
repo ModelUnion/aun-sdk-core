@@ -274,6 +274,51 @@ func TestV2GroupOnlineUnreadHintDelaysDrainAndPulls(t *testing.T) {
 	}
 }
 
+func TestV2GroupOnlineUnreadHintCoveredReconcilesServerCursorWithoutPull(t *testing.T) {
+	groupID := "group.example.com/g-covered"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "group.v2.ack":
+			return map[string]any{"success": true, "ack_seq": params["up_to_seq"]}
+		case "group.v2.pull":
+			t.Fatalf("covered online unread hint 不应触发 group.v2.pull: %#v", params)
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	c.onlineUnreadHintInitialDelay = 0
+	c.onlineUnreadHintInterval = 0
+
+	ns := "group:" + groupID
+	c.seqTracker.ForceContiguousSeq(ns, 9)
+	c.events.Publish("_raw.group.v2.message_created", map[string]any{
+		"group_id":   groupID,
+		"seq":        int64(7),
+		"message_id": "gm-covered-hint",
+		"sender_aid": "alice.example.com",
+		"kind":       "group.online_unread_hint",
+	})
+
+	if !waitForParityCondition(time.Second, func() bool {
+		for _, call := range getCalls() {
+			if call.Method == "group.v2.pull" {
+				t.Fatalf("covered online unread hint 不应触发 group.v2.pull: %#v", getCalls())
+			}
+			if call.Method == "group.v2.ack" &&
+				strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupID &&
+				toInt64(call.Params["up_to_seq"]) == 7 {
+				return c.seqTracker.GetContiguousSeq(ns) == 9
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("covered online unread hint 未补发 group.v2.ack: %#v", getCalls())
+	}
+}
+
 func TestV2GroupOnlineUnreadHintSkipsWhenBackgroundSyncDisabled(t *testing.T) {
 	groupID := "group.example.com/g1"
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {

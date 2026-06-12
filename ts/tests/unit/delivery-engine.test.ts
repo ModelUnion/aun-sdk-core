@@ -479,6 +479,31 @@ describe('MessageDeliveryEngine 组件边界', () => {
     expect(client._pullV2).not.toHaveBeenCalled();
   });
 
+  it('handleGroupChangedEventSeq 本地已覆盖时不发布不补洞，但后台补 ack_events', async () => {
+    const { engine, client, seqTracker, published } = createEngine();
+    const ns = 'group_event:g1';
+    seqTracker.setContiguousSeq(ns, 5);
+    const fillSpy = vi.spyOn(engine, 'fillGroupEventGap');
+
+    await engine.handleGroupChangedEventSeq({
+      group_id: 'g1',
+      event_seq: 4,
+      event_type: 'group.announcement_updated',
+      action: 'announcement_updated',
+    }, 'g1');
+    await Promise.resolve();
+
+    expect(published).toEqual([]);
+    expect(fillSpy).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith('group.ack_events', {
+      group_id: 'g1',
+      event_seq: 4,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+      _rpc_background: true,
+    });
+  });
+
   it('onRawGroupV2MessageCreated 修复过大的 contiguous_seq 后按修复值 pull', async () => {
     const { engine, client, seqTracker } = createEngine();
     const ns = 'group:g1';
@@ -493,6 +518,27 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
     expect(seqTracker.getContiguousSeq(ns)).toBe(2);
     expect(client._pullGroupV2).toHaveBeenCalledWith('g1', 2, 50, { gateLocked: true });
+  });
+
+  it('onRawGroupV2MessageCreated 已覆盖的 online hint 不 pull，但后台补 group.v2.ack', async () => {
+    const { engine, client, seqTracker } = createEngine();
+    const ns = 'group:g1';
+    seqTracker.setContiguousSeq(ns, 8);
+
+    await engine.onRawGroupV2MessageCreated({
+      group_id: 'g1',
+      seq: 7,
+      kind: 'group.online_unread_hint',
+      _online_hint_drained: true,
+    });
+    await Promise.resolve();
+
+    expect(client._pullGroupV2).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith('group.v2.ack', {
+      group_id: 'g1',
+      up_to_seq: 7,
+      _rpc_background: true,
+    });
   });
 
   it('online unread hint 延迟 drain，并在 background_sync=false 时跳过', async () => {
@@ -556,6 +602,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       device_id: 'device-a',
       limit: 50,
       _pull_gate_locked: true,
+      _rpc_background: true,
     });
     expect(published).toEqual([{
       event: 'group.changed',

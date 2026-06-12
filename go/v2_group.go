@@ -389,6 +389,9 @@ func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, groupID string, 
 		params["slot_id"] = c.slotID
 	}
 	c.signClientOperation("group.v2.pull", params)
+	if rpcBackgroundFromContext(ctx) {
+		params["_rpc_background"] = true
+	}
 	return c.transport.Call(ctx, "group.v2.pull", params)
 }
 
@@ -417,10 +420,14 @@ func (v *v2E2EECoordinator) ackGroupV2(ctx context.Context, groupID string, upTo
 	}
 
 	c.logE2.Debug("group.v2.ack send: group=%s ns=%s up_to_seq=%d", groupID, ns, seq)
-	raw, err := c.Call(ctx, "group.v2.ack", map[string]any{
+	ackParams := map[string]any{
 		"group_id":  groupID,
 		"up_to_seq": seq,
-	})
+	}
+	if rpcBackgroundFromContext(ctx) {
+		ackParams["_rpc_background"] = true
+	}
+	raw, err := c.Call(ctx, "group.v2.ack", ackParams)
 	if err != nil {
 		return nil, err
 	}

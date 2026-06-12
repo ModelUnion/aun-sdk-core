@@ -1923,14 +1923,19 @@ async def test_group_recall():
         await asyncio.sleep(0.5)
 
         # SDK 把 tombstone 归一化为 group.message_recalled 事件（不在 pull 消息列表里）。
-        # 验证：bob 收到该事件恰好一次（双 tombstone 去重）。
-        assert len(recall_events_bob) == 1, \
-            f"expected exactly 1 group.message_recalled callback, got {len(recall_events_bob)}: {recall_events_bob}"
-        assert msg_id in (recall_events_bob[0].get("message_ids") or []), \
-            f"recall event missing original message_id: {recall_events_bob[0]}"
+        # 固定 slot 的持久化 E2E 环境可能在上线后重放其它历史群的未读 recall，
+        # 当前用例只校验本次新建群的撤回事件恰好一次（双 tombstone 去重）。
+        current_recall_events = [
+            event for event in recall_events_bob
+            if event.get("group_id") == group_id
+        ]
+        assert len(current_recall_events) == 1, \
+            f"expected exactly 1 current-group group.message_recalled callback, got {len(current_recall_events)}: all={recall_events_bob}"
+        assert msg_id in (current_recall_events[0].get("message_ids") or []), \
+            f"recall event missing original message_id: {current_recall_events[0]}"
 
         # 服务端 raw 校验：双 tombstone 落库，原始密文已删
-        raw = await bob._rpc().raw_call("group.v2.pull", {
+        raw = await bob.call("group.v2.pull", {
             "group_id": group_id, "after_seq": 0, "limit": 50, "force": True,
         })
         raw_msgs = raw.get("messages", []) if isinstance(raw, dict) else []

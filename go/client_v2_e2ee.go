@@ -1070,6 +1070,9 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 	if err := c.signClientOperation("message.v2.pull", pullParams); err != nil {
 		return nil, meta, err
 	}
+	if rpcBackgroundFromContext(ctx) {
+		pullParams["_rpc_background"] = true
+	}
 	raw, err := c.transport.Call(ctx, "message.v2.pull", pullParams)
 	if err != nil {
 		return nil, meta, err
@@ -1192,7 +1195,11 @@ func (v *v2E2EECoordinator) ackV2(ctx context.Context, upToSeq int64) (map[strin
 	}
 
 	c.logE2.Debug("message.v2.ack send: ns=%s up_to_seq=%d", ns, seq)
-	raw, err := c.Call(ctx, "message.v2.ack", map[string]any{"up_to_seq": seq})
+	ackParams := map[string]any{"up_to_seq": seq}
+	if rpcBackgroundFromContext(ctx) {
+		ackParams["_rpc_background"] = true
+	}
+	raw, err := c.Call(ctx, "message.v2.ack", ackParams)
 	if err != nil {
 		return nil, err
 	}

@@ -288,9 +288,16 @@ class RPCTransport:
         self._on_disconnect = on_disconnect
         self._ws: Any | None = None
         self._reader_task: asyncio.Task | None = None
+        self._event_tasks: set[asyncio.Task] = set()
         self._pending: dict[str, asyncio.Future] = {}
+        self._pending_meta: dict[str, dict[str, Any]] = {}
         self._closed = True
         self._challenge: dict[str, Any] | None = None
+        self._send_lock = asyncio.Lock()
+        self._last_reader_closed_at: float = 0.0
+        self._last_reader_error: str = ""
+        self._foreground_waiters = 0
+        self._admission_cond = asyncio.Condition()
         # Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
         # 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
         self._meta_observer: "callable | None" = None
@@ -352,15 +359,91 @@ class RPCTransport:
             except asyncio.CancelledError:
                 pass  # 任务取消，正常清理
             self._reader_task = None
+        await self.cancel_event_tasks()
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
         pending_count = len(self._pending)
+        self._fail_pending(ConnectionError("transport closed"), context="close")
+        self._log.debug("transport", "close exit: elapsed=%.3fs cancelled_pending=%d", time.time() - _t_start, pending_count)
+
+    async def cancel_event_tasks(self) -> None:
+        current_task = asyncio.current_task()
+        tasks = set(self._event_tasks)
+        if not tasks:
+            return
+        for task in tasks:
+            if task is not current_task:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in tasks if task is not current_task),
+            return_exceptions=True,
+        )
+        self._event_tasks.difference_update(tasks)
+
+    def _schedule_event_publish(self, event: str, params: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        task = asyncio.create_task(self._dispatcher.publish(event, params))
+        self._event_tasks.add(task)
+
+        def _discard(done_task: asyncio.Task) -> None:
+            self._event_tasks.discard(done_task)
+            try:
+                done_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        task.add_done_callback(_discard)
+
+    def _pending_snapshot(self, *, limit: int = 8) -> str:
+        items: list[str] = []
+        for rpc_id in list(self._pending.keys())[:limit]:
+            meta = self._pending_meta.get(rpc_id) or {}
+            method = str(meta.get("method") or "?")
+            sent_at = meta.get("sent_at")
+            state = "sent" if sent_at else "queued"
+            items.append(f"{rpc_id}:{method}:{state}")
+        extra = len(self._pending) - len(items)
+        if extra > 0:
+            items.append(f"+{extra}")
+        return ",".join(items)
+
+    def _fail_pending(self, exc: Exception, *, context: str) -> int:
+        if not self._pending:
+            self._pending_meta.clear()
+            return 0
+        snapshot = self._pending_snapshot()
+        count = len(self._pending)
         for future in list(self._pending.values()):
             if not future.done():
-                future.set_exception(ConnectionError("transport closed"))
+                future.set_exception(exc)
         self._pending.clear()
-        self._log.debug("transport", "close exit: elapsed=%.3fs cancelled_pending=%d", time.time() - _t_start, pending_count)
+        self._pending_meta.clear()
+        self._log.warn("transport", "pending RPCs failed: context=%s count=%d pending=%s err=%s", context, count, snapshot, exc)
+        return count
+
+    async def _mark_foreground_waiter(self) -> None:
+        async with self._admission_cond:
+            self._foreground_waiters += 1
+
+    async def _unmark_foreground_waiter(self) -> None:
+        async with self._admission_cond:
+            if self._foreground_waiters > 0:
+                self._foreground_waiters -= 1
+            self._admission_cond.notify_all()
+
+    async def _wait_background_turn(self, *, timeout: float, started_at: float) -> None:
+        while True:
+            async with self._admission_cond:
+                if self._foreground_waiters <= 0:
+                    return
+                remaining = timeout - (time.time() - started_at)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                await asyncio.wait_for(self._admission_cond.wait(), timeout=remaining)
 
     async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, trace: str | None = None, background: bool = False) -> Any:
         if self._closed or self._ws is None:
@@ -371,30 +454,39 @@ class RPCTransport:
         import time as _diag_time
         _t0 = _diag_time.time()
 
-        # RPC inflight 限制：后台 RPC 受双重限制（全局 16 + 后台 8）
+        # RPC inflight 限制：后台 RPC 受双重限制，并在前台 RPC 排队时让路。
         sem = self._rpc_semaphore
         bg_sem = self._background_rpc_semaphore if background else None
+        foreground_marked = False
+        bg_acquired = False
         try:
+            if bg_sem:
+                await asyncio.wait_for(bg_sem.acquire(), timeout=effective_timeout)
+                bg_acquired = True
+                await self._wait_background_turn(timeout=effective_timeout, started_at=_t0)
+            else:
+                await self._mark_foreground_waiter()
+                foreground_marked = True
             await asyncio.wait_for(sem.acquire(), timeout=effective_timeout)
         except asyncio.TimeoutError:
+            if foreground_marked:
+                await self._unmark_foreground_waiter()
+            if bg_sem and bg_acquired:
+                bg_sem.release()
             self._log.warn("transport", "RPC queue timeout (waiting for slot): method=%s elapsed=%.3fs", method, _diag_time.time() - _t0)
             raise TimeoutError(f"rpc queue timeout before send: {method}", retryable=True)
         try:
-            if bg_sem:
-                remaining = effective_timeout - (_diag_time.time() - _t0)
-                if remaining <= 0:
-                    raise asyncio.TimeoutError()
-                try:
-                    await asyncio.wait_for(bg_sem.acquire(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    self._log.warn("transport", "RPC background queue timeout: method=%s elapsed=%.3fs", method, _diag_time.time() - _t0)
-                    raise TimeoutError(f"rpc background queue timeout before send: {method}", retryable=True)
+            if foreground_marked:
+                await self._unmark_foreground_waiter()
+                foreground_marked = False
             try:
                 return await self._call_inner(method, params, effective_timeout=effective_timeout, trace=trace, t0=_t0)
             finally:
                 if bg_sem:
                     bg_sem.release()
         finally:
+            if foreground_marked:
+                await self._unmark_foreground_waiter()
             sem.release()
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
@@ -417,7 +509,8 @@ class RPCTransport:
         if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
             raise ValidationError("payload is too large")
         try:
-            await self._ws.send(payload)
+            async with self._send_lock:
+                await self._ws.send(payload)
         except Exception as exc:
             self._log.warn("transport", "notification send failed: method=%s err=%s", method, exc)
             raise ConnectionError(f"failed to send notification {method}: {exc}") from exc
@@ -431,6 +524,7 @@ class RPCTransport:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending[rpc_id] = future
+        self._pending_meta[rpc_id] = {"method": method, "created_at": _t0, "sent_at": None}
 
         # 注入 _trace（会话级或调用级 mode 非 off 时）
         effective_trace_mode = trace if trace in ("off", "log", "diag") else self._trace_mode
@@ -461,23 +555,34 @@ class RPCTransport:
             payload_bytes = payload.encode("utf-8")
             if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
                 raise ValidationError("payload is too large")
-            await self._ws.send(payload)
+            async with self._send_lock:
+                await self._ws.send(payload)
+            self._pending_meta.get(rpc_id, {})["sent_at"] = _diag_time.time()
         except Exception as exc:
             self._pending.pop(rpc_id, None)
+            self._pending_meta.pop(rpc_id, None)
             self._log.warn("transport", "RPC send failed: method=%s rpc_id=%s err=%s", method, rpc_id, exc)
             raise ConnectionError(f"failed to send rpc {method}: {exc}") from exc
 
         _t_sent = _diag_time.time()
         try:
             response = await asyncio.wait_for(future, timeout=effective_timeout)
+        except asyncio.CancelledError:
+            self._pending.pop(rpc_id, None)
+            self._pending_meta.pop(rpc_id, None)
+            raise
         except asyncio.TimeoutError as exc:
             self._pending.pop(rpc_id, None)
+            self._pending_meta.pop(rpc_id, None)
             _elapsed = _diag_time.time() - _t0
             self._log.warn(
                 "transport",
-                "RPC timeout method=%s rpc_id=%s send_took=%.3fs total=%.3fs pending_count=%d reader_alive=%s",
+                "RPC timeout method=%s rpc_id=%s send_took=%.3fs total=%.3fs pending_count=%d reader_alive=%s reader_closed_at=%.3f reader_error=%s pending=%s",
                 method, rpc_id, _t_sent - _t0, _elapsed, len(self._pending),
                 self._reader_task is not None and not self._reader_task.done() if self._reader_task else False,
+                self._last_reader_closed_at,
+                self._last_reader_error,
+                self._pending_snapshot(),
             )
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
@@ -598,6 +703,14 @@ class RPCTransport:
                 await self._dispatcher.publish("connection.error", {"error": exc})
         finally:
             self._closed = True
+            self._last_reader_closed_at = _diag_time.time()
+            self._last_reader_error = f"{type(disconnect_error).__name__}: {disconnect_error}" if disconnect_error else ""
+            if self._pending:
+                if disconnect_error is not None:
+                    pending_error = ConnectionError(f"transport closed: {disconnect_error}")
+                else:
+                    pending_error = ConnectionError("transport closed")
+                self._fail_pending(pending_error, context="reader_loop")
             if unexpected_disconnect:
                 if self._on_disconnect is not None:
                     # 从 websockets.ConnectionClosed 中提取 close code
@@ -612,6 +725,7 @@ class RPCTransport:
             rpc_id = str(message["id"])
             self._log.debug("transport", "RPC inbound response full: %s", _debug_json(message))
             future = self._pending.pop(rpc_id, None)
+            self._pending_meta.pop(rpc_id, None)
             if future is not None and not future.done():
                 future.set_result(message)
             return
@@ -656,7 +770,7 @@ class RPCTransport:
             if sdk_event.startswith("app."):
                 await self._dispatcher.publish(sdk_event, params)
                 return
-            asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))
+            self._schedule_event_publish(f"_raw.{sdk_event}", params)
             return
 
         if self._meta_observer is not None:

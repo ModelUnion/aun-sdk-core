@@ -123,6 +123,7 @@ function createEngine(): {
     _pullV2: vi.fn(async () => []),
     _pullGroupV2: vi.fn(async () => []),
     _callRawV2Rpc: vi.fn(async () => ({ ok: true })),
+    _withBackgroundRpc: vi.fn(async (operation: () => unknown) => await operation()),
     _shouldSkipEventSignature: vi.fn(() => false),
     _verifyEventSignature: vi.fn(async () => true),
     _isEventSignatureVerified: vi.fn((value: unknown) => value === true),
@@ -488,6 +489,47 @@ describe('MessageDeliveryEngine 组件边界', () => {
     expect(client._pullGroupV2).toHaveBeenCalledWith('g1', 2, 50);
   });
 
+  it('onRawGroupV2MessageCreated 本地已覆盖时不 pull，只后台补 group.v2.ack', async () => {
+    const { engine, client, seqTracker, published } = createEngine();
+    const ns = 'group:g1';
+    seqTracker.setContiguousSeq(ns, 3);
+
+    await engine.onRawGroupV2MessageCreated({
+      group_id: 'g1',
+      seq: 3,
+      message_id: 'gm3',
+      sender_aid: 'bob.agentid.pub',
+    });
+
+    expect(client._pullGroupV2).not.toHaveBeenCalled();
+    expect(published).toEqual([]);
+    expect(client._callRawV2Rpc).toHaveBeenCalledWith('group.v2.ack', {
+      group_id: 'g1',
+      up_to_seq: 3,
+      _rpc_background: true,
+    });
+  });
+
+  it('online unread hint 已 drain 且本地覆盖到更高 seq 时不 pull，只补 group.v2.ack', async () => {
+    const { engine, client, seqTracker } = createEngine();
+    const ns = 'group:g1';
+    seqTracker.setContiguousSeq(ns, 9);
+
+    await engine.onRawGroupV2MessageCreated({
+      group_id: 'g1',
+      seq: 7,
+      kind: 'group.online_unread_hint',
+      _online_hint_drained: true,
+    });
+
+    expect(client._pullGroupV2).not.toHaveBeenCalled();
+    expect(client._callRawV2Rpc).toHaveBeenCalledWith('group.v2.ack', {
+      group_id: 'g1',
+      up_to_seq: 7,
+      _rpc_background: true,
+    });
+  });
+
   it('online unread hint 延迟 drain，并在 background_sync=false 时跳过', async () => {
     const { engine, client } = createEngine();
 
@@ -542,6 +584,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       after_event_seq: 1,
       device_id: 'device-a',
       limit: 50,
+      _rpc_background: true,
     });
     expect(published).toEqual([{
       event: 'group.changed',
@@ -557,6 +600,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       event_seq: 3,
       device_id: 'device-a',
       slot_id: 'slot-a',
+      _rpc_background: true,
     });
   });
 
@@ -614,6 +658,29 @@ describe('MessageDeliveryEngine 组件边界', () => {
     expect(client.call).not.toHaveBeenCalled();
   });
 
+  it('handleGroupChangedEventSeq 本地已覆盖时不 fill/publish，只后台补 ack_events', async () => {
+    const { engine, client, seqTracker, published } = createEngine();
+    const groupId = 'g1';
+    const ns = `group_event:${groupId}`;
+    seqTracker.setContiguousSeq(ns, 8);
+
+    await engine.handleGroupChangedEventSeq({
+      group_id: groupId,
+      event_seq: 7,
+      action: 'announcement_updated',
+    }, groupId);
+
+    expect(published).toEqual([]);
+    expect(client._safeAsync).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith('group.ack_events', {
+      group_id: groupId,
+      event_seq: 7,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+      _rpc_background: true,
+    });
+  });
+
   it('handleGroupChangedEventSeq 连续 push 后持久化并 ack 事件 cursor', async () => {
     const { engine, client, seqTracker } = createEngine();
     const groupId = 'g1';
@@ -632,6 +699,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       event_seq: 6,
       device_id: 'device-a',
       slot_id: 'slot-a',
+      _rpc_background: true,
     });
     expect(client._safeAsync).not.toHaveBeenCalled();
   });

@@ -85,6 +85,10 @@ class RekeyResult(TypedDict):
     new_fingerprint: str
 
 
+class ImportGroupIdentityResult(TypedDict):
+    imported: bool
+
+
 class ChangeSeedResult(TypedDict):
     changed: bool
     count: int
@@ -736,6 +740,57 @@ class AIDStore:
             except Exception as exc:
                 self._log.warn("aid_store", "rekey failed: aid=%s err=%s", target, exc)
                 return result_err(codes.REKEY_FAILED, str(exc), cause=exc)
+
+    def import_group_identity(
+        self,
+        aid: str,
+        *,
+        private_key_pem: str,
+        public_key_der_b64: str,
+        curve: str = "P-256",
+        cert_pem: str,
+    ) -> Result[ImportGroupIdentityResult]:
+        """导入外部生成的群 AID 身份材料。
+
+        用于 group-storage：群主 SDK 本地生成 group_aid 私钥，服务端只签发证书。
+        这里校验证书属于目标 AID 且公钥匹配，再复用 load() 做私钥/证书自检。
+        """
+        target = str(aid or "").strip()
+        if not target:
+            return result_err(codes.INVALID_AID_FORMAT, "import_group_identity requires a non-empty aid")
+        if not str(private_key_pem or "").strip():
+            return result_err(codes.PRIVATE_KEY_PARSE_ERROR, "import_group_identity requires private_key_pem")
+        if not str(public_key_der_b64 or "").strip():
+            return result_err(codes.KEYPAIR_MISMATCH, "import_group_identity requires public_key_der_b64")
+        if not str(cert_pem or "").strip():
+            return result_err(codes.CERT_PARSE_ERROR, "import_group_identity requires cert_pem")
+        try:
+            self._validate_returned_cert(
+                target,
+                cert_pem,
+                expected_public_key_b64=public_key_der_b64,
+                operation="import_group_identity",
+            )
+            self._keystore.save_identity(target, {
+                "aid": target,
+                "private_key_pem": private_key_pem,
+                "public_key_der_b64": public_key_der_b64,
+                "curve": curve or "P-256",
+                "cert": cert_pem,
+            })
+            loaded = self.load(target)
+            if not loaded.ok or loaded.data is None:
+                message = loaded.error.message if loaded.error else "imported group identity reload failed"
+                return result_err(codes.KEYPAIR_MISMATCH, message)
+            aid_obj = loaded.data["aid"]
+            if not aid_obj.is_private_key_valid():
+                return result_err(codes.KEYPAIR_MISMATCH, "imported group identity private key self-test failed")
+            self._log.info("aid_store", "group identity imported: aid=%s", target)
+            return result_ok({"imported": True})
+        except (ValidationError, ValueError) as exc:
+            return result_err(codes.CERT_CHAIN_BROKEN, str(exc), cause=exc)
+        except Exception as exc:
+            return result_err(codes.PRIVATE_KEY_PARSE_ERROR, str(exc), cause=exc)
 
     def _cert_op_lock(self, aid: str) -> asyncio.Lock:
         key = str(aid or "").strip()

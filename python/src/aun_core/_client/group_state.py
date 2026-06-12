@@ -90,8 +90,7 @@ class GroupStateCoordinator:
             )
             and getattr(client, "_v2_session", None)
         ):
-            loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-            loop.create_task(client._v2_auto_propose_state(group_id, leader_delay=True))
+            self.schedule_auto_propose_state(group_id, leader_delay=True)
 
     async def on_group_state_committed(self, data: Any) -> None:
         """处理 event/group.state_committed：验签 → 验证 state_hash 链 → 更新本地存储。"""
@@ -328,8 +327,58 @@ class GroupStateCoordinator:
         if now - last < 10.0:
             return
         client._v2_lazy_propose_triggered[group_id] = now
+        self.schedule_auto_propose_state(group_id, leader_delay=True)
+
+    def schedule_auto_propose_state(self, group_id: str, *, leader_delay: bool = False) -> None:
+        client = self.client
+        state_value = getattr(client._public_state, "value", client._public_state)
+        if getattr(client, "_closing", False) or state_value != "ready":
+            return
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(client._v2_auto_propose_state(group_id, leader_delay=True))
+
+        async def _run() -> None:
+            await client._delivery().run_background_rpc(
+                lambda: client._v2_auto_propose_state(group_id, leader_delay=leader_delay)
+            )
+
+        self.track_auto_state_task(loop.create_task(_run()))
+
+    def schedule_auto_confirm_pending_proposals(self) -> None:
+        client = self.client
+        state_value = getattr(client._public_state, "value", client._public_state)
+        if (
+            not client._v2_auto_state_management_enabled
+            or getattr(client, "_closing", False)
+            or state_value != "ready"
+        ):
+            return
+        loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
+
+        async def _run() -> None:
+            await client._delivery().run_background_rpc(
+                lambda: client._v2_auto_confirm_pending_proposals()
+            )
+
+        self.track_auto_state_task(loop.create_task(_run()))
+
+    def track_auto_state_task(self, task: asyncio.Task) -> None:
+        client = self.client
+        tasks = getattr(client, "_v2_auto_state_tasks", None)
+        if tasks is None:
+            tasks = set()
+            client._v2_auto_state_tasks = tasks
+        tasks.add(task)
+
+        def _discard(done_task: asyncio.Task) -> None:
+            tasks.discard(done_task)
+            try:
+                done_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        task.add_done_callback(_discard)
 
     async def auto_propose_state(self, group_id: str, *, leader_delay: bool = False) -> None:
         from ..group_id import normalize_group_id as _normalize_group_id
@@ -672,9 +721,13 @@ class GroupStateCoordinator:
                 if not group_id or my_role not in ("owner", "admin"):
                     continue
                 try:
-                    confirmed = await client._v2_confirm_pending_proposal(group_id)
+                    confirmed = await client._delivery().run_background_rpc(
+                        lambda: client._v2_confirm_pending_proposal(group_id)
+                    )
                     if not confirmed:
-                        await client._v2_auto_propose_state(group_id)
+                        await client._delivery().run_background_rpc(
+                            lambda: client._v2_auto_propose_state(group_id)
+                        )
                 except Exception as exc:
                     client._log.debug("client", "V2 auto confirm/propose failed (non-fatal): group=%s err=%s", group_id, exc)
         except Exception as exc:
@@ -691,7 +744,9 @@ class GroupStateCoordinator:
         if not client._v2_auto_state_management_enabled:
             return
         try:
-            await client._v2_confirm_pending_proposal(group_id)
+            await client._delivery().run_background_rpc(
+                lambda: client._v2_confirm_pending_proposal(group_id)
+            )
         except Exception as exc:
             client._log.debug("client", "V2 state_proposed handling failed (non-fatal): group=%s err=%s", group_id, exc)
 
@@ -704,7 +759,9 @@ class GroupStateCoordinator:
             return
         await client._dispatcher.publish("group.v2.state_retry_needed", data)
         try:
-            await client._v2_auto_propose_state(group_id, leader_delay=True)
+            await client._delivery().run_background_rpc(
+                lambda: client._v2_auto_propose_state(group_id, leader_delay=True)
+            )
         except Exception as exc:
             client._log.debug("client", "V2 state_retry_needed handling failed (non-fatal): group=%s err=%s", group_id, exc)
 
@@ -715,5 +772,4 @@ class GroupStateCoordinator:
         group_id = str(data.get("group_id") or "").strip()
         if group_id:
             client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
-            client._v2_auto_propose_last_snapshot.pop(group_id, None)
         await client._dispatcher.publish("group.v2.state_confirmed", data)
