@@ -234,6 +234,10 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "group.resources.unmount",
     "group.resources.get_access",
     "group.resources.resolve_access_ticket",
+    "collab.create", "collab.submit", "collab.export", "collab.adopt",
+    "collab.prune", "collab.unregister",
+    "collab.snapshot.create", "collab.snapshot.restore",
+    "collab.snapshot.rm", "collab.snapshot.prune",
 })
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
@@ -684,6 +688,7 @@ class AUNClient:
         self._message_facade = None
         self._group_facade = None
         self._stream_facade = None
+        self._collab_facade = None
 
     # ── 属性 ──────────────────────────────────────────────
 
@@ -710,6 +715,14 @@ class AUNClient:
         if self._storage_vfs is None:
             self._storage_vfs = StorageVFS(self)
         return self._storage_vfs
+
+    @property
+    def collab(self):
+        from .collab import CollabClient
+
+        if self._collab_facade is None:
+            self._collab_facade = CollabClient(self)
+        return self._collab_facade
 
     @property
     def message(self):
@@ -1030,7 +1043,11 @@ class AUNClient:
         "group.resources.unmount",
         "group.resources.get_access",
         "group.resources.resolve_access_ticket",
-    })
+    "collab.create", "collab.submit", "collab.export", "collab.adopt",
+    "collab.prune", "collab.unregister",
+    "collab.snapshot.create", "collab.snapshot.restore",
+    "collab.snapshot.rm", "collab.snapshot.prune",
+})
 
     def _sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
         self._rpc().sign_client_operation(method, params)

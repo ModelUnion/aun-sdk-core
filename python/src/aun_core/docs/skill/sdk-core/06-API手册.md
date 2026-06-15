@@ -74,7 +74,7 @@ store := aun.NewAIDStore(aunPath, encryptionSeed, aun.AIDStoreOptions{
 | `renew_cert(aid)` / `rekey(aid)` | `renewCert(aid)` / `rekey(aid)` | `RenewCert(ctx, aid)` / `Rekey(ctx, aid)` | 证书运维 |
 | `change_seed(old, new)` | `changeSeed(old, new)` | `ChangeSeed(old, new)` | 本地密钥保护种子迁移 |
 
-Python / TS / JS / Go 的 `AIDStore` 方法都返回 Result 包装；Go 形态为 `Result[T]`，字段为 `Ok` / `Data` / `Error`。
+Python、TS/Node 与 Go 的 `AIDStore` 本地方法返回 Result 包装；浏览器 JS 因 IndexedDB / WebCrypto 约束返回 `Promise<Result>`。联网方法在 TS/JS 中均返回 `Promise<Result>`；Go 形态为 `Result[T]`，字段为 `Ok` / `Data` / `Error`。
 
 ### Result 类型
 

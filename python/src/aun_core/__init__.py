@@ -7,6 +7,7 @@ from .result import ErrorInfo, Result, result_err, result_ok
 from .types import ConnectionOptions, ConnectionState
 from .facades import GroupFacade, GroupPendingOpsPartialFailure, GroupResourcesFacade, MessageFacade, StreamFacade, ThoughtFacade
 from .storage import StorageLowLevel, StorageVFS
+from .collab import CollabClient, CollabConflictError, CollabError
 from .errors import (
     AUNError,
     AuthError,
@@ -52,6 +53,9 @@ __all__ = [
     "ThoughtFacade",
     "StorageLowLevel",
     "StorageVFS",
+    "CollabClient",
+    "CollabConflictError",
+    "CollabError",
     "get_device_id",
     "AUNError",
     "AuthError",

@@ -26,7 +26,7 @@
     "test": "vitest run --environment jsdom",
     "test:unit": "vitest run --environment jsdom tests/unit",
     "test:integration": "vitest run --environment jsdom --no-file-parallelism --maxWorkers=1 tests/integration",
-    "test:e2e": "npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/v2-p2p.spec.ts tests/e2e-browser/v2-group.spec.ts tests/e2e-browser/v2-thought.spec.ts --reporter=line",
+    "test:e2e": "npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/v2-p2p.spec.ts tests/e2e-browser/v2-group.spec.ts tests/e2e-browser/v2-thought.spec.ts tests/e2e-browser/collab.spec.ts --reporter=line",
     "test:e2e:smoke": "npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/v2-p2p.spec.ts --grep \"V2 session 自动初始化\" --reporter=line"
   },
   "devDependencies": {

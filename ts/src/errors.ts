@@ -178,6 +178,22 @@ export class E2EEDecryptFailedError extends E2EEError {
 
 // ── 群组 E2EE 错误 ────────────────────────────────────────────
 
+/** 缺少群组密钥 */
+export class E2EEGroupSecretMissingError extends E2EEError {
+  constructor(message: string = 'group secret missing', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
+    super(message, { ...opts, code: -32040, localCode: 'E2EE_GROUP_SECRET_MISSING' });
+    this.name = 'E2EEGroupSecretMissingError';
+  }
+}
+
+/** 群组 epoch 不匹配 */
+export class E2EEGroupEpochMismatchError extends E2EEError {
+  constructor(message: string = 'group epoch mismatch', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
+    super(message, { ...opts, code: -32041, localCode: 'E2EE_GROUP_EPOCH_MISMATCH' });
+    this.name = 'E2EEGroupEpochMismatchError';
+  }
+}
+
 /** Membership Commitment 验证失败 */
 export class E2EEGroupCommitmentInvalidError extends E2EEError {
   constructor(message: string = 'group commitment invalid', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
@@ -283,6 +299,16 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
     err = new GroupStateError(message, opts);
   } else if (code >= -33009 && code <= -33004) {
     err = new GroupError(message, opts);
+  } else if (code === -32040) {
+    err = new E2EEGroupSecretMissingError(message, opts);
+  } else if (code === -32041) {
+    err = new E2EEGroupEpochMismatchError(message, opts);
+  } else if (code === -32042) {
+    err = new E2EEGroupCommitmentInvalidError(message, opts);
+  } else if (code === -32043) {
+    err = new E2EEGroupNotMemberError(message, opts);
+  } else if (code === -32044) {
+    err = new E2EEGroupDecryptFailedError(message, opts);
   } else {
     // 5000-5999 范围的服务端错误可重试
     const retryable = code >= 5000 && code < 6000;

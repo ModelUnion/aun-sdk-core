@@ -57,6 +57,60 @@
 | [storage.revoke_share_link](#storagerevoke_share_link) | 撤销分享链接 |
 | [storage.get_by_share](#storageget_by_share) | 通过分享短码读取对象 |
 
+### POSIX VFS 方法
+
+> 在对象存储之上提供 Linux 文件系统语义（`ls/find/df/stat/mkdir/rm/mv/cp/mount`）。节点类型：`file` / `dir` / `symlink` / `mount`。
+
+| 方法 | 说明 |
+|------|------|
+| [storage.fs.list](#storagefslist) | 列目录（ls） |
+| [storage.fs.find](#storagefsfind) | 递归查找（find，支持 name/type/size/mtime 过滤） |
+| [storage.fs.df](#storagefsdf) | 配额/用量报告（df） |
+| [storage.fs.stat](#storagefsstat) | 查节点（stat，跟随末级软链） |
+| [storage.fs.lstat](#storagefslstat) | 查节点（lstat，不跟随软链） |
+| [storage.fs.mkdir](#storagefsmkdir) | 建目录（mkdir） |
+| [storage.fs.remove](#storagefsremove) | 删除文件/目录/软链（rm） |
+| [storage.fs.rename](#storagefsrename) | 同 owner 内移动/改名（mv） |
+| [storage.fs.copy](#storagefscopy) | 复制对象或软链（cp） |
+| [storage.fs.mount](#storagefsmount) | 挂载卷或他人子树 |
+| [storage.fs.approve](#storagefsapprove) | 源 owner 批准待审挂载 |
+| [storage.fs.reject](#storagefsreject) | 拒绝待审挂载 |
+| [storage.fs.unmount](#storagefsunmount) | 卸载挂载点 |
+| [storage.fs.invalidate_membership](#storagefsinvalidate_membership) | 群成员变更时失效群挂载 |
+
+### 软链方法
+
+| 方法 | 说明 |
+|------|------|
+| [storage.create_symlink](#storagecreate_symlink) | 创建软链 |
+| [storage.readlink](#storagereadlink) | 读软链 target |
+| [storage.atomic_repoint](#storageatomic_repoint) | 原子重指 target（CAS 乐观锁） |
+| [storage.rename_symlink](#storagerename_symlink) | 改软链 key（target 不变） |
+| [storage.delete_symlink](#storagedelete_symlink) | 删软链记录（不动 target） |
+
+### ACL / 权限方法
+
+> 统一权限求值顺序（硬顺序）：公开位 → token → ACL（最近祖先前缀）→ 角色 → owner → 拒绝。
+
+| 方法 | 说明 |
+|------|------|
+| [storage.set_acl](#storageset_acl) | 授予路径前缀 ACL |
+| [storage.remove_acl](#storageremove_acl) | 移除 ACL 授权 |
+| [storage.list_acl](#storagelist_acl) | 列出路径 ACL |
+| [storage.set_visibility](#storageset_visibility) | 切换公开/私有 |
+| [storage.check_access](#storagecheck_access) | 非抛错的访问探测 |
+| [storage.issue_token](#storageissue_token) | 签发路径访问 token |
+| [storage.revoke_token](#storagerevoke_token) | 吊销 token |
+| [storage.list_tokens](#storagelist_tokens) | 列出 token |
+
+### 卷方法
+
+| 方法 | 说明 |
+|------|------|
+| [storage.volume.create](#storagevolumecreate) | 创建/upsert 配额卷 |
+| [storage.volume.renew](#storagevolumerenew) | 续期卷 |
+| [storage.volume.expire_due](#storagevolumeexpire_due) | 过期到期卷并失效其挂载 |
+
 ---
 
 > `object_key` 当前仅支持 ASCII 安全字符集合 `[A-Za-z0-9._/-]`，且不允许空路径段、`..`、反斜杠转义后的非法段。
@@ -820,6 +874,617 @@ share_url = result["aid_share_url"]
 **响应**：小对象返回 `content`；大对象返回 `download_url`。同时返回 `object_id`、`object_key`、`path`、`size_bytes`、`content_type`、`sha256`。
 
 ---
+
+## storage.fs.list
+
+列目录（POSIX `ls`）。混合返回子目录/对象/软链/可用挂载点，排序 dir < file < symlink < mount。群 owner 路径回退到群资源子节点。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 否 | `""` | 目录路径（空=根） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `page` | integer | 否 | `1` | 页码 |
+| `size` | integer | 否 | `100` | 每页条数（受 `list_max_limit` 上限约束） |
+| `marker` | string | 否 | — | 分页游标 |
+| `token` | string | 否 | — | 访问 token |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `nodes` | array | 节点列表，每项 `{type, node_type, name, path, mode, size, mtime, owner_principal}` |
+| `items` | array | 同 `nodes`（兼容别名） |
+| `total` | integer | 总数 |
+| `page` / `size` | integer | 分页 |
+| `next_marker` | string | 下一页游标 |
+
+`type` 取值：`file` / `dir` / `symlink` / `mount`。
+
+---
+
+## storage.fs.find
+
+递归查找（POSIX `find`），支持 name/type/size/mtime 过滤与分页。群资源与 `.collab` 注册表有回退。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 起始目录 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `name` | string | 否 | — | 名称 glob（如 `*.md`） |
+| `type` | string | 否 | — | 节点类型过滤：`f`/`d`/`l`（SDK 形参 `node_type`） |
+| `size` | string | 否 | — | 大小表达式（如 `+1M`） |
+| `mtime` | string | 否 | — | 修改时间表达式 |
+| `page` | integer | 否 | `1` | 页码 |
+| `page_size` | integer | 否 | `1000` | 每页条数 |
+| `token` | string | 否 | — | 访问 token |
+
+### 响应
+
+同 `storage.fs.list`：`{nodes, items, total, page, size, next_marker}`。
+
+---
+
+## storage.fs.df
+
+配额/用量报告（POSIX `df`），含每 owner 卷（过期卷重新计算）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `owner_aid` / `bucket` | string | 所有者 / 桶 |
+| `used_bytes` | integer | 已用字节 |
+| `object_count` | integer | 对象数 |
+| `quota_bytes` | integer | 配额上限 |
+| `avail_bytes` | integer | 剩余可用 |
+| `volumes` | array | 每卷用量明细 |
+
+---
+
+## storage.fs.stat
+
+查节点元数据（POSIX `stat`）。`follow_final=true`，解析末级软链 target。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 节点路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `token` | string | 否 | — | 访问 token |
+
+### 响应
+
+fs 节点视图：`{type, node_type, name, path, mode, size, mtime, owner_principal, ...}`。
+
+---
+
+## storage.fs.lstat
+
+查节点（POSIX `lstat`），**不跟随末级软链**——返回软链本身（携带 `dangling` 悬空标志），不返回 target。
+
+### 参数
+
+同 `storage.fs.stat`。
+
+### 响应
+
+fs 节点视图；若为软链，返回软链节点本身（含 `dangling` 标志）。
+
+---
+
+## storage.fs.mkdir
+
+建目录（POSIX `mkdir`）。委托 `create_folder`。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 目录路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `parents` | boolean | 否 | `false` | 递归创建父目录（类 `mkdir -p`） |
+
+### 响应
+
+fs 目录节点视图。
+
+---
+
+## storage.fs.remove
+
+删除文件/目录/软链（POSIX `rm`，目录用 `recursive`）。**拒绝删除挂载点**（须先 unmount）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 节点路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `recursive` | boolean | 否 | `false` | 递归删除目录 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `owner_aid` / `bucket` / `path` | string | 目标 |
+| `removed_count` | integer | 删除节点数 |
+| `deleted` | boolean | 是否删除成功 |
+
+---
+
+## storage.fs.rename
+
+同 owner/bucket 内移动或改名（POSIX `mv`）。**跨 owner/bucket 被拒**；按节点类型分派到 move_folder / rename_symlink / move_object。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `src` | string | 是 | — | 源路径 |
+| `dst` | string | 是 | — | 目标路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `overwrite` | boolean | 否 | `false` | 覆盖已存在目标 |
+| `expected_version` | integer | 否 | — | 乐观锁版本号 |
+
+### 响应
+
+被重命名节点的 fs 节点视图。
+
+---
+
+## storage.fs.copy
+
+复制对象或软链（POSIX `cp`，目录复制暂不支持）。CAS blob 引用计数复用，支持跨 owner 对象复制。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `src` | string | 是 | — | 源路径 |
+| `dst` | string | 是 | — | 目标路径 |
+| `owner_aid` | string | 否 | 当前用户 | 源所有者 AID |
+| `bucket` | string | 否 | `"default"` | 源存储桶 |
+| `overwrite` | boolean | 否 | `false` | 覆盖已存在目标 |
+| `follow_symlinks` | boolean | 否 | `false` | 复制软链 target 而非软链本身 |
+| `dst_owner_aid` | string | 否 | 同源 | 目标所有者（SDK 形参 `dst_owner`） |
+| `dst_bucket` | string | 否 | 同源 | 目标存储桶 |
+
+### 响应
+
+被复制节点的 fs 节点视图。
+
+---
+
+## storage.fs.mount
+
+挂载卷或他人子树进 owner 命名空间。`readonly` 默认 true；`require_approval=true` 时进入 pending 直到源 owner 批准。群成员卷挂载场景下，storage 通过 CA `aid_type=group` 识别群命名空间，命中 `/memberdata/` 时调 `group.check_membership` 实时校验成员身份。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `mount_path` | string | 是 | — | 挂载点路径 |
+| `owner_aid` | string | 否 | 当前用户 | 命名空间所有者 |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `volume_id` | string | 否 | — | 挂载实体卷（与 source_* 互斥） |
+| `source_aid` | string | 否 | — | 虚拟卷源 AID（与 volume_id 互斥） |
+| `source_path` | string | 否 | — | 虚拟卷源路径 |
+| `source_bucket` | string | 否 | — | 虚拟卷源存储桶 |
+| `readonly` | boolean | 否 | `true` | 只读挂载 |
+| `require_approval` | boolean | 否 | `false` | 需源 owner 批准 |
+| `expires_at` | integer | 否 | — | 挂载过期时间 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mount` | object | 挂载视图 |
+| `status` | string | `active`（直接生效）/ `pending`（待批准） |
+
+---
+
+## storage.fs.approve
+
+源 owner 批准 pending 挂载（重新校验源路径存在）。`mount_id` 或 `(owner_aid, bucket, mount_path)` 二选一定位。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `mount_id` | string | 否 | 挂载 ID（或用下方三元组定位） |
+| `owner_aid` | string | 否 | 命名空间所有者 |
+| `bucket` | string | 否 | 存储桶 |
+| `mount_path` | string | 否 | 挂载点路径 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `approved` | boolean | `true` |
+| `mount` | object | 挂载视图 |
+
+---
+
+## storage.fs.reject
+
+源 owner 或挂载 owner 拒绝 pending 挂载。定位方式同 `fs.approve`。
+
+### 响应
+
+`{rejected: boolean, mount}`。
+
+---
+
+## storage.fs.unmount
+
+卸载挂载点（仅 owner 可操作）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `mount_path` | string | 是 | — | 挂载点路径 |
+| `owner_aid` | string | 否 | 当前用户 | 命名空间所有者 |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+`{unmounted: boolean, owner_aid, bucket, path, mount_path}`。
+
+---
+
+## storage.fs.invalidate_membership
+
+群成员变更/群解散时失效群挂载（仅群 owner 或内部调用者）。SDK 形参不带 owner/bucket。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `group_id` | string | 是 | — | 群 ID |
+| `group_owner_aid` | string | 是 | — | 群 owner AID |
+| `member_aid` | string | 否 | — | 成员 AID（不传=全员） |
+| `reason` | string | 否 | `"membership_changed"` | `dissolved` / `membership_changed` |
+| `status` | string | 否 | — | `inactive` / `unavailable` |
+
+### 响应
+
+`{group_id, group_aid, group_owner_aid, member_aid, reason, status, invalidated}`（`invalidated`=失效挂载数）。
+
+---
+
+## storage.create_symlink
+
+创建软链。target 受限于 owner 命名空间；拒绝同名 file/dir；父路径不可含软链前缀。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 软链路径 |
+| `target` | string | 是 | — | 指向目标路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `overwrite` | boolean | 否 | `false` | 覆盖已存在软链 |
+
+### 响应
+
+软链视图（含 `dangling` 悬空标志）。
+
+---
+
+## storage.readlink
+
+读软链 target（owner 校验）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 软链路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+软链视图 `{symlink, target, version, ...}`。
+
+---
+
+## storage.atomic_repoint
+
+原子重指软链 target（乐观锁 CAS）。**collab submit / snapshot 并发正确性的底层核心**。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 软链路径 |
+| `new_target` | string | 是 | — | 新 target |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `expected_version` | integer | 否 | — | CAS 期望版本（null=跳过 CAS） |
+
+### 响应
+
+**成功**：`{ok: true, ...软链视图}`（version+1）。
+**CAS 失败**：`{ok: false, current_version, current_target}`。
+
+---
+
+## storage.rename_symlink
+
+改软链 key（同 owner/bucket 内移动/改名），target 不变。跨 owner 被拒。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 原软链路径（SDK 形参 `path`/服务端 `src`） |
+| `new_path` | string | 是 | — | 新软链路径（服务端 `dst`） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `overwrite` | boolean | 否 | `false` | 覆盖已存在 |
+| `expected_version` | integer | 否 | — | CAS 期望版本 |
+
+### 响应
+
+**成功**：`{ok: true, ...软链视图}`。
+**CAS 失败**：`{ok: false, current_version, current_path, current_target}`。
+
+---
+
+## storage.delete_symlink
+
+删软链记录（不动 target 对象）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 软链路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+`{deleted: boolean, owner_aid, bucket, path, symlink_id, target}`。
+
+---
+
+## storage.set_acl
+
+授予路径前缀 ACL grant（群内部 admin 或群代理写授权）。支持 `role:<role>` 形式 grantee。ACL 对目录前缀授权，子路径默认继承（最近祖先覆盖）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 授权路径前缀 |
+| `grantee_aid` | string | 是 | — | 被授权 AID（或 `role:<role>`） |
+| `perms` | string | 是 | — | 权限位：`r`/`w`/`rw`/`rwx`（`rwx` 含删除） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `expires_at` | integer | 否 | — | 授权过期时间 |
+| `max_uses` | integer | 否 | — | 最大使用次数 |
+
+### 响应
+
+ACL 视图。
+
+---
+
+## storage.remove_acl
+
+移除路径 ACL 授权。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 授权路径前缀 |
+| `grantee_aid` | string | 是 | — | 被授权 AID |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+`{removed: boolean, owner_aid, bucket, path, grantee_aid}`。
+
+---
+
+## storage.list_acl
+
+列出路径上的 ACL 授权（owner 校验）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+`{owner_aid, bucket, path, acls}`。
+
+---
+
+## storage.set_visibility
+
+切换对象或目录的公开/私有（软链不支持）。`allow_roles` 替换 `role:` 类 ACL。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 路径 |
+| `visibility` | string | 是 | — | `public` / `private` |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `allow_roles` | array | 否 | — | 允许的角色列表（替换 role ACL） |
+
+### 响应
+
+fs 节点视图（含 `allow_roles`）。
+
+---
+
+## storage.check_access
+
+非抛错的访问探测——探测某操作在某路径是否放行（内部捕获 NotFound/Dangling/Permission）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 路径（服务端别名 `object_key`） |
+| `operation` | string | 否 | `"read"` | `read` / `write` / `delete`（服务端别名 `op`） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `token` | string | 否 | — | 访问 token |
+| `follow_symlinks` | boolean | 否 | `true` | 跟随软链 |
+
+### 响应
+
+`{allowed: boolean, reason, message, requester_aid, owner_aid, bucket, path, operation}`。
+
+---
+
+## storage.issue_token
+
+签发 hash 化的 bearer 访问 token，scope 到某路径。返回的明文 token 仅此一次可见。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 授权路径（服务端别名 `object_key`） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `expires_at` | integer | 否 | — | 过期时间 |
+| `max_reads` | integer | 否 | — | 最大读取次数（服务端别名 `max_uses`） |
+
+### 响应
+
+token 视图 + 明文 token（一次性返回）。
+
+---
+
+## storage.revoke_token
+
+按明文 token 值吊销（内部 hash 后查找）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 路径（服务端别名 `object_key`） |
+| `token` | string | 是 | — | 要吊销的明文 token |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+`{revoked: boolean, owner_aid, bucket, path}`。
+
+---
+
+## storage.list_tokens
+
+列出路径上的 token（owner 校验，不返回明文）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | 是 | — | 路径 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+
+### 响应
+
+token 列表（hash 摘要 + 元数据）。
+
+---
+
+## storage.volume.create
+
+创建/upsert 配额卷（含 mount_point）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `size_bytes` | integer | 是 | — | 卷容量（>0） |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `volume_id` | string | 否 | 自动 | 卷 ID |
+| `used_bytes` | integer | 否 | — | 已用字节 |
+| `status` | string | 否 | `active` | `active` / `grace` / `expired` |
+| `mount_point` | string | 否 | — | 挂载点 |
+| `expires_at` | integer | 否 | — | 过期时间 |
+
+### 响应
+
+`{volume, ...卷视图}`。
+
+---
+
+## storage.volume.renew
+
+续期卷过期时间/状态（owner 校验，owner 不符抛 PermissionError）。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `volume_id` | string | 是 | — | 卷 ID（服务端别名 `id`） |
+| `expires_at` | integer | 是 | — | 新过期时间 |
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `status` | string | 否 | — | 卷状态 |
+
+### 响应
+
+`{volume, ...卷视图}`。
+
+---
+
+## storage.volume.expire_due
+
+过期所有到期卷并标记其挂载为 unavailable。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
+| `bucket` | string | 否 | `"default"` | 存储桶 |
+| `now` | integer | 否 | 当前时间 | 判定基准时间 |
+
+### 响应
+
+`{owner_aid, bucket, expired, mounts_unavailable, volumes, mounts}`。
 
 ## 错误码
 

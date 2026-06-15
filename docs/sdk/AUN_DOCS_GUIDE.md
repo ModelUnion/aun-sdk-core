@@ -30,6 +30,7 @@ Storage 的 SDK VFS、控制面/数据面分离、direct backend 上传下载、
 - E2EE：默认加密、ProtectedHeaders、P2P / Group V2
 - RPC 与事件：`client.call()`、`client.on()`、`client.notify()`、RPC 手册
 - Storage：SDK VFS、direct backend 数据面、`storage.*` low-level RPC、类 Linux 权限、mount/symlink、Storage Service 分层
+- 协作（collab）：`collab.*` 版本化文档、乐观锁 CAS submit、三方合并、目录快照（见 `09-collab-rpc-manual.md`）
 - Service Proxy：`ServiceProxyClient`、`proxy.register_services`、proxy-server `register_services`
 - agent.md：`AIDStore.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
 - 错误处理：Result、异常、错误码、重试
@@ -68,6 +69,7 @@ Storage 的 SDK VFS、控制面/数据面分离、direct backend 上传下载、
 | 查消息或群组 RPC | 对应 `09-*-rpc-manual.md` |
 | 查 Storage 架构、SDK VFS、权限模型、mount/symlink 和上传下载链路 | [AUN Storage架构设计.md](<AUN Storage架构设计.md>) |
 | 查 Storage RPC 参数 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) |
+| 查协作（版本化文档/乐观锁/快照）RPC | [09-collab-rpc-manual.md](09-collab-rpc-manual.md) |
 | 查 notify 在线轻量通知 / 跨域 federation | [Notify通知方案.md](Notify通知方案.md) |
 | 查 Service Proxy 服务注册和路由 | [06-API手册](06-API手册.md)、[09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) |
 | 查 payload 格式 | [09-payload-reference.md](09-payload-reference.md) |

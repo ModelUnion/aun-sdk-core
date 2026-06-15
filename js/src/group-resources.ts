@@ -464,7 +464,7 @@ export class GroupResourcesFacade {
         }
       }
 
-      return this.namespaceReady({
+      return storageClient.call('group.resources.namespace_ready', {
         group_id: groupId,
         group_aid: groupAid,
         folder_ids: folderIds,

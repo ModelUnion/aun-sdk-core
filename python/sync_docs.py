@@ -19,6 +19,7 @@ RPC_ALIASES = {
     "09-message-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "message" / "04-RPC-Manual.md",
     "09-group-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "group" / "04-RPC-Manual.md",
     "09-storage-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "storage" / "04-RPC-Manual.md",
+    "09-collab-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "collab" / "04-RPC-Manual.md",
     "09-stream-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "stream" / "04-RPC-Manual.md",
     "09-meta-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "meta" / "01-RPC-Manual.md",
     "09-proxy-rpc-manual.md": SKILL_ROOT / "rpc-manual" / "proxy" / "04-RPC-Manual.md",

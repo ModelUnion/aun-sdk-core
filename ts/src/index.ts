@@ -33,6 +33,8 @@ export {
   GroupStateError,
   E2EEError,
   E2EEDecryptFailedError,
+  E2EEGroupSecretMissingError,
+  E2EEGroupEpochMismatchError,
   E2EEGroupCommitmentInvalidError,
   E2EEGroupNotMemberError,
   E2EEGroupDecryptFailedError,
@@ -109,6 +111,26 @@ export {
   type RemoveResult,
   type UnmountResult,
 } from './storage/index.js';
+
+// ── Collab 协作层 ───────────────────────────────────────────
+export {
+  CollabClient,
+  CollabSnapshotClient,
+  CollabError,
+  CollabConflictError,
+  mapCollabError,
+  type CollabRaw,
+  type CollabRpcClient,
+  type CollabDocumentEntry,
+  type CollabDocumentResult,
+  type CollabHistoryEntry,
+  type CollabDiffResult,
+  type CollabRegistryEntry,
+  type CollabSnapshotEntry,
+  type CollabSnapshot,
+  type CollabSnapshotDiffResult,
+  type CollabSnapshotPruneOptions,
+} from './collab/index.js';
 
 // ── Service plane facades ───────────────────────────────────
 export {

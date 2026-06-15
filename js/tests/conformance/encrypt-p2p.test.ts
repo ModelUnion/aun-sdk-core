@@ -6,7 +6,7 @@ import {
   privateToPublicDer,
 } from '../../src/v2/crypto/ecdh';
 
-const SDK_VERSION = '0.3.6';
+const SDK_VERSION = '0.4.13';
 
 describe('encryptP2PMessage - self loop', () => {
   it('1DH path: alice -> bob (no SPK)', async () => {
@@ -43,7 +43,7 @@ describe('encryptP2PMessage - self loop', () => {
       sdk_lang: 'javascript',
       sdk_version: SDK_VERSION,
     });
-    expect((env as any).protected_headers.sdk_vesion).toBeUndefined();
+    expect((env as any).protected_headers.sdk_version).toBe(SDK_VERSION);
 
     const decrypted = await decryptMessage(
       env,
@@ -286,7 +286,7 @@ describe('encryptP2PMessage - self loop', () => {
       sdk_lang: 'javascript',
       sdk_version: SDK_VERSION,
     });
-    expect((env as any).protected_headers.sdk_vesion).toBeUndefined();
+    expect((env as any).protected_headers.sdk_version).toBe(SDK_VERSION);
     await expect(decryptMessage(
       env,
       'bob.aid.com',
@@ -367,7 +367,7 @@ describe('encryptP2PMessage - self loop', () => {
     expect((env as any).protected_headers.payload_type).toBe('text');
     expect((env as any).protected_headers.sdk_lang).toBe('javascript');
     expect((env as any).protected_headers.sdk_version).toBe(SDK_VERSION);
-    expect((env as any).protected_headers.sdk_vesion).toBeUndefined();
+    expect((env as any).protected_headers.sdk_version).toBe(SDK_VERSION);
     await expect(decryptMessage(
       env,
       'bob.aid.com',

@@ -572,7 +572,9 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ## 10.9 资源管理
 
-群资源是分享到群组的文件/链接引用。资源内容本身存储在 `storage.*` 服务，群组只持有引用。
+> **群存储新架构**：群文件不再是「指向他人对象的引用」，而是 **group_aid 命名空间下的真实对象**（群自有区 announce/public/archive + 成员挂载区 memberdata）。`storage` 是唯一文件系统与唯一鉴权器，`group.resources.*` 门面退化为「鉴权关卡 + 记账 + 索引镜像 + 群 df 视图」。门面名称（`group.resources.*`）保留以兼容，底层接 group storage。完整模型见 `docs/aun-fs/topics/group-space.md` 与 `docs/aun-fs/group-storage/`。
+>
+> 写操作走「甲案」：群服务预鉴权 → 返回待签操作清单 → 群主以 group_aid 身份签名直调 storage → `confirm` 回调记账（最终一致 + 幂等）。成员挂载区由成员自助挂载（自己签名），无需群主审批。逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准。
 
 ### `group.resources.put`
 
@@ -635,25 +637,50 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 **响应**：`{ "resource": { ... }, "download": { ... } }`
 
+### 目录树与挂载方法
+
+群存储命名空间的目录树操作（与 `storage` 目录树语义一致，经群门面鉴权+记账）：
+
+| 方法 | 说明 | 权限 |
+|------|------|------|
+| `group.resources.create_folder` | 在群命名空间建目录（memberdata 下委托 `storage.fs.mkdir`） | owner/admin（自有区）；成员（自己 memberdata） |
+| `group.resources.list_children` | 列目录子节点（读镜像表，不扇出 storage） | member |
+| `group.resources.rename` | 重命名资源节点 | owner/admin（按 ACL） |
+| `group.resources.move` | 移动资源节点 | owner/admin（按 ACL） |
+| `group.resources.mount_object` | 挂载 storage 对象/子树为群资源 | 成员自助（memberdata）|
+| `group.resources.unmount` | 取消挂载 | 挂载者 / owner |
+| `group.resources.resolve_path` | 按路径解析资源节点 | member |
+
+### 命名空间初始化与回调记账（新增）
+
+| 方法 | 说明 |
+|------|------|
+| `group.resources.namespace_ready` | 群主建好基线目录（announce/public/archive/memberdata）后回调，group 服务将根节点镜像入表。入参 `group_id` + 可选 `folder_ids` |
+| `group.resources.confirm` | 甲案写操作完成回调，凭 `op_id` 幂等更新镜像节点 |
+| `group.resources.confirm_mount` | 成员挂载完成回调，凭 `mount_id` 标记槽位 active |
+| `group.resources.get_df` | 群存储 df 视图，聚合自有卷 + 各成员挂载卷的用量与状态 |
+
 ### `group.resources.request_add`
 
 成员申请分享资源（需 owner 审批）。**参数**：同 `group.resources.put`（不需要 `storage_ref`）。
 
+> ⚠️ **已废弃**：`request_add` / `direct_add` / `list_pending` / `approve_request` / `reject_request` 属旧版「引用 + 审批流」模型。新群存储架构下成员挂载区为自助挂载（无审批流），自有区由群主以 group_aid 身份直传。保留仅为兼容，新代码不应依赖。
+
 ### `group.resources.direct_add`
 
-Owner 直接添加资源（无需审批）。需要 **owner** 权限。
+Owner 直接添加资源（无需审批）。需要 **owner** 权限。（已废弃，见上）
 
 ### `group.resources.list_pending`
 
-列出待审批的资源申请。需要 **owner** 权限。
+列出待审批的资源申请。需要 **owner** 权限。（已废弃，见上）
 
 ### `group.resources.approve_request`
 
-批准资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)
+批准资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)（已废弃，见上）
 
 ### `group.resources.reject_request`
 
-拒绝资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)
+拒绝资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)（已废弃，见上）
 
 ---
 

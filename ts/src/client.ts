@@ -49,6 +49,7 @@ import { IdentityRuntimeManager } from './client/identity.js';
 import { LifecycleController } from './client/lifecycle.js';
 import { PeerDirectory } from './client/peers.js';
 import { RpcPipeline } from './client/rpc-pipeline.js';
+import { CollabClient } from './collab/client.js';
 import { GroupFacade, MessageFacade, StreamFacade } from './facades.js';
 import { StorageVFS } from './storage/vfs.js';
 import { V2E2EECoordinator } from './client/v2-e2ee.js';
@@ -287,6 +288,10 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.resources.unmount',
   'group.resources.get_access',
   'group.resources.resolve_access_ticket',
+  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'collab.prune', 'collab.unregister',
+  'collab.snapshot.create', 'collab.snapshot.restore',
+  'collab.snapshot.rm', 'collab.snapshot.prune',
 ]);
 
 /** 需要客户端签名的关键方法。运行时逻辑已迁入 RpcPipeline，此处保留给源码审计测试。 */
@@ -334,6 +339,10 @@ const SIGNED_METHODS = new Set([
   'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
+  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'collab.prune', 'collab.unregister',
+  'collab.snapshot.create', 'collab.snapshot.restore',
+  'collab.snapshot.rm', 'collab.snapshot.prune',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -745,6 +754,7 @@ export class AUNClient {
   private _v2E2EE!: V2E2EECoordinator;
   private _groupState!: GroupStateCoordinator;
   private _storage?: StorageVFS;
+  private _collab?: CollabClient;
   private _message?: MessageFacade;
   private _group?: GroupFacade;
   private _stream?: StreamFacade;
@@ -903,6 +913,12 @@ export class AUNClient {
   get storage(): StorageVFS {
     if (!this._storage) this._storage = new StorageVFS(this);
     return this._storage;
+  }
+
+  /** AUN Collab 入口 */
+  get collab(): CollabClient {
+    if (!this._collab) this._collab = new CollabClient(this);
+    return this._collab;
   }
 
   /** Message facade 入口 */

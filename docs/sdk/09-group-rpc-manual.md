@@ -134,6 +134,10 @@
 | [group.resources.get_access](#groupresourcesget_access) | 获取下载票据 |
 | [group.resources.resolve_access_ticket](#groupresourcesresolve_access_ticket) | 解析访问票据 |
 | [group.resources.delete](#groupresourcesdelete) | 删除资源 |
+| [group.resources.namespace_ready](#groupresourcesnamespace_ready) | 群命名空间初始化回调记账 |
+| [group.resources.confirm](#groupresourcesconfirm) | 写操作完成回调记账（甲案） |
+| [group.resources.confirm_mount](#groupresourcesconfirm_mount) | 成员挂载完成回调记账 |
+| [group.resources.get_df](#groupresourcesget_df) | 群存储 df 视图（自有卷+成员挂载卷聚合） |
 
 ### 在线状态
 
@@ -1544,6 +1548,40 @@ result = await client.call("group.thought.get", {
 **参数**：`ticket` (string, 必填)
 
 **响应**：`{ "resource": { ... }, "download": { ... } }`
+
+### group.resources.namespace_ready
+
+群命名空间初始化回调记账。群主以 group_aid 身份在 storage 建好 `announce/public/archive/memberdata` 基线目录后，调此方法让 group 服务把根节点镜像入 `group_resources` 表。调用者须为群 owner/admin，或以 group_aid 身份（须通过当前群身份签名校验）。
+
+**参数**：`group_id` (string, 必填), `folder_ids` (object, 可选；基线路径 → storage folder_id 映射)
+
+**响应**：`{ "group_id", "group_aid", "namespace_ready": true, "baseline_paths": [...], "items": [...] }`
+
+> 群存储新架构：storage 是唯一文件系统与唯一鉴权器，`group_resources` 表退化为「storage 群命名空间的索引镜像 + 群业务属性（tags/排序/计数）」。详见 `docs/aun-fs/topics/group-space.md`。
+
+### group.resources.confirm
+
+写操作完成回调记账（甲案最终一致）。群主以 group_aid 身份直调 storage 完成写入后，凭 `op_id` 调此方法让 group 服务幂等更新镜像节点。confirm 丢失时由对账任务按 group_aid 命名空间向 storage 拉取实际节点补齐。
+
+**参数**：`group_id` (必填), `op_id` (必填；来自写操作返回的待签清单), `object_id` / `resource_path` 等完成信息
+
+**响应**：`{ "group_id", "group_aid", "resource": { ... } }`
+
+### group.resources.confirm_mount
+
+成员挂载区挂载完成回调记账。成员以自己 AID 自助 `storage.fs.mount` 到 `/memberdata/{自己}/` 成功后，调此方法让 group 服务标记槽位 active、更新注册表。
+
+**参数**：`group_id` (必填), `mount_id` (必填；来自 `storage.fs.mount` 返回)
+
+**响应**：`{ "group_id", "group_aid", "mount": { "mount_id", "mount_path", "member_aid", ... } }`
+
+### group.resources.get_df
+
+群存储 df 视图：聚合群自有卷 + 各成员挂载卷的用量与状态（由 group 服务聚合记账表，不触发 storage 扇出）。
+
+**参数**：`group_id` (string, 必填)
+
+**响应**：`{ "group_id", "group_aid", "volumes": [...], "mounts": [...], ... }`（成员挂载卷过期标 ⚠ unavailable）
 
 ## 在线状态
 

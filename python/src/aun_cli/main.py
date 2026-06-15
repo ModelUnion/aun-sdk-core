@@ -86,6 +86,10 @@ from aun_cli.commands.fs import fs_app
 
 app.add_typer(fs_app)
 
+from aun_cli.commands.collab import collab_app
+
+app.add_typer(collab_app)
+
 from aun_cli.commands.agentmd import agentmd_app
 
 app.add_typer(agentmd_app)

@@ -106,6 +106,26 @@ export {
   type UnmountResult,
 } from './storage/index.js';
 
+// Collab
+export {
+  CollabClient,
+  CollabSnapshotClient,
+  CollabError,
+  CollabConflictError,
+  mapCollabError,
+  type CollabRaw,
+  type CollabRpcClient,
+  type CollabDocumentEntry,
+  type CollabDocumentResult,
+  type CollabHistoryEntry,
+  type CollabDiffResult,
+  type CollabRegistryEntry,
+  type CollabSnapshotEntry,
+  type CollabSnapshot,
+  type CollabSnapshotDiffResult,
+  type CollabSnapshotPruneOptions,
+} from './collab/index.js';
+
 // Facade API
 export {
   MessageFacade,

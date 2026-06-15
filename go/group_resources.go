@@ -377,7 +377,7 @@ func (r *GroupResources) InitializeNamespace(ctx context.Context, params map[str
 			return nil, err
 		}
 	}
-	return r.NamespaceReady(ctx, map[string]any{
+	return storageClient.Call(ctx, "group.resources.namespace_ready", map[string]any{
 		"group_id":   groupID,
 		"group_aid":  groupAID,
 		"folder_ids": folderIDs,

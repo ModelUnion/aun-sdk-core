@@ -348,6 +348,14 @@ class CrossSdkTsAgent {
         await this.groupResourcesRead(req, res);
         return;
       }
+      if (req.method === 'POST' && url.pathname === '/collab/call') {
+        await this.collabCall(req, res);
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/storage/call') {
+        await this.storageCall(req, res);
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/inbox') {
         const traceId = textOf(url.searchParams.get('trace_id') ?? '');
         const fromAid = textOf(url.searchParams.get('from') ?? '');
@@ -697,6 +705,134 @@ class CrossSdkTsAgent {
       };
       this.recordTrace(traceId, { stage: 'group_resources_read_error', error });
       sendJson(res, 500, error);
+    }
+  }
+
+  async collabCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    const action = textOf(body.action).trim();
+    const params = jsonObjectOf(body.params) ?? {};
+    try {
+      const result = await this.callCollabAction(action, params);
+      const response: JsonObject = { ok: true, trace_id: traceId, action, result: jsonSafe(result) as any };
+      this.recordTrace(traceId, { stage: 'collab_call', action, result: response });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        action,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'collab_call_error', action, error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async storageCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    const action = textOf(body.action).trim();
+    const params = jsonObjectOf(body.params) ?? {};
+    try {
+      const result = await this.callStorageAction(action, params);
+      const response: JsonObject = { ok: true, trace_id: traceId, action, result: jsonSafe(result) as any };
+      this.recordTrace(traceId, { stage: 'storage_call', action, result: response });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        action,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'storage_call_error', action, error });
+      sendJson(res, 500, error);
+    }
+  }
+
+  async callCollabAction(action: string, params: JsonObject): Promise<unknown> {
+    const collabRoot = textOf(params.collab_root ?? params.collabRoot);
+    const doc = textOf(params.doc);
+    const source = textOf(params.source);
+    switch (action) {
+      case 'ls':
+        return await this.client.collab.ls(collabRoot);
+      case 'create':
+        return await this.client.collab.create(collabRoot, doc, source);
+      case 'read':
+        return await this.client.collab.read(collabRoot, doc);
+      case 'submit':
+        return await this.client.collab.submit(collabRoot, doc, source, Number(params.base_version ?? params.baseVersion ?? 0) || 0);
+      case 'merge':
+        return await this.client.collab.merge(collabRoot, doc, source, Number(params.base_version ?? params.baseVersion ?? 0) || 0);
+      case 'history':
+        return await this.client.collab.history(collabRoot, doc);
+      case 'get':
+        return await this.client.collab.get(collabRoot, doc, Number(params.version ?? 0) || 0);
+      case 'diff':
+        return await this.client.collab.diff(collabRoot, doc, Number(params.from ?? 0) || 0, Number(params.to ?? 0) || 0);
+      case 'export':
+        return await this.client.collab.export(collabRoot, textOf(params.dest));
+      case 'adopt':
+        return await this.client.collab.adopt(textOf(params.src), textOf(params.new_root ?? params.newRoot));
+      case 'prune':
+        return await this.client.collab.prune(collabRoot, doc);
+      case 'discover':
+        return await this.client.collab.discover(textOf(params.group_aid ?? params.groupAid));
+      case 'unregister':
+        return await this.client.collab.unregister(textOf(params.group_aid ?? params.groupAid), collabRoot);
+      case 'snapshot.create':
+        return await this.client.collab.snapshot.create(collabRoot, {
+          message: textOf(params.message),
+          major: Boolean(params.major),
+        });
+      case 'snapshot.list':
+        return await this.client.collab.snapshot.list(collabRoot);
+      case 'snapshot.show':
+        return await this.client.collab.snapshot.show(collabRoot, textOf(params.version));
+      case 'snapshot.diff':
+        return await this.client.collab.snapshot.diff(collabRoot, textOf(params.version_a ?? params.versionA), textOf(params.version_b ?? params.versionB));
+      case 'snapshot.restore':
+        return await this.client.collab.snapshot.restore(collabRoot, textOf(params.version), { message: textOf(params.message) });
+      case 'snapshot.rm':
+        return await this.client.collab.snapshot.rm(collabRoot, textOf(params.version));
+      case 'snapshot.prune':
+        return await this.client.collab.snapshot.prune(collabRoot, {
+          before: params.before == null ? null : Number(params.before),
+          keep_last: params.keep_last == null && params.keepLast == null ? null : Number(params.keep_last ?? params.keepLast),
+        });
+      default:
+        throw new Error(`unsupported collab action: ${action}`);
+    }
+  }
+
+  async callStorageAction(action: string, params: JsonObject): Promise<unknown> {
+    const storage = this.client.storage;
+    const path = textOf(params.path).trim();
+    const owner = textOf(params.owner_aid ?? params.ownerAID).trim() || undefined;
+    const bucket = textOf(params.bucket).trim() || 'default';
+    switch (action) {
+      case 'set_acl':
+        return await storage.setAcl(path, {
+          owner,
+          bucket,
+          granteeAid: textOf(params.grantee_aid ?? params.granteeAID).trim(),
+          perms: textOf(params.perms).trim(),
+          expiresAt: params.expires_at == null && params.expiresAt == null ? undefined : Number(params.expires_at ?? params.expiresAt),
+          maxUses: params.max_uses == null && params.maxUses == null ? undefined : Number(params.max_uses ?? params.maxUses),
+        });
+      case 'remove_acl':
+        return await storage.removeAcl(path, {
+          owner,
+          bucket,
+          granteeAid: textOf(params.grantee_aid ?? params.granteeAID).trim(),
+        });
+      default:
+        throw new Error(`unsupported storage action: ${action}`);
     }
   }
 

@@ -376,7 +376,10 @@ class GroupResourcesFacade(_RpcFacade):
                     await self._client.call("storage.set_visibility", visibility_params)
                 else:
                     await signer.call("storage.set_visibility", visibility_params)
-            return await self.namespace_ready(group_id=gid, group_aid=gaid, folder_ids=folder_ids)
+            ready_params = {"group_id": gid, "group_aid": gaid, "folder_ids": folder_ids}
+            if signer is None:
+                return await self.namespace_ready(ready_params)
+            return await signer.call("group.resources.namespace_ready", ready_params)
         finally:
             if signer is not None:
                 await signer.close()

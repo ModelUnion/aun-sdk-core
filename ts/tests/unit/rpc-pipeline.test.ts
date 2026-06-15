@@ -144,4 +144,28 @@ describe('RpcPipeline 组件边界', () => {
       35_000,
     );
   });
+
+  it('collab 写操作实际走签名和非幂等 35 秒超时', async () => {
+    const { client, pipeline } = createPipeline({
+      _transport: { call: vi.fn().mockResolvedValue({ ok: true }) },
+      _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
+    });
+
+    await pipeline.call('collab.submit', {
+      collab_root: 'alice.aid.com:/proj',
+      doc: 'd.md',
+      source: 'BASE64',
+      base_version: 1,
+    });
+
+    expect(client._signClientOperation).toHaveBeenCalledWith(
+      'collab.submit',
+      expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
+    );
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'collab.submit',
+      expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
+      35_000,
+    );
+  });
 });

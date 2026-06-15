@@ -183,6 +183,16 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.dissolve",
 		"group.suspend",
 		"group.resume",
+		"collab.create",
+		"collab.submit",
+		"collab.export",
+		"collab.adopt",
+		"collab.prune",
+		"collab.unregister",
+		"collab.snapshot.create",
+		"collab.snapshot.restore",
+		"collab.snapshot.rm",
+		"collab.snapshot.prune",
 	}
 
 	if len(signedMethods) != len(expected) {
@@ -275,6 +285,26 @@ func TestGroupResourceSideEffectMethodsAreNonIdempotent(t *testing.T) {
 	for _, method := range methods {
 		if !nonIdempotentMethods[method] {
 			t.Errorf("nonIdempotentMethods 缺少 group.resources 副作用方法: %s", method)
+		}
+	}
+}
+
+func TestCollabMutationMethodsAreNonIdempotent(t *testing.T) {
+	methods := []string{
+		"collab.create",
+		"collab.submit",
+		"collab.export",
+		"collab.adopt",
+		"collab.prune",
+		"collab.unregister",
+		"collab.snapshot.create",
+		"collab.snapshot.restore",
+		"collab.snapshot.rm",
+		"collab.snapshot.prune",
+	}
+	for _, method := range methods {
+		if !nonIdempotentMethods[method] {
+			t.Errorf("nonIdempotentMethods 缺少 collab 写操作: %s", method)
 		}
 	}
 }

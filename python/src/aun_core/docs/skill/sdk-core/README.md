@@ -111,6 +111,7 @@ Layer 1: 安全层   TLS + AUN E2EE
 | [06-API手册](06-API手册.md) | AIDStore / AID / AUNClient / ServiceProxyClient / 事件 / RPC 索引 |
 | [07-错误处理](07-错误处理.md) | Result、异常层级、错误码、重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等连接、多 AID、资源清理、测试数据保护 |
+| [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 和关键时序 |
 | [Notify通知方案](Notify通知方案.md) | `client.notify()` 在线轻量通知、跨域 federation 和可靠消息分工 |
 
 RPC 专项手册：
@@ -118,8 +119,9 @@ RPC 专项手册：
 | 手册 | 范围 |
 |------|------|
 | [09-message-rpc-manual.md](09-message-rpc-manual.md) | P2P 消息、ack、thought |
-| [09-group-rpc-manual.md](09-group-rpc-manual.md) | 群组生命周期、成员、群消息、群 thought |
-| [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | 文件和对象存储 |
+| [09-group-rpc-manual.md](09-group-rpc-manual.md) | 群组生命周期、成员、群消息、群 thought、群存储资源 |
+| [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | 对象存储 + POSIX VFS（fs/卷/软链/ACL/token） |
+| [09-collab-rpc-manual.md](09-collab-rpc-manual.md) | 协作层：版本化文档、乐观锁、三方合并、目录快照 |
 | [09-meta-rpc-manual.md](09-meta-rpc-manual.md) | ping / status / trust_roots |
 | [09-stream-rpc-manual.md](09-stream-rpc-manual.md) | 流式数据传输 |
 | [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) | Service Proxy 控制面 RPC 和数据面隧道注册 |

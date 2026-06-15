@@ -74,6 +74,19 @@ const STORAGE_SIGNED_METHODS = [
   'storage.get_by_share',
 ] as const;
 
+const COLLAB_MUTATION_METHODS = [
+  'collab.create',
+  'collab.submit',
+  'collab.export',
+  'collab.adopt',
+  'collab.prune',
+  'collab.unregister',
+  'collab.snapshot.create',
+  'collab.snapshot.restore',
+  'collab.snapshot.rm',
+  'collab.snapshot.prune',
+] as const;
+
 /** V2-only 预期需要签名的方法。旧 group.e2ee.* rotation RPC 已移除。 */
 const EXPECTED_SIGNED_METHODS = [
   'message.send',
@@ -131,6 +144,7 @@ const EXPECTED_SIGNED_METHODS = [
   'group.suspend',
   'group.resume',
   'storage.check_access',
+  ...COLLAB_MUTATION_METHODS,
   ...STORAGE_SIGNED_METHODS,
 ] as const;
 
@@ -157,6 +171,19 @@ describe('SIGNED_METHODS 签名覆盖面', () => {
     const nonIdempotent = extractNonIdempotentMethods();
     for (const method of STORAGE_SIGNED_METHODS) {
       expect(nonIdempotent, `缺少非幂等方法: ${method}`).toContain(method);
+    }
+  });
+
+  it('collab 写操作应进入签名和非幂等长超时集合', () => {
+    const signed = extractSignedMethods();
+    const runtimeSigned = extractSignedMethods('../../src/client/rpc-pipeline.ts');
+    const nonIdempotent = extractNonIdempotentMethods();
+    const runtimeNonIdempotent = extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts');
+    for (const method of COLLAB_MUTATION_METHODS) {
+      expect(signed, `缺少签名方法: ${method}`).toContain(method);
+      expect(runtimeSigned, `运行时签名集合缺少: ${method}`).toContain(method);
+      expect(nonIdempotent, `缺少非幂等方法: ${method}`).toContain(method);
+      expect(runtimeNonIdempotent, `运行时非幂等集合缺少: ${method}`).toContain(method);
     }
   });
 

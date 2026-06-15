@@ -27,6 +27,10 @@
 | [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>) | AUN Storage VFS + CLI 的 6 阶段 TDD 实施计划、P1-P6 实际执行记录和验收口径 |
 | [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>) | `group.resources.*` 从旧 `storage_ref` 引用树迁移到 group_aid storage 命名空间、成员 `memberdata` 挂载和 group-storage 门面编排的终态设计 |
 | [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>) | group-storage 0-10 阶段 TDD 实施计划、阶段 IPO/测试矩阵、实际执行记录、四语言 SDK/CLI/服务端验收与 Docker 单域/双域 E2E 通过记录 |
+| [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>) | collab 服务端编排、台账、diff3、snapshot、export/adopt、群协作注册表和四语言薄 SDK 设计 |
+| [collab 协作层 Plan 1 服务端基础](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>) | storage 进程内 collab 编排的 TDD 任务拆分、repository 事务原语、RPC 注册和群协作发现计划 |
+| [collab 协作层 Plan 2 Python SDK/CLI](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>) | Python SDK collab 薄封装、CLI 命令、单域 Docker E2E 和文档同步计划 |
+| [collab 协作层 Plan 3 四语言互操作](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>) | Go / TypeScript / JavaScript SDK collab 薄封装、跨语言 E2E 和双域边界验证计划 |
 | [Notify 通知方案](sdk/Notify通知方案.md) | `client.notify()` 在线轻量通知、跨域 federation 和可靠消息分工 |
 | [Service Proxy RPC 手册](sdk/09-proxy-rpc-manual.md) | `proxy.*` 控制面、proxy-server 数据面注册、服务列表一致性和 wakeup 路由语义 |
 | [协议文档目录](protocol/) | AUN 协议相关文档 |
@@ -56,6 +60,7 @@
 - AUN Storage 6 阶段 TDD 计划、P1/P2/P3/P4/P5/P6 实际执行记录、阶段实施前详细计划和 Docker 验证纪律 → [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>)
 - `group.resources.*` 替代旧 `storage_ref` 引用树、group_aid 命名空间、群自有区、`memberdata` 成员挂载区、签名者切换和下载 ticket → [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>)
 - group-storage 0-10 阶段 TDD 推进记录、CLI 收口、四语言 SDK pending-op signer、服务端回归和 Docker 单域/双域 E2E 通过记录 → [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>)
+- collab 协作层服务端编排、`collab.*` RPC、版本台账、snapshot、群协作注册表和后续四语言 SDK/CLI/E2E 计划 → [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>)、[Plan 1](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>)、[Plan 2](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>)、[Plan 3](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>)
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
 - agent.md 远程缓存、`remote_etag` / `local_etag`、消息信封 ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
@@ -164,6 +169,10 @@
 ### 群存储 group-storage 重构实施计划
 
 把 group-storage 重构拆为 0-10 个 TDD 阶段，覆盖契约脚手架、命名群身份、匿名群 bind、命名空间初始化、自有区写、ACL 映射、读路径、成员挂载、生命周期/df、群主转让 rekey、四语言 SDK 对齐、CLI/E2E/文档收口。文档记录每阶段 IPO、阶段计划、测试矩阵、实际执行记录和命令结果；当前阶段 0-10 的代码与文档收口已完成，Python/TS/JS/Go 单元、服务端 group/CA/storage 回归、Docker 镜像重建、单域 `named_group_storage_full_flow` 与双域 `cross_domain_memberdata_mount_read` E2E 均已通过。
+
+### collab 协作层服务端编排与实施计划
+
+定义 collab 是锚定在 storage 上的自包含版本化目录，服务端负责 `collab.*` 编排、`collab_ledger` 台账、乐观锁、行级 diff3、snapshot、export/adopt、prune 和群协作注册表。Plan 1 拆解 storage 进程内服务端基础实现和测试；Plan 2 扩展 Python SDK/CLI 与单域 Docker E2E；Plan 3 扩展 Go / TypeScript / JavaScript SDK、跨语言互操作和双域边界验证。
 
 ### Notify 通知方案
 

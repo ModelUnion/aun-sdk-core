@@ -290,6 +290,16 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
     Cls = GroupStateError;
   } else if (code >= -33009 && code <= -33004) {
     Cls = GroupError;
+  } else if (code === -32040) {
+    Cls = E2EEGroupSecretMissingError;
+  } else if (code === -32041) {
+    Cls = E2EEGroupEpochMismatchError;
+  } else if (code === -32042) {
+    Cls = E2EEGroupCommitmentInvalidError;
+  } else if (code === -32043) {
+    Cls = E2EEGroupNotMemberError;
+  } else if (code === -32044) {
+    Cls = E2EEGroupDecryptFailedError;
   } else {
     Cls = AUNError;
   }

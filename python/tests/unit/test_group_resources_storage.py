@@ -221,6 +221,8 @@ async def test_initialize_namespace_with_aid_store_uses_signer_client(monkeypatc
         async def call(self, method, params=None):
             payload = dict(params or {})
             self.calls.append((method, payload))
+            if method == "group.resources.namespace_ready":
+                return {"namespace_ready": True}
             return {"node_id": f"fld-{payload['path']}"}
 
         async def close(self):
@@ -264,8 +266,6 @@ async def test_initialize_namespace_with_aid_store_uses_signer_client(monkeypatc
             "storage.set_visibility",
             {"owner_aid": "g.example.test", "bucket": "default", "path": "public", "visibility": "public"},
         ),
-    ]
-    assert client.calls == [
         (
             "group.resources.namespace_ready",
             {
@@ -273,8 +273,9 @@ async def test_initialize_namespace_with_aid_store_uses_signer_client(monkeypatc
                 "group_aid": "g.example.test",
                 "folder_ids": {"announce": "fld-announce", "public": "fld-public"},
             },
-        )
+        ),
     ]
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

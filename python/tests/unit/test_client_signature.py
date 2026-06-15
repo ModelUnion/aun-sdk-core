@@ -121,6 +121,13 @@ class TestSignedMethodsCoverage:
 
     GROUP_RESOURCE_NON_IDEMPOTENT_METHODS = list(GROUP_RESOURCE_SIGNED_METHODS)
 
+    COLLAB_MUTATION_METHODS = [
+        "collab.create", "collab.submit", "collab.export", "collab.adopt",
+        "collab.prune", "collab.unregister",
+        "collab.snapshot.create", "collab.snapshot.restore",
+        "collab.snapshot.rm", "collab.snapshot.prune",
+    ]
+
     EXPECTED_METHODS = [
         # P2P / V2 入口
         "message.send",
@@ -152,7 +159,7 @@ class TestSignedMethodsCoverage:
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
         # 群资源
-    ] + GROUP_RESOURCE_SIGNED_METHODS + STORAGE_SIGNED_PROBE_METHODS + STORAGE_MUTATION_METHODS
+    ] + GROUP_RESOURCE_SIGNED_METHODS + COLLAB_MUTATION_METHODS + STORAGE_SIGNED_PROBE_METHODS + STORAGE_MUTATION_METHODS
 
     # 服务端通过 _require_actor_aid_verified 强制要求签名的方法
     # 如果服务端新增了签名要求，必须同步加入 SDK _SIGNED_METHODS
@@ -188,6 +195,10 @@ class TestSignedMethodsCoverage:
                 f"_SIGNED_METHODS 中包含未预期的方法: {m}"
             )
 
+    def test_collab_snapshot_read_methods_are_not_signed(self):
+        for method in ("collab.snapshot.list", "collab.snapshot.show", "collab.snapshot.diff"):
+            assert method not in AUNClient._SIGNED_METHODS
+
     @pytest.mark.parametrize("method", STORAGE_MUTATION_METHODS)
     def test_storage_mutation_method_is_non_idempotent(self, method):
         assert method in _NON_IDEMPOTENT_METHODS, (
@@ -198,6 +209,12 @@ class TestSignedMethodsCoverage:
     def test_group_resource_method_is_non_idempotent(self, method):
         assert method in _NON_IDEMPOTENT_METHODS, (
             f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免资源写入或单次票据消费沿用短超时"
+        )
+
+    @pytest.mark.parametrize("method", COLLAB_MUTATION_METHODS)
+    def test_collab_mutation_method_is_non_idempotent(self, method):
+        assert method in _NON_IDEMPOTENT_METHODS, (
+            f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免 collab 写操作沿用短超时"
         )
 
     @pytest.mark.parametrize("method", SERVER_VERIFIED_METHODS)

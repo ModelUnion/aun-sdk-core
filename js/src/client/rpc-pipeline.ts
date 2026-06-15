@@ -76,6 +76,10 @@ const SIGNED_METHODS = new Set([
   'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
+  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'collab.prune', 'collab.unregister',
+  'collab.snapshot.create', 'collab.snapshot.restore',
+  'collab.snapshot.rm', 'collab.snapshot.prune',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -115,6 +119,10 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'group.resources.unmount',
   'group.resources.get_access',
   'group.resources.resolve_access_ticket',
+  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'collab.prune', 'collab.unregister',
+  'collab.snapshot.create', 'collab.snapshot.restore',
+  'collab.snapshot.rm', 'collab.snapshot.prune',
 ]);
 
 export interface RpcPreflightResult {

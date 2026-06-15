@@ -20,7 +20,8 @@
 | [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
 | [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC |
-| [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC |
+| [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
+| [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 目录快照） |
 | [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 与关键时序 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
@@ -62,7 +63,8 @@
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
 - Group RPC → [09-group-rpc-manual](09-group-rpc-manual.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
-- Storage RPC → [09-storage-rpc-manual](09-storage-rpc-manual.md)
+- Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
+- Collab RPC（`collab.*` 版本化文档、乐观锁、快照）→ [09-collab-rpc-manual](09-collab-rpc-manual.md)
 - Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)
 - Service Proxy RPC 和隧道注册 → [09-proxy-rpc-manual](09-proxy-rpc-manual.md)
@@ -118,6 +120,10 @@
 ### AUN Storage架构设计
 
 定义 AUN Storage 的 SDK VFS、low-level storage client、Storage Service、Storage Core、Metadata Engine 和 Blob Backend 分层。文档明确主数据流量直连 backend、控制面走 `storage.*` RPC，底层 session/ticket/complete RPC 继续保留，但普通应用通过 SDK VFS 获得类 POSIX 文件操作语义；同时定义类 Linux mode/ACL、目录 `x` 位、mount/unmount、symlink/readlink/lstat、share link 与 direct backend ticket 的授权边界，并给出上传、下载、rename/move、delete/GC、路径解析和鉴权的 Mermaid 时序图。
+
+### 09-collab-rpc-manual
+
+定义协作层 `collab.*` RPC（共 20 个）：文档版本线（ls/create/read/submit/merge/history/get/diff/prune）、备份迁移（export/adopt）、目录级快照（snapshot.create/list/show/diff/restore/rm/prune）、群内发现（discover/unregister）。collab 编排并入 storage 服务进程，以调用者身份直调 storage 原语，授权下沉到 storage ACL。涵盖乐观锁 CAS submit 撞版本响应、三方合并冲突标记、forward-only 快照回滚不变量。
 
 ### 09-proxy-rpc-manual
 

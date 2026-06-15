@@ -298,6 +298,10 @@ func (a *CrossSdkGoAgent) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		a.handleGroupResourcesMount(res, req)
 	case req.Method == http.MethodPost && path == "/group/resources/read":
 		a.handleGroupResourcesRead(res, req)
+	case req.Method == http.MethodPost && path == "/collab/call":
+		a.handleCollabCall(res, req)
+	case req.Method == http.MethodPost && path == "/storage/call":
+		a.handleStorageCall(res, req)
 	case req.Method == http.MethodGet && path == "/group/inbox":
 		a.handleGroupInbox(res, req)
 	case req.Method == http.MethodGet && strings.HasPrefix(path, "/traces/"):
@@ -567,6 +571,132 @@ func (a *CrossSdkGoAgent) handleGroupResourcesPut(res http.ResponseWriter, req *
 	out := map[string]any{"ok": true, "trace_id": traceID, "pending": jsonSafe(pending), "confirmed": jsonSafe(confirmed)}
 	a.recordTrace(traceID, map[string]any{"stage": "group_resources_put", "result": out})
 	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleCollabCall(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	action := strings.TrimSpace(stringValue(body["action"]))
+	params := asMap(body["params"])
+	if params == nil {
+		params = map[string]any{}
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	result, err := a.callCollabAction(ctx, action, params)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "action": action, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "collab_call_error", "action": action, "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "action": action, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "collab_call", "action": action, "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleStorageCall(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	action := strings.TrimSpace(stringValue(body["action"]))
+	params := asMap(body["params"])
+	if params == nil {
+		params = map[string]any{}
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	result, err := a.callStorageAction(ctx, action, params)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "action": action, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "storage_call_error", "action": action, "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "action": action, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "storage_call", "action": action, "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, params map[string]any) (any, error) {
+	collab := a.client.Collab()
+	root := firstNonEmpty(stringValue(params["collab_root"]), stringValue(params["collabRoot"]))
+	doc := stringValue(params["doc"])
+	source := stringValue(params["source"])
+	switch action {
+	case "ls":
+		return collab.LS(ctx, root)
+	case "create":
+		return collab.Create(ctx, root, doc, source)
+	case "read":
+		return collab.Read(ctx, root, doc)
+	case "submit":
+		return collab.Submit(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])))
+	case "merge":
+		return collab.Merge(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])))
+	case "history":
+		return collab.History(ctx, root, doc)
+	case "get":
+		return collab.Get(ctx, root, doc, intValue(params["version"]))
+	case "diff":
+		return collab.Diff(ctx, root, doc, intValue(params["from"]), intValue(params["to"]))
+	case "export":
+		return collab.Export(ctx, root, stringValue(params["dest"]))
+	case "adopt":
+		return collab.Adopt(ctx, stringValue(params["src"]), firstNonEmpty(stringValue(params["new_root"]), stringValue(params["newRoot"])))
+	case "prune":
+		return collab.Prune(ctx, root, doc)
+	case "discover":
+		return collab.Discover(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
+	case "unregister":
+		return collab.Unregister(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])), root)
+	case "snapshot.create":
+		return collab.Snapshot().Create(ctx, root, stringValue(params["message"]), boolValue(params["major"], false))
+	case "snapshot.list":
+		return collab.Snapshot().List(ctx, root)
+	case "snapshot.show":
+		return collab.Snapshot().Show(ctx, root, stringValue(params["version"]))
+	case "snapshot.diff":
+		return collab.Snapshot().Diff(ctx, root, firstNonEmpty(stringValue(params["version_a"]), stringValue(params["versionA"])), firstNonEmpty(stringValue(params["version_b"]), stringValue(params["versionB"])))
+	case "snapshot.restore":
+		return collab.Snapshot().Restore(ctx, root, stringValue(params["version"]), stringValue(params["message"]))
+	case "snapshot.rm":
+		return collab.Snapshot().Remove(ctx, root, stringValue(params["version"]))
+	case "snapshot.prune":
+		before := optionalInt(firstNonNil(params["before"]))
+		keepLast := optionalInt(firstNonNil(params["keep_last"], params["keepLast"]))
+		return collab.Snapshot().Prune(ctx, root, before, keepLast)
+	default:
+		return nil, fmt.Errorf("unsupported collab action: %s", action)
+	}
+}
+
+func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, params map[string]any) (any, error) {
+	storage := a.client.Storage()
+	path := strings.TrimSpace(stringValue(params["path"]))
+	owner := strings.TrimSpace(firstNonEmpty(stringValue(params["owner_aid"]), stringValue(params["ownerAID"])))
+	bucket := strings.TrimSpace(stringValue(params["bucket"]))
+	if bucket == "" {
+		bucket = "default"
+	}
+	switch action {
+	case "set_acl":
+		return storage.SetACL(ctx, path, aun.SetACLOptions{
+			Owner:      owner,
+			Bucket:     bucket,
+			GranteeAID: strings.TrimSpace(firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"]))),
+			Perms:      strings.TrimSpace(stringValue(params["perms"])),
+			ExpiresAt:  optionalInt64(firstNonNil(params["expires_at"], params["expiresAt"])),
+			MaxUses:    optionalInt(firstNonNil(params["max_uses"], params["maxUses"])),
+		})
+	case "remove_acl":
+		return storage.RemoveACL(ctx, path, aun.RemoveACLOptions{
+			Owner:      owner,
+			Bucket:     bucket,
+			GranteeAID: strings.TrimSpace(firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"]))),
+		})
+	default:
+		return nil, fmt.Errorf("unsupported storage action: %s", action)
+	}
 }
 
 func (a *CrossSdkGoAgent) handleGroupResourcesMkdir(res http.ResponseWriter, req *http.Request) {
@@ -983,6 +1113,22 @@ func intValueDefault(value any, fallback int) int {
 		return fallback
 	}
 	return out
+}
+
+func optionalInt(value any) *int {
+	if value == nil {
+		return nil
+	}
+	n := intValue(value)
+	return &n
+}
+
+func optionalInt64(value any) *int64 {
+	if value == nil {
+		return nil
+	}
+	n := int64(intValue(value))
+	return &n
 }
 
 func boolValue(value any, fallback bool) bool {

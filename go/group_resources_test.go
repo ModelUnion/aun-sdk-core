@@ -510,11 +510,14 @@ func TestGroupResourcesInitializeNamespaceUsesAidStoreSignerClient(t *testing.T)
 	if !signer.closed {
 		t.Fatal("signer 未关闭")
 	}
-	gotSignerMethods := []string{signer.calls[0].method, signer.calls[1].method}
-	if !reflect.DeepEqual(gotSignerMethods, []string{"storage.fs.mkdir", "storage.fs.mkdir"}) {
+	gotSignerMethods := []string{}
+	for _, call := range signer.calls {
+		gotSignerMethods = append(gotSignerMethods, call.method)
+	}
+	if !reflect.DeepEqual(gotSignerMethods, []string{"storage.fs.mkdir", "storage.fs.mkdir", "storage.set_visibility", "group.resources.namespace_ready"}) {
 		t.Fatalf("storage RPC 未走 signer: %#v", gotSignerMethods)
 	}
-	for _, call := range signer.calls {
+	for _, call := range signer.calls[:3] {
 		if call.params["owner_aid"] != "team.agentid.pub" {
 			t.Fatalf("storage owner_aid 不正确: %#v", call.params)
 		}
@@ -522,11 +525,15 @@ func TestGroupResourcesInitializeNamespaceUsesAidStoreSignerClient(t *testing.T)
 			t.Fatalf("aidStore 路径不应透传 sign_as 给 storage: %#v", call.params)
 		}
 	}
-	if len(client.calls) != 1 || client.calls[0].method != "group.resources.namespace_ready" {
-		t.Fatalf("主 client 应只执行 namespace_ready: %#v", client.calls)
+	if len(client.calls) != 0 {
+		t.Fatalf("主 client 不应执行 namespace_ready: %#v", client.calls)
 	}
-	if _, exists := client.calls[0].params["sign_as"]; exists {
-		t.Fatalf("aidStore 路径 namespace_ready 不应带 sign_as: %#v", client.calls[0].params)
+	readyParams := signer.calls[3].params
+	if readyParams["group_id"] != "g1" || readyParams["group_aid"] != "team.agentid.pub" {
+		t.Fatalf("namespace_ready 参数不正确: %#v", readyParams)
+	}
+	if _, exists := readyParams["sign_as"]; exists {
+		t.Fatalf("aidStore 路径 namespace_ready 不应带 sign_as: %#v", readyParams)
 	}
 }
 

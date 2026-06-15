@@ -128,4 +128,27 @@ describe('RpcPipeline 组件边界', () => {
       false,
     );
   });
+
+  it('collab 写操作按签名和非幂等长超时发送', async () => {
+    const { client, pipeline } = createPipeline();
+
+    await pipeline.call('collab.submit', {
+      collab_root: 'alice.aid.com:/proj',
+      doc: 'd.md',
+      source: 'BASE64',
+      base_version: 1,
+    });
+
+    expect(client._signClientOperation).toHaveBeenCalledWith(
+      'collab.submit',
+      expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
+    );
+    expect(client._transport.call).toHaveBeenCalledWith(
+      'collab.submit',
+      expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
+      35,
+      undefined,
+      false,
+    );
+  });
 });

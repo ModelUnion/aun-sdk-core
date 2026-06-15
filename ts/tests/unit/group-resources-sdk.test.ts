@@ -456,6 +456,7 @@ describe('TS SDK facade API 契约', () => {
       'storage.fs.mkdir',
       'storage.fs.mkdir',
       'storage.set_visibility',
+      'group.resources.namespace_ready',
     ]);
     for (const call of signer.calls.filter((c) => c.method === 'storage.fs.mkdir')) {
       expect(call.params.owner_aid).toBe('team.agentid.pub');
@@ -466,8 +467,16 @@ describe('TS SDK facade API 契约', () => {
       path: 'public',
       visibility: 'public',
     });
-    expect(client.calls.map((c) => c.method)).toEqual(['group.resources.namespace_ready']);
-    expect(client.calls[0]?.params.sign_as).toBeUndefined();
+    expect(signer.calls[3]?.params).toMatchObject({
+      group_id: 'g1',
+      group_aid: 'team.agentid.pub',
+      folder_ids: {
+        announce: 'folder-announce',
+        public: 'folder-public',
+      },
+    });
+    expect(signer.calls[3]?.params.sign_as).toBeUndefined();
+    expect(client.calls).toEqual([]);
   });
 
   it('initializeNamespace 尊重显式 connectOptions', async () => {
