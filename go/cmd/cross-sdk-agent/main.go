@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -630,7 +631,7 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 	case "read":
 		return collab.Read(ctx, root, doc)
 	case "submit":
-		return collab.Submit(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])))
+		return collab.Submit(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])), stringValue(params["message"]))
 	case "merge":
 		return collab.Merge(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])))
 	case "history":
@@ -645,6 +646,22 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 		return collab.Adopt(ctx, stringValue(params["src"]), firstNonEmpty(stringValue(params["new_root"]), stringValue(params["newRoot"])))
 	case "prune":
 		return collab.Prune(ctx, root, doc)
+	case "gc":
+		dryRun := true
+		if params["dry_run"] != nil {
+			dryRun = boolValue(params["dry_run"], true)
+		} else if params["dryRun"] != nil {
+			dryRun = boolValue(params["dryRun"], true)
+		}
+		return collab.GC(ctx, root, dryRun)
+	case "reflog":
+		limit := intValue(params["limit"])
+		if limit <= 0 {
+			limit = 100
+		}
+		return collab.Reflog(ctx, root, doc, limit)
+	case "reset":
+		return collab.Reset(ctx, root, doc, intValue(params["version"]), stringValue(params["message"]))
 	case "discover":
 		return collab.Discover(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
 	case "unregister":
@@ -678,7 +695,57 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 	if bucket == "" {
 		bucket = "default"
 	}
+	token := strings.TrimSpace(stringValue(params["token"]))
 	switch action {
+	case "write_bytes":
+		contentText := stringValue(params["content"])
+		data := []byte(contentText)
+		if boolValue(firstNonNil(params["content_base64"], params["contentBase64"]), false) {
+			decoded, err := base64.StdEncoding.DecodeString(contentText)
+			if err != nil {
+				return nil, err
+			}
+			data = decoded
+		}
+		overwrite := boolValue(params["overwrite"], true)
+		return storage.WriteBytes(ctx, path, data, &aun.WriteBytesOptions{
+			Owner:       owner,
+			Bucket:      bucket,
+			ContentType: firstNonEmpty(stringValue(params["content_type"]), stringValue(params["contentType"]), "text/plain"),
+			Public:      boolValue(params["public"], false),
+			Overwrite:   &overwrite,
+		})
+	case "read_bytes":
+		data, err := storage.ReadBytes(ctx, path, &aun.ReadOptions{Owner: owner, Bucket: bucket, Token: token})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"content":        string(data),
+			"content_base64": base64.StdEncoding.EncodeToString(data),
+			"size_bytes":     len(data),
+		}, nil
+	case "create_download_ticket":
+		objectKey := strings.TrimLeft(firstNonEmpty(stringValue(params["object_key"]), stringValue(params["objectKey"]), path), "/")
+		callParams := map[string]any{
+			"owner_aid":  owner,
+			"bucket":     bucket,
+			"object_key": objectKey,
+		}
+		if token != "" {
+			callParams["token"] = token
+		}
+		return a.client.Call(ctx, "storage.create_download_ticket", callParams)
+	case "download_text":
+		url := strings.TrimSpace(firstNonEmpty(stringValue(params["url"]), stringValue(params["download_url"]), stringValue(params["downloadUrl"])))
+		if url == "" {
+			return nil, fmt.Errorf("download_text requires url")
+		}
+		content, err := downloadText(ctx, url)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"content": content}, nil
 	case "set_acl":
 		return storage.SetACL(ctx, path, aun.SetACLOptions{
 			Owner:      owner,

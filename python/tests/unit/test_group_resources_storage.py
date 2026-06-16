@@ -8,6 +8,7 @@ class _FakeClient:
     def __init__(self):
         self.calls = []
         self.results = []
+        self.http_puts = []
 
     async def call(self, method, params=None):
         payload = params or {}
@@ -18,6 +19,10 @@ class _FakeClient:
                 raise result
             return result
         return {"method": method, "params": payload}
+
+    async def http_put(self, url, data, headers=None):
+        self.http_puts.append((url, data, dict(headers or {})))
+        return {"status": 200}
 
 
 @pytest.mark.asyncio
@@ -279,15 +284,16 @@ async def test_initialize_namespace_with_aid_store_uses_signer_client(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_execute_pending_ops_runs_in_order_and_calls_confirm_rpc():
+async def test_execute_pending_ops_runs_large_upload_and_calls_confirm_rpc():
     client = _FakeClient()
     client.aid = "g.example.test"
     client.results = [
-        {"session_id": "s1"},
+        {"upload_url": "https://storage.example.test/upload/s1", "session_id": "s1", "headers": {"X-Upload": "1"}},
         {"object_id": "o1", "status": "active"},
         {"confirmed": True},
     ]
     resources = GroupResourcesFacade(client)
+    upload_data = b"hello large file"
 
     result = await resources.execute_pending_ops({
         "mode": "pending_ops",
@@ -303,32 +309,70 @@ async def test_execute_pending_ops_runs_in_order_and_calls_confirm_rpc():
         "pending_ops": [
             {
                 "rpc": "storage.create_upload_session",
-                "params": {"owner_aid": "g.example.test", "object_key": "announce/a.txt"},
+                "params": {
+                    "owner_aid": "g.example.test",
+                    "object_key": "announce/a.txt",
+                    "size_bytes": len(upload_data),
+                },
                 "sign_as": "g.example.test",
                 "confirm_key": "upload_session",
             },
             {
+                "rpc": "storage.http_put",
+                "params": {"content_type": "text/plain"},
+                "params_from_results": {
+                    "upload_url": "upload_session.upload_url",
+                    "headers": "upload_session.headers",
+                },
+                "data_ref": "upload_data",
+                "confirm_key": "http_put",
+            },
+            {
                 "rpc": "storage.complete_upload",
-                "params": {"owner_aid": "g.example.test", "object_key": "announce/a.txt"},
+                "params": {
+                    "owner_aid": "g.example.test",
+                    "object_key": "announce/a.txt",
+                    "size_bytes": len(upload_data),
+                    "sha256": "x" * 64,
+                },
+                "params_from_results": {"session_id": "upload_session.session_id"},
                 "sign_as": "g.example.test",
                 "confirm_key": "upload",
             },
         ],
-    })
+    }, upload_data=upload_data)
 
     assert result["confirmed"] == {"confirmed": True}
     assert result["storage_results"] == {
-        "upload_session": {"session_id": "s1"},
+        "upload_session": {
+            "upload_url": "https://storage.example.test/upload/s1",
+            "session_id": "s1",
+            "headers": {"X-Upload": "1"},
+        },
+        "http_put": {"status": 200, "upload_url": "https://storage.example.test/upload/s1", "size_bytes": len(upload_data)},
         "upload": {"object_id": "o1", "status": "active"},
     }
+    assert client.http_puts == [
+        (
+            "https://storage.example.test/upload/s1",
+            upload_data,
+            {"X-Upload": "1", "Content-Type": "text/plain"},
+        )
+    ]
     assert client.calls == [
         (
             "storage.create_upload_session",
-            {"owner_aid": "g.example.test", "object_key": "announce/a.txt"},
+            {"owner_aid": "g.example.test", "object_key": "announce/a.txt", "size_bytes": len(upload_data)},
         ),
         (
             "storage.complete_upload",
-            {"owner_aid": "g.example.test", "object_key": "announce/a.txt"},
+            {
+                "owner_aid": "g.example.test",
+                "object_key": "announce/a.txt",
+                "size_bytes": len(upload_data),
+                "sha256": "x" * 64,
+                "session_id": "s1",
+            },
         ),
         (
             "group.resources.confirm",
@@ -338,11 +382,29 @@ async def test_execute_pending_ops_runs_in_order_and_calls_confirm_rpc():
                 "resource_type": "file",
                 "op_id": "op1",
                 "storage_results": {
-                    "upload_session": {"session_id": "s1"},
+                    "upload_session": {
+                        "upload_url": "https://storage.example.test/upload/s1",
+                        "session_id": "s1",
+                        "headers": {"X-Upload": "1"},
+                    },
+                    "http_put": {
+                        "status": 200,
+                        "upload_url": "https://storage.example.test/upload/s1",
+                        "size_bytes": len(upload_data),
+                    },
                     "upload": {"object_id": "o1", "status": "active"},
                 },
                 "op_results": [
-                    {"session_id": "s1"},
+                    {
+                        "upload_url": "https://storage.example.test/upload/s1",
+                        "session_id": "s1",
+                        "headers": {"X-Upload": "1"},
+                    },
+                    {
+                        "status": 200,
+                        "upload_url": "https://storage.example.test/upload/s1",
+                        "size_bytes": len(upload_data),
+                    },
                     {"object_id": "o1", "status": "active"},
                 ],
                 "storage_result": {"object_id": "o1", "status": "active"},

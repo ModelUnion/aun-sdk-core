@@ -169,7 +169,7 @@ describe('mapRemoteError', () => {
   });
 
   it('限流错误码 → RateLimitError（且 retryable = true）', () => {
-    for (const code of [4290, 429, -32029]) {
+    for (const code of [4290, 429, -32029, -32429]) {
       const err = mapRemoteError({ code, message: 'rate limited' });
       expect(err).toBeInstanceOf(RateLimitError);
       expect(err.retryable).toBe(true);

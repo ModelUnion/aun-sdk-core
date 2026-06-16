@@ -235,7 +235,7 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "group.resources.get_access",
     "group.resources.resolve_access_ticket",
     "collab.create", "collab.submit", "collab.export", "collab.adopt",
-    "collab.prune", "collab.unregister",
+    "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
     "collab.snapshot.create", "collab.snapshot.restore",
     "collab.snapshot.rm", "collab.snapshot.prune",
 })
@@ -1044,7 +1044,7 @@ class AUNClient:
         "group.resources.get_access",
         "group.resources.resolve_access_ticket",
     "collab.create", "collab.submit", "collab.export", "collab.adopt",
-    "collab.prune", "collab.unregister",
+    "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
     "collab.snapshot.create", "collab.snapshot.restore",
     "collab.snapshot.rm", "collab.snapshot.prune",
 })

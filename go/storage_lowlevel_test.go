@@ -255,6 +255,9 @@ func TestStorageLowLevelLegacyTreeRPCMappings(t *testing.T) {
 	if _, err := low.DeleteObject(ctx, "alice.agentid.pub", "team", "docs/a.txt"); err != nil {
 		t.Fatalf("DeleteObject 失败: %v", err)
 	}
+	if _, err := low.HeadObject(ctx, "alice.agentid.pub", "team", "docs/a.txt", "tok"); err != nil {
+		t.Fatalf("HeadObject 失败: %v", err)
+	}
 	if _, err := low.BatchDelete(ctx, "alice.agentid.pub", "team", []map[string]any{{"object_key": "docs/a.txt"}}, true); err != nil {
 		t.Fatalf("BatchDelete 失败: %v", err)
 	}
@@ -288,11 +291,15 @@ func TestStorageLowLevelLegacyTreeRPCMappings(t *testing.T) {
 	if _, err := low.ResolvePath(ctx, "alice.agentid.pub", "team", "link", "file", &followSymlinks); err != nil {
 		t.Fatalf("ResolvePath 失败: %v", err)
 	}
+	if _, err := low.DeleteSymlink(ctx, "alice.agentid.pub", "team", "link"); err != nil {
+		t.Fatalf("DeleteSymlink 失败: %v", err)
+	}
 
 	wantMethods := []string{
 		"storage.list_objects",
 		"storage.list_prefixes",
 		"storage.delete_object",
+		"storage.head_object",
 		"storage.batch_delete",
 		"storage.move_object",
 		"storage.copy_object",
@@ -301,6 +308,7 @@ func TestStorageLowLevelLegacyTreeRPCMappings(t *testing.T) {
 		"storage.move_folder",
 		"storage.delete_folder",
 		"storage.resolve_path",
+		"storage.delete_symlink",
 	}
 	if len(client.calls) != len(wantMethods) {
 		t.Fatalf("调用次数不正确: got=%d want=%d calls=%#v", len(client.calls), len(wantMethods), client.calls)
@@ -313,16 +321,22 @@ func TestStorageLowLevelLegacyTreeRPCMappings(t *testing.T) {
 	if params := client.calls[0].params; params["prefix"] != "docs" || params["page"] != 2 || params["size"] != 10 || params["marker"] != "m1" {
 		t.Fatalf("list_objects 参数不正确: %#v", params)
 	}
-	if params := client.calls[4].params; params["path"] != "docs/a.txt" || params["dst_parent_path"] != "archive" || params["new_name"] != "a.txt" || params["conflict_policy"] != "replace" || params["expected_version"] != 5 {
+	if params := client.calls[3].params; params["object_key"] != "docs/a.txt" || params["token"] != "tok" {
+		t.Fatalf("head_object 参数不正确: %#v", params)
+	}
+	if params := client.calls[5].params; params["path"] != "docs/a.txt" || params["dst_parent_path"] != "archive" || params["new_name"] != "a.txt" || params["conflict_policy"] != "replace" || params["expected_version"] != 5 {
 		t.Fatalf("move_object 参数不正确: %#v", params)
 	}
-	if params := client.calls[5].params; params["conflict_policy"] != "reject" {
+	if params := client.calls[6].params; params["conflict_policy"] != "reject" {
 		t.Fatalf("copy_object 默认冲突策略不正确: %#v", params)
 	}
-	if params := client.calls[6].params; params["path"] != "docs" || params["mkdirs"] != true {
+	if params := client.calls[7].params; params["path"] != "docs" || params["mkdirs"] != true {
 		t.Fatalf("create_folder 参数不正确: %#v", params)
 	}
-	if params := client.calls[10].params; params["path"] != "link" || params["expected_type"] != "file" || params["follow_symlinks"] != false {
+	if params := client.calls[11].params; params["path"] != "link" || params["expected_type"] != "file" || params["follow_symlinks"] != false {
 		t.Fatalf("resolve_path 参数不正确: %#v", params)
+	}
+	if params := client.calls[12].params; params["path"] != "link" {
+		t.Fatalf("delete_symlink 参数不正确: %#v", params)
 	}
 }

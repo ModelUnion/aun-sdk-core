@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { StorageLowLevel, StorageVFS } from '../../src/storage/vfs.js';
 import { AUNClient } from '../../src/client.js';
@@ -15,6 +18,12 @@ class FakeClient {
     if (method === 'storage.get_object') {
       return {
         content: 'aGVsbG8=',
+        sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
+      };
+    }
+    if (method === 'storage.create_download_ticket') {
+      return {
+        download_url: 'https://download.local/docs/a.txt',
         sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
       };
     }
@@ -112,6 +121,40 @@ describe('P5 StorageVFS TypeScript 契约', () => {
         token: 'tok',
       },
     }]);
+  });
+
+  it('uploadFile/downloadFile 支持 Node 本地文件路径', async () => {
+    const client = new FakeClient();
+    const storage = new StorageVFS(client);
+    storage.lowlevel.httpGet = vi.fn().mockResolvedValue(new TextEncoder().encode('hello'));
+    const dir = await mkdtemp(join(tmpdir(), 'aun-storage-'));
+    try {
+      const localUpload = join(dir, 'upload.txt');
+      const localDownload = join(dir, 'download.txt');
+      await writeFile(localUpload, 'hello');
+
+      const uploaded = await storage.uploadFile(localUpload, '/docs/upload.txt', { contentType: 'text/plain' });
+      const downloaded = await storage.downloadFile('/docs/a.txt', localDownload, { token: 'tok' });
+
+      await expect(readFile(localDownload, 'utf8')).resolves.toBe('hello');
+      expect(uploaded.path).toBe('/docs/upload.txt');
+      expect(downloaded).toMatchObject({
+        path: '/docs/a.txt',
+        localPath: localDownload,
+        size: 5,
+        verified: true,
+      });
+      expect(client.calls.map((c) => c.method)).toEqual([
+        'storage.check_upload',
+        'storage.get_limits',
+        'storage.put_object',
+        'storage.create_download_ticket',
+      ]);
+      expect(client.calls[2].params).toMatchObject({ object_key: 'docs/upload.txt', content_type: 'text/plain' });
+      expect(client.calls[3].params).toMatchObject({ object_key: 'docs/a.txt', token: 'tok' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('readBytes 用错误码判断 inline 过大并降级到下载 ticket', async () => {
@@ -219,7 +262,7 @@ describe('P5 StorageVFS TypeScript 契约', () => {
     const client = new FakeClient();
     const storage = new StorageVFS(client);
 
-    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob.agentid.pub' });
+    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob.agentid.pub', recursive: true });
 
     expect(copied.owner).toBe('bob.agentid.pub');
     expect(client.calls).toHaveLength(1);
@@ -230,6 +273,7 @@ describe('P5 StorageVFS TypeScript 契约', () => {
         dst_owner_aid: 'bob.agentid.pub',
         src: 'docs/a.txt',
         dst: 'inbox/a.txt',
+        recursive: true,
       },
     });
   });

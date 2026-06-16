@@ -50,7 +50,7 @@ func TestCollabFacadeRPCMappings(t *testing.T) {
 		{"ls", func() error { _, err := collab.LS(ctx, "alice.aid.com:/proj"); return err }, "collab.ls"},
 		{"create", func() error { _, err := collab.Create(ctx, "alice.aid.com:/proj", "d.md", "S"); return err }, "collab.create"},
 		{"read", func() error { _, err := collab.Read(ctx, "alice.aid.com:/proj", "d.md"); return err }, "collab.read"},
-		{"submit", func() error { _, err := collab.Submit(ctx, "alice.aid.com:/proj", "d.md", "S", 1); return err }, "collab.submit"},
+		{"submit", func() error { _, err := collab.Submit(ctx, "alice.aid.com:/proj", "d.md", "S", 1, ""); return err }, "collab.submit"},
 		{"merge", func() error { _, err := collab.Merge(ctx, "alice.aid.com:/proj", "d.md", "S", 1); return err }, "collab.merge"},
 		{"history", func() error { _, err := collab.History(ctx, "alice.aid.com:/proj", "d.md"); return err }, "collab.history"},
 		{"get", func() error { _, err := collab.Get(ctx, "alice.aid.com:/proj", "d.md", 1); return err }, "collab.get"},
@@ -229,7 +229,7 @@ func TestCollabConflictErrorPreservesServerFields(t *testing.T) {
 	}
 	collab := newCollabFacade(client)
 
-	_, err := collab.Submit(ctx, "alice.aid.com:/proj", "d.md", "S", 3)
+	_, err := collab.Submit(ctx, "alice.aid.com:/proj", "d.md", "S", 3, "")
 	if err == nil {
 		t.Fatal("expected CollabConflictError, got nil")
 	}

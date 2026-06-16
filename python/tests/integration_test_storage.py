@@ -324,7 +324,7 @@ async def test_storage_upload_session_roundtrip_and_download_ticket():
     rid = uuid.uuid4().hex[:10]
     alice = _make_client()
     bob = _make_client()
-    bucket = f"storage-upload-{rid}"
+    bucket = "default"  # 逻辑 URL 仅支持 default bucket
     object_key = f"archive/{rid}/large.bin"
     payload = (b"AUN-STORAGE-" + rid.encode("ascii")) * 4096  # 大于 inline 上限
     sha256 = hashlib.sha256(payload).hexdigest()
@@ -401,9 +401,11 @@ async def test_storage_upload_session_roundtrip_and_download_ticket():
             raise AssertionError(f"create_download_ticket 未返回 download_url: {ticket}")
         if str(ticket.get("file_name") or "") != "large.bin":
             raise AssertionError(f"download ticket file_name 异常: {ticket}")
-        _assert_non_loopback_url(download_url, "storage.create_download_ticket.download_url")
+        # download_url 格式与 url 一致（AID 风格）；实际 HTTP 下载用 logical_url（直达 storage，无 NameService 跳转）
+        path_dl = str(ticket.get("logical_url") or "")
+        _assert_non_loopback_url(path_dl, "storage.create_download_ticket.logical_url")
 
-        _, body = await _http_request(download_url)
+        _, body = await _http_request(path_dl)
         if body != payload:
             raise AssertionError("下载内容与上传内容不一致")
 
@@ -779,7 +781,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
     rid = uuid.uuid4().hex[:10]
     alice = _make_client()
     bob = _make_client()
-    bucket = f"storage-dedup-{rid}"
+    bucket = "default"  # 逻辑 URL 仅支持 default bucket
     key1 = f"dedup/{rid}/file1.bin"
     key2 = f"dedup/{rid}/file2.bin"
     key3 = f"dedup/{rid}/file3.bin"
@@ -812,7 +814,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
             "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key1,
             "expire_in_seconds": 300,
         })
-        _, body1 = await _http_request(str(t1.get("download_url") or ""))
+        _, body1 = await _http_request(str(t1.get("logical_url") or ""))
         if body1 != payload:
             raise AssertionError("对象1 下载内容与上传不一致（首传对象悬空）")
 
@@ -856,9 +858,9 @@ async def test_storage_cas_dedup_and_instant_upload_download():
             "owner_aid": _BOBB_AID, "bucket": bucket, "object_key": key2,
             "expire_in_seconds": 300,
         })
-        download_url2 = str(t2.get("download_url") or "")
-        _assert_non_loopback_url(download_url2, "对象2 download_url")
-        status2, body2 = await _http_request(download_url2)
+        logical_url2 = str(t2.get("logical_url") or "")
+        _assert_non_loopback_url(logical_url2, "对象2 logical_url")
+        status2, body2 = await _http_request(logical_url2)
         if status2 != 200:
             raise AssertionError(f"对象2（跨 owner 同内容上传）下载失败 status={status2}（CAS 路径悬空 404）")
         if body2 != payload:
@@ -883,7 +885,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
             "owner_aid": _ALICE_AID, "bucket": bucket, "object_key": key3,
             "expire_in_seconds": 300,
         })
-        status3, body3 = await _http_request(str(t3.get("download_url") or ""))
+        status3, body3 = await _http_request(str(t3.get("logical_url") or ""))
         if status3 != 200:
             raise AssertionError(f"对象3（同 owner 秒传）下载失败 status={status3}")
         if body3 != payload:
@@ -1277,8 +1279,8 @@ async def test_storage_logical_url_public_and_private():
         aid_url = str(ticket.get("url") or "")
         if not aid_url:
             raise AssertionError(f"ticket 未返回 url 字段: {ticket}")
-        if f"{_ALICE_AID}/storage/" not in aid_url:
-            raise AssertionError(f"url 不含 AID 路径段: {aid_url}")
+        if f"https://{_ALICE_AID}/" not in aid_url:
+            raise AssertionError(f"url 不含 AID 域: {aid_url}")
         if pub_key not in aid_url:
             raise AssertionError(f"url 不含 object_key: {aid_url}")
         print(f"  url={aid_url}")
@@ -1292,8 +1294,8 @@ async def test_storage_logical_url_public_and_private():
         })
         if not str(put_res.get("url") or ""):
             raise AssertionError(f"put_object 未返回 url: {put_res}")
-        if f"{_ALICE_AID}/storage/" not in put_res["url"]:
-            raise AssertionError(f"put_object url 不含 AID 路径段: {put_res['url']}")
+        if f"https://{_ALICE_AID}/" not in put_res["url"]:
+            raise AssertionError(f"put_object url 不含 AID 域: {put_res['url']}")
         print(f"  put_object url={put_res['url']}")
 
         # 公开文件：无 token 直接访问

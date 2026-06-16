@@ -124,6 +124,13 @@ func (l *StorageLowLevel) GetObject(ctx context.Context, owner, bucket, objectKe
 	return l.call(ctx, "storage.get_object", storageParams(owner, bucket, extra), objectKey)
 }
 
+func (l *StorageLowLevel) HeadObject(ctx context.Context, owner, bucket, objectKey, token string) (map[string]any, error) {
+	return l.call(ctx, "storage.head_object", storageParams(owner, bucket, map[string]any{
+		"object_key": objectKey,
+		"token":      emptyToNil(token),
+	}), objectKey)
+}
+
 func (l *StorageLowLevel) CreateUploadSession(ctx context.Context, owner, bucket, objectKey string, size int, contentType string, expectedVersion *int) (map[string]any, error) {
 	extra := map[string]any{"object_key": objectKey, "size_bytes": size, "content_type": emptyToNil(contentType)}
 	if expectedVersion != nil {
@@ -289,9 +296,9 @@ func (l *StorageLowLevel) FSRename(ctx context.Context, owner, bucket, src, dst 
 	return l.call(ctx, "storage.fs.rename", storageParams(owner, bucket, extra), src)
 }
 
-func (l *StorageLowLevel) FSCopy(ctx context.Context, owner, bucket, src, dst string, overwrite, followSymlinks bool, dstOwner, dstBucket string) (map[string]any, error) {
+func (l *StorageLowLevel) FSCopy(ctx context.Context, owner, bucket, src, dst string, overwrite, followSymlinks, recursive bool, dstOwner, dstBucket string) (map[string]any, error) {
 	extra := map[string]any{
-		"src": src, "dst": dst, "overwrite": overwrite, "follow_symlinks": followSymlinks,
+		"src": src, "dst": dst, "overwrite": overwrite, "follow_symlinks": followSymlinks, "recursive": recursive,
 	}
 	if dstOwner != "" {
 		extra["dst_owner_aid"] = dstOwner
@@ -348,7 +355,7 @@ func (l *StorageLowLevel) FSMount(ctx context.Context, owner, bucket, mountPath,
 	return l.call(ctx, "storage.fs.mount", storageParams(owner, bucket, extra), mountPath)
 }
 
-func (l *StorageLowLevel) FSApprove(ctx context.Context, owner, bucket, mountPath, mountID string) (map[string]any, error) {
+func (l *StorageLowLevel) FSApprove(ctx context.Context, owner, bucket, mountPath, mountID, requestID string) (map[string]any, error) {
 	extra := map[string]any{}
 	if mountPath != "" {
 		extra["mount_path"] = mountPath
@@ -356,10 +363,13 @@ func (l *StorageLowLevel) FSApprove(ctx context.Context, owner, bucket, mountPat
 	if mountID != "" {
 		extra["mount_id"] = mountID
 	}
-	return l.call(ctx, "storage.fs.approve", storageParams(owner, bucket, extra), firstNonEmpty(mountPath, mountID))
+	if requestID != "" {
+		extra["request_id"] = requestID
+	}
+	return l.call(ctx, "storage.fs.approve", storageParams(owner, bucket, extra), firstNonEmpty(mountPath, mountID, requestID))
 }
 
-func (l *StorageLowLevel) FSReject(ctx context.Context, owner, bucket, mountPath, mountID string) (map[string]any, error) {
+func (l *StorageLowLevel) FSReject(ctx context.Context, owner, bucket, mountPath, mountID, requestID string) (map[string]any, error) {
 	extra := map[string]any{}
 	if mountPath != "" {
 		extra["mount_path"] = mountPath
@@ -367,7 +377,10 @@ func (l *StorageLowLevel) FSReject(ctx context.Context, owner, bucket, mountPath
 	if mountID != "" {
 		extra["mount_id"] = mountID
 	}
-	return l.call(ctx, "storage.fs.reject", storageParams(owner, bucket, extra), firstNonEmpty(mountPath, mountID))
+	if requestID != "" {
+		extra["request_id"] = requestID
+	}
+	return l.call(ctx, "storage.fs.reject", storageParams(owner, bucket, extra), firstNonEmpty(mountPath, mountID, requestID))
 }
 
 func (l *StorageLowLevel) FSUnmount(ctx context.Context, owner, bucket, mountPath string) (map[string]any, error) {
@@ -425,6 +438,10 @@ func (l *StorageLowLevel) CreateSymlink(ctx context.Context, owner, bucket, p, t
 
 func (l *StorageLowLevel) Readlink(ctx context.Context, owner, bucket, p string) (map[string]any, error) {
 	return l.call(ctx, "storage.readlink", storageParams(owner, bucket, map[string]any{"path": p}), p)
+}
+
+func (l *StorageLowLevel) DeleteSymlink(ctx context.Context, owner, bucket, p string) (map[string]any, error) {
+	return l.call(ctx, "storage.delete_symlink", storageParams(owner, bucket, map[string]any{"path": p}), p)
 }
 
 func (l *StorageLowLevel) AtomicRepoint(ctx context.Context, owner, bucket, p, newTarget string, expectedVersion *int) (map[string]any, error) {

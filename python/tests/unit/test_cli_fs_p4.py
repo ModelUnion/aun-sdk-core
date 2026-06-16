@@ -86,6 +86,28 @@ def test_cli_fs_chmod_calls_set_visibility(monkeypatch):
     assert json.loads(result.output)["visibility"] == "private"
 
 
+def test_cli_fs_chmod_mode_shorthand(monkeypatch):
+    from aun_cli.commands import fs as fs_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+
+    result = _invoke(["--json", "fs", "chmod", "+r", "alice.agentid.pub:/docs/a.txt"])
+
+    assert result.exit_code == 0, result.output
+    assert client.storage.calls == [
+        ("set_visibility", "/docs/a.txt", {"owner": "alice.agentid.pub", "visibility": "public"})
+    ]
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+    result = _invoke(["--json", "fs", "chmod", "o-r", "alice.agentid.pub:/docs/a.txt"])
+    assert result.exit_code == 0, result.output
+    assert client.storage.calls == [
+        ("set_visibility", "/docs/a.txt", {"owner": "alice.agentid.pub", "visibility": "private"})
+    ]
+
+
 def test_cli_fs_setfacl_getfacl_and_remove(monkeypatch):
     from aun_cli.commands import fs as fs_commands
 

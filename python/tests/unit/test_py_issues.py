@@ -206,6 +206,7 @@ class TestPY003PY005DisconnectSavesSeqTracker:
         client._state = "connected"
         client._transport = MagicMock()
         client._transport.close = AsyncMock()
+        client._transport.cancel_event_tasks = AsyncMock()
         client._discovery = MagicMock()
         client._discovery.check_health = AsyncMock(return_value=True)
         return client
@@ -290,6 +291,7 @@ class TestSDKPY001DisconnectCloseRace:
         client._state = "connected"
         client._transport = MagicMock()
         client._transport.close = AsyncMock()
+        client._transport.cancel_event_tasks = AsyncMock()
         return client
 
     @pytest.mark.asyncio

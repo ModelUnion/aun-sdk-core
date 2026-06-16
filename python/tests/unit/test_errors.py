@@ -1,5 +1,6 @@
 from aun_core.errors import (
     PermissionError as AUNPermissionError,
+    RateLimitError as AUNRateLimitError,
     TimeoutError as AUNTimeoutError,
     map_remote_error,
 )
@@ -26,4 +27,17 @@ def test_legacy_permission_32004_stays_permission_error():
 
     assert isinstance(err, AUNPermissionError)
     assert err.retryable is False
+
+
+def test_gateway_backpressure_32429_maps_to_rate_limit_error():
+    """Gateway 入口背压限流码 -32429 应映射为可重试的 RateLimitError。"""
+    err = map_remote_error({
+        "code": -32429,
+        "message": "too many requests: group message service backpressure pending=20 limit=20",
+    })
+
+    assert isinstance(err, AUNRateLimitError)
+    assert err.code == -32429
+    assert err.retryable is True
+
 

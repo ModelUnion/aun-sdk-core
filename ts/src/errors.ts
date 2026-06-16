@@ -271,7 +271,7 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
   const AUTH_CODES = new Set([4001, 4010, -32001, -32003]);
   const PERMISSION_CODES = new Set([4030, 403, -32004]); // -32004 = PERMISSION_DENIED
   const NOT_FOUND_CODES = new Set([4040, 404, -32008]);
-  const RATE_LIMIT_CODES = new Set([4290, 429, -32029]);
+  const RATE_LIMIT_CODES = new Set([4290, 429, -32029, -32429]);
   const SESSION_CODES = new Set([-32010, -32011, -32013]);
   const VALIDATION_CODES = new Set([-32600, -32601, -32602, 4000]);
 

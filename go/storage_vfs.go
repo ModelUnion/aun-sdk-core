@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"mime"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -81,6 +84,7 @@ type CopyOptions struct {
 	DstBucket      string
 	Overwrite      bool
 	FollowSymlinks bool
+	Recursive      bool
 }
 
 type FindOptions struct {
@@ -145,9 +149,10 @@ type UnmountOptions struct {
 }
 
 type MountReviewOptions struct {
-	Owner   string
-	Bucket  string
-	MountID string
+	Owner     string
+	Bucket    string
+	MountID   string
+	RequestID string
 }
 
 type SetACLOptions struct {
@@ -227,6 +232,11 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	if opts == nil {
 		opts = &WriteBytesOptions{}
 	}
+	// 对齐 Python 行为：overwrite 默认 true
+	if opts.Overwrite == nil {
+		t := true
+		opts.Overwrite = &t
+	}
 	owner := v.owner(opts.Owner)
 	b := bucket(opts.Bucket)
 	objectKey := StoragePathToKey(p)
@@ -270,10 +280,7 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	if uploadURL == "" {
 		return NodeView{}, &StorageError{Message: "create_upload_session did not return upload_url", Code: "ESTORAGE", Path: p}
 	}
-	headers := map[string]string{}
-	if rawHeaders, ok := session["headers"].(map[string]string); ok {
-		headers = rawHeaders
-	}
+	headers := storageHeadersFromAny(session["headers"])
 	if err := v.low.HTTPPut(ctx, uploadURL, data, headers); err != nil {
 		return NodeView{}, MapStorageError(err, p)
 	}
@@ -284,11 +291,58 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	return NodeViewFromAny(raw), nil
 }
 
+func (v *StorageVFS) UploadFile(ctx context.Context, localPath, remotePath string, opts *WriteBytesOptions) (NodeView, error) {
+	if opts == nil {
+		opts = &WriteBytesOptions{}
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return NodeView{}, err
+	}
+	next := *opts
+	if strings.TrimSpace(next.ContentType) == "" {
+		next.ContentType = contentTypeForPath(localPath)
+	}
+	return v.WriteBytes(ctx, remotePath, data, &next)
+}
+
+func contentTypeForPath(localPath string) string {
+	typ := mime.TypeByExtension(filepath.Ext(localPath))
+	if strings.TrimSpace(typ) == "" {
+		return "application/octet-stream"
+	}
+	return typ
+}
+
 func contentType(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "application/octet-stream"
 	}
 	return value
+}
+
+// storageHeadersFromAny 将 JSON unmarshal 产出的 headers（map[string]interface{} 或 map[string]string）
+// 转换为 map[string]string，适配 HTTP 请求头使用。
+func storageHeadersFromAny(raw any) map[string]string {
+	result := map[string]string{}
+	if raw == nil {
+		return result
+	}
+	switch h := raw.(type) {
+	case map[string]string:
+		for k, v := range h {
+			result[k] = v
+		}
+	case map[string]any:
+		for k, v := range h {
+			if s, ok := v.(string); ok {
+				result[k] = s
+			} else if v != nil {
+				result[k] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+	return result
 }
 
 func (v *StorageVFS) ReadBytes(ctx context.Context, p string, opts *ReadOptions) ([]byte, error) {
@@ -317,6 +371,55 @@ func (v *StorageVFS) ReadBytes(ctx context.Context, p string, opts *ReadOptions)
 		return nil, &StorageError{Message: "create_download_ticket did not return download_url", Code: "ESTORAGE", Path: p}
 	}
 	return v.low.HTTPGet(ctx, downloadURL, nil)
+}
+
+func (v *StorageVFS) DownloadFile(ctx context.Context, remotePath, localPath string, opts *ReadOptions) (DownloadResult, error) {
+	if opts == nil {
+		opts = &ReadOptions{}
+	}
+	owner := v.owner(opts.Owner)
+	b := bucket(opts.Bucket)
+	objectKey := StoragePathToKey(remotePath)
+	ticket, err := v.low.CreateDownloadTicket(ctx, owner, b, objectKey, opts.Token)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	downloadURL := storageString(ticket["download_url"], "")
+	if downloadURL == "" {
+		return DownloadResult{}, &StorageError{Message: "create_download_ticket did not return download_url", Code: "ESTORAGE", Path: remotePath}
+	}
+	data, err := v.low.HTTPGet(ctx, downloadURL, nil)
+	if err != nil {
+		return DownloadResult{}, MapStorageError(err, remotePath)
+	}
+	expectedSHA := strings.ToLower(storageString(ticket["sha256"], ""))
+	actualSum := sha256.Sum256(data)
+	actualSHA := fmt.Sprintf("%x", actualSum[:])
+	verified := true
+	if expectedSHA != "" {
+		verified = expectedSHA == strings.ToLower(actualSHA)
+		if !verified {
+			return DownloadResult{}, &StorageError{
+				Message: fmt.Sprintf("download hash verification failed: expected=%s actual=%s", expectedSHA, actualSHA),
+				Code:    "ECONFLICT",
+				Path:    remotePath,
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return DownloadResult{}, err
+	}
+	if err := os.WriteFile(localPath, data, 0o600); err != nil {
+		return DownloadResult{}, err
+	}
+	return DownloadResult{
+		Path:      NormalizeStoragePath(remotePath),
+		LocalPath: localPath,
+		Size:      int64(len(data)),
+		SHA256:    firstNonEmpty(expectedSHA, actualSHA),
+		Verified:  verified,
+		Data:      data,
+	}, nil
 }
 
 func (v *StorageVFS) List(ctx context.Context, p string, opts *ListOptions) ([]NodeView, error) {
@@ -426,7 +529,7 @@ func (v *StorageVFS) Copy(ctx context.Context, src, dst string, opts *CopyOption
 	if opts == nil {
 		opts = &CopyOptions{}
 	}
-	raw, err := v.low.FSCopy(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(src), StoragePathToKey(dst), opts.Overwrite, opts.FollowSymlinks, opts.DstOwner, opts.DstBucket)
+	raw, err := v.low.FSCopy(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(src), StoragePathToKey(dst), opts.Overwrite, opts.FollowSymlinks, opts.Recursive, opts.DstOwner, opts.DstBucket)
 	if err != nil {
 		return NodeView{}, err
 	}
@@ -560,14 +663,14 @@ func (v *StorageVFS) ApproveMount(ctx context.Context, mountPath string, opts *M
 	if opts == nil {
 		opts = &MountReviewOptions{}
 	}
-	return v.low.FSApprove(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(mountPath), opts.MountID)
+	return v.low.FSApprove(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(mountPath), opts.MountID, opts.RequestID)
 }
 
 func (v *StorageVFS) RejectMount(ctx context.Context, mountPath string, opts *MountReviewOptions) (map[string]any, error) {
 	if opts == nil {
 		opts = &MountReviewOptions{}
 	}
-	return v.low.FSReject(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(mountPath), opts.MountID)
+	return v.low.FSReject(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(mountPath), opts.MountID, opts.RequestID)
 }
 
 func (v *StorageVFS) Unmount(ctx context.Context, mountPath string, opts *UnmountOptions) (UnmountResult, error) {

@@ -22,12 +22,15 @@
 | [collab.history](#collabhistory) | 查版本台账 |
 | [collab.get](#collabget) | 读指定历史版本 |
 | [collab.diff](#collabdiff) | 比较两版本 |
+| [collab.reset](#collabreset) | 以历史版本内容提交一个新版本 |
 | [collab.prune](#collabprune) | 清理某文档的历史版本文件 |
 
-### 备份与迁移
+### 运维、备份与迁移
 
 | 方法 | 说明 |
 |------|------|
+| [collab.gc](#collabgc) | 扫描不可达版本文件并可选删除 |
+| [collab.reflog](#collabreflog) | 查看协作审计日志 |
 | [collab.export](#collabexport) | 深拷贝整个协作到新位置 |
 | [collab.adopt](#collabadopt) | 换 host 重建协作（迁移） |
 
@@ -285,6 +288,25 @@ if not res["ok"]:
 
 ---
 
+## collab.reset
+
+以指定历史版本的内容提交一个新版本。reset 不回退版本号，也不直接改写历史文件；它读取目标版本内容，以当前版本为 `base_version` 再走普通 `submit` 流程，因此仍保持 forward-only 不变量。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `collab_root` | string | 是 | — | 协作根 `<aid>:<path>` |
+| `doc` | string | 是 | — | 文档名 |
+| `version` | integer | 是 | — | 要恢复内容的历史版本号 |
+| `message` | string | 否 | `""` | 记录到台账/审计日志的说明 |
+
+### 响应
+
+返回普通 `collab.submit` 的响应字段；如果当前版本已经等于目标版本，返回包含 `no_change: true` 的结果。
+
+---
+
 ## collab.prune
 
 清理某文档的历史版本文件（保留台账与当前版本，回收旧 blob）。
@@ -301,6 +323,47 @@ if not res["ok"]:
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `pruned` | integer | 清理的版本文件数 |
+
+---
+
+## collab.gc
+
+目录级垃圾扫描。服务端会扫描 `.collab-versions`，从台账、当前指针和快照 manifest 标记可达版本文件；未被引用的版本文件计为 garbage。默认 `dry_run=true` 只返回统计，不删除。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `collab_root` | string | 是 | — | 协作根 `<aid>:<path>` |
+| `dry_run` | boolean | 否 | `true` | 只扫描不删除 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `scanned` | integer | 扫描到的版本文件数 |
+| `reachable` | integer | 可达版本文件数 |
+| `garbage` | integer | 不可达版本文件数 |
+| `deleted` | integer | 实际删除数量；`dry_run=true` 时为 0 |
+| `freed_bytes` | integer | 实际释放字节数 |
+
+---
+
+## collab.reflog
+
+读取协作审计日志，用于排查 submit/merge/reset/snapshot 等操作历史。可按文档过滤并限制条数。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `collab_root` | string | 是 | — | 协作根 `<aid>:<path>` |
+| `doc` | string | 否 | — | 仅查看某个文档的日志 |
+| `limit` | integer | 否 | `100` | 返回条数上限 |
+
+### 响应
+
+返回日志数组，每项包含 `seq`、`action`、`requester`、`doc`、`version`、`base_version`、`target`、`status`、`error_code`、`error_msg`、`metadata`、`timestamp` 等字段。
 
 ---
 

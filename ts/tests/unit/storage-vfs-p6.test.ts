@@ -35,8 +35,8 @@ describe('P6 StorageVFS TypeScript mount 契约', () => {
       'group.agentid.pub:/memberdata/alice',
       { readonly: true, expiresAt: 123456, requireApproval: true },
     );
-    const approved = await storage.approveMount('group.agentid.pub:/memberdata/alice');
-    const rejected = await storage.rejectMount('group.agentid.pub:/memberdata/alice');
+    const approved = await storage.approveMount('group.agentid.pub:/memberdata/alice', { requestId: 'req-1' });
+    const rejected = await storage.rejectMount('group.agentid.pub:/memberdata/alice', { requestId: 'req-2' });
 
     expect(node.type).toBe('mount');
     expect(approved.approved).toBe(true);
@@ -64,6 +64,7 @@ describe('P6 StorageVFS TypeScript mount 契约', () => {
           owner_aid: 'group.agentid.pub',
           bucket: 'default',
           mount_path: 'memberdata/alice',
+          request_id: 'req-1',
         },
       },
       {
@@ -72,6 +73,7 @@ describe('P6 StorageVFS TypeScript mount 契约', () => {
           owner_aid: 'group.agentid.pub',
           bucket: 'default',
           mount_path: 'memberdata/alice',
+          request_id: 'req-2',
         },
       },
     ]);
@@ -108,8 +110,8 @@ describe('P6 StorageVFS TypeScript mount 契约', () => {
       { owner: 'group.agentid.pub', path: '/dst' },
       { bucket: 'team', sourceBucket: 'src-bucket', expires: 456 },
     );
-    await storage.approveMount({ owner: 'group.agentid.pub', path: '/dst' }, { bucket: 'team' });
-    await storage.rejectMount({ owner: 'group.agentid.pub', path: '/dst' }, { bucket: 'team' });
+    await storage.approveMount({ owner: 'group.agentid.pub', path: '/dst' }, { bucket: 'team', requestId: 'req-3' });
+    await storage.rejectMount({ owner: 'group.agentid.pub', path: '/dst' }, { bucket: 'team', requestId: 'req-4' });
     const unmounted = await storage.unmount({ owner: 'group.agentid.pub', path: '/dst' }, { bucket: 'team' });
 
     expect(client.calls.map((c) => c.method)).toEqual([
@@ -132,11 +134,13 @@ describe('P6 StorageVFS TypeScript mount 契约', () => {
       owner_aid: 'group.agentid.pub',
       bucket: 'team',
       mount_path: 'dst',
+      request_id: 'req-3',
     });
     expect(client.calls[2].params).toEqual({
       owner_aid: 'group.agentid.pub',
       bucket: 'team',
       mount_path: 'dst',
+      request_id: 'req-4',
     });
     expect(client.calls[3].params).toEqual({
       owner_aid: 'group.agentid.pub',

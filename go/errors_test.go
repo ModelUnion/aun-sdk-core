@@ -46,7 +46,7 @@ func TestMapRemoteError_NotFoundCodes(t *testing.T) {
 
 // TestMapRemoteError_RateLimitCodes 验证限流错误码映射（retryable=true）
 func TestMapRemoteError_RateLimitCodes(t *testing.T) {
-	for _, code := range []int{4290, 429, -32029} {
+	for _, code := range []int{4290, 429, -32029, -32429} {
 		err := MapRemoteError(map[string]any{"code": code, "message": "rate limit"})
 		rl, ok := err.(*RateLimitError)
 		if !ok {

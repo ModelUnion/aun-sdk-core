@@ -610,6 +610,7 @@ class StorageVFS:
         dst_bucket: str | None = None,
         overwrite: bool = False,
         follow_symlinks: bool = False,
+        recursive: bool = False,
     ) -> NodeView:
         owner = self._owner(owner)
         dst_owner = self._owner(dst_owner) if dst_owner else None
@@ -623,13 +624,27 @@ class StorageVFS:
                 dst=dst_key,
                 overwrite=overwrite,
                 follow_symlinks=follow_symlinks,
+                recursive=recursive,
                 dst_owner=dst_owner,
                 dst_bucket=dst_bucket,
             )
             return NodeView.from_any(result.get("node") or result)
         resolved = await self.lowlevel.resolve_path(owner=owner, bucket=bucket, path=src_key)
         if str(resolved.get("type") or "").lower() in {"folder", "dir"}:
-            raise StorageError("directory copy requires recursive traversal", code="EISDIR", path=src)
+            if not recursive:
+                raise StorageError("directory copy requires recursive traversal", code="EISDIR", path=src)
+            result = await self.lowlevel.fs_copy(
+                owner=owner,
+                bucket=bucket,
+                src=src_key,
+                dst=dst_key,
+                overwrite=overwrite,
+                follow_symlinks=follow_symlinks,
+                recursive=True,
+                dst_owner=dst_owner,
+                dst_bucket=dst_bucket,
+            )
+            return NodeView.from_any(result.get("node") or result)
         result = await self.lowlevel.copy_object(
             owner=owner,
             bucket=bucket,
@@ -749,6 +764,7 @@ class StorageVFS:
         owner: str | None = None,
         bucket: str = "default",
         mount_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         mount_owner = owner
         mount_remote_path = mount_path
@@ -764,6 +780,7 @@ class StorageVFS:
             bucket=bucket,
             mount_path=path_to_key(mount_remote_path),
             mount_id=mount_id,
+            request_id=request_id,
         )
 
     async def reject_mount(
@@ -773,6 +790,7 @@ class StorageVFS:
         owner: str | None = None,
         bucket: str = "default",
         mount_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         mount_owner = owner
         mount_remote_path = mount_path
@@ -788,6 +806,7 @@ class StorageVFS:
             bucket=bucket,
             mount_path=path_to_key(mount_remote_path),
             mount_id=mount_id,
+            request_id=request_id,
         )
 
     async def unmount(

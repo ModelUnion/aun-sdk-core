@@ -160,7 +160,14 @@ export class StorageVFS {
           overwrite: options.overwrite ?? true,
         }));
       }
-      const session = await this.lowlevel.createUploadSession({ owner, bucket, objectKey, size: data.length, contentType: options.contentType, expectedVersion: options.expectedVersion });
+      const session = await this.lowlevel.createUploadSession({
+        owner,
+        bucket,
+        objectKey,
+        size: data.length,
+        contentType: options.contentType,
+        expectedVersion: options.expectedVersion,
+      });
       const uploadUrl = String(session.upload_url ?? '');
       if (!uploadUrl) throw new StorageError(`create_upload_session did not return upload_url`, 'ESTORAGE', path);
       await this.lowlevel.httpPut(uploadUrl, data, session.headers as Record<string, string> | undefined);
@@ -209,15 +216,22 @@ export class StorageVFS {
     };
   }
 
-  async downloadFile(path: string, options: ReadOptions = {}): Promise<DownloadResult> {
+  async downloadFile(path: string, options: ReadOptions & { verifyHash?: boolean } = {}): Promise<DownloadResult> {
     const { data, sha256: expectedSha } = await this.readBytesWithMetadata(path, options);
     const actualSha = await sha256Hex(data);
     const expected = expectedSha.toLowerCase();
+    const verified = Boolean(expected) && actualSha.toLowerCase() === expected;
+    if (!verified && expected && (options.verifyHash ?? true)) {
+      throw new StorageError(
+        `hash mismatch: expected=${expected} actual=${actualSha.toLowerCase()}`,
+        'EHASH', path,
+      );
+    }
     return {
       path,
       size: data.length,
       sha256: expectedSha || actualSha,
-      verified: Boolean(expected) && actualSha.toLowerCase() === expected,
+      verified,
       data,
     };
   }
@@ -237,7 +251,15 @@ export class StorageVFS {
     const owner = this.owner(options.owner);
     const bucket = options.bucket ?? 'default';
     const key = pathToKey(path);
-    const raw = await this.lowlevel.fsList({ owner, bucket, path: key, page: options.page, size: options.size, marker: options.marker, token: options.token });
+    const raw = await this.lowlevel.fsList({
+      owner,
+      bucket,
+      path: key,
+      page: options.page,
+      size: options.size,
+      marker: options.marker,
+      token: options.token,
+    });
     const items = (raw.nodes ?? raw.items ?? []) as unknown[];
     return items.map((item) => nodeFromAny(item));
   }
@@ -269,7 +291,7 @@ export class StorageVFS {
     return nodeFromAny(raw.node ?? raw);
   }
 
-  async copy(src: string, dst: string, options: StorageOptions & { overwrite?: boolean; followSymlinks?: boolean; dstOwner?: string | null; dstBucket?: string } = {}): Promise<NodeView> {
+  async copy(src: string, dst: string, options: StorageOptions & { overwrite?: boolean; followSymlinks?: boolean; recursive?: boolean; dstOwner?: string | null; dstBucket?: string } = {}): Promise<NodeView> {
     const raw = await this.lowlevel.fsCopy({
       owner: this.owner(options.owner),
       bucket: options.bucket ?? 'default',
@@ -277,6 +299,7 @@ export class StorageVFS {
       dst: pathToKey(dst),
       overwrite: options.overwrite,
       followSymlinks: options.followSymlinks,
+      recursive: options.recursive,
       dstOwner: options.dstOwner,
       dstBucket: options.dstBucket,
     });
@@ -339,7 +362,7 @@ export class StorageVFS {
     return nodeFromAny(raw.node ?? raw.mount ?? raw);
   }
 
-  approveMount(mountPath: StoragePathLike, options: StorageOptions & { mountId?: string } = {}): Promise<StorageRaw> {
+  approveMount(mountPath: StoragePathLike, options: StorageOptions & { mountId?: string; requestId?: string } = {}): Promise<StorageRaw> {
     const owner = this.owner(options.owner);
     const mountRef = parsePathLike(mountPath, owner);
     return this.lowlevel.fsApprove({
@@ -347,10 +370,11 @@ export class StorageVFS {
       bucket: options.bucket ?? 'default',
       mountPath: pathToKey(mountRef.path),
       mountId: options.mountId,
+      requestId: options.requestId,
     });
   }
 
-  rejectMount(mountPath: StoragePathLike, options: StorageOptions & { mountId?: string } = {}): Promise<StorageRaw> {
+  rejectMount(mountPath: StoragePathLike, options: StorageOptions & { mountId?: string; requestId?: string } = {}): Promise<StorageRaw> {
     const owner = this.owner(options.owner);
     const mountRef = parsePathLike(mountPath, owner);
     return this.lowlevel.fsReject({
@@ -358,6 +382,7 @@ export class StorageVFS {
       bucket: options.bucket ?? 'default',
       mountPath: pathToKey(mountRef.path),
       mountId: options.mountId,
+      requestId: options.requestId,
     });
   }
 

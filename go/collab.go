@@ -107,6 +107,31 @@ type CollabSnapshotRestoreResult struct {
 	RestoredFrom       string   `json:"restored_from,omitempty"`
 	NewSnapshotVersion string   `json:"new_snapshot_version,omitempty"`
 	Warnings           []string `json:"warnings,omitempty"`
+	Partial            bool     `json:"partial,omitempty"`
+	RestoredDocs       []string `json:"restored_docs,omitempty"`
+}
+
+type CollabGCResult struct {
+	Scanned    int `json:"scanned,omitempty"`
+	Reachable  int `json:"reachable,omitempty"`
+	Garbage    int `json:"garbage,omitempty"`
+	Deleted    int `json:"deleted,omitempty"`
+	FreedBytes int `json:"freed_bytes,omitempty"`
+}
+
+type CollabReflogEntry struct {
+	Seq          int               `json:"seq,omitempty"`
+	Action       string            `json:"action,omitempty"`
+	Requester    string            `json:"requester,omitempty"`
+	Doc          string            `json:"doc,omitempty"`
+	Version      int               `json:"version,omitempty"`
+	BaseVersion  int               `json:"base_version,omitempty"`
+	Target       string            `json:"target,omitempty"`
+	Status       string            `json:"status,omitempty"`
+	ErrorCode    int               `json:"error_code,omitempty"`
+	ErrorMsg     string            `json:"error_msg,omitempty"`
+	Metadata     map[string]any    `json:"metadata,omitempty"`
+	Timestamp    int64             `json:"timestamp,omitempty"`
 }
 
 type CollabFacade struct {
@@ -156,8 +181,14 @@ func (f *CollabFacade) Read(ctx context.Context, collabRoot, doc string) (Collab
 	return f.callDocument(ctx, "read", map[string]any{"collab_root": collabRoot, "doc": doc})
 }
 
-func (f *CollabFacade) Submit(ctx context.Context, collabRoot, doc, source string, baseVersion int) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "submit", map[string]any{"collab_root": collabRoot, "doc": doc, "source": source, "base_version": baseVersion})
+func (f *CollabFacade) Submit(ctx context.Context, collabRoot, doc, source string, baseVersion int, message string) (CollabDocumentResult, error) {
+	return f.callDocument(ctx, "submit", map[string]any{
+		"collab_root":  collabRoot,
+		"doc":          doc,
+		"source":       source,
+		"base_version": baseVersion,
+		"message":      message,
+	})
 }
 
 func (f *CollabFacade) Merge(ctx context.Context, collabRoot, doc, source string, baseVersion int) (CollabDocumentResult, error) {
@@ -194,6 +225,34 @@ func (f *CollabFacade) Adopt(ctx context.Context, src, newRoot string) (CollabAc
 
 func (f *CollabFacade) Prune(ctx context.Context, collabRoot, doc string) (CollabActionResult, error) {
 	return f.callAction(ctx, "prune", map[string]any{"collab_root": collabRoot, "doc": doc})
+}
+
+func (f *CollabFacade) GC(ctx context.Context, collabRoot string, dryRun bool) (CollabGCResult, error) {
+	result, err := f.call(ctx, "gc", map[string]any{"collab_root": collabRoot, "dry_run": dryRun})
+	if err != nil {
+		return CollabGCResult{}, err
+	}
+	return collabGCResultFromAny(result), nil
+}
+
+func (f *CollabFacade) Reflog(ctx context.Context, collabRoot string, doc string, limit int) ([]CollabReflogEntry, error) {
+	params := map[string]any{"collab_root": collabRoot, "limit": limit}
+	if doc != "" {
+		params["doc"] = doc
+	}
+	result, err := f.call(ctx, "reflog", params)
+	if err != nil {
+		return nil, err
+	}
+	return collabReflogEntriesFromAny(result), nil
+}
+
+func (f *CollabFacade) Reset(ctx context.Context, collabRoot string, doc string, version int, message string) (CollabDocumentResult, error) {
+	params := map[string]any{"collab_root": collabRoot, "doc": doc, "version": version}
+	if message != "" {
+		params["message"] = message
+	}
+	return f.callDocument(ctx, "reset", params)
 }
 
 func (f *CollabFacade) Discover(ctx context.Context, groupAID string) ([]CollabRegistryEntry, error) {
@@ -360,6 +419,39 @@ func collabRegistryEntriesFromAny(value any) []CollabRegistryEntry {
 	return out
 }
 
+func collabGCResultFromAny(value any) CollabGCResult {
+	row := storageMap(value)
+	return CollabGCResult{
+		Scanned:    int(storageInt64(row["scanned"])),
+		Reachable:  int(storageInt64(row["reachable"])),
+		Garbage:    int(storageInt64(row["garbage"])),
+		Deleted:    int(storageInt64(row["deleted"])),
+		FreedBytes: int(storageInt64(row["freed_bytes"])),
+	}
+}
+
+func collabReflogEntriesFromAny(value any) []CollabReflogEntry {
+	rows := collabMapList(value)
+	out := make([]CollabReflogEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, CollabReflogEntry{
+			Seq:         int(storageInt64(row["seq"])),
+			Action:      storageString(row["action"], ""),
+			Requester:   storageString(row["requester"], ""),
+			Doc:         storageString(row["doc"], ""),
+			Version:     int(storageInt64(row["version"])),
+			BaseVersion: int(storageInt64(row["base_version"])),
+			Target:      storageString(row["target"], ""),
+			Status:      storageString(row["status"], ""),
+			ErrorCode:   int(storageInt64(row["error_code"])),
+			ErrorMsg:    storageString(row["error_msg"], ""),
+			Metadata:    storageMap(row["metadata"]),
+			Timestamp:   storageInt64(row["timestamp"]),
+		})
+	}
+	return out
+}
+
 func collabActionResultFromAny(value any) CollabActionResult {
 	row := storageMap(value)
 	return CollabActionResult{
@@ -430,6 +522,8 @@ func collabSnapshotRestoreResultFromAny(value any) CollabSnapshotRestoreResult {
 		RestoredFrom:       storageString(row["restored_from"], ""),
 		NewSnapshotVersion: storageString(row["new_snapshot_version"], ""),
 		Warnings:           collabStringList(row["warnings"]),
+		Partial:            storageBool(row["partial"], false),
+		RestoredDocs:       collabStringList(row["restored_docs"]),
 	}
 }
 

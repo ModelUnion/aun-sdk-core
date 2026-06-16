@@ -4,6 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -16,6 +22,8 @@ type fakeStorageClient struct {
 	aid         string
 	calls       []storageCallRecord
 	failMethods map[string]error
+	downloadURL string
+	downloadSHA string
 }
 
 func (f *fakeStorageClient) AID() string {
@@ -40,6 +48,8 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 		return map[string]any{"type": "file", "path": params["object_key"], "object_key": params["object_key"], "owner_aid": params["owner_aid"], "size_bytes": 5}, nil
 	case "storage.get_object":
 		return map[string]any{"content": base64.StdEncoding.EncodeToString([]byte("hello"))}, nil
+	case "storage.create_download_ticket":
+		return map[string]any{"download_url": f.downloadURL, "sha256": f.downloadSHA, "size": 5}, nil
 	case "storage.fs.list":
 		return map[string]any{"nodes": []any{map[string]any{"type": "file", "path": "docs/a.txt", "name": "a.txt", "owner_aid": params["owner_aid"], "mode": "0644"}}}, nil
 	case "storage.fs.stat":
@@ -117,11 +127,61 @@ func TestStorageVFSWriteBytesUsesServerLimits(t *testing.T) {
 	if client.calls[2].params["expected_version"] != nil {
 		t.Fatalf("nil ExpectedVersion 不应传入 RPC: %#v", client.calls[2].params)
 	}
-	if _, exists := client.calls[2].params["overwrite"]; exists {
-		t.Fatalf("默认 Overwrite 不应传入 RPC: %#v", client.calls[2].params)
+	if client.calls[2].params["overwrite"] != true {
+		t.Fatalf("默认 Overwrite 应为 true（对齐 Python）: %#v", client.calls[2].params)
 	}
 	if _, exists := client.calls[2].params["metadata"]; exists {
 		t.Fatalf("nil Metadata 不应传入 RPC: %#v", client.calls[2].params)
+	}
+}
+
+func TestStorageVFSUploadAndDownloadFile(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("下载 HTTP 方法不正确: %s", r.Method)
+		}
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer server.Close()
+
+	client := &fakeStorageClient{
+		aid:         "alice.agentid.pub",
+		downloadURL: server.URL,
+		downloadSHA: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+	}
+	storage := NewStorageVFS(client)
+	dir := t.TempDir()
+	localUpload := filepath.Join(dir, "upload.txt")
+	localDownload := filepath.Join(dir, "download.txt")
+	if err := os.WriteFile(localUpload, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("写入本地测试文件失败: %v", err)
+	}
+
+	uploaded, err := storage.UploadFile(ctx, localUpload, "/docs/upload.txt", &WriteBytesOptions{ContentType: "text/plain"})
+	if err != nil {
+		t.Fatalf("UploadFile 失败: %v", err)
+	}
+	downloaded, err := storage.DownloadFile(ctx, "/docs/a.txt", localDownload, &ReadOptions{Token: "tok"})
+	if err != nil {
+		t.Fatalf("DownloadFile 失败: %v", err)
+	}
+	body, err := os.ReadFile(localDownload)
+	if err != nil {
+		t.Fatalf("读取下载文件失败: %v", err)
+	}
+
+	if uploaded.Path != "/docs/upload.txt" || !bytes.Equal(body, []byte("hello")) {
+		t.Fatalf("上传/下载结果不正确: uploaded=%#v body=%q", uploaded, string(body))
+	}
+	if downloaded.Path != "/docs/a.txt" || downloaded.LocalPath != localDownload || downloaded.Size != 5 || downloaded.Verified != true {
+		t.Fatalf("DownloadResult 不正确: %#v", downloaded)
+	}
+	if client.calls[2].method != "storage.put_object" || client.calls[2].params["content_type"] != "text/plain" {
+		t.Fatalf("UploadFile 未正确复用 WriteBytes: %#v", client.calls)
+	}
+	if client.calls[3].method != "storage.create_download_ticket" || client.calls[3].params["token"] != "tok" {
+		t.Fatalf("DownloadFile 未正确创建下载 ticket: %#v", client.calls)
 	}
 }
 
@@ -194,7 +254,7 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rename 失败: %v", err)
 	}
-	copied, err := storage.Copy(ctx, "/docs/b.txt", "/docs/c.txt", &CopyOptions{Overwrite: true, FollowSymlinks: true})
+	copied, err := storage.Copy(ctx, "/docs/b.txt", "/docs/c.txt", &CopyOptions{Overwrite: true, FollowSymlinks: true, Recursive: true})
 	if err != nil {
 		t.Fatalf("Copy 失败: %v", err)
 	}
@@ -242,8 +302,8 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 	if client.calls[7].params["new_path"] != "links/latest.txt" || client.calls[7].params["overwrite"] != true || client.calls[7].params["expected_version"] != 7 {
 		t.Fatalf("rename_symlink 参数不正确: %#v", client.calls[7].params)
 	}
-	if client.calls[3].params["follow_symlinks"] != true {
-		t.Fatalf("follow_symlinks 未正确透传: %#v", client.calls[3].params)
+	if client.calls[3].params["follow_symlinks"] != true || client.calls[3].params["recursive"] != true {
+		t.Fatalf("copy 参数未正确透传: %#v", client.calls[3].params)
 	}
 }
 
@@ -360,11 +420,11 @@ func TestStorageVFSMountUnmountContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mount 失败: %v", err)
 	}
-	approved, err := storage.ApproveMount(ctx, "/memberdata/alice", &MountReviewOptions{Owner: "g-team.agentid.pub"})
+	approved, err := storage.ApproveMount(ctx, "/memberdata/alice", &MountReviewOptions{Owner: "g-team.agentid.pub", RequestID: "req-1"})
 	if err != nil {
 		t.Fatalf("ApproveMount 失败: %v", err)
 	}
-	rejected, err := storage.RejectMount(ctx, "/memberdata/alice", &MountReviewOptions{Owner: "g-team.agentid.pub"})
+	rejected, err := storage.RejectMount(ctx, "/memberdata/alice", &MountReviewOptions{Owner: "g-team.agentid.pub", RequestID: "req-2"})
 	if err != nil {
 		t.Fatalf("RejectMount 失败: %v", err)
 	}
@@ -398,6 +458,9 @@ func TestStorageVFSMountUnmountContracts(t *testing.T) {
 	if client.calls[1].params["mount_path"] != "memberdata/alice" || client.calls[2].params["mount_path"] != "memberdata/alice" || client.calls[3].params["mount_path"] != "memberdata/alice" {
 		t.Fatalf("review/unmount mount_path 不正确: approve=%#v reject=%#v unmount=%#v", client.calls[1].params, client.calls[2].params, client.calls[3].params)
 	}
+	if client.calls[1].params["request_id"] != "req-1" || client.calls[2].params["request_id"] != "req-2" {
+		t.Fatalf("review request_id 未正确透传: approve=%#v reject=%#v", client.calls[1].params, client.calls[2].params)
+	}
 }
 
 func TestStorageVFSMountVolumeContract(t *testing.T) {
@@ -429,4 +492,107 @@ func TestAUNClientStorageEntryIsLazy(t *testing.T) {
 	if client.Storage() != client.Storage() {
 		t.Fatal("Storage() 应返回同一个惰性实例")
 	}
+}
+
+func TestStorageHeadersFromAny_MapStringInterface(t *testing.T) {
+	// JSON unmarshal 产出 map[string]interface{} — 必须正确转换
+	raw := map[string]any{
+		"Content-Type": "application/octet-stream",
+		"X-Custom":     "value",
+		"X-Numeric":    42, // 非 string 值应被跳过或转为字符串
+	}
+	result := storageHeadersFromAny(raw)
+	if result["Content-Type"] != "application/octet-stream" {
+		t.Fatalf("Content-Type 丢失: %#v", result)
+	}
+	if result["X-Custom"] != "value" {
+		t.Fatalf("X-Custom 丢失: %#v", result)
+	}
+}
+
+func TestStorageHeadersFromAny_MapStringString(t *testing.T) {
+	// 已经是 map[string]string 的情况
+	raw := map[string]string{"Content-Type": "text/plain"}
+	result := storageHeadersFromAny(raw)
+	if result["Content-Type"] != "text/plain" {
+		t.Fatalf("直接 map[string]string 未正确传递: %#v", result)
+	}
+}
+
+func TestStorageHeadersFromAny_Nil(t *testing.T) {
+	result := storageHeadersFromAny(nil)
+	if result == nil || len(result) != 0 {
+		t.Fatalf("nil 输入应返回空 map: %#v", result)
+	}
+}
+
+func TestMapStorageError_ClassifiesNotFound(t *testing.T) {
+	err := &RPCError{Code: -32008, Message: "object not found"}
+	mapped := MapStorageError(err, "/docs/a.txt")
+	var nf *StorageNotFoundError
+	if !errorAs(mapped, &nf) {
+		t.Fatalf("code -32008 应映射为 StorageNotFoundError，got: %T", mapped)
+	}
+	if nf.Path != "/docs/a.txt" {
+		t.Fatalf("Path 不正确: %s", nf.Path)
+	}
+}
+
+func TestMapStorageError_ClassifiesConflict(t *testing.T) {
+	err := &RPCError{Code: -32009, Message: "version conflict"}
+	mapped := MapStorageError(err, "/docs/a.txt")
+	var cf *StorageConflictError
+	if !errorAs(mapped, &cf) {
+		t.Fatalf("code -32009 应映射为 StorageConflictError，got: %T", mapped)
+	}
+}
+
+func TestMapStorageError_ClassifiesAccessDenied(t *testing.T) {
+	err := &RPCError{Code: -32004, Message: "permission denied"}
+	mapped := MapStorageError(err, "/docs/a.txt")
+	var ad *StorageAccessDeniedError
+	if !errorAs(mapped, &ad) {
+		t.Fatalf("code -32004 应映射为 StorageAccessDeniedError，got: %T", mapped)
+	}
+}
+
+func TestMapStorageError_ClassifiesQuota(t *testing.T) {
+	err := &RPCError{Code: -32099, Message: "quota exceeded"}
+	mapped := MapStorageError(err, "/docs/a.txt")
+	var qe *StorageQuotaError
+	if !errorAs(mapped, &qe) {
+		t.Fatalf("quota 消息应映射为 StorageQuotaError，got: %T", mapped)
+	}
+}
+
+func TestMapStorageError_ClassifiesLoop(t *testing.T) {
+	err := &RPCError{Code: -32031, Message: "too many symlink hops"}
+	mapped := MapStorageError(err, "/link")
+	var le *StorageLoopError
+	if !errorAs(mapped, &le) {
+		t.Fatalf("code -32031 应映射为 StorageLoopError，got: %T", mapped)
+	}
+}
+
+func TestMapStorageError_GenericFallback(t *testing.T) {
+	err := fmt.Errorf("some random error")
+	mapped := MapStorageError(err, "/docs/a.txt")
+	var se *StorageError
+	if !errorAs(mapped, &se) {
+		t.Fatalf("通用错误应映射为 StorageError，got: %T", mapped)
+	}
+}
+
+// RPCError 模拟 SDK 中从服务端返回的错误
+type RPCError struct {
+	Code    int
+	Message string
+}
+
+func (e *RPCError) Error() string  { return e.Message }
+func (e *RPCError) ErrorCode() int { return e.Code }
+func (e *RPCError) ErrorData() any { return nil }
+
+func errorAs(err error, target any) bool {
+	return errors.As(err, target)
 }

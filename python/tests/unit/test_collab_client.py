@@ -32,6 +32,7 @@ async def test_collab_submit_calls_rpc_with_exact_params():
             "doc": "d.md",
             "source": "BASE64",
             "base_version": 3,
+            "message": "",
         })
     ]
 
@@ -52,6 +53,9 @@ async def test_collab_methods_match_server_rpc_contract():
     await collab.export("alice.aid.com:/proj", "alice.aid.com:/copy")
     await collab.adopt("alice.aid.com:/proj", "alice.aid.com:/new")
     await collab.prune("alice.aid.com:/proj", "d.md")
+    await collab.gc("alice.aid.com:/proj", dry_run=False)
+    await collab.reflog("alice.aid.com:/proj", "d.md", limit=5)
+    await collab.reset("alice.aid.com:/proj", "d.md", 1, message="reset")
     await collab.discover("g-team.aid.com")
     await collab.unregister("g-team.aid.com", "g-team.aid.com:/proj")
     await collab.snapshot.create("alice.aid.com:/proj", message="m", major=True)
@@ -74,6 +78,9 @@ async def test_collab_methods_match_server_rpc_contract():
         "collab.export",
         "collab.adopt",
         "collab.prune",
+        "collab.gc",
+        "collab.reflog",
+        "collab.reset",
         "collab.discover",
         "collab.unregister",
         "collab.snapshot.create",
@@ -93,7 +100,7 @@ async def test_collab_methods_match_server_rpc_contract():
         "src": "alice.aid.com:/proj",
         "new_root": "alice.aid.com:/new",
     }
-    assert client.calls[19][1] == {
+    assert client.calls[22][1] == {
         "collab_root": "alice.aid.com:/proj",
         "before": "2026-06-01",
         "keep_last": 2,

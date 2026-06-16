@@ -4,13 +4,16 @@ import type {
   CollabDiffResult,
   CollabDocumentEntry,
   CollabDocumentResult,
+  CollabGCResult,
   CollabHistoryEntry,
   CollabRaw,
+  CollabReflogEntry,
   CollabRegistryEntry,
   CollabRpcClient,
   CollabSnapshot,
   CollabSnapshotDiffResult,
   CollabSnapshotPruneOptions,
+  CollabSnapshotRestoreResult,
 } from './types.js';
 
 function stripNil(params: RpcParams): RpcParams {
@@ -52,7 +55,7 @@ export class CollabSnapshotClient {
     });
   }
 
-  restore(collabRoot: string, version: string, options: { message?: string } = {}): Promise<CollabRaw> {
+  restore(collabRoot: string, version: string, options: { message?: string } = {}): Promise<CollabSnapshotRestoreResult> {
     return this.parent._call('collab.snapshot.restore', {
       collab_root: collabRoot,
       version,
@@ -103,8 +106,14 @@ export class CollabClient {
     return this._call('collab.read', { collab_root: collabRoot, doc });
   }
 
-  submit(collabRoot: string, doc: string, source: string, baseVersion: number): Promise<CollabDocumentResult> {
-    return this._call('collab.submit', { collab_root: collabRoot, doc, source, base_version: baseVersion });
+  submit(collabRoot: string, doc: string, source: string, baseVersion: number, message = ''): Promise<CollabDocumentResult> {
+    return this._call('collab.submit', {
+      collab_root: collabRoot,
+      doc,
+      source,
+      base_version: baseVersion,
+      message,
+    });
   }
 
   merge(collabRoot: string, doc: string, source: string, baseVersion: number): Promise<CollabDocumentResult> {
@@ -133,6 +142,20 @@ export class CollabClient {
 
   prune(collabRoot: string, doc: string): Promise<CollabRaw> {
     return this._call('collab.prune', { collab_root: collabRoot, doc });
+  }
+
+  gc(collabRoot: string, dryRun = true): Promise<CollabGCResult> {
+    return this._call('collab.gc', { collab_root: collabRoot, dry_run: dryRun });
+  }
+
+  reflog(collabRoot: string, doc?: string, limit = 100): Promise<CollabReflogEntry[]> {
+    const params: RpcParams = { collab_root: collabRoot, limit };
+    if (doc) params.doc = doc;
+    return this._call('collab.reflog', params);
+  }
+
+  reset(collabRoot: string, doc: string, version: number, message = ''): Promise<CollabDocumentResult> {
+    return this._call('collab.reset', { collab_root: collabRoot, doc, version, message });
   }
 
   discover(groupAid: string): Promise<CollabRegistryEntry[]> {

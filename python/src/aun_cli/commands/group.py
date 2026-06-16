@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import mimetypes
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,28 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_ready(item) for item in value]
     return value
+
+
+def _parse_json_object(value: str | None, *, option_name: str) -> dict[str, Any] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"{option_name} must be a valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter(f"{option_name} must be a JSON object")
+    return parsed
+
+
+def _split_option_values(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for item in values:
+        for part in str(item or "").split(","):
+            part = part.strip()
+            if part:
+                result.append(part)
+    return result
 
 
 def _with_group_identity_store(ctx: typer.Context):
@@ -435,6 +458,62 @@ def group_resources_ls(
         output_table(["type", "path", "status"], rows)
 
 
+@resources_app.command("children")
+def group_resources_children(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(None, help="群组 ID 或目录路径；省略时列 active group 根目录"),
+    resource_path: str | None = typer.Argument(None, help="目录路径；省略群组 ID 时使用 active group"),
+    node_type: Optional[str] = typer.Option(None, "--type", help="资源类型：folder / file / link"),
+    page: int = typer.Option(1, "--page", help="页码"),
+    size: int = typer.Option(100, "--size", help="每页数量"),
+    include_status: bool = typer.Option(False, "--include-status", help="附带 storage 状态抽查"),
+    sort_by: Optional[str] = typer.Option(None, "--sort-by", help="排序字段"),
+    order: Optional[str] = typer.Option(None, "--order", help="asc 或 desc"),
+) -> None:
+    """列出群资源目录的直接子节点"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            params: dict[str, Any] = {
+                "group_id": resolved_group_id,
+                "resource_path": resolved_path,
+                "page": page,
+                "size": size,
+                "include_status": include_status,
+            }
+            if node_type:
+                params["resource_type"] = node_type
+            if sort_by:
+                params["sort_by"] = sort_by
+            if order:
+                params["order"] = order
+            return await client.group.resources.list_children(**params)
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(_json_ready(result))
+    else:
+        data = result if isinstance(result, dict) else {"items": result}
+        items = data.get("items") or data.get("children") or []
+        rows = [
+            [
+                item.get("resource_type", item.get("type", "")),
+                item.get("resource_path", item.get("path", "")),
+                item.get("status", ""),
+            ]
+            for item in items
+            if isinstance(item, dict)
+        ]
+        output_table(["type", "path", "status"], rows)
+
+
 @resources_app.command("get")
 def group_resources_get(
     ctx: typer.Context,
@@ -461,6 +540,51 @@ def group_resources_get(
         return
 
     output_json(_json_ready(result)) if is_json_mode() else output_dict(_json_ready(result))
+
+
+@resources_app.command("update")
+def group_resources_update(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或资源路径"),
+    resource_path: str | None = typer.Argument(None, help="资源路径；省略群组 ID 时使用 active group"),
+    title: Optional[str] = typer.Option(None, "--title", help="资源标题"),
+    visibility: Optional[str] = typer.Option(None, "--visibility", help="可见性：members_only / public"),
+    tags: list[str] = typer.Option([], "--tag", help="资源标签，可重复或逗号分隔"),
+    metadata_json: Optional[str] = typer.Option(None, "--metadata-json", help="资源 metadata JSON 对象"),
+    expected_version: Optional[int] = typer.Option(None, "--expected-version", help="CAS 期望版本"),
+) -> None:
+    """更新群资源业务元数据"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+    updates: dict[str, Any] = {"group_id": resolved_group_id, "resource_path": resolved_path}
+    if title is not None:
+        updates["title"] = title
+    if visibility is not None:
+        if visibility not in {"members_only", "public"}:
+            raise typer.BadParameter("visibility must be members_only or public")
+        updates["visibility"] = visibility
+    parsed_tags = _split_option_values(tags)
+    if parsed_tags:
+        updates["tags"] = parsed_tags
+    metadata = _parse_json_object(metadata_json, option_name="--metadata-json")
+    if metadata is not None:
+        updates["metadata"] = metadata
+    if expected_version is not None:
+        updates["expected_version"] = expected_version
+    if set(updates.keys()) <= {"group_id", "resource_path"}:
+        output_error("No update fields specified")
+        raise typer.Exit(2)
+
+    async def _make(client):
+        return await client.group.resources.update(**updates)
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Updated {resolved_path} in {resolved_group_id}")
 
 
 @resources_app.command("df")
@@ -500,27 +624,30 @@ def group_resources_put(
     resolved_group_id = _resolve_group_id(ctx, group_id)
     resolved_path = _normalize_resource_path(resource_path)
     file_path = Path(local_path)
+    upload_data = file_path.read_bytes()
+    guessed_type = content_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    max_inline_bytes = 65536
 
     async def _make(client):
-        data = file_path.read_bytes()
-        guessed_type = content_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         params: dict[str, Any] = {
             "group_id": resolved_group_id,
             "resource_path": resolved_path,
-            "content": base64.b64encode(data).decode("ascii"),
-            "content_encoding": "base64",
             "content_type": guessed_type,
-            "size_bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(upload_data),
+            "sha256": hashlib.sha256(upload_data).hexdigest(),
         }
+        if len(upload_data) <= max_inline_bytes:
+            params["content"] = base64.b64encode(upload_data).decode("ascii")
+            params["content_encoding"] = "base64"
         if title:
             params["title"] = title
         if expected_version is not None:
             params["expected_version"] = expected_version
         return await client.group.resources.put(**params)
 
+    pending_upload_data = upload_data if len(upload_data) > max_inline_bytes else None
     try:
-        result = run_async(_run_pending(ctx, _make, default_sign_as_from_pending=True))
+        result = run_async(_run_pending(ctx, _make, default_sign_as_from_pending=True, upload_data=pending_upload_data))
     except Exception as e:
         handle_error(e)
         return
@@ -528,7 +655,13 @@ def group_resources_put(
     output_json(_json_ready(result)) if is_json_mode() else output_success(f"Put {resolved_path} into {resolved_group_id}")
 
 
-async def _run_pending(ctx: typer.Context, make_pending, *, default_sign_as_from_pending: bool = False) -> Any:
+async def _run_pending(
+    ctx: typer.Context,
+    make_pending,
+    *,
+    default_sign_as_from_pending: bool = False,
+    upload_data: bytes | None = None,
+) -> Any:
     """通用 group-storage 写编排：facade 取 pending_ops，再以对应身份 execute_pending_ops。
 
     群自有区写（put/delete/mkdir/rename/move）以 group_aid 签名，成员挂载（mount）以成员
@@ -545,6 +678,8 @@ async def _run_pending(ctx: typer.Context, make_pending, *, default_sign_as_from
                 group_aid = str(pending.get("group_aid") or pending.get("groupAid") or "").strip()
                 if group_aid:
                     kwargs["sign_as"] = group_aid
+            if upload_data is not None:
+                kwargs["upload_data"] = upload_data
             return await client.group.resources.execute_pending_ops(pending, **kwargs)
         finally:
             close = getattr(store, "close", None)
@@ -664,6 +799,68 @@ def group_resources_rename(
         return
 
     output_json(_json_ready(result)) if is_json_mode() else output_success(f"Renamed {resolved_path} to {resolved_name} in {resolved_group_id}")
+
+
+@resources_app.command("mount-object")
+def group_resources_mount_object(
+    ctx: typer.Context,
+    group_id_or_path: str = typer.Argument(..., help="群组 ID 或资源路径"),
+    resource_path: str | None = typer.Argument(None, help="资源路径；省略群组 ID 时使用 active group"),
+    owner_aid: str = typer.Option(..., "--owner-aid", help="被挂载对象的 owner AID"),
+    object_key: str = typer.Option(..., "--object-key", help="被挂载对象 key"),
+    bucket: str = typer.Option("default", "--bucket", help="storage bucket"),
+    title: Optional[str] = typer.Option(None, "--title", help="资源标题"),
+    visibility: Optional[str] = typer.Option(None, "--visibility", help="可见性：members_only / public"),
+    tags: list[str] = typer.Option([], "--tag", help="资源标签，可重复或逗号分隔"),
+    metadata_json: Optional[str] = typer.Option(None, "--metadata-json", help="资源 metadata JSON 对象"),
+    conflict_policy: str = typer.Option("reject", "--conflict-policy", help="冲突策略：reject / replace / keep_both"),
+    mkdirs: bool = typer.Option(True, "--mkdirs/--no-mkdirs", help="自动创建父目录"),
+) -> None:
+    """把已有 storage 对象挂载为群资源"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_group_id, resolved_path = _resolve_group_and_resource_path(ctx, group_id_or_path, resource_path)
+    policy = str(conflict_policy or "").strip()
+    if policy not in {"reject", "replace", "keep_both"}:
+        raise typer.BadParameter("conflict_policy must be reject, replace, or keep_both")
+    storage_ref = {
+        "owner_aid": str(owner_aid or "").strip(),
+        "bucket": bucket,
+        "object_key": str(object_key or "").strip().replace("\\", "/").lstrip("/"),
+    }
+    if not storage_ref["owner_aid"]:
+        raise typer.BadParameter("owner_aid cannot be empty")
+    if not storage_ref["object_key"]:
+        raise typer.BadParameter("object_key cannot be empty")
+    params: dict[str, Any] = {
+        "group_id": resolved_group_id,
+        "resource_path": resolved_path,
+        "storage_ref": storage_ref,
+        "mkdirs": mkdirs,
+        "conflict_policy": policy,
+    }
+    if title is not None:
+        params["title"] = title
+    if visibility is not None:
+        if visibility not in {"members_only", "public"}:
+            raise typer.BadParameter("visibility must be members_only or public")
+        params["visibility"] = visibility
+    parsed_tags = _split_option_values(tags)
+    if parsed_tags:
+        params["tags"] = parsed_tags
+    metadata = _parse_json_object(metadata_json, option_name="--metadata-json")
+    if metadata is not None:
+        params["metadata"] = metadata
+
+    async def _make(client):
+        return await client.group.resources.mount_object(**params)
+
+    try:
+        result = run_async(_run_pending(ctx, _make))
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(_json_ready(result)) if is_json_mode() else output_success(f"Mounted object {storage_ref['object_key']} as {resolved_path}")
 
 
 @resources_app.command("download")

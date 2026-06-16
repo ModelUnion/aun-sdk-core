@@ -115,6 +115,10 @@
 
 > `object_key` 当前仅支持 ASCII 安全字符集合 `[A-Za-z0-9._/-]`，且不允许空路径段、`..`、反斜杠转义后的非法段。
 
+## SDK 封装状态
+
+Python / Go / TypeScript / JavaScript SDK 均提供 storage low-level 与 VFS 门面。普通应用优先使用 SDK VFS：`write_bytes` / `upload_file` 会先 `check_upload`，小对象走 `put_object`，大对象走 `create_upload_session` → HTTP PUT → `complete_upload`，秒传路径用 `complete_upload(skip_blob=true)`；`read_bytes` / `download_file` 优先尝试 inline `get_object`，超限时回退 `create_download_ticket`。需要精确控制 ACL、token、软链、卷、批量操作或 URL 字段时，再直接调用本手册中的 `storage.*` RPC。
+
 ## storage.put_object
 
 上传小对象（内容 base64 编码通过 RPC 传输）。
@@ -138,7 +142,7 @@
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转到直链 |
+| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/{object_key}`，经 NameService fallback 302 跳转到 storage 服务 |
 | `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 存储桶 |
@@ -597,7 +601,7 @@ for obj in result["items"]:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转 |
+| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/{object_key}`，经 NameService fallback 302 跳转 |
 | `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，无跳转 |
 | `owner_aid` | string | 所有者 AID |
 | `bucket` | string | 存储桶 |
@@ -628,10 +632,11 @@ for obj in result["items"]:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `url` | string | **AID 风格 URL（默认/推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转 |
-| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
-| `download_url` | string | 预签名下载 URL（有时效，签名形式由 BlobStore 后端决定） |
-| `expire_at` | integer | `download_url` 的过期时间戳（Unix 秒） |
+| `url` | string | **AID 风格 URL（默认/推荐）**：public 文件为 `https://{owner_aid}/{object_key}`，private 文件为 `https://{owner_aid}/{object_key}?t={token}`。经 NameService fallback 302 跳转到 storage 服务，storage 实时鉴权后出文件（302 到 blob 后端，对客户端透明） |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无 NameService 跳转 |
+| `download_url` | string | 同 `url`（兼容旧客户端，格式已统一） |
+| `expire_at` | integer | token 过期时间戳（Unix 秒），public 文件此字段无实际约束 |
+| `token` | string | private 文件的不透明访问 token（10 位 Base62），public 文件无此字段 |
 | `file_name` | string | 文件名（从 object_key 提取） |
 | `size_bytes` | integer | 文件大小（字节） |
 | `content_type` | string | MIME 类型 |
@@ -639,9 +644,7 @@ for obj in result["items"]:
 | `version` | integer | 版本号 |
 | `etag` | string | 实体标签 |
 
-客户端获得 `download_url` 后，通过 HTTP GET 下载文件。`url` 为永久可分享的 AID 风格链接，`logical_url` 为无跳转直链。
-
-> 当前实现会对 BlobStore 返回的 loopback URL 做对外地址规范化：优先使用 `KITE_STORAGE_EXTERNAL_URL`，否则按 `storage.{issuer}` 形式改写。对外地址不可使用 `127.0.0.1` 或 `localhost`。
+`url` 是推荐使用的干净链接。访问时 storage 服务实时鉴权：public 文件直接通过，private 文件需 `?t=` token 或 `Authorization: Bearer <AID JWT>` 头证明 owner 身份。鉴权通过后 storage 302 到 blob 后端完成实际下载，这一步对客户端完全透明。
 
 ---
 
@@ -783,13 +786,16 @@ else:
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `share_id` | string | 10 位 Base62 分享短码 |
-| `aid_share_url` | string | **AID 风格分享 URL（默认/推荐）**：`https://{owner_aid}/storage/{share_id}`，体现分享者身份 |
-| `share_url` | string | 直链分享 URL：`{base_url}/s/{share_id}`，兼容字段 |
+| `url` | string | **默认分享 URL（隐藏路径）**：`https://{owner_aid}/s/{share_id}`，最短直链 |
+| `path_url` | string | **可选分享 URL（暴露路径）**：`https://{owner_aid}/{object_key}?t={share_id}`，可读性强 |
+| `aid_share_url` | string | 同 `url`（兼容旧字段） |
+| `share_url` | string | storage 直链：`https://storage.{issuer}/s/{share_id}`，兼容字段 |
 | `expire_at` | integer | 过期时间戳（Unix 秒），`0` 表示永不过期 |
 | `max_uses` | integer | 最大使用次数，`0` 表示无限制 |
 | `allowed_aids` | string[] | 授权 AID 列表，`["*"]` 表示公开 |
 
-> 访问 `aid_share_url` 时经 NameService 302 跳转到 `share_url`。share_id 是 10 位无斜杠 Base62，与 object_key 路径天然区分（object_key 含 `/` 或非 10 位）。
+> 两种格式都通过 `share_id` 定位到 `share_links` 记录鉴权。`url` 隐藏文件结构，`path_url` 暴露文件名便于识别，调用者按需选择。
+> 访问 `url` 时经 NameService 302 跳转到 `storage.{issuer}/s/{share_id}`；访问 `path_url` 时经 NameService fallback 到 storage，由 `?t=` token 鉴权。
 > share_id 指向 `(owner_aid, bucket, object_key)` 逻辑引用，非内容快照：对象改名/移动后原 share_id 失效，内容覆盖后下载到新内容。
 
 ### 示例
@@ -801,7 +807,7 @@ result = await client.call("storage.create_share_link", {
     "expire_in_seconds": 3600,
     "max_uses": 5,
 })
-share_url = result["aid_share_url"]
+share_url = result["url"]  # https://alice.agentid.pub/s/Ab3xK9mZ2q
 ```
 
 ---
@@ -828,8 +834,10 @@ share_url = result["aid_share_url"]
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `share_id` | string | 分享短码 |
-| `aid_share_url` | string | AID 风格分享 URL（主字段） |
-| `share_url` | string | 直链分享 URL（兼容） |
+| `url` | string | 默认分享 URL（隐藏路径）：`https://{owner_aid}/s/{share_id}` |
+| `path_url` | string | 可选分享 URL（暴露路径）：`https://{owner_aid}/{object_key}?t={share_id}` |
+| `aid_share_url` | string | 同 `url`（兼容旧字段） |
+| `share_url` | string | storage 直链（兼容） |
 | `object_key` | string | 被分享对象路径 |
 | `bucket` | string | 存储桶 |
 | `allowed_aids` | string[] | 授权 AID 列表，`["*"]` 表示公开 |

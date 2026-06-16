@@ -150,7 +150,28 @@ def test_cli_fs_cp_remote_cross_owner_calls_vfs_copy(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert client.storage.calls == [
-        ("copy", "/docs/a.txt", "/inbox/a.txt", {"owner": "alice.agentid.pub", "dst_owner": "bob.agentid.pub", "overwrite": False})
+        ("copy", "/docs/a.txt", "/inbox/a.txt", {"owner": "alice.agentid.pub", "dst_owner": "bob.agentid.pub", "overwrite": False, "recursive": False})
+    ]
+
+
+def test_cli_fs_cp_remote_recursive_passes_recursive(monkeypatch):
+    from aun_cli.commands import fs as fs_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+
+    result = _invoke([
+        "--json",
+        "fs",
+        "cp",
+        "-r",
+        "alice.agentid.pub:/docs",
+        "bob.agentid.pub:/inbox/docs",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert client.storage.calls == [
+        ("copy", "/docs", "/inbox/docs", {"owner": "alice.agentid.pub", "dst_owner": "bob.agentid.pub", "overwrite": False, "recursive": True})
     ]
 
 

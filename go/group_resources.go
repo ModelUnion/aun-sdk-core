@@ -1,9 +1,12 @@
 package aun
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +18,7 @@ var groupStorageAllowedPendingRPCs = map[string]bool{
 	"storage.put_object":            true,
 	"storage.create_upload_session": true,
 	"storage.complete_upload":       true,
+	"storage.http_put":              true,
 	"storage.delete_object":         true,
 	"storage.fs.mkdir":              true,
 	"storage.fs.rename":             true,
@@ -71,7 +75,37 @@ var groupStorageNewSignerClient = func(aid *AID) groupStorageSignerClient {
 type GroupResources struct {
 	rpcFacade
 	groupAidMu    sync.Mutex
-	groupAidCache map[string]string
+	groupAidCache map[string]groupAidCacheEntry
+}
+
+type groupAidCacheEntry struct {
+	groupAID  string
+	expiresAt time.Time
+}
+
+const groupAidCacheTTL = 30 * time.Second
+
+var groupStorageNow = time.Now
+
+var groupStorageHTTPPut = func(ctx context.Context, uploadURL string, data []byte, headers map[string]string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range headers {
+		if strings.TrimSpace(key) != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP PUT failed: status=%d", resp.StatusCode)
+	}
+	return map[string]any{"status": resp.StatusCode, "upload_url": uploadURL, "size_bytes": len(data)}, nil
 }
 
 type GroupPendingOpsPartialFailure struct {
@@ -115,7 +149,7 @@ type groupStorageSignerConnectionOptions struct {
 }
 
 func NewGroupResources(client StorageRPCClient) *GroupResources {
-	return &GroupResources{rpcFacade: newRPCFacade(client, "group.resources"), groupAidCache: map[string]string{}}
+	return &GroupResources{rpcFacade: newRPCFacade(client, "group.resources"), groupAidCache: map[string]groupAidCacheEntry{}}
 }
 
 // resolveMemberdataTarget 成员挂载区透明路由：memberdata/{self_aid}/{rest} → 成员自己 storage 空间。
@@ -189,8 +223,8 @@ func (r *GroupResources) memberdataNamespaceKey(ctx context.Context, params map[
 	r.groupAidMu.Lock()
 	cached := r.groupAidCache[groupID]
 	r.groupAidMu.Unlock()
-	if cached != "" {
-		return cached, nil
+	if cached.groupAID != "" && cached.expiresAt.After(groupStorageNow()) {
+		return cached.groupAID, nil
 	}
 	result, err := r.client.Call(ctx, "group.get", facadeParams(map[string]any{"group_id": groupID}))
 	if err != nil {
@@ -200,7 +234,10 @@ func (r *GroupResources) memberdataNamespaceKey(ctx context.Context, params map[
 		if group, ok := root["group"].(map[string]any); ok {
 			if groupAID := strings.TrimSpace(storageAnyToString(group["group_aid"])); groupAID != "" {
 				r.groupAidMu.Lock()
-				r.groupAidCache[groupID] = groupAID
+				r.groupAidCache[groupID] = groupAidCacheEntry{
+					groupAID:  groupAID,
+					expiresAt: groupStorageNow().Add(groupAidCacheTTL),
+				}
 				r.groupAidMu.Unlock()
 				return groupAID, nil
 			}
@@ -443,12 +480,24 @@ func (r *GroupResources) ExecutePendingOps(ctx context.Context, plan map[string]
 		for key, value := range opParams {
 			callParams[key] = value
 		}
-		signAs := strings.TrimSpace(storageAnyToString(firstNonNil(op["sign_as"], op["signAs"], defaultSignAs)))
-		storageClient, err := r.groupStorageSignerFor(ctx, signAs, aidStore, signerCache, signerOptions)
-		if err != nil {
-			return nil, err
+		groupStorageApplyResultMappings(callParams, op, results, opResults)
+		if value := firstNonNil(op["data_ref"], op["dataRef"]); !isNilStorageParam(value) {
+			if _, exists := callParams["data_ref"]; !exists {
+				callParams["data_ref"] = value
+			}
 		}
-		result, err := storageClient.Call(ctx, rpc, facadeParams(callParams))
+		var result any
+		var err error
+		if rpc == "storage.http_put" {
+			result, err = groupStorageRunHTTPPut(ctx, plan, callParams)
+		} else {
+			signAs := strings.TrimSpace(storageAnyToString(firstNonNil(op["sign_as"], op["signAs"], defaultSignAs)))
+			storageClient, signerErr := r.groupStorageSignerFor(ctx, signAs, aidStore, signerCache, signerOptions)
+			if signerErr != nil {
+				return nil, signerErr
+			}
+			result, err = storageClient.Call(ctx, rpc, facadeParams(callParams))
+		}
 		if err != nil {
 			compResults, compErrors := r.groupStorageRunCompensations(ctx, plan, successfulOps, successfulKeys, results, defaultSignAs, aidStore, signerCache, signerOptions)
 			if len(successfulOps) == 0 && len(compResults) == 0 && len(compErrors) == 0 {
@@ -753,6 +802,103 @@ func groupStoragePendingOps(plan map[string]any) ([]any, error) {
 		return result, nil
 	default:
 		return nil, fmt.Errorf("ExecutePendingOps requires pending_ops array")
+	}
+}
+
+func groupStorageApplyResultMappings(params map[string]any, op map[string]any, results map[string]any, opResults []any) {
+	mappings, ok := firstNonNil(op["params_from_results"], op["paramsFromResults"]).(map[string]any)
+	if !ok {
+		return
+	}
+	context := map[string]any{
+		"results":         results,
+		"storage_results": results,
+		"op_results":      opResults,
+	}
+	for resultKey, resultValue := range results {
+		context[resultKey] = resultValue
+	}
+	for paramKey, pathValue := range mappings {
+		if value, found := groupStorageResultPathValue(context, storageAnyToString(pathValue)); found {
+			params[paramKey] = value
+		}
+	}
+}
+
+func groupStorageRunHTTPPut(ctx context.Context, plan map[string]any, params map[string]any) (map[string]any, error) {
+	uploadURL := strings.TrimSpace(storageAnyToString(firstNonNil(params["upload_url"], params["uploadUrl"], params["url"])))
+	if uploadURL == "" {
+		return nil, fmt.Errorf("storage.http_put requires upload_url")
+	}
+	dataRef := strings.TrimSpace(storageAnyToString(firstNonNil(params["data_ref"], params["dataRef"])))
+	if dataRef == "" {
+		dataRef = "upload_data"
+	}
+	rawData := firstNonNil(params["data"])
+	if rawData == nil {
+		if dataRef == "upload_data" {
+			rawData = firstNonNil(plan["upload_data"], plan["uploadData"])
+		} else {
+			rawData = plan[dataRef]
+		}
+	}
+	data, err := groupStorageBytes(rawData)
+	if err != nil {
+		return nil, err
+	}
+	headers := map[string]string{}
+	if rawHeaders, ok := params["headers"].(map[string]any); ok {
+		for key, value := range rawHeaders {
+			headers[key] = storageAnyToString(value)
+		}
+	}
+	if rawHeaders, ok := params["headers"].(map[string]string); ok {
+		for key, value := range rawHeaders {
+			headers[key] = value
+		}
+	}
+	contentType := strings.TrimSpace(storageAnyToString(firstNonNil(params["content_type"], params["contentType"])))
+	hasContentType := false
+	for key := range headers {
+		if strings.EqualFold(key, "Content-Type") {
+			hasContentType = true
+			break
+		}
+	}
+	if contentType != "" && !hasContentType {
+		headers["Content-Type"] = contentType
+	}
+	result, err := groupStorageHTTPPut(ctx, uploadURL, data, headers)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		result = map[string]any{}
+	}
+	if _, exists := result["status"]; !exists {
+		result["status"] = 200
+	}
+	if _, exists := result["upload_url"]; !exists {
+		result["upload_url"] = uploadURL
+	}
+	if _, exists := result["size_bytes"]; !exists {
+		result["size_bytes"] = len(data)
+	}
+	return result, nil
+}
+
+func groupStorageBytes(value any) ([]byte, error) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, fmt.Errorf("storage.http_put requires upload_data")
+	case []byte:
+		return typed, nil
+	case string:
+		return []byte(typed), nil
+	case io.Reader:
+		return io.ReadAll(typed)
+	default:
+		return nil, fmt.Errorf("storage.http_put requires upload_data bytes")
 	}
 }
 

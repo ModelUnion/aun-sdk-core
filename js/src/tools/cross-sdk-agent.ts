@@ -513,6 +513,12 @@ class CrossSdkJsAgent {
           before: params.before == null ? null : Number(params.before),
           keep_last: params.keep_last == null && params.keepLast == null ? null : Number(params.keep_last ?? params.keepLast),
         });
+      case 'gc':
+        return await this.client.collab.gc(collabRoot, params.dry_run == null && params.dryRun == null ? true : Boolean(params.dry_run ?? params.dryRun));
+      case 'reflog':
+        return await this.client.collab.reflog(collabRoot, doc || undefined, Number(params.limit ?? 100) || 100);
+      case 'reset':
+        return await this.client.collab.reset(collabRoot, doc, Number(params.version ?? 0) || 0, textOf(params.message) || '');
       default:
         throw new Error(`unsupported collab action: ${action}`);
     }
@@ -523,7 +529,39 @@ class CrossSdkJsAgent {
     const path = textOf(params.path).trim();
     const owner = textOf(params.owner_aid ?? params.ownerAID).trim() || undefined;
     const bucket = textOf(params.bucket).trim() || 'default';
+    const token = textOf(params.token).trim() || undefined;
     switch (action) {
+      case 'write_bytes':
+        return await storage.writeBytes(
+          path,
+          params.content_base64 || params.contentBase64
+            ? Buffer.from(textOf(params.content), 'base64')
+            : textOf(params.content),
+          {
+            owner,
+            bucket,
+            contentType: textOf(params.content_type ?? params.contentType).trim() || 'text/plain',
+            public: Boolean(params.public),
+            overwrite: params.overwrite == null ? true : Boolean(params.overwrite),
+          },
+        );
+      case 'read_bytes': {
+        const data = await storage.readBytes(path, { owner, bucket, token });
+        return {
+          content: Buffer.from(data).toString('utf-8'),
+          content_base64: Buffer.from(data).toString('base64'),
+          size_bytes: data.byteLength,
+        };
+      }
+      case 'create_download_ticket': {
+        const objectKey = textOf(params.object_key ?? params.objectKey ?? path).replace(/^\/+/, '');
+        return await storage.lowlevel.createDownloadTicket({ owner, bucket, objectKey, token });
+      }
+      case 'download_text': {
+        const url = textOf(params.url ?? params.download_url ?? params.downloadUrl).trim();
+        if (!url) throw new Error('download_text requires url');
+        return { content: await downloadText(url) };
+      }
       case 'set_acl':
         return await storage.setAcl(path, {
           owner,

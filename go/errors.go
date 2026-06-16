@@ -464,7 +464,7 @@ func MapRemoteError(errMap map[string]any) error {
 	case code == -32009:
 		return &VersionConflictError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
-	case code == 4290 || code == 429 || code == -32029:
+	case code == 4290 || code == 429 || code == -32029 || code == -32429:
 		return &RateLimitError{AUNError{Message: message, Code: code, Data: data, Retryable: true, TraceID: traceID}}
 
 	case code == -32010 || code == -32011:

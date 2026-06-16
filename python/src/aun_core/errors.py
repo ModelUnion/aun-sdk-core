@@ -174,7 +174,7 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
         cls = VersionConflictError
     elif code in {4040, 404}:
         cls = NotFoundError
-    elif code in {4290, 429, -32029}:
+    elif code in {4290, 429, -32029, -32429}:
         cls = RateLimitError
     elif code in {-32010, -32011, -32013}:
         cls = SessionError

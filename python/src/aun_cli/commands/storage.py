@@ -10,6 +10,8 @@ from aun_cli.output import (
     output_json,
     output_success,
     output_error,
+    output_dict,
+    output_table,
     is_json_mode,
     set_json_mode,
 )
@@ -22,6 +24,83 @@ def _resolve_verify_ssl() -> bool:
     from aun_core.config import resolve_verify_ssl_from_env
 
     return resolve_verify_ssl_from_env()
+
+
+def _normalize_object_key(value: str) -> str:
+    return str(value or "").strip().replace("\\", "/").lstrip("/")
+
+
+@storage_app.command("list")
+@storage_app.command("ls")
+def storage_list(
+    ctx: typer.Context,
+    prefix: str = typer.Argument("", help="对象 key 前缀"),
+    page: int = typer.Option(1, "--page", help="页码"),
+    size: int = typer.Option(100, "--size", help="每页数量"),
+    marker: Optional[str] = typer.Option(None, "--marker", help="分页游标"),
+    include_prefixes: bool = typer.Option(True, "--prefixes/--no-prefixes", help="同时列出直接子前缀"),
+) -> None:
+    """列出当前身份的对象"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_prefix = _normalize_object_key(prefix)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            params = {"prefix": resolved_prefix, "page": page, "size": size}
+            if marker is not None:
+                params["marker"] = marker
+            objects = await client.call("storage.list_objects", params)
+            prefixes = {}
+            if include_prefixes:
+                prefixes = await client.call("storage.list_prefixes", {"prefix": resolved_prefix, "size": size})
+            return {"prefix": resolved_prefix, "objects": objects or {}, "prefixes": prefixes or {}}
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(result)
+        return
+
+    rows = []
+    for item in (result.get("prefixes") or {}).get("prefixes", []) or []:
+        rows.append(["prefix", str(item), "-", "-", "-"])
+    for item in (result.get("objects") or {}).get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append([
+            "object",
+            item.get("object_key") or item.get("path") or item.get("name") or "",
+            str(item.get("size_bytes") or item.get("size") or 0),
+            item.get("content_type", ""),
+            str(item.get("updated_at") or item.get("mtime") or ""),
+        ])
+    output_table(["type", "key", "size", "content_type", "updated_at"], rows)
+
+
+@storage_app.command("info")
+def storage_info(
+    ctx: typer.Context,
+    object_key: str = typer.Argument(..., help="对象 key"),
+) -> None:
+    """查看对象元信息"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_key = _normalize_object_key(object_key)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.call("storage.head_object", {"object_key": resolved_key})
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    output_json(result) if is_json_mode() else output_dict(result)
 
 
 @storage_app.command("upload")
@@ -120,4 +199,3 @@ def storage_delete(
         output_json(result)
     else:
         output_success(f"Deleted: {object_key}")
-

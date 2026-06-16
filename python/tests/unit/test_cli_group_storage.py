@@ -33,6 +33,10 @@ class _FakeResources:
         self.calls.append(("list", kwargs))
         return {"items": [{"resource_path": "announce/a.txt", "resource_type": "file"}]}
 
+    async def list_children(self, **kwargs):
+        self.calls.append(("list_children", kwargs))
+        return {"items": [{"resource_path": "announce/a.txt", "resource_type": "file"}]}
+
     async def get(self, **kwargs):
         self.calls.append(("get", kwargs))
         return {"resource": {"resource_path": kwargs.get("resource_path"), "resource_type": "file"}}
@@ -67,6 +71,10 @@ class _FakeResources:
 
     async def mount_object(self, **kwargs):
         self.calls.append(("mount_object", kwargs))
+        return self.pending_result
+
+    async def update(self, **kwargs):
+        self.calls.append(("update", kwargs))
         return self.pending_result
 
     async def unmount(self, **kwargs):
@@ -270,6 +278,41 @@ def test_cli_group_resources_commands_use_facade_and_pending_executor(monkeypatc
     assert json.loads(put.output)["confirmed"]["resource"]["resource_path"] == "announce/a.txt"
 
 
+def test_cli_group_resources_put_large_file_uses_upload_data_pending_executor(monkeypatch, tmp_path):
+    from aun_cli.commands import group as group_commands
+
+    client = _FakeClient()
+    store = _install_fake_group_session(monkeypatch, group_commands, client)
+    local_file = tmp_path / "large.bin"
+    data = b"x" * 70000
+    local_file.write_bytes(data)
+
+    result = _invoke([
+        "--json",
+        "group",
+        "resources",
+        "put",
+        "group.agentid.pub/team",
+        str(local_file),
+        "announce/large.bin",
+        "--content-type",
+        "application/octet-stream",
+    ])
+
+    assert result.exit_code == 0, result.output
+    put_call = client.resources.calls[0]
+    assert put_call[0] == "put"
+    assert put_call[1]["resource_path"] == "announce/large.bin"
+    assert "content" not in put_call[1]
+    assert put_call[1]["size_bytes"] == len(data)
+    assert put_call[1]["sha256"]
+    exec_call = client.resources.calls[1]
+    assert exec_call[0] == "execute_pending_ops"
+    assert exec_call[2]["aid_store"] is store
+    assert exec_call[2]["sign_as"] == "team.agentid.pub"
+    assert exec_call[2]["upload_data"] == data
+
+
 def test_cli_group_resources_defaults_to_active_group(monkeypatch, tmp_path):
     from aun_cli.commands import group as group_commands
     from aun_cli.config import load_config, save_config
@@ -288,6 +331,35 @@ def test_cli_group_resources_defaults_to_active_group(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert client.resources.calls == [("get_df", {"group_id": "group.agentid.pub/team"})]
+
+
+def test_cli_group_resources_children_calls_list_children(monkeypatch):
+    from aun_cli.commands import group as group_commands
+
+    client = _FakeClient()
+    _install_fake_group_session(monkeypatch, group_commands, client)
+
+    result = _invoke([
+        "--json", "group", "resources", "children",
+        "group.agentid.pub/team", "announce",
+        "--type", "file", "--include-status", "--page", "2", "--size", "20",
+        "--sort-by", "name", "--order", "asc",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert client.resources.calls == [
+        ("list_children", {
+            "group_id": "group.agentid.pub/team",
+            "resource_path": "announce",
+            "page": 2,
+            "size": 20,
+            "include_status": True,
+            "resource_type": "file",
+            "sort_by": "name",
+            "order": "asc",
+        })
+    ]
+    assert json.loads(result.output)["items"][0]["resource_path"] == "announce/a.txt"
 
 
 def test_cli_group_resources_rm_uses_pending_executor(monkeypatch):
@@ -335,6 +407,37 @@ def test_cli_group_resources_rm_memberdata_direct_result_skips_pending_executor(
     assert store.closed is False
 
 
+def test_cli_group_resources_update_uses_pending_executor(monkeypatch):
+    from aun_cli.commands import group as group_commands
+
+    client = _FakeClient()
+    store = _install_fake_group_session(monkeypatch, group_commands, client)
+
+    result = _invoke([
+        "--json", "group", "resources", "update",
+        "group.agentid.pub/team", "announce/a.txt",
+        "--title", "Guide", "--visibility", "public",
+        "--tag", "doc,release", "--tag", "pinned",
+        "--metadata-json", '{"lang":"zh"}',
+        "--expected-version", "3",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert client.resources.calls == [
+        ("update", {
+            "group_id": "group.agentid.pub/team",
+            "resource_path": "announce/a.txt",
+            "title": "Guide",
+            "visibility": "public",
+            "tags": ["doc", "release", "pinned"],
+            "metadata": {"lang": "zh"},
+            "expected_version": 3,
+        }),
+        ("execute_pending_ops", client.resources.pending_result, {"aid_store": store}),
+    ]
+    assert store.closed is True
+
+
 def test_cli_group_resources_mkdir_uses_pending_executor(monkeypatch):
     from aun_cli.commands import group as group_commands
 
@@ -346,6 +449,46 @@ def test_cli_group_resources_mkdir_uses_pending_executor(monkeypatch):
     assert result.exit_code == 0, result.output
     assert client.resources.calls == [
         ("create_folder", {"group_id": "group.agentid.pub/team", "resource_path": "announce/sub", "resource_type": "folder"}),
+        ("execute_pending_ops", client.resources.pending_result, {"aid_store": store}),
+    ]
+    assert store.closed is True
+
+
+def test_cli_group_resources_mount_object_uses_pending_executor(monkeypatch):
+    from aun_cli.commands import group as group_commands
+
+    client = _FakeClient()
+    store = _install_fake_group_session(monkeypatch, group_commands, client)
+
+    result = _invoke([
+        "--json", "group", "resources", "mount-object",
+        "group.agentid.pub/team", "announce/a.txt",
+        "--owner-aid", "alice.agentid.pub",
+        "--object-key", "/docs/a.txt",
+        "--title", "A",
+        "--visibility", "members_only",
+        "--tag", "doc",
+        "--metadata-json", '{"k":"v"}',
+        "--conflict-policy", "replace",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert client.resources.calls == [
+        ("mount_object", {
+            "group_id": "group.agentid.pub/team",
+            "resource_path": "announce/a.txt",
+            "storage_ref": {
+                "owner_aid": "alice.agentid.pub",
+                "bucket": "default",
+                "object_key": "docs/a.txt",
+            },
+            "mkdirs": True,
+            "conflict_policy": "replace",
+            "title": "A",
+            "visibility": "members_only",
+            "tags": ["doc"],
+            "metadata": {"k": "v"},
+        }),
         ("execute_pending_ops", client.resources.pending_result, {"aid_store": store}),
     ]
     assert store.closed is True

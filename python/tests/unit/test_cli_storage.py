@@ -130,3 +130,47 @@ def test_delete_calls_delete_object_with_object_key(monkeypatch):
     assert result.exit_code == 0, result.output
     assert client.calls == [("storage.delete_object", {"object_key": "docs/old.bin"})]
     assert json.loads(result.output)["deleted"] is True
+
+
+def test_list_calls_object_and_prefix_listing(monkeypatch):
+    from aun_cli.commands import storage as storage_commands
+
+    client = _FakeClient({
+        "storage.list_objects": {
+            "items": [{"object_key": "docs/a.txt", "size_bytes": 3, "content_type": "text/plain"}],
+            "page": 2,
+            "size": 10,
+        },
+        "storage.list_prefixes": {"prefixes": ["docs/sub/"]},
+    })
+    _install_fake_session(monkeypatch, storage_commands, client)
+
+    result = _invoke(["--json", "storage", "list", "docs", "--page", "2", "--size", "10", "--marker", "m1"])
+
+    assert result.exit_code == 0, result.output
+    assert client.calls == [
+        ("storage.list_objects", {"prefix": "docs", "page": 2, "size": 10, "marker": "m1"}),
+        ("storage.list_prefixes", {"prefix": "docs", "size": 10}),
+    ]
+    payload = json.loads(result.output)
+    assert payload["objects"]["items"][0]["object_key"] == "docs/a.txt"
+    assert payload["prefixes"]["prefixes"] == ["docs/sub/"]
+
+
+def test_info_calls_head_object(monkeypatch):
+    from aun_cli.commands import storage as storage_commands
+
+    client = _FakeClient({
+        "storage.head_object": lambda p: {
+            "object_key": p["object_key"],
+            "size_bytes": 3,
+            "content_type": "text/plain",
+        }
+    })
+    _install_fake_session(monkeypatch, storage_commands, client)
+
+    result = _invoke(["--json", "storage", "info", "/docs/a.txt"])
+
+    assert result.exit_code == 0, result.output
+    assert client.calls == [("storage.head_object", {"object_key": "docs/a.txt"})]
+    assert json.loads(result.output)["object_key"] == "docs/a.txt"

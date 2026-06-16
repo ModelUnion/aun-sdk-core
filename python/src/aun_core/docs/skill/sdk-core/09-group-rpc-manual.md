@@ -125,7 +125,7 @@
 | [group.resources.list_children](#groupresourceslist_children) | 列出目录子节点 |
 | [group.resources.rename](#groupresourcesrename) | 重命名资源节点 |
 | [group.resources.move](#groupresourcesmove) | 移动资源节点 |
-| [group.resources.mount_object](#groupresourcesmount_object) | 挂载 storage 对象为资源 |
+| [group.resources.mount_object](#groupresourcesmount_object) | 挂载成员自有 storage 子树 |
 | [group.resources.unmount](#groupresourcesunmount) | 取消挂载资源 |
 | [group.resources.resolve_path](#groupresourcesresolve_path) | 按路径解析资源 |
 | [group.resources.get](#groupresourcesget) | 查看资源 |
@@ -138,6 +138,7 @@
 | [group.resources.confirm](#groupresourcesconfirm) | 写操作完成回调记账（甲案） |
 | [group.resources.confirm_mount](#groupresourcesconfirm_mount) | 成员挂载完成回调记账 |
 | [group.resources.get_df](#groupresourcesget_df) | 群存储 df 视图（自有卷+成员挂载卷聚合） |
+| [group.resources.mark_volume_unavailable](#groupresourcesmark_volume_unavailable) | 标记成员挂载卷不可用 |
 
 ### 在线状态
 
@@ -1335,9 +1336,23 @@ result = await client.call("group.thought.get", {
 
 ## 资源管理
 
+群资源当前采用 **storage 执行 + group 镜像记账** 的最终一致模型。`group.resources.put` / `create_folder` / `rename` / `move` / `delete` / `mount_object` / `unmount` 等写操作通常不直接落盘最终资源，而是返回 `mode: "pending_ops"` 的待执行计划；调用方应通过 SDK 高层 helper 执行计划并自动回调 `confirm_rpc`。
+
+四语言 SDK 均封装了执行入口：
+
+| 语言 | 推荐入口 |
+|------|----------|
+| Python | `client.group.resources.execute_pending_ops(plan, aid_store=..., upload_data=...)` |
+| Go | `client.Group().Resources().ExecutePendingOps(ctx, plan, ...)` |
+| TypeScript / JavaScript | `client.groupResources.executePendingOps(plan, options)` |
+
+`pending_ops` 只允许 SDK 白名单内 RPC：`storage.put_object`、`storage.create_upload_session`、`storage.complete_upload`、`storage.http_put`、`storage.delete_object`、`storage.fs.mkdir`、`storage.fs.rename`、`storage.fs.remove`、`storage.fs.mount`、`storage.fs.unmount`、`storage.issue_token`、`storage.revoke_token`、`storage.set_acl`、`storage.remove_acl`、`storage.set_visibility`。确认 RPC 仅允许 `group.resources.confirm` / `group.resources.confirm_mount`。
+
+命名空间初始化由 SDK helper `initialize_namespace` 完成：以 `group_aid` 身份创建 `announce`、`public`、`archive`、`memberdata` 基线目录，将 `public` 设为公开，再调用 `group.resources.namespace_ready`。成员自有区有透明路由：对 `memberdata/{self_aid}/...` 的 `put` / `create_folder` / `delete` 会由 SDK 直接转到成员本人 storage 空间 `{self_aid}/{group_aid}/...`；他人槽位和群自有区仍走 `group.resources.*` 待执行计划。
+
 ### group.resources.put
 
-分享资源链接到群组。需要 **member 及以上**权限。
+向群 storage 命名空间写入资源。需要 **member 及以上**权限；实际写入由返回的 `pending_ops` 完成。
 
 **参数**：
 
@@ -1352,17 +1367,23 @@ result = await client.call("group.thought.get", {
 | `visibility` | string | 否 | `"members_only"` / `"public"`，默认 `"members_only"` |
 | `tags` | array | 否 | 标签数组 |
 
-**响应**：
+**响应**：返回待执行计划。小对象 inline 内容对应 `storage.put_object`；大对象上传对应 `storage.create_upload_session` → `storage.http_put` → `storage.complete_upload`。
 
 ```json
 {
+    "mode": "pending_ops",
     "group_id": "g-abc123.agentid.pub",
-    "resource": { ... },
-    "created": true
+    "group_aid": "my-team.agentid.pub",
+    "operation": "put",
+    "op_id": "gso_...",
+    "resource_path": "docs/guide.pdf",
+    "pending_ops": [ ... ],
+    "confirm_rpc": "group.resources.confirm",
+    "confirm_params": { ... }
 }
 ```
 
-> `created` 为 `true` 表示新建，`false` 表示更新已有资源。
+> 直接调用 RPC 时只会得到计划；普通应用应调用 SDK `execute_pending_ops` 完成 storage 写入和 confirm。
 
 ### group.resources.create_folder
 
@@ -1383,7 +1404,7 @@ result = await client.call("group.thought.get", {
 | `mkdirs` | boolean | 否 | 是否递归创建父目录 |
 | `sort_order` | integer | 否 | 排序值 |
 
-**响应**：`{ "group_id": "...", "resource": { ... }, "created": true }`。
+**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.mkdir`，确认 RPC 为 `group.resources.confirm`。
 
 ### group.resources.list_children
 
@@ -1410,7 +1431,7 @@ result = await client.call("group.thought.get", {
 
 **参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`），`new_name`；可选 `title`、`expected_version`。
 
-**响应**：更新后的 `resource`。
+**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.rename`，确认 RPC 为 `group.resources.confirm`。
 
 ### group.resources.move
 
@@ -1418,35 +1439,35 @@ result = await client.call("group.thought.get", {
 
 **参数**：`group_id`，资源选择器，目标父目录（`dst_parent_resource_id` / `dst_parent_path`），可选 `new_name` / `dst_name`、`expected_version`。
 
-**响应**：更新后的 `resource`。
+**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.rename`，确认 RPC 为 `group.resources.confirm`。
 
 ### group.resources.mount_object
 
-将 `storage.*` 对象挂载为群资源。需要 **owner/admin** 权限。
+将成员自有 storage 子树挂载到群命名空间的 `memberdata/{aid}` 槽位。调用者必须是该槽位成员本人；服务端会要求挂载点精确为 `memberdata/{self_aid}`，源路径限定在该成员为本群准备的目录下。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `group_id` | string | 是 | 群组 ID |
-| `storage_ref` | object | 是 | storage 引用，通常包含 `owner_aid`、`bucket`、`object_id` 或 `object_key` |
-| `path` / `resource_path` | string | 否 | 资源路径；不传时用 storage 文件名 |
+| `path` / `resource_path` / `mount_path` | string | 是 | 挂载路径，必须是 `memberdata/{self_aid}` |
+| `source_path` / `src_path` | string | 否 | 源路径；为空时默认 `{self_aid}/{group_aid}` 或 `{self_aid}/{group_id}` |
+| `source_bucket` | string | 否 | 源 bucket，默认 `"default"` |
 | `title` | string | 否 | 显示标题 |
 | `metadata` | object | 否 | 自定义元数据 |
-| `visibility` | string | 否 | `"members_only"` / `"public"` |
-| `tags` | array | 否 | 标签 |
-| `mkdirs` | boolean | 否 | 是否递归创建父目录，默认 `true` |
-| `conflict_policy` | string | 否 | `"reject"` / `"replace"` / `"keep_both"` |
+| `readonly` | boolean | 否 | 是否只读挂载，默认 `true` |
+| `volume_id` | string | 否 | 关联成员卷 |
+| `expires_at` | integer | 否 | 挂载过期时间 |
 
-**响应**：`{ "group_id": "...", "resource": { ... }, "created": true }`。
+**响应**：返回成员挂载待执行计划，核心操作为 `storage.issue_token` + `storage.fs.mount`，确认 RPC 为 `group.resources.confirm_mount`。
 
 ### group.resources.unmount
 
-取消挂载资源，等价于非递归 `group.resources.delete`。
+取消成员挂载区资源。当前仅针对 `memberdata/{aid}` 挂载，返回 `storage.fs.unmount` 待执行计划；确认 RPC 为 `group.resources.confirm_mount`，confirm 后槽位状态变为 `inactive`。
 
 **参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`）。
 
-**响应**：删除结果。
+**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.unmount`。
 
 ### group.resources.resolve_path
 
@@ -1527,11 +1548,11 @@ result = await client.call("group.thought.get", {
 
 ### group.resources.delete
 
-删除群资源。需要 admin 权限。
+删除群资源。需要资源创建者、storage owner、owner 或 admin 权限；目录删除需按需传 `recursive=true`。
 
 **参数**：`group_id` (string), `resource_path` (string)
 
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource_path": "/path/to/file" }`
+**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.remove`，确认 RPC 为 `group.resources.confirm`。
 
 ### group.resources.update
 
@@ -1582,6 +1603,14 @@ result = await client.call("group.thought.get", {
 **参数**：`group_id` (string, 必填)
 
 **响应**：`{ "group_id", "group_aid", "volumes": [...], "mounts": [...], ... }`（成员挂载卷过期标 ⚠ unavailable）
+
+### group.resources.mark_volume_unavailable
+
+标记成员挂载卷不可用。该 RPC 由服务内部或 `group_aid` 身份调用，用于卷过期、源卷失效等场景下把 member mount 标为 `missing` / `unavailable`；普通业务 SDK 不提供直接高层封装。
+
+**参数**：`group_id` (必填)；可选 `volume_id`、`mount_path`、`source_aid`、`source_bucket`、`reason`。
+
+**响应**：返回匹配并更新的挂载记录数量及挂载视图。
 
 ## 在线状态
 

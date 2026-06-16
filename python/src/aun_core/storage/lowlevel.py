@@ -824,6 +824,7 @@ class StorageLowLevel:
         dst: str,
         overwrite: bool = False,
         follow_symlinks: bool = False,
+        recursive: bool = False,
         dst_owner: str | None = None,
         dst_bucket: str | None = None,
     ) -> dict[str, Any]:
@@ -836,6 +837,7 @@ class StorageLowLevel:
                 dst=dst,
                 overwrite=overwrite,
                 follow_symlinks=follow_symlinks,
+                recursive=recursive,
                 dst_owner_aid=dst_owner,
                 dst_bucket=dst_bucket,
             ),
@@ -917,11 +919,12 @@ class StorageLowLevel:
         bucket: str = "default",
         mount_path: str | None = None,
         mount_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._call(
             "storage.fs.approve",
-            self._params(owner, bucket, mount_path=mount_path, mount_id=mount_id),
-            path=mount_path or mount_id or "",
+            self._params(owner, bucket, mount_path=mount_path, mount_id=mount_id, request_id=request_id),
+            path=mount_path or mount_id or request_id or "",
         )
 
     async def fs_reject(
@@ -931,11 +934,12 @@ class StorageLowLevel:
         bucket: str = "default",
         mount_path: str | None = None,
         mount_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._call(
             "storage.fs.reject",
-            self._params(owner, bucket, mount_path=mount_path, mount_id=mount_id),
-            path=mount_path or mount_id or "",
+            self._params(owner, bucket, mount_path=mount_path, mount_id=mount_id, request_id=request_id),
+            path=mount_path or mount_id or request_id or "",
         )
 
     async def fs_unmount(

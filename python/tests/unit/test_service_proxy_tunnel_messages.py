@@ -489,7 +489,8 @@ async def test_service_proxy_client_serve_once_dispatches_ws_connect(monkeypatch
     seen = []
 
     async def _fake_handle_ws_connect(message, tunnel, *, inbound_queue=None):
-        seen.append((message["connection_id"], tunnel is ws))
+        # tunnel 是 _SendLockedWebSocket 包装，底层仍是同一个 ws
+        seen.append((message["connection_id"], hasattr(tunnel, "send")))
 
     monkeypatch.setattr(client, "handle_ws_connect_message", _fake_handle_ws_connect)
 
@@ -527,7 +528,8 @@ async def test_service_proxy_client_serve_once_demuxes_concurrent_ws_connections
     seen = []
 
     async def _fake_handle_ws_connect(message, tunnel, *, inbound_queue=None):
-        assert tunnel is ws
+        # tunnel 是 _SendLockedWebSocket 包装，底层代理了原 ws 的属性
+        assert hasattr(tunnel, "send")
         assert inbound_queue is not None
         connection_id = message["connection_id"]
         seen.append(("start", connection_id))

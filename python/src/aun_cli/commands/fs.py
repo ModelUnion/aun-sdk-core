@@ -331,6 +331,7 @@ def fs_cp(
                 owner=src_owner,
                 dst_owner=dst_owner if dst_owner != src_owner else None,
                 overwrite=force,
+                recursive=recursive,
             )
 
     try:
@@ -531,6 +532,7 @@ def fs_mount(
 def fs_approve(
     ctx: typer.Context,
     target: str = typer.Argument(..., help="远程挂载点，形如 aid:/mount/path"),
+    request_id: Optional[str] = typer.Option(None, "--request-id", help="待审批挂载请求 ID"),
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
@@ -538,7 +540,10 @@ def fs_approve(
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
-            return await client.storage.approve_mount(remote_path, owner=owner)
+            kwargs: dict[str, Any] = {"owner": owner}
+            if request_id is not None:
+                kwargs["request_id"] = request_id
+            return await client.storage.approve_mount(remote_path, **kwargs)
 
     try:
         result = run_async(_run())
@@ -552,6 +557,7 @@ def fs_approve(
 def fs_reject(
     ctx: typer.Context,
     target: str = typer.Argument(..., help="远程挂载点，形如 aid:/mount/path"),
+    request_id: Optional[str] = typer.Option(None, "--request-id", help="待审批挂载请求 ID"),
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
@@ -559,7 +565,10 @@ def fs_reject(
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
-            return await client.storage.reject_mount(remote_path, owner=owner)
+            kwargs: dict[str, Any] = {"owner": owner}
+            if request_id is not None:
+                kwargs["request_id"] = request_id
+            return await client.storage.reject_mount(remote_path, **kwargs)
 
     try:
         result = run_async(_run())
@@ -635,15 +644,27 @@ def fs_find(
 @fs_app.command("chmod")
 def fs_chmod(
     ctx: typer.Context,
-    path: str = typer.Argument(..., help="远程路径"),
+    path: str = typer.Argument(..., help="远程路径或 chmod 模式"),
+    maybe_path: Optional[str] = typer.Argument(None, help="使用 +r/o-r 时的远程路径"),
     visibility: Optional[str] = typer.Option(None, "--visibility", help="public 或 private"),
     allow_roles: list[str] = typer.Option([], "--allow-roles", help="允许读取的群角色，可重复或逗号分隔"),
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
+    mode = None
+    if maybe_path is not None:
+        mode = path
+        path = maybe_path
+    if mode in {"+r", "a+r"}:
+        visibility = "public"
+    elif mode in {"o-r", "-r", "a-r"}:
+        visibility = "private"
+    elif mode is not None:
+        output_error("chmod 当前支持 +r、o-r 或 --visibility public|private")
+        raise typer.Exit(2)
     owner, remote_path = _remote_or_exit(path)
     if visibility not in {"public", "private"}:
-        output_error("chmod 当前支持 --visibility public|private")
+        output_error("chmod 当前支持 +r、o-r 或 --visibility public|private")
         raise typer.Exit(2)
     roles = []
     for item in allow_roles:

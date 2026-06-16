@@ -82,6 +82,33 @@ async def test_put_routes_memberdata_self_to_storage_put_object():
 
 
 @pytest.mark.asyncio
+async def test_memberdata_group_aid_cache_expires_after_ttl(monkeypatch):
+    facade, client = _facade("alice.agentid.pub")
+    now = 1000.0
+    monkeypatch.setattr("aun_core.facades.time.monotonic", lambda: now)
+
+    await facade.put(
+        group_id="g-team.agentid.pub/team",
+        resource_path="memberdata/alice.agentid.pub/docs/a.txt",
+        content="a",
+    )
+    now += 29.0
+    await facade.put(
+        group_id="g-team.agentid.pub/team",
+        resource_path="memberdata/alice.agentid.pub/docs/b.txt",
+        content="b",
+    )
+    now += 2.0
+    await facade.put(
+        group_id="g-team.agentid.pub/team",
+        resource_path="memberdata/alice.agentid.pub/docs/c.txt",
+        content="c",
+    )
+
+    assert [method for method, _params in client.calls].count("group.get") == 2
+
+
+@pytest.mark.asyncio
 async def test_put_group_own_area_still_calls_group_resources_put():
     facade, client = _facade("alice.agentid.pub")
 

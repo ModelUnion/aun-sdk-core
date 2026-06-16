@@ -176,3 +176,20 @@ def test_cli_fs_approve_reject_calls_vfs_review_methods(monkeypatch):
     ]
     assert json.loads(approved.output)["approved"] is True
     assert json.loads(rejected.output)["rejected"] is True
+
+
+def test_cli_fs_approve_reject_pass_request_id(monkeypatch):
+    from aun_cli.commands import fs as fs_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+
+    approved = _invoke(["--json", "fs", "approve", "--request-id", "mnt_1", "g-team.agentid.pub:/memberdata/alice"])
+    rejected = _invoke(["--json", "fs", "reject", "--request-id", "mnt_2", "g-team.agentid.pub:/memberdata/alice"])
+
+    assert approved.exit_code == 0, approved.output
+    assert rejected.exit_code == 0, rejected.output
+    assert client.storage.calls == [
+        ("approve_mount", "/memberdata/alice", {"owner": "g-team.agentid.pub", "request_id": "mnt_1"}),
+        ("reject_mount", "/memberdata/alice", {"owner": "g-team.agentid.pub", "request_id": "mnt_2"}),
+    ]

@@ -483,12 +483,13 @@ export class StorageLowLevel {
     }), options.src);
   }
 
-  fsCopy(options: LowLevelBaseOptions & { src: string; dst: string; overwrite?: boolean; followSymlinks?: boolean; dstOwner?: string | null; dstBucket?: string }): Promise<StorageRaw> {
+  fsCopy(options: LowLevelBaseOptions & { src: string; dst: string; overwrite?: boolean; followSymlinks?: boolean; recursive?: boolean; dstOwner?: string | null; dstBucket?: string }): Promise<StorageRaw> {
     return this.call('storage.fs.copy', params(options.owner, options.bucket, {
       src: options.src,
       dst: options.dst,
       overwrite: options.overwrite ?? false,
       follow_symlinks: options.followSymlinks ?? false,
+      recursive: options.recursive ?? false,
       dst_owner_aid: options.dstOwner,
       dst_bucket: options.dstBucket,
     }), options.src);
@@ -533,18 +534,20 @@ export class StorageLowLevel {
     }), options.mountPath);
   }
 
-  fsApprove(options: LowLevelBaseOptions & { mountPath?: string; mountId?: string }): Promise<StorageRaw> {
+  fsApprove(options: LowLevelBaseOptions & { mountPath?: string; mountId?: string; requestId?: string }): Promise<StorageRaw> {
     return this.call('storage.fs.approve', params(options.owner, options.bucket, {
       mount_path: options.mountPath,
       mount_id: options.mountId,
-    }), options.mountPath ?? options.mountId ?? '');
+      request_id: options.requestId,
+    }), options.mountPath ?? options.mountId ?? options.requestId ?? '');
   }
 
-  fsReject(options: LowLevelBaseOptions & { mountPath?: string; mountId?: string }): Promise<StorageRaw> {
+  fsReject(options: LowLevelBaseOptions & { mountPath?: string; mountId?: string; requestId?: string }): Promise<StorageRaw> {
     return this.call('storage.fs.reject', params(options.owner, options.bucket, {
       mount_path: options.mountPath,
       mount_id: options.mountId,
-    }), options.mountPath ?? options.mountId ?? '');
+      request_id: options.requestId,
+    }), options.mountPath ?? options.mountId ?? options.requestId ?? '');
   }
 
   fsUnmount(options: LowLevelBaseOptions & { mountPath: string }): Promise<StorageRaw> {

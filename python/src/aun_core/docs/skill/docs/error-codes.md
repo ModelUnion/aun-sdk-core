@@ -19,7 +19,7 @@
 | `4001`, `4010` | `AuthError` |
 | `4030`, `403`, `-32003` | `PermissionError` |
 | `4040`, `404`, `-32004` | `NotFoundError` |
-| `4290`, `429`, `-32029` | `RateLimitError` |
+| `4290`, `429`, `-32029`, `-32429` | `RateLimitError` |
 | `-32600`, `-32601`, `-32602`, `4000` | `ValidationError` |
 | 其他错误码 | `AUNError` |
 

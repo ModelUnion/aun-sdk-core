@@ -90,7 +90,7 @@ class MessageFacade(_RpcFacade):
 
 class GroupResourcesFacade(_RpcFacade):
     BASELINE_PATHS = ("announce", "public", "archive", "memberdata")
-    GROUP_AID_CACHE_TTL_SECONDS = 300
+    GROUP_AID_CACHE_TTL_SECONDS = 30
 
     def __init__(self, client: Any) -> None:
         super().__init__(client, "group.resources")
@@ -391,6 +391,7 @@ class GroupResourcesFacade(_RpcFacade):
         aid_store: Any | None = None,
         connect_options: dict[str, Any] | None = None,
         sign_as: str | None = None,
+        upload_data: bytes | bytearray | memoryview | Any | None = None,
     ) -> dict[str, Any]:
         if not isinstance(pending, dict):
             raise TypeError("pending must be a dict")
@@ -410,6 +411,7 @@ class GroupResourcesFacade(_RpcFacade):
             "storage.put_object",
             "storage.create_upload_session",
             "storage.complete_upload",
+            "storage.http_put",
             "storage.delete_object",
             "storage.fs.mkdir",
             "storage.fs.rename",
@@ -477,6 +479,58 @@ class GroupResourcesFacade(_RpcFacade):
                 if current is None:
                     return None
             return current
+
+        def _apply_result_mappings(params: dict[str, Any], op: dict[str, Any]) -> dict[str, Any]:
+            mappings = op.get("params_from_results") or op.get("paramsFromResults") or {}
+            if not isinstance(mappings, dict):
+                return params
+            result_context = {
+                **storage_results,
+                "results": storage_results,
+                "storage_results": storage_results,
+                "op_results": op_results,
+            }
+            for param_key, result_path in mappings.items():
+                value = _result_path_value(result_context, str(result_path or ""))
+                if value is not None:
+                    params[str(param_key)] = value
+            return params
+
+        async def _http_put(params: dict[str, Any]) -> dict[str, Any]:
+            upload_url = str(params.get("upload_url") or params.get("url") or "").strip()
+            if not upload_url:
+                raise ValueError("storage.http_put requires upload_url")
+            data_ref = str(params.get("data_ref") or "upload_data").strip() or "upload_data"
+            payload = params.get("data")
+            if payload is None and data_ref == "upload_data":
+                payload = upload_data
+            if hasattr(payload, "read"):
+                payload = payload.read()
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            if isinstance(payload, bytearray):
+                payload = bytes(payload)
+            if not isinstance(payload, bytes):
+                raise ValueError("storage.http_put requires upload_data bytes")
+            headers = dict(params.get("headers") or {}) if isinstance(params.get("headers"), dict) else {}
+            content_type = str(params.get("content_type") or params.get("contentType") or "").strip()
+            if content_type:
+                headers.setdefault("Content-Type", content_type)
+            putter = getattr(self._client, "http_put", None)
+            if callable(putter):
+                result = await putter(upload_url, payload, headers=headers)
+            else:
+                from .storage.lowlevel import StorageLowLevel
+
+                await StorageLowLevel(self._client).http_put(upload_url, payload, headers=headers)
+                result = None
+            if isinstance(result, dict):
+                base = dict(result)
+            else:
+                base = {"status": int(result)} if isinstance(result, int) else {"status": 200}
+            base.setdefault("upload_url", upload_url)
+            base.setdefault("size_bytes", len(payload))
+            return base
 
         def _validate_rpc_plan() -> None:
             confirm_rpc = str(pending.get("confirm_rpc") or "group.resources.confirm").strip()
@@ -567,10 +621,16 @@ class GroupResourcesFacade(_RpcFacade):
                 if rpc not in allowed_pending_rpcs:
                     raise ValueError(f"unsupported pending rpc: {rpc}")
                 params = dict(op.get("params") or {})
+                params = _apply_result_mappings(params, op)
+                if "data_ref" in op and "data_ref" not in params:
+                    params["data_ref"] = op.get("data_ref")
                 op_sign_as = str(op.get("sign_as") or op.get("signAs") or default_sign_as or "").strip()
                 key = str(op.get("confirm_key") or f"op_{index}").strip()
                 try:
-                    result = await _call_rpc(rpc, params, op_sign_as)
+                    if rpc == "storage.http_put":
+                        result = await _http_put(params)
+                    else:
+                        result = await _call_rpc(rpc, params, op_sign_as)
                 except Exception as exc:
                     compensation_results, compensation_errors = await _run_compensations(successful_ops, storage_results)
                     if not successful_ops and not compensation_results and not compensation_errors:
@@ -610,7 +670,19 @@ class GroupResourcesFacade(_RpcFacade):
                 or default_sign_as
                 or ""
             ).strip()
-            confirmed = await _call_rpc(confirm_rpc, confirm_params, confirm_sign_as)
+            try:
+                confirmed = await _call_rpc(confirm_rpc, confirm_params, confirm_sign_as)
+            except Exception as exc:
+                # confirm 失败时触发补偿，避免 storage 操作已执行但 confirm 未确认的悬空状态
+                compensation_results, compensation_errors = await _run_compensations(successful_ops, storage_results)
+                raise GroupPendingOpsPartialFailure(
+                    f"confirm failed: {exc}",
+                    storage_results=storage_results,
+                    op_results=op_results,
+                    compensation_results=compensation_results,
+                    compensation_errors=compensation_errors,
+                    failed_index=len(ops),
+                ) from exc
             return {
                 "storage_results": storage_results,
                 "confirmed": confirmed,

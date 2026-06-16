@@ -21,6 +21,18 @@ class FakeClient {
     if (method === 'storage.fs.mkdir') {
       return { folder_id: `folder-${String(params?.path ?? '')}`, path: params?.path };
     }
+    if (method === 'storage.create_upload_session') {
+      return {
+        upload_url: 'https://storage.agentid.pub/upload/s1',
+        session_id: 's1',
+        headers: { 'X-Upload': '1' },
+        method,
+        params: params ?? {},
+      };
+    }
+    if (method === 'storage.complete_upload') {
+      return { object_id: 'o1', status: 'active', method, params: params ?? {} };
+    }
     if (method === 'group.get') {
       return { group: { group_id: params?.group_id, group_aid: 'team.agentid.pub' } };
     }
@@ -1023,6 +1035,87 @@ describe('TS SDK facade API 契约', () => {
     expect(client.calls[1]?.params).not.toHaveProperty('results');
   });
 
+  it('executePendingOps 支持 group put 大文件的 HTTP PUT + complete_upload 编排', async () => {
+    const client = new FakeClient();
+    client.aid = 'team.agentid.pub';
+    const resources = new GroupResourcesFacade(client);
+    const uploadData = new Uint8Array([1, 2, 3, 4]);
+    const httpPuts: Array<{ url: string; data: unknown; headers: Record<string, string> }> = [];
+
+    await resources.executePendingOps({
+      mode: 'pending_ops',
+      group_id: 'g1',
+      group_aid: 'team.agentid.pub',
+      op_id: 'op1',
+      confirm_rpc: 'group.resources.confirm',
+      confirm_params: {
+        group_id: 'g1',
+        path: 'announce/a.bin',
+        resource_type: 'file',
+      },
+      pending_ops: [
+        {
+          rpc: 'storage.create_upload_session',
+          params: { owner_aid: 'team.agentid.pub', object_key: 'announce/a.bin', size_bytes: 4 },
+          confirm_key: 'upload_session',
+        },
+        {
+          rpc: 'storage.http_put',
+          params: { content_type: 'application/octet-stream' },
+          params_from_results: {
+            upload_url: 'upload_session.upload_url',
+            headers: 'upload_session.headers',
+          },
+          data_ref: 'upload_data',
+          confirm_key: 'http_put',
+        },
+        {
+          rpc: 'storage.complete_upload',
+          params: {
+            owner_aid: 'team.agentid.pub',
+            object_key: 'announce/a.bin',
+            size_bytes: 4,
+            sha256: 'a'.repeat(64),
+          },
+          params_from_results: { session_id: 'upload_session.session_id' },
+          confirm_key: 'upload',
+        },
+      ],
+    }, {
+      uploadData,
+      httpPut: async (url: string, data: unknown, headers: Record<string, string>) => {
+        httpPuts.push({ url, data, headers });
+        return { status: 200 };
+      },
+    });
+
+    expect(client.calls.map((c) => c.method)).toEqual([
+      'storage.create_upload_session',
+      'storage.complete_upload',
+      'group.resources.confirm',
+    ]);
+    expect(httpPuts).toEqual([{
+      url: 'https://storage.agentid.pub/upload/s1',
+      data: uploadData,
+      headers: { 'X-Upload': '1', 'Content-Type': 'application/octet-stream' },
+    }]);
+    expect(client.calls[1]?.params).toMatchObject({
+      owner_aid: 'team.agentid.pub',
+      object_key: 'announce/a.bin',
+      session_id: 's1',
+      size_bytes: 4,
+      sha256: 'a'.repeat(64),
+    });
+    expect(client.calls[2]?.params).toMatchObject({
+      group_id: 'g1',
+      op_id: 'op1',
+      storage_results: {
+        http_put: { status: 200, upload_url: 'https://storage.agentid.pub/upload/s1', size_bytes: 4 },
+      },
+      confirm_key: 'upload',
+    });
+  });
+
   it('client.stream.* 映射到 stream 控制面 RPC', async () => {
     const client = new FakeClient();
     const stream = new StreamFacade(client);
@@ -1145,6 +1238,38 @@ describe('TS SDK facade API 契约', () => {
         content_encoding: 'base64',
         overwrite: true,
       });
+    });
+
+    it('memberdata group_aid 缓存 30 秒后重新查询', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = new FakeClient();
+        client.aid = 'alice.agentid.pub';
+        const resources = new GroupResourcesFacade(client);
+
+        vi.setSystemTime(0);
+        await resources.put({
+          group_id: 'g-team.agentid.pub/team',
+          resource_path: 'memberdata/alice.agentid.pub/docs/a.txt',
+          content: 'a',
+        });
+        vi.setSystemTime(29_000);
+        await resources.put({
+          group_id: 'g-team.agentid.pub/team',
+          resource_path: 'memberdata/alice.agentid.pub/docs/b.txt',
+          content: 'b',
+        });
+        vi.setSystemTime(31_000);
+        await resources.put({
+          group_id: 'g-team.agentid.pub/team',
+          resource_path: 'memberdata/alice.agentid.pub/docs/c.txt',
+          content: 'c',
+        });
+
+        expect(client.calls.filter((c) => c.method === 'group.get')).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('put 命中本人 memberdata 但 group_aid 查找失败时不回退 group_id', async () => {

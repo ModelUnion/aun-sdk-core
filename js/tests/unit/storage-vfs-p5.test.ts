@@ -219,7 +219,7 @@ describe('P5 StorageVFS Browser SDK 契约', () => {
     const client = new FakeClient();
     const storage = new StorageVFS(client);
 
-    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob.agentid.pub' });
+    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob.agentid.pub', recursive: true });
 
     expect(copied.owner).toBe('bob.agentid.pub');
     expect(client.calls).toHaveLength(1);
@@ -230,6 +230,7 @@ describe('P5 StorageVFS Browser SDK 契约', () => {
         dst_owner_aid: 'bob.agentid.pub',
         src: 'docs/a.txt',
         dst: 'inbox/a.txt',
+        recursive: true,
       },
     });
   });

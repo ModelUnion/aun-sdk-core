@@ -76,10 +76,10 @@ class CollabClient:
     async def read(self, collab_root: str, doc: str) -> dict[str, Any]:
         return await self._call("collab.read", {"collab_root": collab_root, "doc": doc})
 
-    async def submit(self, collab_root: str, doc: str, source: str, base_version: int) -> dict[str, Any]:
+    async def submit(self, collab_root: str, doc: str, source: str, base_version: int, *, message: str = "") -> dict[str, Any]:
         return await self._call(
             "collab.submit",
-            {"collab_root": collab_root, "doc": doc, "source": source, "base_version": base_version},
+            {"collab_root": collab_root, "doc": doc, "source": source, "base_version": base_version, "message": message},
         )
 
     async def merge(self, collab_root: str, doc: str, source: str, base_version: int) -> dict[str, Any]:
@@ -108,6 +108,18 @@ class CollabClient:
 
     async def prune(self, collab_root: str, doc: str) -> dict[str, Any]:
         return await self._call("collab.prune", {"collab_root": collab_root, "doc": doc})
+
+    async def gc(self, collab_root: str, *, dry_run: bool = True) -> dict[str, Any]:
+        return await self._call("collab.gc", {"collab_root": collab_root, "dry_run": dry_run})
+
+    async def reflog(self, collab_root: str, doc: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+        params = {"collab_root": collab_root, "limit": limit}
+        if doc:
+            params["doc"] = doc
+        return await self._call("collab.reflog", params)
+
+    async def reset(self, collab_root: str, doc: str, version: int, *, message: str = "") -> dict[str, Any]:
+        return await self._call("collab.reset", {"collab_root": collab_root, "doc": doc, "version": version, "message": message})
 
     async def discover(self, group_aid: str) -> list[dict[str, Any]]:
         return await self._call("collab.discover", {"group_aid": group_aid})

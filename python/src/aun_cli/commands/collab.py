@@ -82,7 +82,7 @@ def _is_collab_user_error(exc: Exception) -> bool:
     if isinstance(exc, (AUNPermissionError, AUNNotFoundError, ValidationError)):
         return True
     if isinstance(exc, AUNError):
-        return exc.code in {-32600, -32601, -32602, -32001, -32004, -32008, 4000, 403, 4030, 404, 4040}
+        return exc.code in {-32600, -32601, -32602, -32001, -32004, -32008, -32009, -32010, 4000, 403, 4030, 404, 4040}
     return False
 
 
@@ -125,12 +125,19 @@ def collab_read(ctx: typer.Context, collab_root: str, doc: str, output: Optional
 
 
 @collab_app.command("submit")
-def collab_submit(ctx: typer.Context, collab_root: str, doc: str, source: str, base_version: int = typer.Option(..., "--base-version")) -> None:
+def collab_submit(
+    ctx: typer.Context,
+    collab_root: str,
+    doc: str,
+    source: str,
+    base_version: int = typer.Option(..., "--base-version"),
+    message: str = typer.Option("", "--message"),
+) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.submit(collab_root, doc, _source_value(source), base_version)
+            return await client.collab.submit(collab_root, doc, _source_value(source), base_version, message=message)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -230,6 +237,54 @@ def collab_prune(ctx: typer.Context, collab_root: str, doc: str) -> None:
     async def _run():
         async with CLISession(ctx) as client:
             return await client.collab.prune(collab_root, doc)
+
+    _print_result(_run_collab(ctx, _run()))
+
+
+@collab_app.command("reset")
+def collab_reset(
+    ctx: typer.Context,
+    collab_root: str,
+    doc: str,
+    version: int = typer.Option(..., "--version"),
+    message: str = typer.Option("", "--message"),
+) -> None:
+    _set_json(ctx)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.collab.reset(collab_root, doc, version, message=message)
+
+    _print_result(_run_collab(ctx, _run()))
+
+
+@collab_app.command("gc")
+def collab_gc(
+    ctx: typer.Context,
+    collab_root: str,
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="默认只预览；--apply 才实际清理"),
+) -> None:
+    _set_json(ctx)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.collab.gc(collab_root, dry_run=dry_run)
+
+    _print_result(_run_collab(ctx, _run()))
+
+
+@collab_app.command("reflog")
+def collab_reflog(
+    ctx: typer.Context,
+    collab_root: str,
+    doc: Optional[str] = typer.Argument(None),
+    limit: int = typer.Option(100, "--limit"),
+) -> None:
+    _set_json(ctx)
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.collab.reflog(collab_root, doc, limit=limit)
 
     _print_result(_run_collab(ctx, _run()))
 

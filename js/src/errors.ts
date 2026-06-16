@@ -276,7 +276,7 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
     Cls = PermissionError;
   } else if ([4040, 404, -32008].includes(code)) {
     Cls = NotFoundError;
-  } else if ([4290, 429, -32029].includes(code)) {
+  } else if ([4290, 429, -32029, -32429].includes(code)) {
     Cls = RateLimitError;
   } else if (code === -32009) {
     Cls = VersionConflictError;

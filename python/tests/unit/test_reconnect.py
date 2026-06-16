@@ -51,6 +51,7 @@ def _make_client(auto_reconnect: bool = True) -> AUNClient:
     # mock transport.close 和 discovery.check_health，避免真实 I/O
     client._transport = MagicMock()
     client._transport.close = AsyncMock()
+    client._transport.cancel_event_tasks = AsyncMock()
     client._discovery = MagicMock()
     client._discovery.check_health = AsyncMock(return_value=True)
 

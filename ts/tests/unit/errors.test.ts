@@ -42,7 +42,7 @@ describe('mapRemoteError', () => {
   });
 
   // ── 频率限制错误（可重试） ──────────────────────────────
-  it.each([4290, 429, -32029])('code %d 映射为 RateLimitError（retryable=true）', (code) => {
+  it.each([4290, 429, -32029, -32429])('code %d 映射为 RateLimitError（retryable=true）', (code) => {
     const err = mapRemoteError({ code, message: 'rate limited' });
     expect(err).toBeInstanceOf(RateLimitError);
     expect(err.retryable).toBe(true);

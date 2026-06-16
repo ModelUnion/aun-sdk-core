@@ -19,7 +19,7 @@
 | [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md) | aun-console 消息通信页的服务端可观察 P0 诊断面板 |
 | [AUN 反向代理服务方案与 TDD 实施计划](design/AUN反向代理服务方案与TDD实施计划.md) | AUN Service Proxy、service_proxy 服务模块、SDK service-proxy-client、URL 路由、隧道协议、Web 边界和分阶段 TDD 落地计划 |
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
-| [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
+| [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE、Storage VFS、Group resources pending_ops 和 Collab 的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
 | [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、服务端分层和 direct backend 上传下载 |
 | [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>) | Python SDK StorageVFS / StorageLowLevel 接口契约、返回类型、错误映射和跨语言对齐要求 |
@@ -52,7 +52,7 @@
 
 ### SDK 使用与协议
 
-- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制 → [SDK 文档索引](sdk/INDEX.md)
+- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制、Storage VFS、Group resources pending_ops、Collab GC/reflog/reset → [SDK 文档索引](sdk/INDEX.md)
 - 按主题和行区间查 SDK 文档 → [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md)
 - Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、direct backend 上传下载和服务端分层 → [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>)
 - StorageVFS / StorageLowLevel 接口契约、NodeView/ObjectView、错误映射和跨语言对齐 → [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>)
@@ -136,7 +136,7 @@
 
 ### SDK 文档索引
 
-`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE、API 手册、错误处理、最佳实践、payload、Service Proxy 和各类 RPC 手册。
+`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group resources pending_ops 执行模型、Collab GC/reflog/reset 和各类 RPC 手册。
 
 ### Service Proxy RPC 手册
 

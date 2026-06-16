@@ -29,6 +29,10 @@ interface GroupResourcesOptions {
   connect_options?: FacadeParams;
   sign_as?: unknown;
   signAs?: unknown;
+  uploadData?: unknown;
+  upload_data?: unknown;
+  httpPut?: unknown;
+  http_put?: unknown;
   [key: string]: unknown;
 }
 
@@ -38,11 +42,13 @@ const DEFAULT_SIGNER_CONNECT_OPTIONS: FacadeParams = {
   heartbeat_interval: 0,
 };
 
+const GROUP_AID_CACHE_TTL_MS = 30_000;
 const GROUP_STORAGE_BASELINE_DIRS = ['announce', 'public', 'archive', 'memberdata'] as const;
 const GROUP_STORAGE_ALLOWED_PENDING_RPCS = new Set([
   'storage.put_object',
   'storage.create_upload_session',
   'storage.complete_upload',
+  'storage.http_put',
   'storage.delete_object',
   'storage.fs.mkdir',
   'storage.fs.rename',
@@ -187,6 +193,18 @@ function resultPathValue(source: unknown, path: string): unknown {
   return current;
 }
 
+function payloadSize(value: unknown): number {
+  if (value instanceof Uint8Array) return value.byteLength;
+  if (value instanceof ArrayBuffer) return value.byteLength;
+  if (typeof Blob !== 'undefined' && value instanceof Blob) return value.size;
+  if (typeof value === 'string') return value.length;
+  if (isRecord(value)) {
+    const size = Number(value.size ?? value.length ?? value.byteLength);
+    return Number.isFinite(size) && size >= 0 ? size : 0;
+  }
+  return 0;
+}
+
 function extractLoadedAid(result: unknown, signAs: string): unknown {
   if (!isRecord(result) || result.ok !== true || !isRecord(result.data)) {
     const error = isRecord(result) && isRecord(result.error) ? result.error : {};
@@ -267,7 +285,7 @@ export class MessageFacade extends RpcFacade {
 }
 
 export class GroupResourcesFacade extends RpcFacade {
-  private readonly groupAidCache = new Map<string, string>();
+  private readonly groupAidCache = new Map<string, { groupAid: string; expiresAt: number }>();
 
   private async createSignerClient(aidObj: unknown, options: GroupResourcesOptions): Promise<GroupResourcesSignerClient> {
     const factory = options.clientFactory ?? options.client_factory;
@@ -294,6 +312,38 @@ export class GroupResourcesFacade extends RpcFacade {
     return signer;
   }
 
+  private async httpPut(params: FacadeParams, options: GroupResourcesOptions): Promise<RpcResult> {
+    const uploadUrl = stringValue(params.upload_url ?? params.uploadUrl ?? params.url);
+    if (!uploadUrl) throw new Error('storage.http_put requires upload_url');
+    const dataRef = stringValue(params.data_ref ?? params.dataRef) || 'upload_data';
+    const payload = params.data ?? (dataRef === 'upload_data' ? (options.uploadData ?? options.upload_data) : options[dataRef]);
+    if (payload === undefined || payload === null) throw new Error('storage.http_put requires upload_data');
+    const headers: Record<string, string> = {};
+    if (isRecord(params.headers)) {
+      for (const [key, value] of Object.entries(params.headers)) {
+        if (value !== undefined && value !== null) headers[key] = String(value);
+      }
+    }
+    const contentType = stringValue(params.content_type ?? params.contentType);
+    if (contentType && !Object.keys(headers).some((key) => key.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = contentType;
+    }
+    const customPut = options.httpPut ?? options.http_put;
+    let result: unknown;
+    if (typeof customPut === 'function') {
+      result = await customPut(uploadUrl, payload, headers);
+    } else {
+      const fetchFn = (globalThis as unknown as { fetch?: typeof fetch }).fetch;
+      if (typeof fetchFn !== 'function') throw new Error('storage.http_put requires fetch or httpPut option');
+      const response = await fetchFn(uploadUrl, { method: 'PUT', body: payload as BodyInit, headers });
+      if (!response.ok) throw new Error(`HTTP PUT failed: status=${response.status}`);
+      result = { status: response.status };
+    }
+    const sizeBytes = payloadSize(payload);
+    const base = isRecord(result) ? asFacadeParams(result) : { status: typeof result === 'number' ? result : 200 };
+    return { ...base, upload_url: uploadUrl, size_bytes: base.size_bytes ?? base.sizeBytes ?? sizeBytes };
+  }
+
   private resourceCall(name: string, params?: FacadeParams): Promise<RpcResult> {
     return this.call(`group.resources.${name}`, params);
   }
@@ -312,7 +362,7 @@ export class GroupResourcesFacade extends RpcFacade {
     const groupId = stringValue(params.group_id ?? params.groupId);
     if (!groupId) return '';
     const cached = this.groupAidCache.get(groupId);
-    if (cached) return cached;
+    if (cached && cached.expiresAt > Date.now()) return cached.groupAid;
     let result: RpcResult;
     try {
       result = await this.client.call('group.get', stripNil({ group_id: groupId }));
@@ -322,7 +372,7 @@ export class GroupResourcesFacade extends RpcFacade {
     const group = isRecord(result) ? result.group : undefined;
     const groupAid = isRecord(group) ? stringValue(group.group_aid) : '';
     if (!groupAid) throw memberdataLookupError(groupId, 'group_aid missing', result);
-    this.groupAidCache.set(groupId, groupAid);
+    this.groupAidCache.set(groupId, { groupAid, expiresAt: Date.now() + GROUP_AID_CACHE_TTL_MS });
     return groupAid;
   }
 
@@ -582,6 +632,22 @@ export class GroupResourcesFacade extends RpcFacade {
       return { compensationResults, compensationErrors };
     };
 
+    const applyResultMappings = (op: FacadeParams, params: FacadeParams): FacadeParams => {
+      const mappings = op.params_from_results ?? op.paramsFromResults;
+      if (isRecord(mappings)) {
+        for (const [paramKey, resultPath] of Object.entries(mappings)) {
+          const value = resultPathValue({ ...results, results, storage_results: results, op_results: opResults }, stringValue(resultPath));
+          if (value !== undefined && value !== null) {
+            (params as Record<string, unknown>)[paramKey] = value;
+          }
+        }
+      }
+      if ((op.data_ref ?? op.dataRef) !== undefined && params.data_ref === undefined && params.dataRef === undefined) {
+        params.data_ref = op.data_ref ?? op.dataRef;
+      }
+      return params;
+    };
+
     try {
       for (let index = 0; index < pendingOps.length; index += 1) {
         if (!isRecord(pendingOps[index])) {
@@ -590,13 +656,17 @@ export class GroupResourcesFacade extends RpcFacade {
         const op = asFacadeParams(pendingOps[index]);
         const rpc = stringValue(op.rpc ?? op.method);
         if (!rpc) throw new Error(`pending op ${index} missing rpc`);
-        const opParams = asFacadeParams(op.params);
-        const opSignAs = stringValue(op.sign_as ?? op.signAs ?? defaultSignAs);
-        const storageClient = await this.signerFor(opSignAs, options, signerCache);
+        const opParams = applyResultMappings(op, asFacadeParams(op.params));
         const confirmKey = stringValue(op.confirm_key ?? op.confirmKey) || `op_${index}`;
         let result: RpcResult;
         try {
-          result = await storageClient.call(rpc, stripNil(opParams));
+          if (rpc === 'storage.http_put') {
+            result = await this.httpPut(stripNil(opParams), options);
+          } else {
+            const opSignAs = stringValue(op.sign_as ?? op.signAs ?? defaultSignAs);
+            const storageClient = await this.signerFor(opSignAs, options, signerCache);
+            result = await storageClient.call(rpc, stripNil(opParams));
+          }
         } catch (exc) {
           const compensation = await runCompensations();
           if (successfulOps.length === 0 && Object.keys(compensation.compensationResults).length === 0 && compensation.compensationErrors.length === 0) {

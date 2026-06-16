@@ -252,6 +252,46 @@ func TestGroupResourcesPutRoutesMemberdataToStorage(t *testing.T) {
 	}
 }
 
+func TestGroupResourcesMemberdataGroupAidCacheExpires(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeStorageClient{aid: "alice.agentid.pub"}
+	resources := newGroupFacade(client).Resources()
+	oldNow := groupStorageNow
+	current := time.Unix(0, 0)
+	groupStorageNow = func() time.Time { return current }
+	t.Cleanup(func() {
+		groupStorageNow = oldNow
+	})
+
+	for _, tc := range []struct {
+		at   time.Duration
+		path string
+	}{
+		{0, "memberdata/alice.agentid.pub/docs/a.txt"},
+		{29 * time.Second, "memberdata/alice.agentid.pub/docs/b.txt"},
+		{31 * time.Second, "memberdata/alice.agentid.pub/docs/c.txt"},
+	} {
+		current = time.Unix(0, 0).Add(tc.at)
+		if _, err := resources.Put(ctx, map[string]any{
+			"group_id":      "g1",
+			"resource_path": tc.path,
+			"content":       "hello",
+		}); err != nil {
+			t.Fatalf("Put 失败: %v", err)
+		}
+	}
+
+	groupGetCount := 0
+	for _, call := range client.calls {
+		if call.method == "group.get" {
+			groupGetCount++
+		}
+	}
+	if groupGetCount != 2 {
+		t.Fatalf("group_aid 缓存 TTL 未生效，group.get 次数=%d calls=%#v", groupGetCount, client.calls)
+	}
+}
+
 func TestGroupResourcesMemberdataLookupFailureDoesNotFallbackToGroupID(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeStorageClient{
@@ -650,6 +690,126 @@ func TestGroupResourcesExecutePendingOpsRunsInOrderAndConfirms(t *testing.T) {
 	}
 	if confirmParams["storage_result"] == nil || confirmParams["confirm_key"] != "rename" {
 		t.Fatalf("confirm 未携带 storage_result/confirm_key: %#v", confirmParams)
+	}
+}
+
+func TestGroupResourcesExecutePendingOpsRunsLargeUploadHTTPPutAndComplete(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeStorageClient{aid: "team.agentid.pub"}
+	clientProxy := &callOverrideStorageClient{
+		fakeStorageClient: client,
+		call: func(ctx context.Context, method string, params map[string]any) (any, error) {
+			client.calls = append(client.calls, storageCallRecord{method: method, params: params})
+			switch method {
+			case "storage.create_upload_session":
+				return map[string]any{
+					"upload_url": "https://storage.agentid.pub/upload/s1",
+					"session_id": "s1",
+					"headers":    map[string]any{"X-Upload": "1"},
+				}, nil
+			case "storage.complete_upload":
+				return map[string]any{"object_id": "o1", "status": "active"}, nil
+			default:
+				return map[string]any{"ok": true}, nil
+			}
+		},
+	}
+	resources := newGroupFacade(clientProxy).Resources()
+	uploadData := []byte{1, 2, 3, 4}
+	var httpPuts []map[string]any
+	oldHTTPPut := groupStorageHTTPPut
+	groupStorageHTTPPut = func(ctx context.Context, uploadURL string, data []byte, headers map[string]string) (map[string]any, error) {
+		httpPuts = append(httpPuts, map[string]any{
+			"url":     uploadURL,
+			"data":    append([]byte(nil), data...),
+			"headers": headers,
+		})
+		return map[string]any{"status": 200}, nil
+	}
+	t.Cleanup(func() {
+		groupStorageHTTPPut = oldHTTPPut
+	})
+
+	result, err := resources.ExecutePendingOps(ctx, map[string]any{
+		"mode":        "pending_ops",
+		"group_id":    "g1",
+		"group_aid":   "team.agentid.pub",
+		"op_id":       "op1",
+		"confirm_rpc": "group.resources.confirm",
+		"upload_data": uploadData,
+		"confirm_params": map[string]any{
+			"group_id":      "g1",
+			"resource_path": "announce/a.bin",
+			"resource_type": "file",
+		},
+		"pending_ops": []any{
+			map[string]any{
+				"rpc": "storage.create_upload_session",
+				"params": map[string]any{
+					"owner_aid":  "team.agentid.pub",
+					"object_key": "announce/a.bin",
+					"size_bytes": len(uploadData),
+				},
+				"confirm_key": "upload_session",
+			},
+			map[string]any{
+				"rpc":    "storage.http_put",
+				"params": map[string]any{"content_type": "application/octet-stream"},
+				"params_from_results": map[string]any{
+					"upload_url": "upload_session.upload_url",
+					"headers":    "upload_session.headers",
+				},
+				"data_ref":    "upload_data",
+				"confirm_key": "http_put",
+			},
+			map[string]any{
+				"rpc": "storage.complete_upload",
+				"params": map[string]any{
+					"owner_aid":  "team.agentid.pub",
+					"object_key": "announce/a.bin",
+					"size_bytes": len(uploadData),
+					"sha256":     strings.Repeat("a", 64),
+				},
+				"params_from_results": map[string]any{"session_id": "upload_session.session_id"},
+				"confirm_key":         "upload",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecutePendingOps 失败: %v", err)
+	}
+	if len(httpPuts) != 1 {
+		t.Fatalf("HTTP PUT 次数不正确: %#v", httpPuts)
+	}
+	if httpPuts[0]["url"] != "https://storage.agentid.pub/upload/s1" {
+		t.Fatalf("HTTP PUT URL 不正确: %#v", httpPuts)
+	}
+	if !reflect.DeepEqual(httpPuts[0]["data"], uploadData) {
+		t.Fatalf("HTTP PUT payload 不正确: %#v", httpPuts)
+	}
+	headers, ok := httpPuts[0]["headers"].(map[string]string)
+	if !ok || headers["X-Upload"] != "1" || headers["Content-Type"] != "application/octet-stream" {
+		t.Fatalf("HTTP PUT headers 不正确: %#v", httpPuts)
+	}
+	gotMethods := []string{client.calls[0].method, client.calls[1].method, client.calls[2].method}
+	wantMethods := []string{"storage.create_upload_session", "storage.complete_upload", "group.resources.confirm"}
+	if !reflect.DeepEqual(gotMethods, wantMethods) {
+		t.Fatalf("调用顺序不正确: got=%v want=%v", gotMethods, wantMethods)
+	}
+	if client.calls[1].params["session_id"] != "s1" {
+		t.Fatalf("complete_upload 未从 upload_session 映射 session_id: %#v", client.calls[1].params)
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("ExecutePendingOps 返回不正确: %#v", result)
+	}
+	storageResults, ok := resultMap["storage_results"].(map[string]any)
+	if !ok || storageResults["http_put"] == nil {
+		t.Fatalf("storage_results 缺少 http_put: %#v", result)
+	}
+	confirmResults, ok := client.calls[2].params["storage_results"].(map[string]any)
+	if !ok || confirmResults["http_put"] == nil {
+		t.Fatalf("confirm 未携带 http_put 结果: %#v", client.calls[2].params)
 	}
 }
 

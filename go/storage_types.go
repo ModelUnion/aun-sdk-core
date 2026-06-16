@@ -41,11 +41,12 @@ type UnmountResult struct {
 }
 
 type DownloadResult struct {
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	SHA256   string `json:"sha256"`
-	Verified bool   `json:"verified"`
-	Data     []byte `json:"-"`
+	Path      string `json:"path"`
+	LocalPath string `json:"local_path"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+	Verified  bool   `json:"verified"`
+	Data      []byte `json:"-"`
 }
 
 type UsageView struct {

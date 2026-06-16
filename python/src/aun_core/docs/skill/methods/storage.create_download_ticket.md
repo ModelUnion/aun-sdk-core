@@ -37,10 +37,11 @@ download_url = result["download_url"]
 
 ```json
 {
-    "url": "https://alice.agentid.pub/storage/attachments/report.pdf",
+    "url": "https://alice.agentid.pub/attachments/report.pdf?t=Ab3xK9mZ2q",
     "logical_url": "https://storage.agentid.pub/alice/attachments/report.pdf",
-    "download_url": "https://storage.example.com/download?key=...&sig=...",
+    "download_url": "https://alice.agentid.pub/attachments/report.pdf?t=Ab3xK9mZ2q",
     "expire_at": 1711238167,
+    "token": "Ab3xK9mZ2q",
     "file_name": "report.pdf",
     "size_bytes": 5242880,
     "content_type": "application/pdf",
@@ -52,10 +53,11 @@ download_url = result["download_url"]
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `url` | string | **AID 风格 URL（推荐）**：`https://{owner_aid}/storage/{object_key}`，经 NameService 302 跳转，可长期分享 |
-| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无跳转 |
-| `download_url` | string | 预签名下载 URL，有时效，签名形式由底层 BlobStore 后端决定 |
-| `expire_at` | integer | `download_url` 的过期时间戳（Unix 秒） |
+| `url` | string | **AID 风格 URL（推荐）**：public 文件为 `https://{owner_aid}/{object_key}`，private 文件为 `https://{owner_aid}/{object_key}?t={token}`。经 NameService fallback 302 跳转，storage 实时鉴权后 302 到 blob 后端（对客户端透明） |
+| `logical_url` | string | 直链 URL：`https://storage.{issuer}/{user}/{object_key}`，直达 storage 服务，无 NameService 跳转 |
+| `download_url` | string | 同 `url`（兼容旧客户端，格式已统一，不再暴露 blobstore presigned URL） |
+| `expire_at` | integer | token 过期时间戳（Unix 秒） |
+| `token` | string | private 文件的不透明访问 token（10 位 Base62），public 文件无此字段 |
 | `file_name` | string | 文件名（从 object_key 提取） |
 | `size_bytes` | integer | 文件大小（字节） |
 | `content_type` | string | MIME 类型 |

@@ -123,7 +123,7 @@ class TestSignedMethodsCoverage:
 
     COLLAB_MUTATION_METHODS = [
         "collab.create", "collab.submit", "collab.export", "collab.adopt",
-        "collab.prune", "collab.unregister",
+        "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
         "collab.snapshot.create", "collab.snapshot.restore",
         "collab.snapshot.rm", "collab.snapshot.prune",
     ]

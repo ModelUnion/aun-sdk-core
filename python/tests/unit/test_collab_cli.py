@@ -17,8 +17,8 @@ class _FakeCollab:
         self.calls.append(("create", collab_root, doc, source))
         return {"version": 1, "current_target": f"{collab_root}/target"}
 
-    async def submit(self, collab_root, doc, source, base_version):
-        self.calls.append(("submit", collab_root, doc, source, base_version))
+    async def submit(self, collab_root, doc, source, base_version, *, message=""):
+        self.calls.append(("submit", collab_root, doc, source, base_version, message))
         return {"ok": True, "version": 2}
 
     async def read(self, collab_root, doc):
@@ -56,6 +56,18 @@ class _FakeCollab:
     async def prune(self, collab_root, doc):
         self.calls.append(("prune", collab_root, doc))
         return {"pruned": 1}
+
+    async def reset(self, collab_root, doc, version, *, message=""):
+        self.calls.append(("reset", collab_root, doc, version, message))
+        return {"ok": True, "version": version + 1}
+
+    async def gc(self, collab_root, *, dry_run=True):
+        self.calls.append(("gc", collab_root, dry_run))
+        return {"scanned": 3, "garbage": 1, "deleted": 0 if dry_run else 1}
+
+    async def reflog(self, collab_root, doc=None, *, limit=100):
+        self.calls.append(("reflog", collab_root, doc, limit))
+        return [{"version": 2, "action": "submit"}]
 
     async def discover(self, group_aid):
         self.calls.append(("discover", group_aid))
@@ -143,7 +155,7 @@ def test_collab_submit_keeps_aid_path_source(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert client.collab.calls == [
-        ("submit", "alice.aid.com:/proj", "draft.md", "alice.aid.com:/tmp/draft.md", 2)
+        ("submit", "alice.aid.com:/proj", "draft.md", "alice.aid.com:/tmp/draft.md", 2, "")
     ]
 
 
@@ -179,7 +191,7 @@ def test_collab_submit_conflict_exit_code_and_hint(monkeypatch):
     from aun_core.collab import CollabConflictError
 
     class ConflictCollab(_FakeCollab):
-        async def submit(self, collab_root, doc, source, base_version):
+        async def submit(self, collab_root, doc, source, base_version, *, message=""):
             raise CollabConflictError(
                 "conflict",
                 current_version=3,
@@ -245,3 +257,35 @@ def test_collab_snapshot_and_discover_commands(monkeypatch):
         ("discover", "g-team.aid.com"),
     ]
     assert json.loads(discover.output)[0]["collab_root"] == "g-team.aid.com:/proj"
+
+
+def test_collab_submit_message_and_maintenance_commands(monkeypatch):
+    from aun_cli.commands import collab as collab_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, collab_commands, client)
+
+    submit = _invoke([
+        "--json", "collab", "submit",
+        "alice.aid.com:/proj", "draft.md", "INLINE",
+        "--base-version", "2", "--message", "edit",
+    ])
+    reset = _invoke([
+        "--json", "collab", "reset",
+        "alice.aid.com:/proj", "draft.md",
+        "--version", "1", "--message", "rollback",
+    ])
+    gc = _invoke(["--json", "collab", "gc", "alice.aid.com:/proj", "--apply"])
+    reflog = _invoke(["--json", "collab", "reflog", "alice.aid.com:/proj", "draft.md", "--limit", "5"])
+
+    for result in [submit, reset, gc, reflog]:
+        assert result.exit_code == 0, result.output
+
+    submit_source = client.collab.calls[0][3]
+    assert base64.b64decode(submit_source).decode() == "INLINE"
+    assert client.collab.calls == [
+        ("submit", "alice.aid.com:/proj", "draft.md", submit_source, 2, "edit"),
+        ("reset", "alice.aid.com:/proj", "draft.md", 1, "rollback"),
+        ("gc", "alice.aid.com:/proj", False),
+        ("reflog", "alice.aid.com:/proj", "draft.md", 5),
+    ]

@@ -45,7 +45,7 @@ func TestIntegration_CollabCreateReadSubmitDiff(t *testing.T) {
 		t.Fatalf("collab.read 返回异常: %#v", read)
 	}
 
-	submitted, err := alice.Collab().Submit(ctx, root, doc, collabB64("a\nb\n"), 1)
+	submitted, err := alice.Collab().Submit(ctx, root, doc, collabB64("a\nb\n"), 1, "Update content")
 	if err != nil {
 		t.Fatalf("collab.submit 调用失败: %v", err)
 	}

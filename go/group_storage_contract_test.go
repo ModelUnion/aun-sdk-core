@@ -101,6 +101,7 @@ func TestGroupStorageContractOverRPCPipeline(t *testing.T) {
 	wantMethods := []string{
 		"storage.fs.mkdir",
 		"storage.fs.mkdir",
+		"storage.set_visibility",
 		"group.resources.namespace_ready",
 		"storage.fs.mkdir",
 		"storage.fs.rename",
@@ -119,7 +120,7 @@ func TestGroupStorageContractOverRPCPipeline(t *testing.T) {
 			t.Fatalf("同身份 storage RPC 不应透传 sign_as: %#v", params)
 		}
 	}
-	namespaceParams := calls[2].Params
+	namespaceParams := calls[3].Params
 	if namespaceParams["group_id"] != "group-1" || namespaceParams["group_aid"] != "team.agentid.pub" {
 		t.Fatalf("namespace_ready 参数不正确: %#v", namespaceParams)
 	}
@@ -135,12 +136,12 @@ func TestGroupStorageContractOverRPCPipeline(t *testing.T) {
 		}
 	}
 
-	for _, index := range []int{3, 4} {
+	for _, index := range []int{4, 5} {
 		if _, exists := calls[index].Params["sign_as"]; exists {
 			t.Fatalf("同身份 pending op 不应透传 sign_as: index=%d params=%#v", index, calls[index].Params)
 		}
 	}
-	confirmParams := calls[5].Params
+	confirmParams := calls[6].Params
 	if confirmParams["group_id"] != "group-1" || confirmParams["op_id"] != "op-1" {
 		t.Fatalf("confirm 参数主键不正确: %#v", confirmParams)
 	}

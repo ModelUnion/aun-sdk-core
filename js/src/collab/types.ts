@@ -86,3 +86,34 @@ export interface CollabSnapshotPruneOptions {
   keep_last?: number | null;
   keepLast?: number | null;
 }
+
+export interface CollabSnapshotRestoreResult extends JsonObject {
+  restored_from?: string;
+  new_snapshot_version?: string;
+  warnings?: string[];
+  partial?: boolean;
+  restored_docs?: string[];
+}
+
+export interface CollabGCResult extends JsonObject {
+  scanned?: number;
+  reachable?: number;
+  garbage?: number;
+  deleted?: number;
+  freed_bytes?: number;
+}
+
+export interface CollabReflogEntry extends JsonObject {
+  seq?: number;
+  action?: string;
+  requester?: string;
+  doc?: string;
+  version?: number;
+  base_version?: number;
+  target?: string;
+  status?: string;
+  error_code?: number;
+  error_msg?: string;
+  metadata?: JsonObject;
+  timestamp?: number;
+}
