@@ -79,6 +79,23 @@ async def test_put_routes_memberdata_self_to_storage_put_object():
     assert params["object_key"] == "alice.agentid.pub/team.agentid.pub/docs/x.txt"
     assert params["content"] == "aGVsbG8="
     assert params["content_type"] == "text/plain"
+    assert params["overwrite"] is False
+
+
+@pytest.mark.asyncio
+async def test_put_routes_memberdata_overwrite_true_to_storage_put_object():
+    facade, client = _facade("alice.agentid.pub")
+
+    await facade.put(
+        group_id="g-team.agentid.pub/team",
+        resource_path="memberdata/alice.agentid.pub/docs/x.txt",
+        content="aGVsbG8=",
+        overwrite=True,
+    )
+
+    method, params = client.calls[1]
+    assert method == "storage.put_object"
+    assert params["overwrite"] is True
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,7 @@ def storage_upload(
     local_path: str = typer.Argument(..., help="本地文件路径"),
     name: Optional[str] = typer.Option(None, "--name", help="远程对象 key（默认使用本地文件名）"),
     public: bool = typer.Option(False, "--public", help="公开可读（默认私有）"),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在对象"),
 ) -> None:
     """上传文件（小文件走 inline，大文件走上传会话 + HTTP PUT）"""
     set_json_mode(ctx.obj.get("json", False))
@@ -126,7 +127,7 @@ def storage_upload(
             return await storage_core.upload_object(
                 client, object_key=object_key, data=data,
                 content_type=content_type, is_private=not public,
-                verify_ssl=_resolve_verify_ssl(),
+                verify_ssl=_resolve_verify_ssl(), overwrite=force,
             )
 
     try:
@@ -146,9 +147,13 @@ def storage_download(
     ctx: typer.Context,
     object_key: str = typer.Argument(..., help="对象 key"),
     output_path: Optional[str] = typer.Option(None, "--output", "-o", help="保存路径"),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在本地文件"),
 ) -> None:
     """下载文件（统一走下载 ticket + HTTP GET，兼容 inline 与历史 folder-path 对象）"""
     set_json_mode(ctx.obj.get("json", False))
+    if output_path and Path(output_path).exists() and not force:
+        output_error(f"本地文件已存在: {output_path}，使用 --force 覆盖")
+        raise typer.Exit(1)
 
     async def _run():
         async with CLISession(ctx) as client:
@@ -164,6 +169,9 @@ def storage_download(
 
     file_name = ticket.get("file_name") or object_key.split("/")[-1]
     save_path = Path(output_path) if output_path else Path(file_name)
+    if save_path.exists() and not force:
+        output_error(f"本地文件已存在: {save_path}，使用 --force 覆盖")
+        raise typer.Exit(1)
     save_path.write_bytes(data)
 
     if is_json_mode():

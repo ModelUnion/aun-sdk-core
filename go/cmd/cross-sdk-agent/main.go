@@ -707,7 +707,7 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 			}
 			data = decoded
 		}
-		overwrite := boolValue(params["overwrite"], true)
+		overwrite := boolValue(params["overwrite"], false)
 		return storage.WriteBytes(ctx, path, data, &aun.WriteBytesOptions{
 			Owner:       owner,
 			Bucket:      bucket,

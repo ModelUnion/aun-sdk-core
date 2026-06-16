@@ -1,4 +1,4 @@
-import { mapStorageError, StorageConflictError, StorageError } from './errors.js';
+import { mapStorageError, StorageConflictError, StorageError, StorageExistsError } from './errors.js';
 import { base64ToBytes, StorageLowLevel, type StorageRpcClient } from './lowlevel.js';
 import {
   nodeFromAny,
@@ -61,6 +61,7 @@ export interface ReadOptions extends StorageOptions {
   token?: string;
   offset?: number;
   limit?: number;
+  overwrite?: boolean;
 }
 
 export interface ListOptions extends StorageOptions {
@@ -128,9 +129,16 @@ export class StorageVFS {
     const bucket = options.bucket ?? 'default';
     const objectKey = pathToKey(path);
     const sha256 = await sha256Hex(data);
+    const overwrite = options.overwrite ?? false;
     try {
       const check = await this.lowlevel.checkUpload({ owner, bucket, objectKey, size: data.length, sha256 });
-      if (check.dedup_hit || check.skip_upload || check.exists) {
+      if (check.within_limit === false) {
+        throw new StorageError(`file size exceeds max_file_size_bytes: ${data.length}`, 'E2BIG', path, check);
+      }
+      if (check.target_exists && !overwrite && options.expectedVersion === undefined) {
+        throw new StorageExistsError(`remote path already exists: ${path}`, 'EEXIST', path, check.target);
+      }
+      if (check.dedup_hit || check.skip_upload) {
         const completed = await this.lowlevel.completeUpload({
           owner,
           bucket,
@@ -142,12 +150,11 @@ export class StorageVFS {
           isPublic: options.public ?? false,
           expectedVersion: options.expectedVersion,
           skipBlob: true,
+          overwrite,
         });
         return nodeFromAny(completed);
       }
-      const limits = await this.lowlevel.getLimits({ owner, bucket });
-      const maxInline = Number(limits.max_inline_bytes ?? limits.inline_max ?? 65536);
-      if (check.inline === true || data.length <= maxInline) {
+      if (check.inline === true) {
         return nodeFromAny(await this.lowlevel.putObject({
           owner,
           bucket,
@@ -157,7 +164,7 @@ export class StorageVFS {
           metadata: options.metadata,
           isPublic: options.public ?? false,
           expectedVersion: options.expectedVersion,
-          overwrite: options.overwrite ?? true,
+          overwrite,
         }));
       }
       const session = await this.lowlevel.createUploadSession({
@@ -167,6 +174,7 @@ export class StorageVFS {
         size: data.length,
         contentType: options.contentType,
         expectedVersion: options.expectedVersion,
+        overwrite,
       });
       const uploadUrl = String(session.upload_url ?? '');
       if (!uploadUrl) throw new StorageError(`create_upload_session did not return upload_url`, 'ESTORAGE', path);
@@ -182,6 +190,7 @@ export class StorageVFS {
         metadata: options.metadata,
         isPublic: options.public ?? false,
         expectedVersion: options.expectedVersion,
+        overwrite,
       }));
     } catch (exc) {
       throw mapStorageError(exc, path);

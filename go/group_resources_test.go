@@ -247,7 +247,7 @@ func TestGroupResourcesPutRoutesMemberdataToStorage(t *testing.T) {
 	if params["owner_aid"] != "alice.agentid.pub" || params["object_key"] != "alice.agentid.pub/team.agentid.pub/docs/a.txt" {
 		t.Fatalf("storage.put_object 目标不正确: %#v", params)
 	}
-	if params["content"] != "hello" || params["overwrite"] != true || params["content_type"] != "text/plain" {
+	if params["content"] != "hello" || params["overwrite"] != false || params["content_type"] != "text/plain" {
 		t.Fatalf("storage.put_object 参数不正确: %#v", params)
 	}
 }

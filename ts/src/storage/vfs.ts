@@ -1,7 +1,7 @@
-import { mapStorageError, StorageConflictError, StorageError } from './errors.js';
+import { mapStorageError, StorageConflictError, StorageError, StorageExistsError } from './errors.js';
 import { base64ToBytes, StorageLowLevel, type StorageRpcClient } from './lowlevel.js';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, extname } from 'node:path';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, join } from 'node:path';
 import {
   nodeFromAny,
   pathToKey,
@@ -64,6 +64,15 @@ function isInlineFallbackError(error: StorageError): boolean {
   return error.code === -32602 && error.message.toLowerCase().includes('inline');
 }
 
+async function statOrNull(path: string) {
+  try {
+    return await stat(path);
+  } catch (exc) {
+    if ((exc as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw exc;
+  }
+}
+
 export interface StorageOptions {
   owner?: string | null;
   bucket?: string;
@@ -81,6 +90,7 @@ export interface ReadOptions extends StorageOptions {
   token?: string;
   offset?: number;
   limit?: number;
+  overwrite?: boolean;
 }
 
 export interface ListOptions extends StorageOptions {
@@ -148,9 +158,16 @@ export class StorageVFS {
     const bucket = options.bucket ?? 'default';
     const objectKey = pathToKey(path);
     const sha256 = await sha256Hex(data);
+    const overwrite = options.overwrite ?? false;
     try {
       const check = await this.lowlevel.checkUpload({ owner, bucket, objectKey, size: data.length, sha256 });
-      if (check.dedup_hit || check.skip_upload || check.exists) {
+      if (check.within_limit === false) {
+        throw new StorageError(`file size exceeds max_file_size_bytes: ${data.length}`, 'E2BIG', path, check);
+      }
+      if (check.target_exists && !overwrite && options.expectedVersion === undefined) {
+        throw new StorageExistsError(`remote path already exists: ${path}`, 'EEXIST', path, check.target);
+      }
+      if (check.dedup_hit || check.skip_upload) {
         const completed = await this.lowlevel.completeUpload({
           owner,
           bucket,
@@ -162,12 +179,11 @@ export class StorageVFS {
           isPublic: options.public ?? false,
           expectedVersion: options.expectedVersion,
           skipBlob: true,
+          overwrite,
         });
         return nodeFromAny(completed);
       }
-      const limits = await this.lowlevel.getLimits({ owner, bucket });
-      const maxInline = Number(limits.max_inline_bytes ?? limits.inline_max ?? 65536);
-      if (check.inline === true || data.length <= maxInline) {
+      if (check.inline === true) {
         return nodeFromAny(await this.lowlevel.putObject({
           owner,
           bucket,
@@ -177,7 +193,7 @@ export class StorageVFS {
           metadata: options.metadata,
           isPublic: options.public ?? false,
           expectedVersion: options.expectedVersion,
-          overwrite: options.overwrite ?? true,
+          overwrite,
         }));
       }
       const session = await this.lowlevel.createUploadSession({
@@ -187,6 +203,7 @@ export class StorageVFS {
         size: data.length,
         contentType: options.contentType,
         expectedVersion: options.expectedVersion,
+        overwrite,
       });
       const uploadUrl = String(session.upload_url ?? '');
       if (!uploadUrl) throw new StorageError(`create_upload_session did not return upload_url`, 'ESTORAGE', path);
@@ -202,6 +219,7 @@ export class StorageVFS {
         metadata: options.metadata,
         isPublic: options.public ?? false,
         expectedVersion: options.expectedVersion,
+        overwrite,
       }));
     } catch (exc) {
       throw mapStorageError(exc, path);
@@ -256,6 +274,17 @@ export class StorageVFS {
       const ticket = await this.lowlevel.createDownloadTicket({ owner, bucket, objectKey, token: options.token });
       const downloadUrl = String(ticket.download_url ?? '');
       if (!downloadUrl) throw new StorageError(`create_download_ticket did not return download_url`, 'ESTORAGE', path);
+      let targetPath = localPath;
+      const localInfo = await statOrNull(targetPath);
+      if (localInfo?.isDirectory()) {
+        targetPath = join(targetPath, textValue(ticket.file_name) || basename(objectKey));
+      }
+      const targetInfo = await statOrNull(targetPath);
+      const overwrite = options.overwrite ?? false;
+      if (targetInfo) {
+        if (targetInfo.isDirectory()) throw new StorageError(`local path is a directory: ${targetPath}`, 'EISDIR', targetPath);
+        if (!overwrite) throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
+      }
       const data = await this.lowlevel.httpGet(downloadUrl);
       const actualSha = await sha256Hex(data);
       const expectedSha = textValue(ticket.sha256);
@@ -267,11 +296,18 @@ export class StorageVFS {
           'EHASH', path,
         );
       }
-      await mkdir(dirname(localPath), { recursive: true });
-      await writeFile(localPath, data);
+      await mkdir(dirname(targetPath), { recursive: true });
+      try {
+        await writeFile(targetPath, data, { flag: overwrite ? 'w' : 'wx' });
+      } catch (exc) {
+        if (!overwrite && (exc as NodeJS.ErrnoException)?.code === 'EEXIST') {
+          throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
+        }
+        throw exc;
+      }
       return {
         path,
-        localPath,
+        localPath: targetPath,
         size: data.length,
         sha256: expectedSha || actualSha,
         verified,

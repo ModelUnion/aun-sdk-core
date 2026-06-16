@@ -376,7 +376,7 @@ export class GroupResourcesFacade {
         owner_aid: ownerAid,
         object_key: objectKey,
         content: merged.content ?? '',
-        overwrite: merged.overwrite ?? true,
+        overwrite: merged.overwrite ?? false,
       };
       for (const key of ['content_type', 'content_encoding', 'metadata', 'expected_version'] as const) {
         if (merged[key] !== undefined && merged[key] !== null) storageParams[key] = merged[key];

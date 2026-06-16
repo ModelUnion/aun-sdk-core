@@ -254,7 +254,7 @@ func (r *GroupResources) Put(ctx context.Context, params map[string]any) (any, e
 			"owner_aid":  owner,
 			"object_key": objectKey,
 			"content":    firstNonNil(params["content"], ""),
-			"overwrite":  true,
+			"overwrite":  false,
 		}
 		if value := firstNonNil(params["overwrite"]); !isNilStorageParam(value) {
 			storageParams["overwrite"] = value

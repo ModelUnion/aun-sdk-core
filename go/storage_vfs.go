@@ -34,11 +34,12 @@ type WriteBytesOptions struct {
 }
 
 type ReadOptions struct {
-	Owner  string
-	Bucket string
-	Token  string
-	Offset *int
-	Limit  *int
+	Owner     string
+	Bucket    string
+	Token     string
+	Offset    *int
+	Limit     *int
+	Overwrite *bool
 }
 
 type ListOptions struct {
@@ -232,9 +233,9 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	if opts == nil {
 		opts = &WriteBytesOptions{}
 	}
-	// 对齐 Python 行为：overwrite 默认 true
+	// VFS 上传默认不覆盖；调用方显式 Overwrite=true 才覆盖。
 	if opts.Overwrite == nil {
-		t := true
+		t := false
 		opts.Overwrite = &t
 	}
 	owner := v.owner(opts.Owner)
@@ -246,22 +247,20 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	if err != nil {
 		return NodeView{}, err
 	}
-	if storageBool(firstNonNil(check["dedup_hit"], check["skip_upload"], check["exists"]), false) {
-		raw, err := v.low.CompleteUpload(ctx, owner, b, objectKey, "", len(data), shaHex, contentType(opts.ContentType), opts.Metadata, opts.Public, opts.ExpectedVersion, true)
+	if storageBool(check["within_limit"], true) == false {
+		return NodeView{}, &StorageError{Message: fmt.Sprintf("file size exceeds max_file_size_bytes: %d", len(data)), Code: "E2BIG", Path: p, Data: check}
+	}
+	if storageBool(check["target_exists"], false) && !*opts.Overwrite && opts.ExpectedVersion == nil {
+		return NodeView{}, &StorageExistsError{StorageError{Message: "remote path already exists", Code: "EEXIST", Path: p, Data: check["target"]}}
+	}
+	if storageBool(firstNonNil(check["dedup_hit"], check["skip_upload"]), false) {
+		raw, err := v.low.CompleteUpload(ctx, owner, b, objectKey, "", len(data), shaHex, contentType(opts.ContentType), opts.Metadata, opts.Public, opts.ExpectedVersion, true, opts.Overwrite)
 		if err != nil {
 			return NodeView{}, err
 		}
 		return NodeViewFromAny(raw), nil
 	}
-	limits, err := v.low.GetLimits(ctx, owner, b)
-	if err != nil {
-		return NodeView{}, err
-	}
-	maxInline := storageInt64(firstNonNil(limits["max_inline_bytes"], limits["inline_max"]))
-	if maxInline == 0 {
-		maxInline = 65536
-	}
-	if storageBool(check["inline"], false) || int64(len(data)) <= maxInline {
+	if storageBool(check["inline"], false) {
 		raw, err := v.low.PutObject(ctx, PutObjectOptions{
 			Owner: owner, Bucket: b, ObjectKey: objectKey, Content: data,
 			ContentType: contentType(opts.ContentType), Metadata: opts.Metadata,
@@ -272,7 +271,7 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 		}
 		return NodeViewFromAny(raw), nil
 	}
-	session, err := v.low.CreateUploadSession(ctx, owner, b, objectKey, len(data), opts.ContentType, opts.ExpectedVersion)
+	session, err := v.low.CreateUploadSession(ctx, owner, b, objectKey, len(data), opts.ContentType, opts.ExpectedVersion, opts.Overwrite)
 	if err != nil {
 		return NodeView{}, err
 	}
@@ -284,7 +283,7 @@ func (v *StorageVFS) WriteBytes(ctx context.Context, p string, data []byte, opts
 	if err := v.low.HTTPPut(ctx, uploadURL, data, headers); err != nil {
 		return NodeView{}, MapStorageError(err, p)
 	}
-	raw, err := v.low.CompleteUpload(ctx, owner, b, objectKey, storageString(session["session_id"], ""), len(data), shaHex, opts.ContentType, opts.Metadata, opts.Public, opts.ExpectedVersion, false)
+	raw, err := v.low.CompleteUpload(ctx, owner, b, objectKey, storageString(session["session_id"], ""), len(data), shaHex, opts.ContentType, opts.Metadata, opts.Public, opts.ExpectedVersion, false, opts.Overwrite)
 	if err != nil {
 		return NodeView{}, err
 	}
@@ -388,6 +387,27 @@ func (v *StorageVFS) DownloadFile(ctx context.Context, remotePath, localPath str
 	if downloadURL == "" {
 		return DownloadResult{}, &StorageError{Message: "create_download_ticket did not return download_url", Code: "ESTORAGE", Path: remotePath}
 	}
+	targetPath := localPath
+	if info, statErr := os.Stat(targetPath); statErr == nil && info.IsDir() {
+		fileName := storageString(firstNonNil(ticket["file_name"], filepath.Base(objectKey)), filepath.Base(objectKey))
+		targetPath = filepath.Join(targetPath, fileName)
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return DownloadResult{}, statErr
+	}
+	overwrite := false
+	if opts.Overwrite != nil {
+		overwrite = *opts.Overwrite
+	}
+	if info, statErr := os.Stat(targetPath); statErr == nil {
+		if info.IsDir() {
+			return DownloadResult{}, &StorageError{Message: "local path is a directory", Code: "EISDIR", Path: targetPath}
+		}
+		if !overwrite {
+			return DownloadResult{}, &StorageExistsError{StorageError{Message: "local path already exists", Code: "EEXIST", Path: targetPath}}
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return DownloadResult{}, statErr
+	}
 	data, err := v.low.HTTPGet(ctx, downloadURL, nil)
 	if err != nil {
 		return DownloadResult{}, MapStorageError(err, remotePath)
@@ -406,15 +426,32 @@ func (v *StorageVFS) DownloadFile(ctx context.Context, remotePath, localPath str
 			}
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		return DownloadResult{}, err
 	}
-	if err := os.WriteFile(localPath, data, 0o600); err != nil {
-		return DownloadResult{}, err
+	if overwrite {
+		if err := os.WriteFile(targetPath, data, 0o600); err != nil {
+			return DownloadResult{}, err
+		}
+	} else {
+		file, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				return DownloadResult{}, &StorageExistsError{StorageError{Message: "local path already exists", Code: "EEXIST", Path: targetPath}}
+			}
+			return DownloadResult{}, err
+		}
+		if _, err := file.Write(data); err != nil {
+			_ = file.Close()
+			return DownloadResult{}, err
+		}
+		if err := file.Close(); err != nil {
+			return DownloadResult{}, err
+		}
 	}
 	return DownloadResult{
 		Path:      NormalizeStoragePath(remotePath),
-		LocalPath: localPath,
+		LocalPath: targetPath,
 		Size:      int64(len(data)),
 		SHA256:    firstNonEmpty(expectedSHA, actualSHA),
 		Verified:  verified,

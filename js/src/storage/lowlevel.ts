@@ -96,7 +96,7 @@ export class StorageLowLevel {
       metadata: options.metadata,
       is_private: !(options.isPublic ?? false),
       expected_version: options.expectedVersion,
-      overwrite: options.overwrite ?? true,
+      overwrite: options.overwrite ?? false,
     }), options.objectKey);
   }
 
@@ -109,12 +109,13 @@ export class StorageLowLevel {
     }), options.objectKey);
   }
 
-  createUploadSession(options: LowLevelBaseOptions & { objectKey: string; size: number; contentType?: string; expectedVersion?: number }): Promise<StorageRaw> {
+  createUploadSession(options: LowLevelBaseOptions & { objectKey: string; size: number; contentType?: string; expectedVersion?: number; overwrite?: boolean }): Promise<StorageRaw> {
     return this.call('storage.create_upload_session', params(options.owner, options.bucket, {
       object_key: options.objectKey,
       size_bytes: options.size,
       content_type: options.contentType,
       expected_version: options.expectedVersion,
+      overwrite: options.overwrite ?? false,
     }), options.objectKey);
   }
 
@@ -128,6 +129,7 @@ export class StorageLowLevel {
     isPublic?: boolean;
     expectedVersion?: number;
     skipBlob?: boolean;
+    overwrite?: boolean;
   }): Promise<StorageRaw> {
     return this.call('storage.complete_upload', params(options.owner, options.bucket, {
       object_key: options.objectKey,
@@ -139,6 +141,7 @@ export class StorageLowLevel {
       is_private: !(options.isPublic ?? false),
       expected_version: options.expectedVersion,
       skip_blob: options.skipBlob,
+      overwrite: options.overwrite ?? false,
     }), options.objectKey);
   }
 

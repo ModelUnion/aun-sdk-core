@@ -25,6 +25,8 @@
 | [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>) | Python SDK StorageVFS / StorageLowLevel 接口契约、返回类型、错误映射和跨语言对齐要求 |
 | [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>) | `aun fs` 命令语义、寻址规则、输出格式、CLI 工程改造和端到端场景 |
 | [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>) | AUN Storage VFS + CLI 的 6 阶段 TDD 实施计划、P1-P6 实际执行记录和验收口径 |
+| [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-storage/group.fs-POSIX化详细设计.md>) | 对外去除 `group.resources` 概念，统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs` 的 POSIX 风格群文件系统设计 |
+| [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md>) | group.fs 重构的 8 阶段实施计划，每阶段包含目标、IPO、Step-by-step、用例集、Checklist、验收与回滚 |
 | [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>) | `group.resources.*` 从旧 `storage_ref` 引用树迁移到 group_aid storage 命名空间、成员 `memberdata` 挂载和 group-storage 门面编排的终态设计 |
 | [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>) | group-storage 0-10 阶段 TDD 实施计划、阶段 IPO/测试矩阵、实际执行记录、四语言 SDK/CLI/服务端验收与 Docker 单域/双域 E2E 通过记录 |
 | [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>) | collab 服务端编排、台账、diff3、snapshot、export/adopt、群协作注册表和四语言薄 SDK 设计 |
@@ -58,6 +60,8 @@
 - StorageVFS / StorageLowLevel 接口契约、NodeView/ObjectView、错误映射和跨语言对齐 → [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>)
 - `aun fs` 命令语义、AID 路径解析、输出格式和 CLI 到 SDK 的调用边界 → [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>)
 - AUN Storage 6 阶段 TDD 计划、P1/P2/P3/P4/P5/P6 实际执行记录、阶段实施前详细计划和 Docker 验证纪律 → [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>)
+- `group.fs.*` POSIX 风格群文件系统、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载心智、服务端 memberdata 映射和 SDK 数据面编排 → [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-storage/group.fs-POSIX化详细设计.md>)
+- group.fs 8 阶段重构步骤、每阶段 IPO、Step-by-step、用例集、Checklist、验收和回滚 → [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md>)
 - `group.resources.*` 替代旧 `storage_ref` 引用树、group_aid 命名空间、群自有区、`memberdata` 成员挂载区、签名者切换和下载 ticket → [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>)
 - group-storage 0-10 阶段 TDD 推进记录、CLI 收口、四语言 SDK pending-op signer、服务端回归和 Docker 单域/双域 E2E 通过记录 → [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>)
 - collab 协作层服务端编排、`collab.*` RPC、版本台账、snapshot、群协作注册表和后续四语言 SDK/CLI/E2E 计划 → [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>)、[Plan 1](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>)、[Plan 2](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>)、[Plan 3](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>)
@@ -161,6 +165,14 @@
 ### AUN Storage 分阶段实施计划
 
 把 AUN Storage 架构、SDK 分层和 CLI 设计落地为 6 个 TDD 阶段。文档记录 P1 VFS 基础读写层、P2 symlink 原语、P3 `storage.fs.*` 统一 RPC、P4 ACL/token、P5 四语言 SDK/CLI 对齐和 P6 mount/umount 的实际修改范围、执行顺序、单元/集成/E2E 覆盖内容、Docker 内 Python/TS/Go 实测结果、JS 浏览器 Playwright Storage VFS P6 E2E 补跑结果、公网验证口径修正，以及 P6 退群自动失效和完整虚拟卷生命周期等遗留边界；并在每阶段开始前展开服务端表/RPC 变更、任务依赖图、可并行工作包、TDD 执行步骤和 Docker 验证纪律。
+
+### 群文件系统 group.fs POSIX 化详细设计
+
+定义下一版群存储对外模型：删除 `group.resources` 用户概念，统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs`。文档规定群自有区与成员 `memberdata` 由 `group_aid:/...` 路径表达，`group_aid:/memberdata/{member_ref}/...` 在服务端映射到 `member_aid:/groupdata/{group_id}/...`，跨域成员必须使用完整 AID；上传、下载和远程复制统一用 `cp`，不提供 `read/write/put/get` 主入口，数据面由 SDK 编排，group 服务只负责控制面。
+
+### 群文件系统 group.fs POSIX 化分阶段实施计划
+
+把 group.fs 重构拆为 8 个阶段：契约冻结、服务端路径解析与 memberdata 映射、读侧 POSIX RPC、写侧控制面、Python SDK GroupFSVFS、CLI `aun group fs`、TS/JS/Go SDK 对齐、对外移除 `group.resources` 概念和 Docker 单域/双域 E2E。每阶段都按阶段目标、IPO、Step-by-step 流程、用例集、Checklist、验收和回滚展开。
 
 ### 群存储 group.resources.* 重构设计
 

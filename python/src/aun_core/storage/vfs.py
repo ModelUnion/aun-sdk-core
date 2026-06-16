@@ -5,10 +5,11 @@ import hashlib
 import mimetypes
 import posixpath
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, StorageError, map_storage_error
+from .errors import ConflictError, ExistsError, NotFoundError, StorageError, map_storage_error
 from .lowlevel import StorageLowLevel
 from .types import DownloadResult, NodeView, ObjectView, RemoveResult, UsageView, normalize_display_path
 
@@ -87,7 +88,7 @@ class StorageVFS:
         owner: str | None = None,
         bucket: str = "default",
         content_type: str | None = None,
-        overwrite: bool = True,
+        overwrite: bool = False,
         expected_version: int | None = None,
         public: bool = False,
         metadata: dict[str, Any] | None = None,
@@ -117,7 +118,7 @@ class StorageVFS:
         owner: str | None = None,
         bucket: str = "default",
         content_type: str | None = None,
-        overwrite: bool = True,
+        overwrite: bool = False,
         expected_version: int | None = None,
         public: bool = False,
         metadata: dict[str, Any] | None = None,
@@ -161,7 +162,13 @@ class StorageVFS:
                 size=len(data),
                 sha256=sha256,
             )
-            if check.get("dedup_hit") or check.get("skip_upload") or check.get("exists"):
+            if check.get("within_limit") is False:
+                max_file = int(check.get("max_file_size_bytes") or 0)
+                suffix = f" > {max_file}" if max_file else ""
+                raise StorageError(f"file size exceeds max_file_size_bytes: {len(data)}{suffix}", code="E2BIG", path=remote_path)
+            if check.get("target_exists") and not overwrite and expected_version is None:
+                raise ExistsError(f"remote path already exists: {remote_path}", code="EEXIST", path=remote_path, data=check.get("target"))
+            if check.get("dedup_hit") or check.get("skip_upload"):
                 completed = await self.lowlevel.complete_upload(
                     owner=owner,
                     bucket=bucket,
@@ -173,12 +180,11 @@ class StorageVFS:
                     is_public=public,
                     expected_version=expected_version,
                     skip_blob=True,
+                    overwrite=overwrite,
                 )
                 return ObjectView.from_dict(completed)
 
-            limits = await self.lowlevel.get_limits(owner=owner, bucket=bucket)
-            max_inline = int(limits.get("max_inline_bytes") or limits.get("inline_max") or 65536)
-            if check.get("inline") is True or len(data) <= max_inline:
+            if check.get("inline") is True:
                 result = await self.lowlevel.put_object(
                     owner=owner,
                     bucket=bucket,
@@ -199,6 +205,7 @@ class StorageVFS:
                 size=len(data),
                 content_type=content_type,
                 expected_version=expected_version,
+                overwrite=overwrite,
             )
             upload_url = str(session.get("upload_url") or "")
             if not upload_url:
@@ -220,6 +227,7 @@ class StorageVFS:
                 metadata=metadata,
                 is_public=public,
                 expected_version=expected_version,
+                overwrite=overwrite,
             )
             return ObjectView.from_dict(completed)
         except Exception as exc:
@@ -234,6 +242,7 @@ class StorageVFS:
         bucket: str = "default",
         verify_hash: bool = True,
         token: str | None = None,
+        overwrite: bool = False,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> DownloadResult:
         owner = self._owner(owner)
@@ -242,18 +251,36 @@ class StorageVFS:
         download_url = str(ticket.get("download_url") or "")
         if not download_url:
             raise StorageError(f"create_download_ticket did not return download_url: {ticket}", path=remote_path)
+        target = Path(local_path)
+        if target.exists() and target.is_dir():
+            target = target / (str(ticket.get("file_name") or Path(object_key).name))
+        if target.exists():
+            if target.is_dir():
+                raise StorageError(f"local path is a directory: {target}", code="EISDIR", path=str(target))
+            if not overwrite:
+                raise ExistsError(f"local path already exists: {target}", code="EEXIST", path=str(target))
         data = await self.lowlevel.http_get(download_url, on_progress=on_progress)
         expected_sha = str(ticket.get("sha256") or "")
         verified = not verify_hash or not expected_sha or hashlib.sha256(data).hexdigest() == expected_sha
         if verify_hash and not verified:
             raise StorageError("download hash verification failed", code="ECONFLICT", path=remote_path)
-        target = Path(local_path)
-        if target.exists() and target.is_dir():
-            target = target / (str(ticket.get("file_name") or Path(object_key).name))
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f"{target.name}.tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
+        if not overwrite:
+            try:
+                with target.open("xb") as handle:
+                    handle.write(data)
+            except FileExistsError as exc:
+                raise ExistsError(f"local path already exists: {target}", code="EEXIST", path=str(target)) from exc
+        else:
+            tmp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile("wb", delete=False, dir=target.parent, prefix=f".{target.name}.", suffix=".tmp") as handle:
+                    tmp_path = Path(handle.name)
+                    handle.write(data)
+                tmp_path.replace(target)
+            finally:
+                if tmp_path is not None and tmp_path.exists():
+                    tmp_path.unlink()
         return DownloadResult(path=normalize_path(remote_path), local_path=str(target), size=len(data), sha256=expected_sha, verified=verified)
 
     async def read_bytes(

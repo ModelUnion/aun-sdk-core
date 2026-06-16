@@ -138,7 +138,6 @@
 | [group.resources.confirm](#groupresourcesconfirm) | 写操作完成回调记账（甲案） |
 | [group.resources.confirm_mount](#groupresourcesconfirm_mount) | 成员挂载完成回调记账 |
 | [group.resources.get_df](#groupresourcesget_df) | 群存储 df 视图（自有卷+成员挂载卷聚合） |
-| [group.resources.mark_volume_unavailable](#groupresourcesmark_volume_unavailable) | 标记成员挂载卷不可用 |
 
 ### 在线状态
 
@@ -1603,14 +1602,6 @@ result = await client.call("group.thought.get", {
 **参数**：`group_id` (string, 必填)
 
 **响应**：`{ "group_id", "group_aid", "volumes": [...], "mounts": [...], ... }`（成员挂载卷过期标 ⚠ unavailable）
-
-### group.resources.mark_volume_unavailable
-
-标记成员挂载卷不可用。该 RPC 由服务内部或 `group_aid` 身份调用，用于卷过期、源卷失效等场景下把 member mount 标为 `missing` / `unavailable`；普通业务 SDK 不提供直接高层封装。
-
-**参数**：`group_id` (必填)；可选 `volume_id`、`mount_path`、`source_aid`、`source_bucket`、`reason`。
-
-**响应**：返回匹配并更新的挂载记录数量及挂载视图。
 
 ## 在线状态
 

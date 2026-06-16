@@ -90,7 +90,7 @@ class StorageLowLevel:
         metadata: dict[str, Any] | None = None,
         is_public: bool = False,
         expected_version: int | None = None,
-        overwrite: bool = True,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         return await self._call(
             "storage.put_object",
@@ -133,6 +133,7 @@ class StorageLowLevel:
         size: int,
         content_type: str | None = None,
         expected_version: int | None = None,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         return await self._call(
             "storage.create_upload_session",
@@ -143,6 +144,7 @@ class StorageLowLevel:
                 size_bytes=size,
                 content_type=content_type,
                 expected_version=expected_version,
+                overwrite=overwrite,
             ),
             path=object_key,
         )
@@ -161,6 +163,7 @@ class StorageLowLevel:
         is_public: bool = False,
         expected_version: int | None = None,
         skip_blob: bool = False,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         return await self._call(
             "storage.complete_upload",
@@ -176,6 +179,7 @@ class StorageLowLevel:
                 is_private=not is_public,
                 expected_version=expected_version,
                 skip_blob=skip_blob,
+                overwrite=overwrite,
             ),
             path=object_key,
         )

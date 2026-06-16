@@ -43,7 +43,7 @@ def test_upload_small_file_uses_put_object(monkeypatch, tmp_path):
     f = tmp_path / "hello.txt"
     f.write_bytes(b"hello world")
     client = _FakeClient({
-        "storage.get_limits": {"max_inline_bytes": 65536, "max_file_size_bytes": 10485760},
+        "storage.check_upload": {"within_limit": True, "inline": True, "target_exists": False, "skip_upload": False},
         "storage.put_object": lambda p: {"object_key": p["object_key"], "size_bytes": 11, "version": 1},
     })
     _install_fake_session(monkeypatch, storage_commands, client)
@@ -57,6 +57,7 @@ def test_upload_small_file_uses_put_object(monkeypatch, tmp_path):
     _, params = next((m, p) for m, p in client.calls if m == "storage.put_object")
     assert params["object_key"] == "docs/hello.txt"
     assert params["is_private"] is True  # 默认私有
+    assert params["overwrite"] is False
     import base64
     assert base64.b64decode(params["content"]) == b"hello world"
 
@@ -74,7 +75,7 @@ def test_upload_large_file_uses_ticket_flow(monkeypatch, tmp_path):
         lambda url, data, content_type, verify_ssl=True: put_calls.append((url, len(data))) or 200,
     )
     client = _FakeClient({
-        "storage.get_limits": {"max_inline_bytes": 50, "max_file_size_bytes": 10485760},
+        "storage.check_upload": {"within_limit": True, "inline": False, "target_exists": False, "skip_upload": False},
         "storage.create_upload_session": lambda p: {"upload_url": "https://storage.agentid.pub/upload/x"},
         "storage.complete_upload": lambda p: {"object_key": p["object_key"], "size_bytes": p["size_bytes"], "version": 1},
     })
@@ -84,13 +85,34 @@ def test_upload_large_file_uses_ticket_flow(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     methods = [m for m, _ in client.calls]
-    assert methods == ["storage.get_limits", "storage.create_upload_session", "storage.complete_upload"]
+    assert methods == ["storage.check_upload", "storage.create_upload_session", "storage.complete_upload"]
     assert put_calls == [("https://storage.agentid.pub/upload/x", 100)]
+    _, sess = next((m, p) for m, p in client.calls if m == "storage.create_upload_session")
+    assert sess["overwrite"] is False
     _, comp = next((m, p) for m, p in client.calls if m == "storage.complete_upload")
     import hashlib
     assert comp["sha256"] == hashlib.sha256(big).hexdigest()
     assert comp["size_bytes"] == 100
     assert comp["is_private"] is False  # --public
+    assert comp["overwrite"] is False
+
+
+def test_upload_force_passes_overwrite_true(monkeypatch, tmp_path):
+    from aun_cli.commands import storage as storage_commands
+
+    f = tmp_path / "hello.txt"
+    f.write_bytes(b"hello world")
+    client = _FakeClient({
+        "storage.check_upload": {"within_limit": True, "inline": True, "target_exists": True, "skip_upload": False},
+        "storage.put_object": lambda p: {"object_key": p["object_key"], "size_bytes": 11, "version": 2},
+    })
+    _install_fake_session(monkeypatch, storage_commands, client)
+
+    result = _invoke(["--json", "storage", "upload", str(f), "--name", "docs/hello.txt", "--force"])
+
+    assert result.exit_code == 0, result.output
+    _, params = next((m, p) for m, p in client.calls if m == "storage.put_object")
+    assert params["overwrite"] is True
 
 
 def test_download_uses_ticket_and_writes_file(monkeypatch, tmp_path):
@@ -117,6 +139,28 @@ def test_download_uses_ticket_and_writes_file(monkeypatch, tmp_path):
     _, params = client.calls[0]
     assert params["object_key"] == "docs/legacy.bin"
     assert out.read_bytes() == b"DOWNLOADED-BYTES"
+
+
+def test_download_refuses_existing_file_without_force(monkeypatch, tmp_path):
+    from aun_cli.commands import storage as storage_commands
+    from aun_cli import storage_core
+
+    out = tmp_path / "got.bin"
+    out.write_bytes(b"OLD")
+    monkeypatch.setattr(storage_core, "_http_get", lambda url, verify_ssl=True: b"DOWNLOADED-BYTES")
+    client = _FakeClient({
+        "storage.create_download_ticket": lambda p: {
+            "download_url": "https://storage.agentid.pub/dl/x",
+            "file_name": "got.bin",
+            "size_bytes": 16,
+        },
+    })
+    _install_fake_session(monkeypatch, storage_commands, client)
+
+    result = _invoke(["storage", "download", "docs/legacy.bin", "--output", str(out)])
+
+    assert result.exit_code == 1, result.output
+    assert out.read_bytes() == b"OLD"
 
 
 def test_delete_calls_delete_object_with_object_key(monkeypatch):

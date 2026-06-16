@@ -4,6 +4,7 @@ import pytest
 
 from aun_core.errors import AUNError
 from aun_core.storage import NotFoundError, ObjectView, StorageVFS, normalize_path, path_to_key
+from aun_core.storage.errors import ExistsError
 
 
 class _FakeClient:
@@ -72,8 +73,7 @@ async def test_upload_large_uses_session_and_complete(tmp_path):
     local = tmp_path / "large.bin"
     local.write_bytes(data)
     client = _FakeClient({
-        "storage.check_upload": {"skip_upload": False, "within_limit": True},
-        "storage.get_limits": {"max_inline_bytes": 50, "max_file_size_bytes": 1000},
+        "storage.check_upload": {"skip_upload": False, "within_limit": True, "inline": False, "max_inline_bytes": 50, "max_file_size_bytes": 1000},
         "storage.create_upload_session": {"upload_url": "https://storage.agentid.pub/upload/1", "session_id": "s1"},
         "storage.complete_upload": lambda p: {
             "owner_aid": p["owner_aid"],
@@ -98,10 +98,43 @@ async def test_upload_large_uses_session_and_complete(tmp_path):
     assert put_calls == [("https://storage.agentid.pub/upload/1", 100, {"Content-Type": "application/octet-stream"})]
     assert [m for m, _ in client.calls] == [
         "storage.check_upload",
-        "storage.get_limits",
         "storage.create_upload_session",
         "storage.complete_upload",
     ]
+
+
+@pytest.mark.asyncio
+async def test_upload_refuses_existing_remote_target_unless_overwrite():
+    data = b"hello"
+    client = _FakeClient({
+        "storage.check_upload": {
+            "skip_upload": False,
+            "within_limit": True,
+            "inline": True,
+            "target_exists": True,
+            "target": {"path": "docs/a.txt", "version": 3, "size_bytes": 5, "sha256": "old"},
+        },
+        "storage.put_object": lambda p: {
+            "owner_aid": p["owner_aid"],
+            "bucket": p["bucket"],
+            "object_key": p["object_key"],
+            "size_bytes": len(data),
+            "sha256": p.get("sha256", ""),
+            "version": 4,
+        },
+    })
+    vfs = StorageVFS(client, use_fs_rpc=False)
+
+    with pytest.raises(ExistsError):
+        await vfs.write_bytes("/docs/a.txt", data, owner="alice.agentid.pub")
+
+    assert [m for m, _ in client.calls] == ["storage.check_upload"]
+
+    result = await vfs.write_bytes("/docs/a.txt", data, owner="alice.agentid.pub", overwrite=True)
+
+    assert result.path == "/docs/a.txt"
+    assert [m for m, _ in client.calls] == ["storage.check_upload", "storage.check_upload", "storage.put_object"]
+    assert client.calls[-1][1]["overwrite"] is True
 
 
 @pytest.mark.asyncio

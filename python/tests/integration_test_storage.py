@@ -822,7 +822,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
         chk_bob = await bob.call("storage.check_upload", {
             "sha256": sha256, "size_bytes": len(payload),
         })
-        if chk_bob.get("exists") is not False or chk_bob.get("skip_upload") is not False:
+        if chk_bob.get("dedup_hit") is not False or chk_bob.get("skip_upload") is not False:
             raise AssertionError(f"check_upload 不应允许跨 owner 秒传: {chk_bob}")
 
         await _expect_failure(
@@ -870,7 +870,7 @@ async def test_storage_cas_dedup_and_instant_upload_download():
         chk_alice = await alice.call("storage.check_upload", {
             "sha256": sha256, "size_bytes": len(payload),
         })
-        if chk_alice.get("exists") is not True or chk_alice.get("skip_upload") is not True:
+        if chk_alice.get("dedup_hit") is not True or chk_alice.get("skip_upload") is not True:
             raise AssertionError(f"check_upload 同 owner 未命中去重: {chk_alice}")
 
         completed3 = await alice.call("storage.complete_upload", {

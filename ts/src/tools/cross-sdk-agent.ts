@@ -834,7 +834,7 @@ class CrossSdkTsAgent {
             bucket,
             contentType: textOf(params.content_type ?? params.contentType).trim() || 'text/plain',
             public: Boolean(params.public),
-            overwrite: params.overwrite == null ? true : Boolean(params.overwrite),
+            overwrite: params.overwrite == null ? false : Boolean(params.overwrite),
           },
         );
       case 'read_bytes': {

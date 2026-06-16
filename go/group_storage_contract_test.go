@@ -210,7 +210,7 @@ func TestGroupStorageMemberdataContractOverRPCPipeline(t *testing.T) {
 	}
 	putParams := calls[1].Params
 	if putParams["owner_aid"] != "alice.agentid.pub" || putParams["object_key"] != "alice.agentid.pub/team.agentid.pub/docs/a.txt" ||
-		putParams["content"] != "hello" || putParams["content_type"] != "text/plain" || putParams["overwrite"] != true {
+		putParams["content"] != "hello" || putParams["content_type"] != "text/plain" || putParams["overwrite"] != false {
 		t.Fatalf("memberdata Put 参数不正确: %#v", putParams)
 	}
 	if calls[2].Method != "storage.fs.remove" {

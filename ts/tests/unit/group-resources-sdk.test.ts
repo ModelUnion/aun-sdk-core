@@ -1236,7 +1236,7 @@ describe('TS SDK facade API 契约', () => {
         content: 'aGVsbG8=',
         content_type: 'text/plain',
         content_encoding: 'base64',
-        overwrite: true,
+        overwrite: false,
       });
     });
 

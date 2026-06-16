@@ -24,6 +24,7 @@ type fakeStorageClient struct {
 	failMethods map[string]error
 	downloadURL string
 	downloadSHA string
+	checkUpload map[string]any
 }
 
 func (f *fakeStorageClient) AID() string {
@@ -41,7 +42,10 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 	case "group.get":
 		return map[string]any{"group": map[string]any{"group_id": params["group_id"], "group_aid": "team.agentid.pub"}}, nil
 	case "storage.check_upload":
-		return map[string]any{"inline": false}, nil
+		if f.checkUpload != nil {
+			return f.checkUpload, nil
+		}
+		return map[string]any{"inline": true, "within_limit": true, "target_exists": false, "skip_upload": false}, nil
 	case "storage.get_limits":
 		return map[string]any{"max_inline_bytes": 64}, nil
 	case "storage.put_object":
@@ -103,7 +107,38 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 	}
 }
 
-func TestStorageVFSWriteBytesUsesServerLimits(t *testing.T) {
+func TestStorageVFSWriteBytesRefusesExistingTargetUnlessOverwrite(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeStorageClient{
+		aid: "alice.agentid.pub",
+		checkUpload: map[string]any{
+			"inline":        true,
+			"within_limit":  true,
+			"target_exists": true,
+			"target":        map[string]any{"path": "docs/a.txt", "version": 3, "size_bytes": 5, "sha256": "old"},
+		},
+	}
+	storage := NewStorageVFS(client)
+
+	_, err := storage.WriteBytes(ctx, "/docs/a.txt", []byte("hello"), nil)
+	var existsErr *StorageExistsError
+	if !errors.As(err, &existsErr) {
+		t.Fatalf("默认覆盖已有目标应返回 StorageExistsError，got: %T %v", err, err)
+	}
+	if len(client.calls) != 1 || client.calls[0].method != "storage.check_upload" {
+		t.Fatalf("默认拒绝覆盖时不应继续上传: %#v", client.calls)
+	}
+
+	overwrite := true
+	if _, err := storage.WriteBytes(ctx, "/docs/a.txt", []byte("hello"), &WriteBytesOptions{Overwrite: &overwrite}); err != nil {
+		t.Fatalf("Overwrite=true 应允许上传: %v", err)
+	}
+	if len(client.calls) != 3 || client.calls[2].method != "storage.put_object" || client.calls[2].params["overwrite"] != true {
+		t.Fatalf("Overwrite=true 未透传到 put_object: %#v", client.calls)
+	}
+}
+
+func TestStorageVFSWriteBytesUsesCheckUploadInline(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeStorageClient{aid: "alice.agentid.pub"}
 	storage := NewStorageVFS(client)
@@ -115,23 +150,23 @@ func TestStorageVFSWriteBytesUsesServerLimits(t *testing.T) {
 	if node.Type != "file" || node.Path != "/docs/a.txt" {
 		t.Fatalf("NodeView 不正确: %#v", node)
 	}
-	want := []string{"storage.check_upload", "storage.get_limits", "storage.put_object"}
+	want := []string{"storage.check_upload", "storage.put_object"}
 	for i, method := range want {
 		if client.calls[i].method != method {
 			t.Fatalf("第 %d 次调用方法不正确: got=%s want=%s", i, client.calls[i].method, method)
 		}
 	}
-	if client.calls[2].params["owner_aid"] != "alice.agentid.pub" {
-		t.Fatalf("owner_aid 未默认使用客户端 AID: %#v", client.calls[2].params)
+	if client.calls[1].params["owner_aid"] != "alice.agentid.pub" {
+		t.Fatalf("owner_aid 未默认使用客户端 AID: %#v", client.calls[1].params)
 	}
-	if client.calls[2].params["expected_version"] != nil {
-		t.Fatalf("nil ExpectedVersion 不应传入 RPC: %#v", client.calls[2].params)
+	if client.calls[1].params["expected_version"] != nil {
+		t.Fatalf("nil ExpectedVersion 不应传入 RPC: %#v", client.calls[1].params)
 	}
-	if client.calls[2].params["overwrite"] != true {
-		t.Fatalf("默认 Overwrite 应为 true（对齐 Python）: %#v", client.calls[2].params)
+	if client.calls[1].params["overwrite"] != false {
+		t.Fatalf("默认 Overwrite 应为 false: %#v", client.calls[1].params)
 	}
-	if _, exists := client.calls[2].params["metadata"]; exists {
-		t.Fatalf("nil Metadata 不应传入 RPC: %#v", client.calls[2].params)
+	if _, exists := client.calls[1].params["metadata"]; exists {
+		t.Fatalf("nil Metadata 不应传入 RPC: %#v", client.calls[1].params)
 	}
 }
 
@@ -177,11 +212,52 @@ func TestStorageVFSUploadAndDownloadFile(t *testing.T) {
 	if downloaded.Path != "/docs/a.txt" || downloaded.LocalPath != localDownload || downloaded.Size != 5 || downloaded.Verified != true {
 		t.Fatalf("DownloadResult 不正确: %#v", downloaded)
 	}
-	if client.calls[2].method != "storage.put_object" || client.calls[2].params["content_type"] != "text/plain" {
+	if client.calls[1].method != "storage.put_object" || client.calls[1].params["content_type"] != "text/plain" {
 		t.Fatalf("UploadFile 未正确复用 WriteBytes: %#v", client.calls)
 	}
-	if client.calls[3].method != "storage.create_download_ticket" || client.calls[3].params["token"] != "tok" {
+	if client.calls[2].method != "storage.create_download_ticket" || client.calls[2].params["token"] != "tok" {
 		t.Fatalf("DownloadFile 未正确创建下载 ticket: %#v", client.calls)
+	}
+}
+
+func TestStorageVFSDownloadFileRefusesExistingLocalTargetUnlessOverwrite(t *testing.T) {
+	ctx := context.Background()
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer server.Close()
+
+	client := &fakeStorageClient{
+		aid:         "alice.agentid.pub",
+		downloadURL: server.URL,
+		downloadSHA: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+	}
+	storage := NewStorageVFS(client)
+	dir := t.TempDir()
+	localDownload := filepath.Join(dir, "download.txt")
+	if err := os.WriteFile(localDownload, []byte("old"), 0o600); err != nil {
+		t.Fatalf("写入本地测试文件失败: %v", err)
+	}
+
+	_, err := storage.DownloadFile(ctx, "/docs/a.txt", localDownload, nil)
+	var existsErr *StorageExistsError
+	if !errors.As(err, &existsErr) {
+		t.Fatalf("默认覆盖已有本地文件应返回 StorageExistsError，got: %T %v", err, err)
+	}
+	body, _ := os.ReadFile(localDownload)
+	if string(body) != "old" || hits != 0 {
+		t.Fatalf("默认拒绝覆盖时不应下载或改写: body=%q hits=%d", string(body), hits)
+	}
+
+	overwrite := true
+	if _, err := storage.DownloadFile(ctx, "/docs/a.txt", localDownload, &ReadOptions{Overwrite: &overwrite}); err != nil {
+		t.Fatalf("Overwrite=true 下载失败: %v", err)
+	}
+	body, _ = os.ReadFile(localDownload)
+	if string(body) != "hello" || hits != 1 {
+		t.Fatalf("Overwrite=true 应覆盖本地文件: body=%q hits=%d", string(body), hits)
 	}
 }
 

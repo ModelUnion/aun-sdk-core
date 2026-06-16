@@ -1,8 +1,10 @@
 import base64
+import hashlib
 
 import pytest
 
 from aun_core.storage import StorageVFS
+from aun_core.storage.errors import ExistsError
 
 
 class _FakeClient:
@@ -92,6 +94,41 @@ async def test_vfs_read_methods_forward_token_to_read_rpc_paths(tmp_path):
     assert client.calls[2] == ("storage.fs.lstat", {"path": "docs/a.txt", "token": "tok", "owner_aid": "alice.agentid.pub", "bucket": "default"})
     assert client.calls[3] == ("storage.get_object", {"object_key": "docs/a.txt", "token": "tok", "owner_aid": "alice.agentid.pub", "bucket": "default"})
     assert client.calls[4] == ("storage.create_download_ticket", {"object_key": "docs/a.txt", "token": "tok", "owner_aid": "alice.agentid.pub", "bucket": "default"})
+
+
+@pytest.mark.asyncio
+async def test_vfs_download_file_refuses_existing_local_file_unless_overwrite(tmp_path):
+    body = b"fresh"
+    client = _FakeClient({
+        "storage.create_download_ticket": {
+            "download_url": "https://storage.agentid.pub/dl/1",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "file_name": "a.txt",
+        },
+    })
+    vfs = StorageVFS(client)
+    http_calls = 0
+
+    async def _fake_http_get(_url, on_progress=None):
+        nonlocal http_calls
+        http_calls += 1
+        return body
+
+    vfs.lowlevel.http_get = _fake_http_get
+    target = tmp_path / "local.txt"
+    target.write_bytes(b"old")
+
+    with pytest.raises(ExistsError):
+        await vfs.download_file("/docs/a.txt", str(target), owner="alice.agentid.pub")
+
+    assert target.read_bytes() == b"old"
+    assert http_calls == 0
+
+    result = await vfs.download_file("/docs/a.txt", str(target), owner="alice.agentid.pub", overwrite=True)
+
+    assert result.local_path == str(target)
+    assert target.read_bytes() == body
+    assert http_calls == 1
 
 
 @pytest.mark.asyncio

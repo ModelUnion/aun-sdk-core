@@ -1242,7 +1242,7 @@ describe('memberdata 透明路由（成员挂载区映射到成员自己 storage
       content: 'aGVsbG8=',
       content_type: 'text/plain',
       content_encoding: 'base64',
-      overwrite: true,
+      overwrite: false,
     });
   });
 

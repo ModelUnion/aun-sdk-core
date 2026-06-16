@@ -213,7 +213,7 @@ class GroupResourcesFacade(_RpcFacade):
                 "owner_aid": owner_aid,
                 "object_key": object_key,
                 "content": merged.get("content", ""),
-                "overwrite": merged.get("overwrite", True),
+                "overwrite": merged.get("overwrite", False),
             }
             for src, dst in (("content_type", "content_type"), ("content_encoding", "content_encoding"),
                              ("metadata", "metadata"), ("expected_version", "expected_version")):

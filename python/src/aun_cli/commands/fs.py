@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 import typer
 
-from aun_cli.adapter import CLISession, handle_error, run_async
+from aun_cli.adapter import CLISession, handle_error, resolve_profile_config, run_async
 from aun_cli.fs_utils import format_remote, is_remote, normalize_path, parse_remote
 from aun_cli.output import is_json_mode, output_dict, output_error, output_json, output_success, output_table, set_json_mode
 from aun_core.storage.types import to_plain
@@ -33,6 +33,17 @@ def _remote_or_exit(value: str) -> tuple[str, str]:
     except ValueError as exc:
         output_error(str(exc))
         raise typer.Exit(2)
+
+
+def _remote_or_default(ctx: typer.Context, value: str) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if is_remote(text):
+        return parse_remote(text)
+    aid = str(resolve_profile_config(ctx).get("aid") or "").strip()
+    if not aid:
+        output_error("当前 profile 未配置 AID，裸路径无法自动补全 owner")
+        raise typer.Exit(2)
+    return aid, normalize_path(text or "/")
 
 
 def _is_text(content_type: str, data: bytes) -> bool:
@@ -186,7 +197,7 @@ def fs_ls(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -215,7 +226,7 @@ def fs_stat(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -241,7 +252,7 @@ def fs_cat(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -304,14 +315,24 @@ def fs_cp(
     _set_json(ctx)
     src_remote = is_remote(src)
     dst_remote = is_remote(dst)
-    if not src_remote and not dst_remote:
-        output_error("本地到本地复制请使用系统 cp/copy")
-        raise typer.Exit(2)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
+            if not src_remote and not dst_remote:
+                if Path(src).exists():
+                    owner, remote_path = _remote_or_default(ctx, dst)
+                    return await client.storage.upload_file(
+                        src,
+                        remote_path,
+                        owner=owner,
+                        content_type=content_type,
+                        public=public,
+                        overwrite=force,
+                    )
+                owner, remote_path = _remote_or_default(ctx, src)
+                return await client.storage.download_file(remote_path, dst, owner=owner, token=token, overwrite=force)
             if not src_remote and dst_remote:
-                owner, remote_path = parse_remote(dst)
+                owner, remote_path = _remote_or_default(ctx, dst)
                 return await client.storage.upload_file(
                     src,
                     remote_path,
@@ -321,10 +342,10 @@ def fs_cp(
                     overwrite=force,
                 )
             if src_remote and not dst_remote:
-                owner, remote_path = parse_remote(src)
-                return await client.storage.download_file(remote_path, dst, owner=owner, token=token)
-            src_owner, src_path = parse_remote(src)
-            dst_owner, dst_path = parse_remote(dst)
+                owner, remote_path = _remote_or_default(ctx, src)
+                return await client.storage.download_file(remote_path, dst, owner=owner, token=token, overwrite=force)
+            src_owner, src_path = _remote_or_default(ctx, src)
+            dst_owner, dst_path = _remote_or_default(ctx, dst)
             return await client.storage.copy(
                 src_path,
                 dst_path,
@@ -354,8 +375,8 @@ def fs_mv(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    src_owner, src_path = _remote_or_exit(src)
-    dst_owner, dst_path = _remote_or_exit(dst)
+    src_owner, src_path = _remote_or_default(ctx, src)
+    dst_owner, dst_path = _remote_or_default(ctx, dst)
     if src_owner != dst_owner:
         output_error("跨 AID mv 不具备原子性，请使用 cp 后 rm")
         raise typer.Exit(2)
@@ -381,7 +402,7 @@ def fs_rm(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
     _ = force
 
     async def _run():
@@ -410,7 +431,7 @@ def fs_ln(
     if not symbolic:
         output_error("当前仅支持 ln -s")
         raise typer.Exit(2)
-    owner, remote_link = _remote_or_exit(link_path)
+    owner, remote_link = _remote_or_default(ctx, link_path)
     link_target = _link_target_value(target, link_owner=owner)
     if not link_target:
         output_error("软链目标不能为空")
@@ -443,7 +464,7 @@ def fs_mkdir(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -464,7 +485,7 @@ def fs_df(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, _ = _remote_or_exit(target)
+    owner, _ = _remote_or_default(ctx, target)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -491,13 +512,13 @@ def fs_mount(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(target)
+    owner, remote_path = _remote_or_default(ctx, target)
     if bool(source) == bool(volume):
         output_error("mount 必须且只能指定 --source 或 --volume")
         raise typer.Exit(2)
     source_ref = ""
     if source:
-        source_owner, source_path = _remote_or_exit(source or "")
+        source_owner, source_path = _remote_or_default(ctx, source or "")
         source_ref = format_remote(source_owner, source_path)
 
     async def _run():
@@ -536,7 +557,7 @@ def fs_approve(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(target)
+    owner, remote_path = _remote_or_default(ctx, target)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -561,7 +582,7 @@ def fs_reject(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(target)
+    owner, remote_path = _remote_or_default(ctx, target)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -585,7 +606,7 @@ def fs_umount(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(target)
+    owner, remote_path = _remote_or_default(ctx, target)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -611,7 +632,7 @@ def fs_find(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
     if node_type and node_type not in {"f", "d", "l", "file", "dir", "symlink"}:
         output_error("--type 仅支持 f、d、l")
         raise typer.Exit(2)
@@ -662,7 +683,7 @@ def fs_chmod(
     elif mode is not None:
         output_error("chmod 当前支持 +r、o-r 或 --visibility public|private")
         raise typer.Exit(2)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
     if visibility not in {"public", "private"}:
         output_error("chmod 当前支持 +r、o-r 或 --visibility public|private")
         raise typer.Exit(2)
@@ -699,7 +720,7 @@ def fs_setfacl(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
     if bool(modify) == bool(remove):
         output_error("setfacl 必须且只能指定 -m 或 -x")
         raise typer.Exit(2)
@@ -734,7 +755,7 @@ def fs_getfacl(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -757,7 +778,7 @@ def fs_token_issue(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -784,7 +805,7 @@ def fs_token_revoke(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
@@ -805,7 +826,7 @@ def fs_token_ls(
     as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
 ) -> None:
     _set_json(ctx)
-    owner, remote_path = _remote_or_exit(path)
+    owner, remote_path = _remote_or_default(ctx, path)
 
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:

@@ -115,6 +115,7 @@ def test_cli_fs_cp_upload_and_download(monkeypatch, tmp_path):
     assert client.storage.calls[0][0] == "upload_file"
     assert client.storage.calls[0][2] == "/docs/hello.txt"
     assert client.storage.calls[1][0] == "download_file"
+    assert client.storage.calls[1][3]["overwrite"] is False
 
 
 def test_cli_fs_cp_upload_overwrite_follows_force(monkeypatch, tmp_path):
@@ -131,6 +132,24 @@ def test_cli_fs_cp_upload_overwrite_follows_force(monkeypatch, tmp_path):
     assert default_result.exit_code == 0, default_result.output
     assert forced_result.exit_code == 0, forced_result.output
     assert client.storage.calls[0][3]["overwrite"] is False
+    assert client.storage.calls[1][3]["overwrite"] is True
+
+
+def test_cli_fs_cp_download_overwrite_follows_force(monkeypatch, tmp_path):
+    from aun_cli.commands import fs as fs_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+    out = tmp_path / "out.txt"
+
+    default_result = _invoke(["--json", "fs", "cp", "alice.agentid.pub:/docs/hello.txt", str(out)])
+    forced_result = _invoke(["--json", "fs", "cp", "--force", "alice.agentid.pub:/docs/hello.txt", str(out)])
+
+    assert default_result.exit_code == 0, default_result.output
+    assert forced_result.exit_code == 0, forced_result.output
+    assert client.storage.calls[0][0] == "download_file"
+    assert client.storage.calls[0][3]["overwrite"] is False
+    assert client.storage.calls[1][0] == "download_file"
     assert client.storage.calls[1][3]["overwrite"] is True
 
 
@@ -188,6 +207,63 @@ def test_cli_fs_rm_recursive_and_mkdir(monkeypatch):
     assert mkdir.exit_code == 0, mkdir.output
     assert client.storage.calls[0] == ("remove", "/tmp", {"owner": "alice.agentid.pub", "recursive": True})
     assert client.storage.calls[1] == ("mkdir", "/tmp/new", {"owner": "alice.agentid.pub", "parents": True})
+
+
+def test_cli_fs_bare_paths_default_to_profile_aid(monkeypatch, tmp_path):
+    from aun_cli.commands import fs as fs_commands
+    from aun_cli.config import load_config, save_config
+
+    monkeypatch.setenv("AUN_CLI_CONFIG", str(tmp_path / ".aun" / "cli.toml"))
+    monkeypatch.setenv("AUN_CLI_STATE_DIR", str(tmp_path / ".aun" / "sessions"))
+    monkeypatch.setenv("AUN_CLI_SESSION_ID", "fs-default-owner")
+    cfg = load_config()
+    cfg["default"]["profile"] = "default"
+    cfg["profiles"] = {"default": {"aid": "yayi2001.agentid.pub"}}
+    save_config(cfg)
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+
+    mkdir = _invoke(["--json", "fs", "mkdir", "docs"])
+    listed = _invoke(["--json", "fs", "ls", "/docs"])
+
+    assert mkdir.exit_code == 0, mkdir.output
+    assert listed.exit_code == 0, listed.output
+    assert client.storage.calls == [
+        ("mkdir", "/docs", {"owner": "yayi2001.agentid.pub", "parents": False}),
+        ("list", "/docs", {"owner": "yayi2001.agentid.pub", "page": 1, "size": 100, "marker": None, "long": False}),
+    ]
+
+
+def test_cli_fs_cp_bare_remote_upload_and_download(monkeypatch, tmp_path):
+    from aun_cli.commands import fs as fs_commands
+    from aun_cli.config import load_config, save_config
+
+    monkeypatch.setenv("AUN_CLI_CONFIG", str(tmp_path / ".aun" / "cli.toml"))
+    monkeypatch.setenv("AUN_CLI_STATE_DIR", str(tmp_path / ".aun" / "sessions"))
+    monkeypatch.setenv("AUN_CLI_SESSION_ID", "fs-cp-default-owner")
+    cfg = load_config()
+    cfg["default"]["profile"] = "default"
+    cfg["profiles"] = {"default": {"aid": "yayi2001.agentid.pub"}}
+    save_config(cfg)
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+    src = tmp_path / "hello.txt"
+    src.write_text("hello", encoding="utf-8")
+    out = tmp_path / "out.txt"
+
+    up = _invoke(["--json", "fs", "cp", str(src), "docs/hello.txt"])
+    down = _invoke(["--json", "fs", "cp", "docs/hello.txt", str(out)])
+
+    assert up.exit_code == 0, up.output
+    assert down.exit_code == 0, down.output
+    assert client.storage.calls[0][0] == "upload_file"
+    assert client.storage.calls[0][2] == "/docs/hello.txt"
+    assert client.storage.calls[0][3]["owner"] == "yayi2001.agentid.pub"
+    assert client.storage.calls[1][0] == "download_file"
+    assert client.storage.calls[1][1] == "/docs/hello.txt"
+    assert client.storage.calls[1][3]["owner"] == "yayi2001.agentid.pub"
 
 
 def test_cli_fs_stat_cat_df(monkeypatch):

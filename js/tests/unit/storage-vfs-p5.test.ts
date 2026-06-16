@@ -9,8 +9,7 @@ class FakeClient {
 
   async call(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
     this.calls.push({ method, params: params ?? {} });
-    if (method === 'storage.check_upload') return { inline: false };
-    if (method === 'storage.get_limits') return { max_inline_bytes: 64 };
+    if (method === 'storage.check_upload') return { inline: true, within_limit: true, target_exists: false, skip_upload: false };
     if (method === 'storage.put_object') return { type: 'file', path: params?.object_key, object_key: params?.object_key, owner_aid: params?.owner_aid, size_bytes: 5, sha256: 'sha' };
     if (method === 'storage.get_object') {
       return {
@@ -36,7 +35,7 @@ class FakeClient {
 }
 
 describe('P5 StorageVFS Browser SDK 契约', () => {
-  it('writeBytes 使用服务端 get_limits 决定 inline 上传路径', async () => {
+  it('writeBytes 使用 check_upload 的 inline 判断上传路径', async () => {
     const client = new FakeClient();
     const storage = new StorageVFS(client);
 
@@ -45,15 +44,41 @@ describe('P5 StorageVFS Browser SDK 契约', () => {
     expect(node.type).toBe('file');
     expect(client.calls.map((c) => c.method)).toEqual([
       'storage.check_upload',
-      'storage.get_limits',
       'storage.put_object',
     ]);
-    expect(client.calls[2].params).toMatchObject({
+    expect(client.calls[1].params).toMatchObject({
       owner_aid: 'alice.agentid.pub',
       bucket: 'default',
       object_key: 'docs/a.txt',
       is_private: true,
+      overwrite: false,
     });
+  });
+
+  it('writeBytes 默认拒绝覆盖远程已有目标，overwrite=true 才上传', async () => {
+    class ExistingTargetClient extends FakeClient {
+      async call(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'storage.check_upload') {
+          this.calls.push({ method, params: params ?? {} });
+          return {
+            inline: true,
+            within_limit: true,
+            target_exists: true,
+            target: { path: 'docs/a.txt', version: 3, size_bytes: 5, sha256: 'old' },
+          };
+        }
+        return super.call(method, params);
+      }
+    }
+    const client = new ExistingTargetClient();
+    const storage = new StorageVFS(client);
+
+    await expect(storage.writeBytes('/docs/a.txt', 'hello')).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(client.calls.map((c) => c.method)).toEqual(['storage.check_upload']);
+
+    await expect(storage.writeBytes('/docs/a.txt', 'hello', { overwrite: true })).resolves.toMatchObject({ path: '/docs/a.txt' });
+    expect(client.calls.map((c) => c.method)).toEqual(['storage.check_upload', 'storage.check_upload', 'storage.put_object']);
+    expect(client.calls[2].params.overwrite).toBe(true);
   });
 
   it('read/list/stat 支持 token 透传并默认走 storage.fs.*', async () => {

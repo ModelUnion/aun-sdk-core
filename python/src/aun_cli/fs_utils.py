@@ -13,8 +13,9 @@ def is_remote(value: str) -> bool:
         return False
     if text.startswith(("http://", "https://")):
         return False
-    idx = text.find(":")
-    return idx > 0
+    if text.endswith(":"):
+        return len(text) > 1
+    return text.find(":/") > 0
 
 
 def normalize_path(path: str) -> str:
@@ -30,7 +31,11 @@ def parse_remote(value: str) -> tuple[str, str]:
     text = str(value or "").strip()
     if not is_remote(text):
         raise ValueError(f"不是远程路径: {value}")
-    owner, path = text.split(":", 1)
+    if text.endswith(":"):
+        owner, path = text[:-1], "/"
+    else:
+        owner, path = text.split(":/", 1)
+        path = f"/{path}"
     owner = owner.strip()
     if not owner:
         raise ValueError(f"远程路径缺少 AID: {value}")

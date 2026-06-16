@@ -131,15 +131,18 @@ func (l *StorageLowLevel) HeadObject(ctx context.Context, owner, bucket, objectK
 	}), objectKey)
 }
 
-func (l *StorageLowLevel) CreateUploadSession(ctx context.Context, owner, bucket, objectKey string, size int, contentType string, expectedVersion *int) (map[string]any, error) {
+func (l *StorageLowLevel) CreateUploadSession(ctx context.Context, owner, bucket, objectKey string, size int, contentType string, expectedVersion *int, overwrite *bool) (map[string]any, error) {
 	extra := map[string]any{"object_key": objectKey, "size_bytes": size, "content_type": emptyToNil(contentType)}
 	if expectedVersion != nil {
 		extra["expected_version"] = *expectedVersion
 	}
+	if overwrite != nil {
+		extra["overwrite"] = *overwrite
+	}
 	return l.call(ctx, "storage.create_upload_session", storageParams(owner, bucket, extra), objectKey)
 }
 
-func (l *StorageLowLevel) CompleteUpload(ctx context.Context, owner, bucket, objectKey, sessionID string, size int, sha256, contentType string, metadata map[string]any, isPublic bool, expectedVersion *int, skipBlob bool) (map[string]any, error) {
+func (l *StorageLowLevel) CompleteUpload(ctx context.Context, owner, bucket, objectKey, sessionID string, size int, sha256, contentType string, metadata map[string]any, isPublic bool, expectedVersion *int, skipBlob bool, overwrite *bool) (map[string]any, error) {
 	extra := map[string]any{
 		"object_key":   objectKey,
 		"session_id":   emptyToNil(sessionID),
@@ -152,6 +155,9 @@ func (l *StorageLowLevel) CompleteUpload(ctx context.Context, owner, bucket, obj
 	}
 	if expectedVersion != nil {
 		extra["expected_version"] = *expectedVersion
+	}
+	if overwrite != nil {
+		extra["overwrite"] = *overwrite
 	}
 	return l.call(ctx, "storage.complete_upload", storageParams(owner, bucket, extra), objectKey)
 }

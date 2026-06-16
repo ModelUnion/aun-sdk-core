@@ -22,6 +22,8 @@
 | [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 group resources pending_ops 执行模型） |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
 | [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 目录快照 / GC / reflog / reset） |
+| [group.fs POSIX 化详细设计](../aun-fs/group-storage/group.fs-POSIX化详细设计.md) | 下一版 `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计 |
+| [group.fs POSIX 化分阶段实施计划](../aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md) | group.fs 重构的 IPO、Step-by-step、用例集、Checklist、验收和回滚 |
 | [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 与关键时序 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
@@ -62,6 +64,7 @@
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
 - Group RPC 与群资源 `pending_ops` 执行模型 → [09-group-rpc-manual](09-group-rpc-manual.md)
+- 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs` 和 `cp/mv` POSIX 化语义 → [group.fs POSIX 化详细设计](../aun-fs/group-storage/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
 - Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
 - Collab RPC（`collab.*` 版本化文档、乐观锁、快照、GC、reflog、reset）→ [09-collab-rpc-manual](09-collab-rpc-manual.md)

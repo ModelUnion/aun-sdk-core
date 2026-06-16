@@ -63,25 +63,44 @@ def _http_get(url: str, verify_ssl: bool = True) -> bytes:
 
 async def upload_object(
     client: Any, *, object_key: str, data: bytes, content_type: str,
-    is_private: bool, verify_ssl: bool,
+    is_private: bool, verify_ssl: bool, overwrite: bool = False,
 ) -> dict:
     """小文件走 inline put_object，大文件走 upload session + HTTP PUT + complete_upload。"""
-    limits = await client.call("storage.get_limits", {})
-    max_inline = int(limits.get("max_inline_bytes") or 65536)
+    sha256 = hashlib.sha256(data).hexdigest()
+    check = await client.call("storage.check_upload", {
+        "object_key": object_key,
+        "size_bytes": len(data),
+        "sha256": sha256,
+    })
+    if check.get("within_limit") is False:
+        raise ValueError(f"文件大小超过上限: {len(data)}")
+    if check.get("target_exists") and not overwrite:
+        raise RuntimeError("对象已存在，overwrite=false")
+    if check.get("dedup_hit") or check.get("skip_upload"):
+        return await client.call("storage.complete_upload", {
+            "object_key": object_key,
+            "size_bytes": len(data),
+            "sha256": sha256,
+            "content_type": content_type,
+            "is_private": is_private,
+            "skip_blob": True,
+            "overwrite": overwrite,
+        })
 
-    if len(data) <= max_inline:
+    if check.get("inline") is True:
         return await client.call("storage.put_object", {
             "object_key": object_key,
             "content": base64.b64encode(data).decode("ascii"),
             "content_type": content_type,
             "is_private": is_private,
-            "overwrite": True,
+            "overwrite": overwrite,
         })
 
     session = await client.call("storage.create_upload_session", {
         "object_key": object_key,
         "size_bytes": len(data),
         "content_type": content_type,
+        "overwrite": overwrite,
     })
     upload_url = str(session.get("upload_url") or "")
     if not upload_url:
@@ -92,9 +111,10 @@ async def upload_object(
     return await client.call("storage.complete_upload", {
         "object_key": object_key,
         "size_bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "sha256": sha256,
         "content_type": content_type,
         "is_private": is_private,
+        "overwrite": overwrite,
     })
 
 
