@@ -219,6 +219,7 @@ class RpcPipeline:
                 params.pop("client_signature", None)
             else:
                 self.sign_client_operation(method, params)
+        params.pop("_client_signature_identity", None)
 
         call_kwargs: dict[str, Any] = {}
         if method in _NON_IDEMPOTENT_METHODS:
@@ -336,7 +337,9 @@ class RpcPipeline:
     def sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
         """为关键操作附加客户端 ECDSA 签名（_client_signature 字段）。"""
         client = self.client
-        current_aid = client._current_aid
+        current_aid = params.get("_client_signature_identity") or client._current_aid
+        if isinstance(current_aid, dict):
+            current_aid = current_aid.get("aid") or current_aid
         if not current_aid or not current_aid.private_key_pem:
             return
         try:
@@ -473,6 +476,7 @@ class RpcPipeline:
                 payload.pop("client_signature", None)
             else:
                 client._sign_client_operation(method, payload)
+        payload.pop("_client_signature_identity", None)
         call_kwargs: dict[str, Any] = {}
         if timeout is not None:
             call_kwargs["timeout"] = timeout

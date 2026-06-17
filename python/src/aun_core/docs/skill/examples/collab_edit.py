@@ -3,7 +3,7 @@
 ================
 
 演示 client.collab（CollabClient 门面）的版本化文档协作：
-create / read / submit（乐观锁）/ merge（撞版本）/ history / snapshot。
+create / show / commit（乐观锁）/ merge（撞版本）/ log / tag.create。
 
 collab 是「锚定在某块存储上的自包含版本化目录」，授权下沉 storage ACL。
 """
@@ -30,28 +30,28 @@ async def main():
     res = await collab.create(root, "design.md", "./design.md")
     print(f"[create] design.md version={res['version']}")
 
-    # ── read：读当前内容 + version（submit 的 base_version 来源） ──
-    cur = await collab.read(root, "design.md")
-    print(f"[read] version={cur['version']} author={cur['author']}")
+    # ── show：读当前内容 + version（commit 的 onto 来源） ──
+    cur = await collab.show(root, "design.md")
+    print(f"[show] version={cur['version']} author={cur['author']}")
 
-    # ── submit：乐观锁提交新版本 ──
-    res = await collab.submit(root, "design.md", "./design.md", cur["version"])
+    # ── commit：乐观锁提交新版本 ──
+    res = await collab.commit(root, "design.md", "./design.md", cur["version"])
     if res["ok"]:
-        print(f"[submit] 成功 version={res['version']}")
+        print(f"[commit] 成功 version={res['version']}")
     else:
-        # 撞版本：数据已安全保存，merge 后用 current_version 作新 base_version 重提
-        print(f"[submit] 撞版本，当前 version={res['current_version']}")
+        # 撞版本：数据已安全保存，merge 后用 current_version 作新 onto 重提
+        print(f"[commit] 撞版本，当前 version={res['current_version']}")
         await collab.merge(root, "design.md", "./design.md", cur["version"])
-        res = await collab.submit(root, "design.md", "./design.md", res["current_version"])
+        res = await collab.commit(root, "design.md", "./design.md", res["current_version"])
         print(f"[resubmit] version={res['version']}")
 
-    # ── history：查版本台账 ──
-    history = await collab.history(root, "design.md")
-    print(f"[history] {len(history)} 个版本")
+    # ── log：查版本台账 ──
+    history = await collab.log(root, "design.md")
+    print(f"[log] {len(history)} 个版本")
 
-    # ── snapshot：目录级快照（语义化版本自动判定） ──
-    snap = await collab.snapshot.create(root, message="里程碑 v1")
-    print(f"[snapshot] version={snap['version']} bump={snap['bump']}")
+    # ── tag.create：目录级标签（语义化版本自动判定） ──
+    snap = await collab.tag.create(root, message="里程碑 v1")
+    print(f"[tag.create] version={snap['version']} bump={snap['bump']}")
 
     await close_clients(client)
 

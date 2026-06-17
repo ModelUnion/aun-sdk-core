@@ -58,14 +58,6 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
-  'group.resources.put', 'group.resources.create_folder',
-  'group.resources.rename', 'group.resources.move',
-  'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete',
-  'group.resources.namespace_ready', 'group.resources.confirm',
-  'group.resources.confirm_mount', 'group.resources.get_df',
-  'group.resources.unmount',
-  'group.resources.get_access', 'group.resources.resolve_access_ticket',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.create_upload_session', 'storage.complete_upload',
@@ -81,10 +73,14 @@ const SIGNED_METHODS = new Set([
   'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
-  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.mount', 'group.fs.umount',
+  'group.fs.check_upload', 'group.fs.create_upload_session',
+  'group.fs.complete_upload', 'group.fs.create_download_ticket',
+  'collab.create', 'collab.commit', 'collab.clone',
   'collab.prune', 'collab.unregister',
-  'collab.snapshot.create', 'collab.snapshot.restore',
-  'collab.snapshot.rm', 'collab.snapshot.prune',
+  'collab.tag.create', 'collab.tag.restore',
+  'collab.tag.rm', 'collab.tag.prune',
   'group.commit_state',
   'group.ban', 'group.unban',
   'group.dissolve', 'group.suspend', 'group.resume',
@@ -112,22 +108,17 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'storage.fs.mount', 'storage.fs.approve', 'storage.fs.reject', 'storage.fs.unmount',
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
+  'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.mount', 'group.fs.umount',
+  'group.fs.check_upload', 'group.fs.create_upload_session',
+  'group.fs.complete_upload', 'group.fs.create_download_ticket',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
   'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
-  'group.resources.put', 'group.resources.create_folder',
-  'group.resources.rename', 'group.resources.move',
-  'group.resources.mount_object', 'group.resources.update',
-  'group.resources.delete',
-  'group.resources.namespace_ready', 'group.resources.confirm',
-  'group.resources.confirm_mount', 'group.resources.get_df',
-  'group.resources.unmount',
-  'group.resources.get_access',
-  'group.resources.resolve_access_ticket',
-  'collab.create', 'collab.submit', 'collab.export', 'collab.adopt',
+  'collab.create', 'collab.commit', 'collab.clone',
   'collab.prune', 'collab.unregister',
-  'collab.snapshot.create', 'collab.snapshot.restore',
-  'collab.snapshot.rm', 'collab.snapshot.prune',
+  'collab.tag.create', 'collab.tag.restore',
+  'collab.tag.rm', 'collab.tag.prune',
 ]);
 
 export interface RpcPreflightResult {
@@ -435,14 +426,18 @@ export class RpcPipeline {
   }
 
   applyClientSignature(method: string, params: RpcParams): void {
-    if (!SIGNED_METHODS.has(method)) {
-      return;
+    try {
+      if (!SIGNED_METHODS.has(method)) {
+        return;
+      }
+      if (this.shouldSkipClientSignature(method, params)) {
+        delete params.client_signature;
+        return;
+      }
+      this.runtime.client._signClientOperation(method, params);
+    } finally {
+      delete (params as Record<string, unknown>)._client_signature_identity;
     }
-    if (this.shouldSkipClientSignature(method, params)) {
-      delete params.client_signature;
-      return;
-    }
-    this.runtime.client._signClientOperation(method, params);
   }
 
   shouldSkipClientSignature(method: string, params: RpcParams): boolean {
@@ -452,7 +447,10 @@ export class RpcPipeline {
   }
 
   signClientOperation(method: string, params: RpcParams): void {
-    const currentAid = this.runtime.client._currentAid;
+    const internal = (params as Record<string, unknown>)._client_signature_identity;
+    const currentAid = (internal && typeof internal === 'object')
+      ? internal as { aid?: string; privateKeyPem?: string; certPem?: string }
+      : this.runtime.client._currentAid;
     if (!currentAid?.privateKeyPem) return;
 
     try {

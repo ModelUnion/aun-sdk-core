@@ -315,3 +315,5 @@ agent.md 不写入 SQLite。当前 SDK 使用以下持久化位置：
 - `agent.md` 上传后，Gateway 缓存失效，后续消息能看到新 ETag。
 - HEAD/GET 404、超时、网络错误不影响消息收发主链路。
 - Python / TS / JS / Go 四个 SDK 对 `remote_etag`、`local_etag`、`content`、`remote_status`、`verify_status` 语义一致。
+
+

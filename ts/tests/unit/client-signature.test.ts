@@ -72,15 +72,27 @@ const STORAGE_MUTATION_METHODS = [
 
 const COLLAB_MUTATION_METHODS = [
   'collab.create',
-  'collab.submit',
-  'collab.export',
-  'collab.adopt',
+  'collab.commit',
+  'collab.clone',
   'collab.prune',
   'collab.unregister',
-  'collab.snapshot.create',
-  'collab.snapshot.restore',
-  'collab.snapshot.rm',
-  'collab.snapshot.prune',
+  'collab.tag.create',
+  'collab.tag.restore',
+  'collab.tag.rm',
+  'collab.tag.prune',
+] as const;
+
+const GROUP_FS_CONTROL_METHODS = [
+  'group.fs.mkdir',
+  'group.fs.rm',
+  'group.fs.cp',
+  'group.fs.mv',
+  'group.fs.mount',
+  'group.fs.umount',
+  'group.fs.check_upload',
+  'group.fs.create_upload_session',
+  'group.fs.complete_upload',
+  'group.fs.create_download_ticket',
 ] as const;
 
 /** 预期需要签名的方法 */
@@ -119,20 +131,6 @@ const EXPECTED_SIGNED_METHODS = [
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
-  'group.resources.put',
-  'group.resources.create_folder',
-  'group.resources.rename',
-  'group.resources.move',
-  'group.resources.mount_object',
-  'group.resources.update',
-  'group.resources.delete',
-  'group.resources.namespace_ready',
-  'group.resources.confirm',
-  'group.resources.confirm_mount',
-  'group.resources.get_df',
-  'group.resources.unmount',
-  'group.resources.get_access',
-  'group.resources.resolve_access_ticket',
   'group.commit_state',
   'group.ban',
   'group.unban',
@@ -140,6 +138,7 @@ const EXPECTED_SIGNED_METHODS = [
   'group.suspend',
   'group.resume',
   'storage.check_access',
+  ...GROUP_FS_CONTROL_METHODS,
   ...COLLAB_MUTATION_METHODS,
   ...STORAGE_MUTATION_METHODS,
 ] as const;
@@ -198,25 +197,16 @@ describe('SIGNED_METHODS 签名覆盖面', () => {
     expect(signed, '运行时签名集合缺少: storage.check_access').toContain('storage.check_access');
     expect(nonIdempotent, 'storage.check_access 不应进入非幂等集合').not.toContain('storage.check_access');
   });
-
-  it('资源票据类方法应进入签名和非幂等长超时集合', () => {
-    for (const method of [
-      'group.resources.namespace_ready',
-      'group.resources.confirm',
-      'group.resources.confirm_mount',
-      'group.resources.get_access',
-      'group.resources.resolve_access_ticket',
-    ]) {
-      expect(extractSignedMethods(), `缺少签名方法: ${method}`).toContain(method);
-      expect(extractSignedMethods('../../src/client/rpc-pipeline.ts'), `运行时签名集合缺少: ${method}`).toContain(method);
-      expect(extractNonIdempotentMethods(), `缺少非幂等方法: ${method}`).toContain(method);
-      expect(extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts'), `运行时非幂等集合缺少: ${method}`).toContain(method);
-    }
-    for (const method of ['group.resources.get_df']) {
-      expect(extractSignedMethods(), `缺少签名方法: ${method}`).toContain(method);
-      expect(extractSignedMethods('../../src/client/rpc-pipeline.ts'), `运行时签名集合缺少: ${method}`).toContain(method);
-      expect(extractNonIdempotentMethods(), `${method} 应进入非幂等集合`).toContain(method);
-      expect(extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts'), `${method} 运行时应进入非幂等集合`).toContain(method);
+  it('group.fs 写侧和 ticket/session 控制面应进入签名和非幂等长超时集合', () => {
+    const signed = extractSignedMethods();
+    const runtimeSigned = extractSignedMethods('../../src/client/rpc-pipeline.ts');
+    const nonIdempotent = extractNonIdempotentMethods();
+    const runtimeNonIdempotent = extractNonIdempotentMethods('../../src/client/rpc-pipeline.ts');
+    for (const method of GROUP_FS_CONTROL_METHODS) {
+      expect(signed, `缺少签名方法: ${method}`).toContain(method);
+      expect(runtimeSigned, `运行时签名集合缺少: ${method}`).toContain(method);
+      expect(nonIdempotent, `缺少非幂等方法: ${method}`).toContain(method);
+      expect(runtimeNonIdempotent, `运行时非幂等集合缺少: ${method}`).toContain(method);
     }
   });
 });

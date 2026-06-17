@@ -90,8 +90,8 @@ async def _grant_collab_root_acl(client: AUNClient, owner: str, root: str, grant
     await client.storage.set_acl(root_path, owner=owner, grantee_aid=grantee_aid, perms="rwd")
 
 
-async def test_collab_create_read_submit_history_get_diff() -> None:
-    name = "collab_create_read_submit_history_get_diff"
+async def test_collab_create_show_commit_log_get_diff() -> None:
+    name = "collab_create_show_commit_log_get_diff"
     rid = uuid.uuid4().hex[:10]
     root = f"{_ALICE_AID}:/collab-e2e/{rid}/proj"
     doc = "spec.md"
@@ -102,23 +102,23 @@ async def test_collab_create_read_submit_history_get_diff() -> None:
         if created.get("version") != 1 or not str(created.get("current_target") or "").startswith(f"{_ALICE_AID}:/"):
             raise AssertionError(f"create 返回异常: {created}")
 
-        read = await alice.collab.read(root, doc)
+        read = await alice.collab.show(root, doc)
         if read.get("version") != 1 or _text(read) != "a\n":
-            raise AssertionError(f"read 返回异常: {read}")
+            raise AssertionError(f"show 返回异常: {read}")
 
-        submitted = await alice.collab.submit(root, doc, _b64("a\nb\n"), base_version=1)
+        submitted = await alice.collab.commit(root, doc, _b64("a\nb\n"), onto=1)
         if submitted.get("version") != 2:
-            raise AssertionError(f"submit 返回异常: {submitted}")
+            raise AssertionError(f"commit 返回异常: {submitted}")
 
-        history = await alice.collab.history(root, doc)
+        history = await alice.collab.log(root, doc)
         if [item.get("version") for item in history] != [1, 2]:
-            raise AssertionError(f"history 返回异常: {history}")
+            raise AssertionError(f"log 返回异常: {history}")
         if not all(str(item.get("target") or "").startswith(f"{_ALICE_AID}:/") for item in history):
-            raise AssertionError(f"history target 不是完整 AID path: {history}")
+            raise AssertionError(f"log target 不是完整 AID path: {history}")
 
-        first = await alice.collab.get(root, doc, 1)
+        first = await alice.collab.show(root, doc, rev=1)
         if _text(first) != "a\n":
-            raise AssertionError(f"get v1 返回异常: {first}")
+            raise AssertionError(f"show rev=1 返回异常: {first}")
 
         diff = await alice.collab.diff(root, doc, 1, 2)
         if "+b" not in str(diff.get("diff") or ""):
@@ -141,24 +141,24 @@ async def test_collab_submit_conflict_hint_and_merge_modes() -> None:
     try:
         await ensure_connected_identity(alice, _ALICE_AID)
         await alice.collab.create(root, doc, _b64("line1\nline2\nline3\n"))
-        await alice.collab.submit(root, doc, _b64("line1\nLINE2\nline3\n"), base_version=1)
+        await alice.collab.commit(root, doc, _b64("line1\nLINE2\nline3\n"), onto=1)
 
-        no_conflict = await alice.collab.merge(root, doc, _b64("line1\nline2\nLINE3\n"), base_version=1)
+        no_conflict = await alice.collab.merge(root, doc, _b64("line1\nline2\nLINE3\n"), onto=1)
         if no_conflict.get("conflicts") is not False or _text(no_conflict) != "line1\nLINE2\nLINE3\n":
             raise AssertionError(f"merge no-conflict 返回异常: {no_conflict}")
 
         try:
-            await alice.collab.submit(root, doc, _b64("stale\n"), base_version=1)
+            await alice.collab.commit(root, doc, _b64("stale\n"), onto=1)
         except CollabConflictError as exc:
             if exc.current_version != 2 or "merge" not in exc.hint.lower() or not exc.current_target:
                 raise AssertionError(f"冲突字段异常: {exc.current_version}, {exc.current_target}, {exc.hint}")
         else:
-            raise AssertionError("submit stale base 应触发 CAS 冲突")
+            raise AssertionError("commit stale base 应触发 CAS 冲突")
 
         conflict_root = f"{_ALICE_AID}:/collab-e2e/{rid}/conflict"
         await alice.collab.create(conflict_root, doc, _b64("X\n"))
-        await alice.collab.submit(conflict_root, doc, _b64("THEIRS\n"), base_version=1)
-        conflict = await alice.collab.merge(conflict_root, doc, _b64("OURS\n"), base_version=1)
+        await alice.collab.commit(conflict_root, doc, _b64("THEIRS\n"), onto=1)
+        conflict = await alice.collab.merge(conflict_root, doc, _b64("OURS\n"), onto=1)
         if conflict.get("conflicts") is not True or "<<<<<<< ours" not in _text(conflict):
             raise AssertionError(f"merge conflict 返回异常: {conflict}")
 
@@ -188,42 +188,42 @@ async def test_collab_snapshot_export_adopt_roundtrip() -> None:
         await alice.storage.write_bytes(f"/collab-e2e/{rid}/snap/.collab", f"root: {root}\nauthority: {_ALICE_AID}\n".encode(), owner=_ALICE_AID)
         await alice.collab.create(root, "a.md", _b64("v1\n"))
 
-        snap1 = await alice.collab.snapshot.create(root, message="init")
+        snap1 = await alice.collab.tag.create(root, message="init")
         if snap1.get("version") != "1.0.0" or "a.md" not in snap1.get("changed", []):
-            raise AssertionError(f"snapshot create 返回异常: {snap1}")
-        await alice.collab.submit(root, "a.md", _b64("v2\n"), base_version=1)
-        snap2 = await alice.collab.snapshot.create(root, message="patch")
+            raise AssertionError(f"tag create 返回异常: {snap1}")
+        await alice.collab.commit(root, "a.md", _b64("v2\n"), onto=1)
+        snap2 = await alice.collab.tag.create(root, message="patch")
         if snap2.get("version") != "1.0.1":
-            raise AssertionError(f"snapshot patch 版本异常: {snap2}")
+            raise AssertionError(f"tag patch 版本异常: {snap2}")
 
-        listed = await alice.collab.snapshot.list(root)
+        listed = await alice.collab.tag.list(root)
         if [item.get("version") for item in listed] != ["1.0.0", "1.0.1"]:
-            raise AssertionError(f"snapshot list 返回异常: {listed}")
-        shown = await alice.collab.snapshot.show(root, "1.0.0")
+            raise AssertionError(f"tag list 返回异常: {listed}")
+        shown = await alice.collab.tag.show(root, "1.0.0")
         if not any(entry.get("doc") == "a.md" for entry in shown.get("entries", [])):
-            raise AssertionError(f"snapshot show 返回异常: {shown}")
+            raise AssertionError(f"tag show 返回异常: {shown}")
         if not all(str(entry.get("current_target") or "").startswith(f"{_ALICE_AID}:/") for entry in shown.get("entries", [])):
-            raise AssertionError(f"snapshot show current_target 应为完整 AID path: {shown}")
-        snap_diff = await alice.collab.snapshot.diff(root, "1.0.0", "1.0.1")
+            raise AssertionError(f"tag show current_target 应为完整 AID path: {shown}")
+        snap_diff = await alice.collab.tag.diff(root, "1.0.0", "1.0.1")
         if snap_diff.get("changed") != ["a.md"]:
-            raise AssertionError(f"snapshot diff 返回异常: {snap_diff}")
+            raise AssertionError(f"tag diff 返回异常: {snap_diff}")
 
-        restored = await alice.collab.snapshot.restore(root, "1.0.0", message="restore")
+        restored = await alice.collab.tag.restore(root, "1.0.0", message="restore")
         if restored.get("restored_from") != "1.0.0":
-            raise AssertionError(f"snapshot restore 返回异常: {restored}")
-        if _text(await alice.collab.read(root, "a.md")) != "v1\n":
+            raise AssertionError(f"tag restore 返回异常: {restored}")
+        if _text(await alice.collab.show(root, "a.md")) != "v1\n":
             raise AssertionError("restore 后 current 内容不匹配")
 
-        exported = await alice.collab.export(root, exported_root)
+        exported = await alice.collab.clone(root, exported_root, reroot=False)
         if exported.get("ok") is not True or exported.get("dest") != exported_root:
-            raise AssertionError(f"export 返回异常: {exported}")
-        exported_history = await alice.collab.history(exported_root, "a.md")
+            raise AssertionError(f"clone reroot=False 返回异常: {exported}")
+        exported_history = await alice.collab.log(exported_root, "a.md")
         if [item.get("version") for item in exported_history] != [1, 2, 3]:
-            raise AssertionError(f"export ledger 复制异常: {exported_history}")
+            raise AssertionError(f"clone ledger 复制异常: {exported_history}")
 
-        adopted = await alice.collab.adopt(root, adopted_root)
+        adopted = await alice.collab.clone(root, adopted_root, reroot=True)
         if adopted.get("new_root") != adopted_root or adopted.get("new_authority_aid") != _ALICE_AID:
-            raise AssertionError(f"adopt 返回异常: {adopted}")
+            raise AssertionError(f"clone reroot=True 返回异常: {adopted}")
         anchor = await alice.storage.read_bytes(f"/collab-e2e/{rid}/adopted/.collab", owner=_ALICE_AID)
         if f"root: {adopted_root}" not in anchor.decode("utf-8"):
             raise AssertionError(f"adopt 未重写 .collab root: {anchor!r}")
@@ -271,16 +271,16 @@ async def test_collab_group_discover_unregister_and_wrong_namespace() -> None:
         await _grant_collab_root_acl(owner, group_aid, collab_root, owner_aid)
         await _grant_collab_root_acl(owner, group_aid, collab_root, member_aid)
         await member.collab.create(collab_root, "g.md", _b64("group\n"))
-        roots = await member.collab.discover(group_aid)
+        roots = await member.collab.ls_remote(group_aid)
         if {"collab_root": collab_root, "authority_aid": group_aid} not in roots:
-            raise AssertionError(f"discover 未返回群协作根: {roots}")
+            raise AssertionError(f"ls_remote 未返回群协作根: {roots}")
 
         removed = await member.collab.unregister(group_aid, collab_root)
-        if removed.get("removed") != 1 or await member.collab.discover(group_aid) != []:
-            raise AssertionError(f"unregister/discover 返回异常: {removed}")
+        if removed.get("removed") != 1 or await member.collab.ls_remote(group_aid) != []:
+            raise AssertionError(f"unregister/ls_remote 返回异常: {removed}")
 
         try:
-            await member.call("storage.collab.read", {"collab_root": collab_root, "doc": "g.md"})
+            await member.call("storage.collab.show", {"collab_root": collab_root, "doc": "g.md"})
         except Exception as exc:
             error_text = str(exc)
             if "Method not found" not in error_text and "Permission denied" not in error_text:
@@ -311,7 +311,7 @@ async def main() -> None:
     print(f"ALICE    = {_ALICE_AID}")
     print(f"BOB      = {_BOB_AID}")
     tests = [
-        test_collab_create_read_submit_history_get_diff,
+        test_collab_create_show_commit_log_get_diff,
         test_collab_submit_conflict_hint_and_merge_modes,
         test_collab_snapshot_export_adopt_roundtrip,
         test_collab_group_discover_unregister_and_wrong_namespace,

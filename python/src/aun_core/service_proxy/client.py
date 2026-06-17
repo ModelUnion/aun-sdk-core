@@ -42,6 +42,17 @@ _AUTO_RESPONSE_HEADERS = {
 _PROXY_DISCOVERY_CACHE_KEY = "service_proxy_discovery"
 _PROXY_DISCOVERY_CACHE_TTL_SECONDS = 3600.0
 _TOKEN_EXPIRY_SKEW_SECONDS = 30.0
+_NON_SENDABLE_WS_CLOSE_CODES = {1005, 1006, 1015}
+
+
+def _normalize_ws_close_code_for_send(value: Any) -> int:
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return 1000
+    if code < 1000 or code > 4999 or code in _NON_SENDABLE_WS_CLOSE_CODES:
+        return 1000
+    return code
 
 
 class _ResponseBodyTooLarge(Exception):
@@ -1576,7 +1587,7 @@ class ServiceProxyClient:
             await self._send_tunnel_message(tunnel, {
                 "type": "ws_close",
                 "connection_id": connection_id,
-                "code": int(backend_ws.close_code or 1000),
+                "code": _normalize_ws_close_code_for_send(getattr(backend_ws, "close_code", None)),
                 "reason": "",
             })
         except Exception as exc:
@@ -1620,7 +1631,10 @@ class ServiceProxyClient:
                     await backend_ws.send_bytes(data)
             elif msg_type == "ws_close":
                 reason = str(message.get("reason") or "")
-                await backend_ws.close(code=int(message.get("code") or 1000), message=reason.encode("utf-8"))
+                await backend_ws.close(
+                    code=_normalize_ws_close_code_for_send(message.get("code")),
+                    message=reason.encode("utf-8"),
+                )
                 return
             elif msg_type == "ws_error":
                 await backend_ws.close()

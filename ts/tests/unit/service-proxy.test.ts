@@ -149,4 +149,40 @@ describe('ServiceProxyClient tunnel', () => {
       await closeServer(server);
     }
   });
+
+  it('后端 WebSocket close 使用可发送 close code', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await once(server, 'listening');
+    const address = server.address() as AddressInfo;
+    const wsUrl = `ws://127.0.0.1:${address.port}/root`;
+    const serverClosed = new Promise<void>((resolve) => {
+      server.on('connection', (ws) => {
+        ws.on('close', () => resolve());
+      });
+    });
+    const client = new ServiceProxyClient({ providerAid: 'alice.agentid.pub' });
+    client.registerService('chat', wsUrl, { serviceType: 'websocket', visibility: 'public' });
+    const sent: Array<Record<string, unknown>> = [];
+    const tunnel = { send: vi.fn(async (payload: Record<string, unknown>) => { sent.push(payload); }) };
+    let shifted = false;
+    const inboundQueue = {
+      async shift() {
+        if (shifted) return null;
+        shifted = true;
+        return { type: 'ws_close', connection_id: 'ws-1', code: 1006, reason: 'abnormal' };
+      },
+    };
+
+    try {
+      await expect(client.handleWsConnectMessage(
+        { type: 'ws_connect', connection_id: 'ws-1', service_name: 'chat', path: '/socket' },
+        tunnel as any,
+        inboundQueue as any,
+      )).resolves.toBeUndefined();
+      await expect(serverClosed).resolves.toBeUndefined();
+      expect(sent[0]).toMatchObject({ type: 'ws_connected', connection_id: 'ws-1' });
+    } finally {
+      await closeServer(server);
+    }
+  });
 });

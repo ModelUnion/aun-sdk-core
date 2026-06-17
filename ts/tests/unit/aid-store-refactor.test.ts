@@ -174,7 +174,7 @@ describe('AIDStore 群身份导入', () => {
     expect(imported.ok).toBe(true);
     const loaded = store.load(groupAid);
     expect(loaded.ok).toBe(true);
-    const sign = loaded.ok ? loaded.data.aid.sign('group-storage-probe') : resultErr('X', 'not loaded');
+    const sign = loaded.ok ? loaded.data.aid.sign('group-fs-probe') : resultErr('X', 'not loaded');
     expect(sign.ok).toBe(true);
   });
 
@@ -266,7 +266,7 @@ describe('AUNClient.createGroup 高层编排', () => {
       const groupStore = new AIDStore({ aunPath, encryptionSeed: '' });
       const loaded = groupStore.load(groupAid);
       expect(loaded.ok).toBe(true);
-      expect(loaded.ok ? loaded.data.aid.sign('group-storage-probe').ok : false).toBe(true);
+      expect(loaded.ok ? loaded.data.aid.sign('group-fs-probe').ok : false).toBe(true);
     } finally {
       generateSpy.mockRestore();
     }
@@ -318,7 +318,7 @@ describe('AUNClient.bindGroupAid 高层编排', () => {
       expect(callSpy).toHaveBeenCalledTimes(1);
       const loaded = groupStore.load(groupAid);
       expect(loaded.ok).toBe(true);
-      expect(loaded.ok ? loaded.data.aid.sign('group-storage-bind-probe').ok : false).toBe(true);
+      expect(loaded.ok ? loaded.data.aid.sign('group-fs-bind-probe').ok : false).toBe(true);
     } finally {
       generateSpy.mockRestore();
       groupStore.close();
@@ -375,7 +375,7 @@ describe('AUNClient.completeGroupTransfer 高层编排', () => {
       expect(callSpy).toHaveBeenCalledTimes(2);
       const loaded = groupStore.load(groupAid);
       expect(loaded.ok).toBe(true);
-      expect(loaded.ok ? loaded.data.aid.sign('group-storage-transfer-probe').ok : false).toBe(true);
+      expect(loaded.ok ? loaded.data.aid.sign('group-fs-transfer-probe').ok : false).toBe(true);
     } finally {
       generateSpy.mockRestore();
       groupStore.close();

@@ -26,8 +26,8 @@ func TestClientFacadeGettersAreCached(t *testing.T) {
 	if first, second := client.Group().Thought(), client.Group().Thought(); first == nil || first != second {
 		t.Fatal("Group().Thought getter 应惰性缓存同一实例")
 	}
-	if first, second := client.Group().Resources(), client.Group().Resources(); first == nil || first != second {
-		t.Fatal("Group().Resources getter 应惰性缓存同一实例")
+	if first, second := client.Group().FS(), client.Group().FS(); first == nil || first != second {
+		t.Fatal("Group().FS getter 应惰性缓存同一实例")
 	}
 }
 

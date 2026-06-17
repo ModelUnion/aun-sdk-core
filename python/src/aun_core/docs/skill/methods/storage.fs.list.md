@@ -1,6 +1,6 @@
 # storage.fs.list
 
-POSIX `ls`：列目录。混合返回子目录/对象/软链/挂载点，排序 dir < file < symlink < mount。群 owner 路径回退到群资源子节点。
+POSIX `ls`：列目录。混合返回子目录/对象/软链/挂载点，排序 dir < file < symlink < mount。群 owner 路径回退到 Group FS 子节点。
 
 ## 调用示例
 

@@ -109,7 +109,7 @@ export {
 // Collab
 export {
   CollabClient,
-  CollabSnapshotClient,
+  CollabTagClient,
   CollabError,
   CollabConflictError,
   mapCollabError,
@@ -120,10 +120,16 @@ export {
   type CollabHistoryEntry,
   type CollabDiffResult,
   type CollabRegistryEntry,
+  type CollabTagEntry,
+  type CollabTag,
+  type CollabTagDiffResult,
+  type CollabTagPruneOptions,
+  type CollabTagRestoreResult,
   type CollabSnapshotEntry,
   type CollabSnapshot,
   type CollabSnapshotDiffResult,
   type CollabSnapshotPruneOptions,
+  type CollabSnapshotRestoreResult,
 } from './collab/index.js';
 
 // Facade API
@@ -131,10 +137,10 @@ export {
   MessageFacade,
   MessageThoughtFacade,
   GroupFacade,
+  GroupFSVFS,
   GroupThoughtFacade,
-  GroupResourcesFacade,
-  GroupPendingOpsPartialFailure,
   StreamFacade,
+  isGroupRemotePath,
   type FacadeParams,
   type FacadeRpcClient,
 } from './facades.js';

@@ -122,3 +122,5 @@ per-device pull envelope 中，`recipient.device_id=""` 直接按 1DH 解密。
    - Go 跑相关 package 测试。
    - TS/JS 跑类型检查或最小编译检查。
    - 用 1DH/per-AID 构造 P2P 和 Group envelope，验证 row 格式、AAD 无新增字段、解密成功。
+
+

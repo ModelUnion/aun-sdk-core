@@ -116,28 +116,25 @@
 | [group.get_join_requirements](#groupget_join_requirements) | 获取入群要求 |
 | [group.update_join_requirements](#groupupdate_join_requirements) | 更新入群要求 |
 
-### 资源管理
+### 群文件系统
 
 | 方法 | 说明 |
 |------|------|
-| [group.resources.put](#groupresourcesput) | 分享资源 |
-| [group.resources.create_folder](#groupresourcescreate_folder) | 创建资源目录 |
-| [group.resources.list_children](#groupresourceslist_children) | 列出目录子节点 |
-| [group.resources.rename](#groupresourcesrename) | 重命名资源节点 |
-| [group.resources.move](#groupresourcesmove) | 移动资源节点 |
-| [group.resources.mount_object](#groupresourcesmount_object) | 挂载成员自有 storage 子树 |
-| [group.resources.unmount](#groupresourcesunmount) | 取消挂载资源 |
-| [group.resources.resolve_path](#groupresourcesresolve_path) | 按路径解析资源 |
-| [group.resources.get](#groupresourcesget) | 查看资源 |
-| [group.resources.list](#groupresourceslist) | 列出资源 |
-| [group.resources.update](#groupresourcesupdate) | 更新资源元数据 |
-| [group.resources.get_access](#groupresourcesget_access) | 获取下载票据 |
-| [group.resources.resolve_access_ticket](#groupresourcesresolve_access_ticket) | 解析访问票据 |
-| [group.resources.delete](#groupresourcesdelete) | 删除资源 |
-| [group.resources.namespace_ready](#groupresourcesnamespace_ready) | 群命名空间初始化回调记账 |
-| [group.resources.confirm](#groupresourcesconfirm) | 写操作完成回调记账（甲案） |
-| [group.resources.confirm_mount](#groupresourcesconfirm_mount) | 成员挂载完成回调记账 |
-| [group.resources.get_df](#groupresourcesget_df) | 群存储 df 视图（自有卷+成员挂载卷聚合） |
+| [group.fs.ls](#groupfsls) | 列出目录 |
+| [group.fs.find](#groupfsfind) | 查找节点 |
+| [group.fs.stat](#groupfsstat) | 查看节点 |
+| [group.fs.lstat](#groupfslstat) | 查看链接本身 |
+| [group.fs.df](#groupfsdf) | 查看用量 |
+| [group.fs.create_download_ticket](#groupfscreate_download_ticket) | 创建下载票据 |
+| [group.fs.mkdir](#groupfsmkdir) | 创建目录 |
+| [group.fs.rm](#groupfsrm) | 删除节点 |
+| [group.fs.cp](#groupfscp) | 远程复制 |
+| [group.fs.mv](#groupfsmv) | 远程移动 |
+| [group.fs.check_upload](#groupfscheck_upload) | 上传前检查 |
+| [group.fs.create_upload_session](#groupfscreate_upload_session) | 创建上传会话 |
+| [group.fs.complete_upload](#groupfscomplete_upload) | 完成上传 |
+| [group.fs.mount](#groupfsmount) | 挂载成员数据区 |
+| [group.fs.umount](#groupfsumount) | 卸载成员数据区 |
 
 ### 在线状态
 
@@ -149,11 +146,13 @@
 
 ## Group ID 规范
 
-`group_id` 支持三种输入形式：`g-{slug}`、`g-{slug}@issuer-domain`、`g-{slug}.issuer-domain`。服务端接受输入后会统一规范化为 canonical group_id；本域内 `g-{slug}` 只是简写别名，响应、签名、E2EE AAD 和内部存储使用 canonical 形式。
+`group_id` 的 canonical 形式为 `group.{issuer-domain}/{base}`，例如 `group.agentid.pub/10042`、`group.agentid.pub/team01`、`group.agentid.pub/g-abc123`。服务端接受输入后会规范化为 canonical group_id；响应和内部存储以 canonical 形式为准。SDK 发起 `group.*` 调用时也会对带域旧格式做同等规范化；裸客户端应使用同一规则生成签名和 E2EE AAD，避免同一群的不同别名产生不同材料。
 
-短形式必须以 `g-` 开头，总长度 6 到 16 字符；`slug` 为 4 到 14 位，只能包含小写字母和数字。`group.create` 可以指定 `group_id`，但必须满足该规则且未被占用；如果已被占用会返回错误。不指定 `group_id` 时由服务端自动分配，服务端通过唯一约束兜底，发现碰撞会重新生成。
+兼容输入包括 canonical `group.{issuer-domain}/{base}`、本域简写 `{base}` / `g-{slug}`，以及旧跨域形式 `{base}@issuer-domain`、`{base}.issuer-domain`、`g-{slug}@issuer-domain`、`g-{slug}.issuer-domain`。`base` 支持 5 位及以上小写字母或数字，或 4 到 64 位 `[a-z0-9_-]` 风格名称；旧 `g-` 前缀形式继续兼容，`g-` 后为 4 到 32 位小写字母或数字。命名群使用 `group_name` 作为 base，规则见 `group.create` 参数说明。
 
-在 `https://group.issuer-domain/...` 这类群链接中，host 已携带 issuer，path 中的 `group_id` 使用本域简写形式，例如 `https://group.agentid.pub/g-abc123/invite/ic-xxx`。
+`group.create` 可以指定自定义 `group_id`，但不能是纯数字（纯数字群号保留给服务端自动分配），且规范化后的 canonical group_id 未被占用；如果已被占用或与旧别名碰撞会返回错误。不指定 `group_id` 时服务端按群号自动分配，并通过唯一约束兜底，发现碰撞会重新生成。
+
+在 `https://group.issuer-domain/...` 这类群链接中，host 已携带 issuer，path 中的 `group_id` 使用 base 简写形式，例如 `https://group.agentid.pub/10042/invite/ic-xxx`；旧 `g-` base 群也可以表示为 `https://group.agentid.pub/g-abc123/invite/ic-xxx`。
 
 ---
 
@@ -1333,275 +1332,85 @@ result = await client.call("group.thought.get", {
 
 ---
 
-## 资源管理
+## 群文件系统
 
-群资源当前采用 **storage 执行 + group 镜像记账** 的最终一致模型。`group.resources.put` / `create_folder` / `rename` / `move` / `delete` / `mount_object` / `unmount` 等写操作通常不直接落盘最终资源，而是返回 `mode: "pending_ops"` 的待执行计划；调用方应通过 SDK 高层 helper 执行计划并自动回调 `confirm_rpc`。
+新代码统一使用 `group.fs.*`。路径为 POSIX 风格 group path：`group_aid:/docs/a.md`、`https://{group_aid}/docs/a.md` 或带 `group_id` 参数的裸路径。`group_aid:/memberdata/{member_ref}/...` 只由服务端映射到真实成员 storage，SDK 不拼接 `groupdata/{group_id}`。
 
-四语言 SDK 均封装了执行入口：
+推荐通过 SDK/CLI 使用：
 
-| 语言 | 推荐入口 |
-|------|----------|
-| Python | `client.group.resources.execute_pending_ops(plan, aid_store=..., upload_data=...)` |
-| Go | `client.Group().Resources().ExecutePendingOps(ctx, plan, ...)` |
-| TypeScript / JavaScript | `client.groupResources.executePendingOps(plan, options)` |
+| 语言 | 入口 |
+|------|------|
+| Python | `client.group.fs` |
+| TypeScript / JavaScript | `client.group.fs` |
+| Go | `client.Group().FS()` |
+| CLI | `aun group fs ...` |
 
-`pending_ops` 只允许 SDK 白名单内 RPC：`storage.put_object`、`storage.create_upload_session`、`storage.complete_upload`、`storage.http_put`、`storage.delete_object`、`storage.fs.mkdir`、`storage.fs.rename`、`storage.fs.remove`、`storage.fs.mount`、`storage.fs.unmount`、`storage.issue_token`、`storage.revoke_token`、`storage.set_acl`、`storage.remove_acl`、`storage.set_visibility`。确认 RPC 仅允许 `group.resources.confirm` / `group.resources.confirm_mount`。
+权限与签名约束：
 
-命名空间初始化由 SDK helper `initialize_namespace` 完成：以 `group_aid` 身份创建 `announce`、`public`、`archive`、`memberdata` 基线目录，将 `public` 设为公开，再调用 `group.resources.namespace_ready`。成员自有区有透明路由：对 `memberdata/{self_aid}/...` 的 `put` / `create_folder` / `delete` 会由 SDK 直接转到成员本人 storage 空间 `{self_aid}/{group_aid}/...`；他人槽位和群自有区仍走 `group.resources.*` 待执行计划。
+- 群自有区（如 `group_aid:/announce`、`/public`、`/archive`）只有 owner 可写，但实际调用身份必须是 `group_aid`，并且 `client_signature_aid` 必须是当前 group_identity。`group_aid` 私钥由群主持有；admin/member 不能用个人 AID 直接写群自有区。
+- `memberdata/{member_ref}` 写入默认只允许该成员本人；SDK 只传 group path，不拼接真实 storage 路径。
+- 上传控制面会透传 `parents` 到 storage：默认 `parents=true` 时可递归创建父目录，显式 `parents=false` 时父目录必须已存在。
+- JavaScript 浏览器版 `cp(string, group)` 默认把 string 当文本内容上传；Node 本地路径需显式传 `sourceType: "path"`、`localPath: true` 或使用 `local:` 前缀。Python、TypeScript 和 Go 默认把 string 当本地路径。
 
-### group.resources.put
+### group.fs.ls
 
-向群 storage 命名空间写入资源。需要 **member 及以上**权限；实际写入由返回的 `pending_ops` 完成。
+列出目录。参数：`path` 必填；可选 `page`、`size`、`marker`、`long`、`recursive`。响应返回 group view `items`，节点 `path` 仍为 group path。
 
-**参数**：
+### group.fs.find
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `resource_path` | string | 是 | 资源路径 |
-| `resource_type` | string | 否 | `"file"` / `"folder"` / `"link"`，默认 `"file"` |
-| `title` | string | 是 | 资源标题 |
-| `storage_ref` | object | 否 | 存储引用对象 |
-| `metadata` | object | 否 | 自定义元数据 |
-| `visibility` | string | 否 | `"members_only"` / `"public"`，默认 `"members_only"` |
-| `tags` | array | 否 | 标签数组 |
+查找节点。参数：`path` 必填；可选 `pattern`、`name`、`type`、`size`、`mtime`、`page`、`page_size`。
 
-**响应**：返回待执行计划。小对象 inline 内容对应 `storage.put_object`；大对象上传对应 `storage.create_upload_session` → `storage.http_put` → `storage.complete_upload`。
+### group.fs.stat
 
-```json
-{
-    "mode": "pending_ops",
-    "group_id": "g-abc123.agentid.pub",
-    "group_aid": "my-team.agentid.pub",
-    "operation": "put",
-    "op_id": "gso_...",
-    "resource_path": "docs/guide.pdf",
-    "pending_ops": [ ... ],
-    "confirm_rpc": "group.resources.confirm",
-    "confirm_params": { ... }
-}
-```
+查看节点。参数：`path` 必填。响应为 NodeView。
 
-> 直接调用 RPC 时只会得到计划；普通应用应调用 SDK `execute_pending_ops` 完成 storage 写入和 confirm。
+### group.fs.lstat
 
-### group.resources.create_folder
+查看链接节点本身。参数同 `group.fs.stat`。
 
-创建群资源目录。需要 **member 及以上**权限。
+### group.fs.df
 
-**参数**：
+查看群文件系统用量。参数可传 `path` 或 `group_id`。
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `path` / `resource_path` | string | 否 | 完整目录路径 |
-| `name` | string | 否 | 目录名；未提供完整路径时使用 |
-| `parent_resource_id` / `parent_path` | string | 否 | 父目录 |
-| `title` | string | 否 | 显示标题，默认目录名 |
-| `metadata` | object | 否 | 自定义元数据 |
-| `visibility` | string | 否 | `"members_only"` / `"public"` |
-| `tags` | array | 否 | 标签 |
-| `mkdirs` | boolean | 否 | 是否递归创建父目录 |
-| `sort_order` | integer | 否 | 排序值 |
+### group.fs.create_download_ticket
 
-**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.mkdir`，确认 RPC 为 `group.resources.confirm`。
+创建下载票据。参数：`path` 必填。响应包含 `download_url`、可选 `sha256`、`content_type`、`file_name`。SDK 下载数据面使用该票据执行 HTTP GET 并校验 sha256。
 
-### group.resources.list_children
+### group.fs.mkdir
 
-列出某个资源目录下的直接子节点。
+创建目录。参数：`path` 必填；`parents` 可选，默认 `false`。
 
-**参数**：
+### group.fs.rm
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `resource_id` / `path` / `resource_path` | string | 否 | 父目录；不传表示根目录 |
-| `type` / `resource_type` | string | 否 | `"folder"` / `"file"` / `"link"` |
-| `include_status` | boolean | 否 | 是否附带 storage 状态 |
-| `page` / `offset` | integer | 否 | 分页位置 |
-| `size` / `limit` | integer | 否 | 每页数量 |
-| `sort_by` | string | 否 | 排序字段，默认 `sort_order` |
-| `order` | string | 否 | `"asc"` / `"desc"` |
+删除节点。参数：`path` 必填；`recursive`、`force` 可选。
 
-**响应**：`group_id`、`resource_id`、`path`、`items`、`total`、`count`、`page`、`size`、`offset`。
+### group.fs.cp
 
-### group.resources.rename
+只处理 group→group 远程复制。参数：`src`、`dst` 必填；`force`、`recursive`、`follow_symlinks` 可选。本地上传和下载由 SDK 的 `cp` 编排数据面，不直接调用此 RPC。
 
-重命名资源节点。需要资源创建者、storage owner、owner 或 admin 权限。
+### group.fs.mv
 
-**参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`），`new_name`；可选 `title`、`expected_version`。
+只处理 group→group 远程移动。参数：`src`、`dst` 必填；`force` 可选。本地路径参与时 SDK/CLI 应拒绝。
 
-**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.rename`，确认 RPC 为 `group.resources.confirm`。
+### group.fs.check_upload
 
-### group.resources.move
+上传前检查。参数：`path`、`size_bytes`、`sha256`、`content_type`；可选 `force`、`parents`、`expected_version`、`metadata`。响应可包含 `target_exists`、`within_limit`、`instant`、`dedup_hit` 或 `skip_upload`。
 
-移动资源节点。目录不能移动到自身或自身子目录。
+### group.fs.create_upload_session
 
-**参数**：`group_id`，资源选择器，目标父目录（`dst_parent_resource_id` / `dst_parent_path`），可选 `new_name` / `dst_name`、`expected_version`。
+创建上传会话。参数同 `check_upload`。响应包含 `upload_url`、`session_id`、可选 `headers`。SDK 使用该 URL 执行 HTTP PUT。
 
-**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.rename`，确认 RPC 为 `group.resources.confirm`。
+### group.fs.complete_upload
 
-### group.resources.mount_object
+完成上传。参数包含 `path`、`sha256`、`size_bytes`、可选 `session_id`、`skip_blob`、`metadata`、`expected_version`。响应为 group view NodeView。
 
-将成员自有 storage 子树挂载到群命名空间的 `memberdata/{aid}` 槽位。调用者必须是该槽位成员本人；服务端会要求挂载点精确为 `memberdata/{self_aid}`，源路径限定在该成员为本群准备的目录下。
+### group.fs.mount
 
-**参数**：
+挂载成员数据区。参数：`path` 必填；可选 `readonly`、`require_approval`、`source_bucket`、`expires_at`、`volume_id`。
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `path` / `resource_path` / `mount_path` | string | 是 | 挂载路径，必须是 `memberdata/{self_aid}` |
-| `source_path` / `src_path` | string | 否 | 源路径；为空时默认 `{self_aid}/{group_aid}` 或 `{self_aid}/{group_id}` |
-| `source_bucket` | string | 否 | 源 bucket，默认 `"default"` |
-| `title` | string | 否 | 显示标题 |
-| `metadata` | object | 否 | 自定义元数据 |
-| `readonly` | boolean | 否 | 是否只读挂载，默认 `true` |
-| `volume_id` | string | 否 | 关联成员卷 |
-| `expires_at` | integer | 否 | 挂载过期时间 |
+### group.fs.umount
 
-**响应**：返回成员挂载待执行计划，核心操作为 `storage.issue_token` + `storage.fs.mount`，确认 RPC 为 `group.resources.confirm_mount`。
-
-### group.resources.unmount
-
-取消成员挂载区资源。当前仅针对 `memberdata/{aid}` 挂载，返回 `storage.fs.unmount` 待执行计划；确认 RPC 为 `group.resources.confirm_mount`，confirm 后槽位状态变为 `inactive`。
-
-**参数**：`group_id`，资源选择器（`resource_id` / `resource_path` / `path`）。
-
-**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.unmount`。
-
-### group.resources.resolve_path
-
-按路径解析资源节点。
-
-**参数**：`group_id`、`path` / `resource_path`；可选 `expected_type`。
-
-**响应**：`resource_id`、`resource_type`、`resource_path`、`path`、`status`、`resource`。
-
-### group.resources.get
-
-查看资源详情。
-
-**参数**：`group_id` (string), `resource_path` (string)
-
-### group.resources.list
-
-列出群资源。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `group_id` | string | 是 | — | 群组 ID |
-| `prefix` | string | 否 | — | 资源路径前缀 |
-| `owner_aid` | string | 否 | — | 筛选创建者 |
-| `visibility` | string | 否 | — | 筛选可见性 |
-| `tags` | array | 否 | — | 筛选标签 |
-| `sort_by` | string | 否 | `"resource_path"` | 排序字段 |
-| `order` | string | 否 | `"asc"` | `"asc"` / `"desc"` |
-| `size` | integer | 否 | 50 | 每页数量（也接受 `limit`） |
-| `page` | integer | 否 | 1 | 页码（也接受 `offset`） |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "prefix": "",
-    "owner_aid": null,
-    "visibility": null,
-    "tags": [],
-    "limit": 50,
-    "size": 50,
-    "offset": 0,
-    "page": 1,
-    "items": [ ... ],
-    "count": 3,
-    "total": 3
-}
-```
-
-### group.resources.get_access
-
-获取资源下载票据。
-
-**参数**：`group_id` (string), `resource_path` (string)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "resource_path": "/docs/guide.pdf",
-    "resource": { ... },
-    "access_ticket": {
-        "ticket": "tk_...",
-        "ticket_type": "group-resource-access",
-        "issued_to": "alice.agentid.pub",
-        "issued_at": 1234567890,
-        "expire_at": 1234571490
-    },
-    "access_token": "tk_...",
-    "token_type": "Bearer",
-    "download": { ... }
-}
-```
-
-### group.resources.delete
-
-删除群资源。需要资源创建者、storage owner、owner 或 admin 权限；目录删除需按需传 `recursive=true`。
-
-**参数**：`group_id` (string), `resource_path` (string)
-
-**响应**：返回 `mode: "pending_ops"` 计划，核心操作为 `storage.fs.remove`，确认 RPC 为 `group.resources.confirm`。
-
-### group.resources.update
-
-更新资源元数据。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `resource_path` (必填), `title` / `metadata` / `tags` / `visibility` (可选)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource": { ... } }`
-
-### group.resources.resolve_access_ticket
-
-使用访问票据换取下载令牌。
-
-**参数**：`ticket` (string, 必填)
-
-**响应**：`{ "resource": { ... }, "download": { ... } }`
-
-### group.resources.namespace_ready
-
-群命名空间初始化回调记账。群主以 group_aid 身份在 storage 建好 `announce/public/archive/memberdata` 基线目录后，调此方法让 group 服务把根节点镜像入 `group_resources` 表。调用者须为群 owner/admin，或以 group_aid 身份（须通过当前群身份签名校验）。
-
-**参数**：`group_id` (string, 必填), `folder_ids` (object, 可选；基线路径 → storage folder_id 映射)
-
-**响应**：`{ "group_id", "group_aid", "namespace_ready": true, "baseline_paths": [...], "items": [...] }`
-
-> 群存储新架构：storage 是唯一文件系统与唯一鉴权器，`group_resources` 表退化为「storage 群命名空间的索引镜像 + 群业务属性（tags/排序/计数）」。详见 `docs/aun-fs/topics/group-space.md`。
-
-### group.resources.confirm
-
-写操作完成回调记账（甲案最终一致）。群主以 group_aid 身份直调 storage 完成写入后，凭 `op_id` 调此方法让 group 服务幂等更新镜像节点。confirm 丢失时由对账任务按 group_aid 命名空间向 storage 拉取实际节点补齐。
-
-**参数**：`group_id` (必填), `op_id` (必填；来自写操作返回的待签清单), `object_id` / `resource_path` 等完成信息
-
-**响应**：`{ "group_id", "group_aid", "resource": { ... } }`
-
-### group.resources.confirm_mount
-
-成员挂载区挂载完成回调记账。成员以自己 AID 自助 `storage.fs.mount` 到 `/memberdata/{自己}/` 成功后，调此方法让 group 服务标记槽位 active、更新注册表。
-
-**参数**：`group_id` (必填), `mount_id` (必填；来自 `storage.fs.mount` 返回)
-
-**响应**：`{ "group_id", "group_aid", "mount": { "mount_id", "mount_path", "member_aid", ... } }`
-
-### group.resources.get_df
-
-群存储 df 视图：聚合群自有卷 + 各成员挂载卷的用量与状态（由 group 服务聚合记账表，不触发 storage 扇出）。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id", "group_aid", "volumes": [...], "mounts": [...], ... }`（成员挂载卷过期标 ⚠ unavailable）
+卸载成员数据区。参数：`path` 必填。对成员数据区卸载不删除成员源数据。
 
 ## 在线状态
 
@@ -2115,3 +1924,5 @@ Group 服务定义了以下专用错误码（-33xxx 段）：
 | -33009 | Resource request not found | 检查 request_id |
 
 > SDK 客户端将 -33001 映射为 `GroupNotFoundError`，-33002~-33003 映射为 `GroupStateError`，其余映射为 `GroupError`。未识别的错误码 fallback 到 `AUNError`。
+
+

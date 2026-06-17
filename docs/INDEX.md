@@ -19,16 +19,16 @@
 | [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md) | aun-console 消息通信页的服务端可观察 P0 诊断面板 |
 | [AUN 反向代理服务方案与 TDD 实施计划](design/AUN反向代理服务方案与TDD实施计划.md) | AUN Service Proxy、service_proxy 服务模块、SDK service-proxy-client、URL 路由、隧道协议、Web 边界和分阶段 TDD 落地计划 |
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
-| [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE、Storage VFS、Group resources pending_ops 和 Collab 的子索引 |
+| [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE、Storage VFS、Group FS 和 Collab 的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
+| [AUN CLI 手册](cli/CLI手册.md) | Python CLI 源码位置、安装运行入口、全局选项、profile 配置和主要命令集 |
+| [AUN CLI 设计文档](cli/AUN-CLI设计文档.md) | `python/src/aun_cli` 当前实现架构、命令注册面、配置解析、SDK 桥接和实现边界 |
 | [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、服务端分层和 direct backend 上传下载 |
 | [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>) | Python SDK StorageVFS / StorageLowLevel 接口契约、返回类型、错误映射和跨语言对齐要求 |
 | [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>) | `aun fs` 命令语义、寻址规则、输出格式、CLI 工程改造和端到端场景 |
 | [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>) | AUN Storage VFS + CLI 的 6 阶段 TDD 实施计划、P1-P6 实际执行记录和验收口径 |
-| [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-storage/group.fs-POSIX化详细设计.md>) | 对外去除 `group.resources` 概念，统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs` 的 POSIX 风格群文件系统设计 |
-| [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md>) | group.fs 重构的 8 阶段实施计划，每阶段包含目标、IPO、Step-by-step、用例集、Checklist、验收与回滚 |
-| [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>) | `group.resources.*` 从旧 `storage_ref` 引用树迁移到 group_aid storage 命名空间、成员 `memberdata` 挂载和 group-storage 门面编排的终态设计 |
-| [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>) | group-storage 0-10 阶段 TDD 实施计划、阶段 IPO/测试矩阵、实际执行记录、四语言 SDK/CLI/服务端验收与 Docker 单域/双域 E2E 通过记录 |
+| [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>) | 统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs` 的 POSIX 风格群文件系统设计；包含群自有区写身份、`parents` 和 JS string 语义 |
+| [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md>) | group.fs 重构的 8 阶段实施计划，每阶段包含目标、IPO、Step-by-step、用例集、Checklist、验收与回滚，并记录 Phase 8 单域/双域 Docker 与四语言互操作验收 |
 | [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>) | collab 服务端编排、台账、diff3、snapshot、export/adopt、群协作注册表和四语言薄 SDK 设计 |
 | [collab 协作层 Plan 1 服务端基础](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>) | storage 进程内 collab 编排的 TDD 任务拆分、repository 事务原语、RPC 注册和群协作发现计划 |
 | [collab 协作层 Plan 2 Python SDK/CLI](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>) | Python SDK collab 薄封装、CLI 命令、单域 Docker E2E 和文档同步计划 |
@@ -54,16 +54,16 @@
 
 ### SDK 使用与协议
 
-- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制、Storage VFS、Group resources pending_ops、Collab GC/reflog/reset → [SDK 文档索引](sdk/INDEX.md)
+- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制、Storage VFS、Group FS、Collab GC/reflog/reset → [SDK 文档索引](sdk/INDEX.md)
 - 按主题和行区间查 SDK 文档 → [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md)
+- Python CLI 源码位置、安装运行入口、全局选项、profile 配置、身份/消息/群组/Storage/Group FS/Collab/诊断等命令用法 → [AUN CLI 手册](cli/CLI手册.md)
+- Python CLI 当前实现架构、`main.py` 命令注册、`CLISession` SDK 桥接、配置解析和实现边界 → [AUN CLI 设计文档](cli/AUN-CLI设计文档.md)
 - Storage SDK VFS、控制面/数据面分离、类 Linux 权限、mount/symlink、direct backend 上传下载和服务端分层 → [AUN Storage 架构设计](<aun-fs/AUN Storage架构设计.md>)
 - StorageVFS / StorageLowLevel 接口契约、NodeView/ObjectView、错误映射和跨语言对齐 → [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>)
 - `aun fs` 命令语义、AID 路径解析、输出格式和 CLI 到 SDK 的调用边界 → [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>)
 - AUN Storage 6 阶段 TDD 计划、P1/P2/P3/P4/P5/P6 实际执行记录、阶段实施前详细计划和 Docker 验证纪律 → [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>)
-- `group.fs.*` POSIX 风格群文件系统、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载心智、服务端 memberdata 映射和 SDK 数据面编排 → [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-storage/group.fs-POSIX化详细设计.md>)
-- group.fs 8 阶段重构步骤、每阶段 IPO、Step-by-step、用例集、Checklist、验收和回滚 → [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md>)
-- `group.resources.*` 替代旧 `storage_ref` 引用树、group_aid 命名空间、群自有区、`memberdata` 成员挂载区、签名者切换和下载 ticket → [群存储 group.resources.* 重构设计](<aun-fs/group-storage/2026-06-10-group-storage-重构设计.md>)
-- group-storage 0-10 阶段 TDD 推进记录、CLI 收口、四语言 SDK pending-op signer、服务端回归和 Docker 单域/双域 E2E 通过记录 → [群存储 group-storage 重构实施计划](<aun-fs/group-storage/2026-06-10-group-storage-重构实施计划.md>)
+- `group.fs.*` POSIX 风格群文件系统、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载心智、群自有区 `group_aid` 写身份、`parents` 语义、JS string 差异、服务端 memberdata 映射和 SDK 数据面编排 → [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>)
+- group.fs 8 阶段重构步骤、每阶段 IPO、Step-by-step、用例集、Checklist、验收、回滚和 Phase 8 Docker 完成记录 → [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md>)
 - collab 协作层服务端编排、`collab.*` RPC、版本台账、snapshot、群协作注册表和后续四语言 SDK/CLI/E2E 计划 → [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>)、[Plan 1](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>)、[Plan 2](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>)、[Plan 3](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>)
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
@@ -96,7 +96,7 @@
 
 ### aun测试运行指南
 
-记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 43 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三语言 agent 同群的明文/E2EE 矩阵，以及 `group_storage_matrix_python_ts_go_js` 四语言 group-storage 互操作，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口和数据保护规则。
+记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 43 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三语言 agent 同群的明文/E2EE 矩阵，以及 `group_fs_matrix_python_ts_go_js` 四语言 group.fs 互操作，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口和数据保护规则。
 
 ### AUN SDK 重构修改清单
 
@@ -140,7 +140,7 @@
 
 ### SDK 文档索引
 
-`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group resources pending_ops 执行模型、Collab GC/reflog/reset 和各类 RPC 手册。
+`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group FS、Collab GC/reflog/reset 和各类 RPC 手册。
 
 ### Service Proxy RPC 手册
 
@@ -149,6 +149,14 @@
 ### SDK 查阅指南
 
 `docs/sdk/AUN_DOCS_GUIDE.md` 说明如何按行区间渐进式读取 SDK 文档，避免一次性加载过多文档内容。
+
+### AUN CLI 手册
+
+面向 CLI 使用者，说明 Python CLI 位于 `D:\modelunion\kite\aun-sdk-core\python\src\aun_cli`，安装后入口为 `aun`，也可通过 `python -m aun_cli` 运行。文档列出全局选项、`~/.aun/cli.toml` profile 配置、身份、P2P 消息、群组、`aun group fs`、`aun fs`、对象存储、Collab、agent.md、keys、诊断和 bench 命令集，并给出常用示例和退出码。
+
+### AUN CLI 设计文档
+
+描述当前 `python/src/aun_cli` 实现，而不是早期设想。文档覆盖 Typer 根应用、命令模块目录、`adapter.CLISession` 对 AIDStore/AUNClient 的生命周期桥接、Gateway discovery 边界、profile 解析顺序、命令注册表、各命令组职责、错误码映射和当前未实现命令边界。
 
 ### AUN Storage 架构设计
 
@@ -168,19 +176,11 @@
 
 ### 群文件系统 group.fs POSIX 化详细设计
 
-定义下一版群存储对外模型：删除 `group.resources` 用户概念，统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs`。文档规定群自有区与成员 `memberdata` 由 `group_aid:/...` 路径表达，`group_aid:/memberdata/{member_ref}/...` 在服务端映射到 `member_aid:/groupdata/{group_id}/...`，跨域成员必须使用完整 AID；上传、下载和远程复制统一用 `cp`，不提供 `read/write/put/get` 主入口，数据面由 SDK 编排，group 服务只负责控制面。
+定义群文件系统对外模型：统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs`。文档规定群自有区与成员 `memberdata` 由 `group_aid:/...` 路径表达，群自有区只有 owner 可写但实际调用身份必须是 `group_aid` 并通过当前 group_identity 签名；`group_aid:/memberdata/{member_ref}/...` 在服务端映射到 `member_aid:/groupdata/{group_id}/...`，跨域成员必须使用完整 AID；上传、下载和远程复制统一用 `cp`，不提供 `read/write/put/get` 主入口，数据面由 SDK 编排，group 服务只负责控制面。
 
 ### 群文件系统 group.fs POSIX 化分阶段实施计划
 
-把 group.fs 重构拆为 8 个阶段：契约冻结、服务端路径解析与 memberdata 映射、读侧 POSIX RPC、写侧控制面、Python SDK GroupFSVFS、CLI `aun group fs`、TS/JS/Go SDK 对齐、对外移除 `group.resources` 概念和 Docker 单域/双域 E2E。每阶段都按阶段目标、IPO、Step-by-step 流程、用例集、Checklist、验收和回滚展开。
-
-### 群存储 group.resources.* 重构设计
-
-定义 `group.resources.*` 从旧的独立群资源树与 `storage_ref` 引用模型切换为 group_aid storage 命名空间封装层。文档明确 group 服务不持群私钥、不代签，群自有区由群主以 group_aid 身份签名直调 storage，成员 `memberdata/<aid>/` 区由成员自助挂载，storage 通过 CA `aid_type=group` 与 `group.check_membership` 实时校验成员身份。文档还给出目录基线、身份生成与匿名群 bind、群主转让 rekey、鉴权矩阵、pending ops、`group.resources.*` 门面重映射、列表/下载/df/生命周期和服务端改造边界。
-
-### 群存储 group-storage 重构实施计划
-
-把 group-storage 重构拆为 0-10 个 TDD 阶段，覆盖契约脚手架、命名群身份、匿名群 bind、命名空间初始化、自有区写、ACL 映射、读路径、成员挂载、生命周期/df、群主转让 rekey、四语言 SDK 对齐、CLI/E2E/文档收口。文档记录每阶段 IPO、阶段计划、测试矩阵、实际执行记录和命令结果；当前阶段 0-10 的代码与文档收口已完成，Python/TS/JS/Go 单元、服务端 group/CA/storage 回归、Docker 镜像重建、单域 `named_group_storage_full_flow` 与双域 `cross_domain_memberdata_mount_read` E2E 均已通过。
+把 group.fs 重构拆为 8 个阶段：契约冻结、服务端路径解析与 memberdata 映射、读侧 POSIX RPC、写侧控制面、Python SDK GroupFSVFS、CLI `aun group fs`、TS/JS/Go SDK 对齐、旧兼容入口移除和 Docker 单域/双域 E2E。每阶段都按阶段目标、IPO、Step-by-step 流程、用例集、Checklist、验收和回滚展开；Phase 8 已记录本地目标回归、Docker 镜像重建、单域 Python/CLI E2E、四语言 cross-sdk group.fs 矩阵和双域 group.fs/memberdata 验收结果。
 
 ### collab 协作层服务端编排与实施计划
 
@@ -189,3 +189,4 @@
 ### Notify 通知方案
 
 定义 `client.notify()` 的 JSON-RPC Notification 发送语义。方案规定 notify 只投递在线长连接设备，不做离线存储、不分配 seq、不进入 pull/ack；同时说明服务端通知、AID 在线转发、群在线转发、跨域 federation 转发的路由模型，以及和 `message.send` / `group.send` 可靠应用事件的分工。
+

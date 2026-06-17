@@ -59,7 +59,8 @@ class _InteractiveTunnel:
 
 
 class _ClosedBackendWebSocket:
-    close_code = 1000
+    def __init__(self, close_code=1000):
+        self.close_code = close_code
 
     def __aiter__(self):
         return self
@@ -71,6 +72,28 @@ class _ClosedBackendWebSocket:
 class _ClosedTunnel:
     async def send(self, _payload):
         raise websockets.ConnectionClosedOK(None, None)
+
+
+class _CaptureTunnel:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, payload):
+        self.sent.append(json.loads(payload))
+
+
+class _CloseCaptureBackendWebSocket:
+    def __init__(self):
+        self.close_calls = []
+
+    async def close(self, *, code=1000, message=b""):
+        self.close_calls.append((code, message))
+
+    async def send_str(self, _text):
+        pass
+
+    async def send_bytes(self, _data):
+        pass
 
 
 async def _start_ws_backend(handler):
@@ -205,3 +228,36 @@ async def test_service_proxy_client_ws_backend_close_ignores_closed_tunnel():
         _ClosedTunnel(),
         connection_id="ws-closed",
     )
+
+
+@pytest.mark.asyncio
+async def test_service_proxy_client_ws_backend_reports_sendable_close_code():
+    client = ServiceProxyClient(provider_aid="alice.agentid.pub")
+    tunnel = _CaptureTunnel()
+
+    await client._relay_backend_ws_to_tunnel(
+        _ClosedBackendWebSocket(close_code=1006),
+        tunnel,
+        connection_id="ws-closed",
+    )
+
+    assert tunnel.sent == [
+        {"type": "ws_close", "connection_id": "ws-closed", "code": 1000, "reason": ""}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_proxy_client_ws_backend_normalizes_unsendable_close_code():
+    client = ServiceProxyClient(provider_aid="alice.agentid.pub")
+    backend_ws = _CloseCaptureBackendWebSocket()
+    queue = asyncio.Queue()
+    queue.put_nowait({"type": "ws_close", "connection_id": "ws-1", "code": 1006, "reason": "abnormal"})
+
+    await client._relay_tunnel_to_backend_ws(
+        object(),
+        backend_ws,
+        connection_id="ws-1",
+        inbound_queue=queue,
+    )
+
+    assert backend_ws.close_calls == [(1000, b"abnormal")]

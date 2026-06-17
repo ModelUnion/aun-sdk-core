@@ -108,24 +108,20 @@ class TestSignedMethodsCoverage:
         "storage.check_access",
     ]
 
-    GROUP_RESOURCE_SIGNED_METHODS = [
-        "group.resources.put", "group.resources.create_folder",
-        "group.resources.rename", "group.resources.move",
-        "group.resources.mount_object", "group.resources.update",
-        "group.resources.delete",
-        "group.resources.namespace_ready", "group.resources.confirm",
-        "group.resources.confirm_mount", "group.resources.get_df",
-        "group.resources.unmount",
-        "group.resources.get_access", "group.resources.resolve_access_ticket",
+    GROUP_FS_SIGNED_METHODS = [
+        "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+        "group.fs.mount", "group.fs.umount",
+        "group.fs.check_upload", "group.fs.create_upload_session",
+        "group.fs.complete_upload", "group.fs.create_download_ticket",
     ]
 
-    GROUP_RESOURCE_NON_IDEMPOTENT_METHODS = list(GROUP_RESOURCE_SIGNED_METHODS)
+    GROUP_FS_NON_IDEMPOTENT_METHODS = list(GROUP_FS_SIGNED_METHODS)
 
     COLLAB_MUTATION_METHODS = [
-        "collab.create", "collab.submit", "collab.export", "collab.adopt",
-        "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
-        "collab.snapshot.create", "collab.snapshot.restore",
-        "collab.snapshot.rm", "collab.snapshot.prune",
+        "collab.create", "collab.commit", "collab.clone",
+        "collab.prune", "collab.revert", "collab.gc", "collab.unregister",
+        "collab.tag.create", "collab.tag.restore",
+        "collab.tag.rm", "collab.tag.prune",
     ]
 
     EXPECTED_METHODS = [
@@ -158,8 +154,8 @@ class TestSignedMethodsCoverage:
         # 群生命周期
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
-        # 群资源
-    ] + GROUP_RESOURCE_SIGNED_METHODS + COLLAB_MUTATION_METHODS + STORAGE_SIGNED_PROBE_METHODS + STORAGE_MUTATION_METHODS
+        # 群文件系统
+    ] + GROUP_FS_SIGNED_METHODS + COLLAB_MUTATION_METHODS + STORAGE_SIGNED_PROBE_METHODS + STORAGE_MUTATION_METHODS
 
     # 服务端通过 _require_actor_aid_verified 强制要求签名的方法
     # 如果服务端新增了签名要求，必须同步加入 SDK _SIGNED_METHODS
@@ -195,8 +191,8 @@ class TestSignedMethodsCoverage:
                 f"_SIGNED_METHODS 中包含未预期的方法: {m}"
             )
 
-    def test_collab_snapshot_read_methods_are_not_signed(self):
-        for method in ("collab.snapshot.list", "collab.snapshot.show", "collab.snapshot.diff"):
+    def test_collab_tag_read_methods_are_not_signed(self):
+        for method in ("collab.tag.list", "collab.tag.show", "collab.tag.diff"):
             assert method not in AUNClient._SIGNED_METHODS
 
     @pytest.mark.parametrize("method", STORAGE_MUTATION_METHODS)
@@ -205,10 +201,10 @@ class TestSignedMethodsCoverage:
             f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免写操作沿用短超时"
         )
 
-    @pytest.mark.parametrize("method", GROUP_RESOURCE_NON_IDEMPOTENT_METHODS)
-    def test_group_resource_method_is_non_idempotent(self, method):
+    @pytest.mark.parametrize("method", GROUP_FS_NON_IDEMPOTENT_METHODS)
+    def test_group_fs_method_is_non_idempotent(self, method):
         assert method in _NON_IDEMPOTENT_METHODS, (
-            f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免资源写入或单次票据消费沿用短超时"
+            f"{method} 应进入 _NON_IDEMPOTENT_METHODS，避免群文件系统写入或票据/session 控制面沿用短超时"
         )
 
     @pytest.mark.parametrize("method", COLLAB_MUTATION_METHODS)
@@ -295,6 +291,35 @@ class TestSignClientOperation:
         client._sign_client_operation("group.update", params)
         cs = params["client_signature"]
         assert cs["cert_fingerprint"] == ""
+
+    @pytest.mark.asyncio
+    async def test_call_strips_client_signature_identity_before_transport(self, tmp_path):
+        client, _ = _make_client_with_identity(tmp_path)
+        client._state = "ready"
+
+        class _Transport:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, method, params, **kwargs):
+                json.dumps(params, ensure_ascii=False)
+                self.calls.append((method, dict(params), dict(kwargs)))
+                return {"ok": True}
+
+        transport = _Transport()
+        client._transport = transport
+
+        await client.call(
+            "group.fs.mkdir",
+            {
+                "path": "g-team.example.test:/docs",
+                "_client_signature_identity": client._current_aid,
+            },
+        )
+
+        payload = transport.calls[0][1]
+        assert "_client_signature_identity" not in payload
+        assert payload["client_signature"]["aid"] == "test.example.com"
 
 
 # ── 验签测试 ──────────────────────────────────────────────

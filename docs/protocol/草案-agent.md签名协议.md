@@ -203,3 +203,5 @@ description: "An example agent"
 - 是否支持多签名（多个 AID 共同背书同一个 agent.md）？当前版本不支持
 - 是否定义签名过期后的"续签"流程？当前版本依赖重新签名
 - 是否把签名字段扩展到 agent.md 以外的 Agent Web 资源（如 index.html）？超出本草案范围
+
+

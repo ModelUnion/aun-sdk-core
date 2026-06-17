@@ -6,6 +6,100 @@
 
 ---
 
+## 0.5.0 — 2026-06-17
+
+### 新功能
+
+#### Storage 子协议（重大新增）
+- **Storage VFS（虚拟文件系统）**：新增 `StorageVFS` 类，支持 P1-P6 全栈能力
+  - P1: `putObject` / `getObject` / `deleteObject` / `listObjects` / `headObject`
+  - P2: `createFolder` / `renameFolder` / `moveFolder` / `deleteFolder` / `moveObject` / `copyObject` / `batchDelete`
+  - P3: `setObjectMeta` / `appendObject`
+  - P4: `mount` / `unmount` / `stat` / `list` / `find`
+  - P5: `copy` / `rename` / `remove` / `createSymlink` / `deleteSymlink` / `renameSymlink` / `readlink` / `atomicRepoint`
+  - P6: `setAcl` / `removeAcl` / `listAcl` / `checkAccess` / `issueToken` / `revokeToken` / `listTokens` / `createVolume` / `renewVolume` / `expireDueVolume` / `setVisibility`
+- **Storage LowLevel（底层存储）**：新增 `StorageLowLevel` 类，提供对象级存储操作
+- **Group FS（`group.fs` POSIX 群文件系统）**：新增 `GroupFSVFS` 类，通过 `client.group.fs` 暴露群共享文件系统门面，替代 0.4.x 草案中的 `group.resources`
+  - POSIX 控制面：`ls` / `find` / `stat` / `lstat` / `mkdir` / `rm` / `cp` / `mv` / `df` / `mount` / `umount`
+  - `cp` 支持三种路径组合：本地 → 群文件、群文件 → 本地、群文件 → 群文件；本地路径支持 `local:` 前缀，Windows 盘符不会被误判为远程路径
+  - 上传数据面：`group.fs.check_upload` / `create_upload_session` / `complete_upload` + HTTP PUT，支持秒传、dedup、`force` 覆盖和 sha256 校验
+  - 下载数据面：`group.fs.create_download_ticket` + HTTP GET，自动携带 Bearer token，下载后校验 sha256，默认拒绝覆盖本地文件
+  - 群自有区写身份：写操作支持 `signAs` / `aidStore`，SDK 本地加载 `group_aid` 私钥注入 `client_signature`，不会把签名身份参数透传给服务端
+  - 浏览器环境支持 Blob/Uint8Array/ArrayBuffer 数据源；Node-like 环境可通过本地文件路径上传/下载
+
+#### Collab 协作编辑子协议（重大新增）
+- **CollabClient**：新增协作编辑客户端，支持多人实时文档协作
+  - Diff3 三路合并算法（`diff3Merge`）
+  - 快照管理（`createSnapshot` / `listSnapshots` / `getSnapshot` / `restoreSnapshot`）
+  - 标签管理（`createTag` / `listTags` / `getTag` / `restoreTag`）
+  - 群组权限验证和冲突解决
+- **CollabError / CollabConflictError**：新增协作编辑专用异常类型
+
+#### Facade 架构（API 重构）
+- **AUNClient Facade 属性**：新增统一的子系统访问入口
+  - `client.storage` → `StorageVFS` 实例
+  - `client.message` → `MessageFacade` 实例
+  - `client.group` → `GroupFacade` 实例（含 `client.group.fs`）
+  - `client.stream` → `StreamFacade` 实例
+  - `client.collab` → `CollabClient` 实例
+- **GroupFacade / MessageFacade / StreamFacade / ThoughtFacade**：新增 facade 类封装高级操作，简化常用场景
+
+### 架构变更
+
+#### 身份管理职责剥离（重大重构）
+- **AID 持私钥**：`AID` 类现在直接持有明文私钥（`privateKeyPem`），不再依赖外部密钥管理
+- **AIDStore 简化**：`AIDStore` 职责收窄为纯存储层，移除加密/签名等密码学操作
+- **AUNClient 职责清晰化**：`AUNClient` 专注连接和消息传输，不再承担身份管理职责
+- **导入群组身份**：新增 `importGroupIdentity()` 支持群组身份导入和迁移
+
+### 修复
+
+#### 群撤回相关
+- 修复群撤回时间源不一致问题
+- 修复后加入成员收到撤回通知泄漏历史消息问题
+- 修复空 `message_ids` 列表处理异常
+- 修复 V2 重复撤回导致的状态不一致
+
+#### 存储相关
+- 修复 `group.fs` 签名集合缺失导致的签名验证失败
+- 修复幂等性集合缺失导致的重试异常
+- 修复 `memberdata` 路由逻辑错误
+
+### 优化
+
+#### 性能优化（服务端协同）
+- **Gateway**：证书验签 LRU 缓存（1024），Nonce 池淘汰 O(1)
+- **Group**：DB 连接池可配置（默认 40），`_require_group` 短 TTL 缓存，`list_members` 支持跳过 COUNT(*)
+- **Message**：DB 连接池可配置（默认 30），合并查询减少 acquire，思维锁改为分桶锁
+
+### 测试
+
+#### 新增测试
+- Storage VFS P1-P6 层级单元测试
+- Storage LowLevel 单元测试
+- Group FS 单元测试（`tests/unit/group-fs.test.ts` / `tests/unit/group-fs-node.test.ts`）
+- Collab Client 单元测试
+- Collab Diff3 单元测试
+- Facades 单元测试
+- AIDStore 重构测试
+
+#### 单元/浏览器 E2E 测试
+- Group FS 跨运行时单元测试
+- Collab 浏览器协作测试（Playwright）
+
+### 文档
+
+- 更新索引和导航文档
+- 新增 Storage/Group FS/Collab RPC 手册
+- 更新群组方法文档
+- 新增示例代码
+
+### 依赖
+
+- 保持现有依赖版本不变
+
+---
+
 ## 0.4.13 — 2026-06-09
 
 ### 新功能

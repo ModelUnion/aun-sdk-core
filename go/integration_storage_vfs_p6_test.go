@@ -14,9 +14,9 @@ import (
 func TestIntegration_StorageVFSP6(t *testing.T) {
 	rid := runID()
 	alice := makeClient(t)
-	group := makeClient(t)
+	groupOwner := makeClient(t)
 	defer alice.Close()
-	defer group.Close()
+	defer groupOwner.Close()
 
 	aliceAID := fmt.Sprintf("p6goa%s.%s", rid, testIssuer())
 	groupAID := fmt.Sprintf("p6gog%s.%s", rid, testIssuer())
@@ -27,7 +27,7 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 	writtenViaMount := []byte(fmt.Sprintf("write-p6-go-%s", rid))
 
 	ensureConnected(t, alice, aliceAID)
-	ensureConnected(t, group, groupAID)
+	ensureConnected(t, groupOwner, groupAID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -35,7 +35,7 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()
 		_, _ = alice.Storage().Remove(cleanupCtx, root, &RemoveOptions{Owner: aliceAID, Recursive: true})
-		_, _ = group.Storage().Remove(cleanupCtx, root, &RemoveOptions{Owner: groupAID, Recursive: true})
+		_, _ = groupOwner.Storage().Remove(cleanupCtx, root, &RemoveOptions{Owner: groupAID, Recursive: true})
 	}()
 
 	if _, err := alice.Storage().WriteBytes(ctx, sourceDir+"/a.txt", body, &WriteBytesOptions{
@@ -52,7 +52,7 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		t.Fatalf("source ACL 授权失败: %v", err)
 	}
 
-	mounted, err := group.Storage().Mount(ctx, mountDir, &MountOptions{
+	mounted, err := groupOwner.Storage().Mount(ctx, mountDir, &MountOptions{
 		Owner:      groupAID,
 		SourceAID:  aliceAID,
 		SourcePath: sourceDir,
@@ -68,22 +68,22 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		t.Fatalf("MountSource 异常: %#v", mounted)
 	}
 
-	lstat, err := group.Storage().Lstat(ctx, mountDir, &StatOptions{Owner: groupAID})
+	lstat, err := groupOwner.Storage().Lstat(ctx, mountDir, &StatOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("Lstat 挂载点失败: %v", err)
 	}
-	stat, err := group.Storage().Stat(ctx, mountDir, &StatOptions{Owner: groupAID})
+	stat, err := groupOwner.Storage().Stat(ctx, mountDir, &StatOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("Stat 挂载点失败: %v", err)
 	}
-	listed, err := group.Storage().List(ctx, mountDir, &ListOptions{Owner: groupAID, Long: true})
+	listed, err := groupOwner.Storage().List(ctx, mountDir, &ListOptions{Owner: groupAID, Long: true})
 	if err != nil {
 		t.Fatalf("List 挂载点失败: %v", err)
 	}
 	if lstat.Type != "mount" || stat.Type != "dir" || !hasStorageNodeName(listed, "a.txt") {
 		t.Fatalf("挂载点解析异常: lstat=%#v stat=%#v listed=%#v", lstat, stat, listed)
 	}
-	groupRead, err := group.Storage().ReadBytes(ctx, mountDir+"/a.txt", &ReadOptions{Owner: groupAID})
+	groupRead, err := groupOwner.Storage().ReadBytes(ctx, mountDir+"/a.txt", &ReadOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("通过挂载点读取失败: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		t.Fatalf("通过挂载点读取内容不匹配: got=%q want=%q", string(groupRead), string(body))
 	}
 
-	if _, err := group.Storage().WriteBytes(ctx, mountDir+"/b.txt", writtenViaMount, &WriteBytesOptions{
+	if _, err := groupOwner.Storage().WriteBytes(ctx, mountDir+"/b.txt", writtenViaMount, &WriteBytesOptions{
 		Owner:       groupAID,
 		ContentType: "text/plain",
 	}); err != nil {
@@ -105,15 +105,15 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		t.Fatalf("挂载写入未落到 source: got=%q want=%q", string(sourceRead), string(writtenViaMount))
 	}
 
-	copied, err := group.Storage().Copy(ctx, mountDir+"/b.txt", mountDir+"/copied.txt", &CopyOptions{Owner: groupAID})
+	copied, err := groupOwner.Storage().Copy(ctx, mountDir+"/b.txt", mountDir+"/copied.txt", &CopyOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("通过挂载点 Copy 失败: %v", err)
 	}
-	renamed, err := group.Storage().Rename(ctx, mountDir+"/copied.txt", mountDir+"/renamed.txt", &RenameOptions{Owner: groupAID})
+	renamed, err := groupOwner.Storage().Rename(ctx, mountDir+"/copied.txt", mountDir+"/renamed.txt", &RenameOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("通过挂载点 Rename 失败: %v", err)
 	}
-	removed, err := group.Storage().Remove(ctx, mountDir+"/renamed.txt", &RemoveOptions{Owner: groupAID})
+	removed, err := groupOwner.Storage().Remove(ctx, mountDir+"/renamed.txt", &RemoveOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("通过挂载点 Remove 失败: %v", err)
 	}
@@ -124,14 +124,14 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 		t.Fatalf("renamed.txt 删除后不应仍可 stat")
 	}
 
-	unmounted, err := group.Storage().Unmount(ctx, mountDir, &UnmountOptions{Owner: groupAID})
+	unmounted, err := groupOwner.Storage().Unmount(ctx, mountDir, &UnmountOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("Unmount 失败: %v", err)
 	}
 	if !unmounted.Unmounted || unmounted.MountPath != mountDir {
 		t.Fatalf("UnmountResult 异常: %#v", unmounted)
 	}
-	if _, err := group.Storage().Stat(ctx, mountDir, &StatOptions{Owner: groupAID}); err == nil {
+	if _, err := groupOwner.Storage().Stat(ctx, mountDir, &StatOptions{Owner: groupAID}); err == nil {
 		t.Fatalf("unmount 后挂载点不应仍可 stat")
 	}
 	sourceAfterUnmount, err := alice.Storage().ReadBytes(ctx, sourceDir+"/a.txt", &ReadOptions{Owner: aliceAID})

@@ -898,3 +898,5 @@ msg_key[i] = HKDF(sender_chain_key[i], info="msg")
 | 1.0-draft-r1 | 2026-04 | 修正：Membership Commitment 去掉 "Signed" 命名，明确为哈希一致性检测而非签名防伪；修正 message_id 来源为客户端生成；新增外层路由字段与 AAD 绑定校验要求 |
 | 1.0-draft | 2026-04 | 初始版本：Epoch Group Key 机制；Membership Commitment；密钥恢复协议 |
 
+
+

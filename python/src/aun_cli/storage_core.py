@@ -131,23 +131,3 @@ async def download_object(client: Any, *, object_key: str, verify_ssl: bool) -> 
 async def delete_object(client: Any, *, object_key: str) -> dict:
     return await client.call("storage.delete_object", {"object_key": object_key})
 
-
-async def download_group_resource(
-    client: Any, *, group_id: str, resource_path: str, verify_ssl: bool,
-) -> tuple[dict, bytes]:
-    """下载群资源：先 group.resources.get_access 校验群成员身份并取下载 ticket，再 HTTP GET。
-
-    群文件不能直接用个人 storage.create_download_ticket（object_key 是 group_aid 空间下
-    的逻辑路径），必须通过 group.resources.get_access 由群服务以 group_aid 出 ticket。
-    """
-    access = await client.group.resources.get_access(
-        group_id=group_id, resource_path=resource_path,
-    )
-    download = access.get("download") if isinstance(access, dict) else None
-    if not isinstance(download, dict):
-        raise RuntimeError(f"get_access 未返回 download ticket: {access}")
-    download_url = str(download.get("download_url") or "")
-    if not download_url:
-        raise RuntimeError(f"get_access download ticket 缺少 download_url: {download}")
-    data = _http_get(download_url, verify_ssl)
-    return download, data

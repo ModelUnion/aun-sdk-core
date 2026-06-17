@@ -18,21 +18,22 @@ class FakeClient {
 }
 
 describe('CollabClient Browser SDK 契约', () => {
-  it('submit 调用裸 collab.submit RPC 并使用精确参数名', async () => {
+  it('commit 调用裸 collab.commit RPC 并使用精确参数名', async () => {
     const client = new FakeClient();
     const collab = new CollabClient(client);
 
-    const result = await collab.submit('alice.aid.com:/proj', 'd.md', 'BASE64', 3);
+    const result = await collab.commit('alice.aid.com:/proj', 'd.md', 'BASE64', 3);
 
-    expect(result).toMatchObject({ method: 'collab.submit' });
+    expect(result).toMatchObject({ method: 'collab.commit' });
     expect(client.calls).toEqual([
       {
-        method: 'collab.submit',
+        method: 'collab.commit',
         params: {
           collab_root: 'alice.aid.com:/proj',
           doc: 'd.md',
           source: 'BASE64',
-          base_version: 3,
+          onto: 3,
+          message: '',
         },
       },
     ]);
@@ -42,48 +43,54 @@ describe('CollabClient Browser SDK 契约', () => {
     const client = new FakeClient();
     const collab = new CollabClient(client);
 
-    await collab.ls('alice.aid.com:/proj');
+    await collab.lsFiles('alice.aid.com:/proj');
     await collab.create('alice.aid.com:/proj', 'd.md', 'S');
-    await collab.read('alice.aid.com:/proj', 'd.md');
-    await collab.submit('alice.aid.com:/proj', 'd.md', 'S', 1);
+    await collab.show('alice.aid.com:/proj', 'd.md');
+    await collab.commit('alice.aid.com:/proj', 'd.md', 'S', 1);
     await collab.merge('alice.aid.com:/proj', 'd.md', 'S', 1);
-    await collab.history('alice.aid.com:/proj', 'd.md');
-    await collab.get('alice.aid.com:/proj', 'd.md', 1);
+    await collab.log('alice.aid.com:/proj', 'd.md');
+    await collab.show('alice.aid.com:/proj', 'd.md', 1);
     await collab.diff('alice.aid.com:/proj', 'd.md', 1, 2);
-    await collab.export('alice.aid.com:/proj', 'alice.aid.com:/copy');
-    await collab.adopt('alice.aid.com:/proj', 'alice.aid.com:/new');
+    await collab.clone('alice.aid.com:/proj', 'alice.aid.com:/copy');
+    await collab.clone('alice.aid.com:/proj', 'alice.aid.com:/new', true);
     await collab.prune('alice.aid.com:/proj', 'd.md');
-    await collab.discover('g-team.aid.com');
+    await collab.gc('alice.aid.com:/proj', false);
+    await collab.reflog('alice.aid.com:/proj', 'd.md', 5);
+    await collab.revert('alice.aid.com:/proj', 'd.md', 1, 'reset');
+    await collab.lsRemote('g-team.aid.com');
     await collab.unregister('g-team.aid.com', 'g-team.aid.com:/proj');
-    await collab.snapshot.create('alice.aid.com:/proj', { message: 'm', major: true });
-    await collab.snapshot.list('alice.aid.com:/proj');
-    await collab.snapshot.show('alice.aid.com:/proj', '1.0.0');
-    await collab.snapshot.diff('alice.aid.com:/proj', '1.0.0', '1.0.1');
-    await collab.snapshot.restore('alice.aid.com:/proj', '1.0.0', { message: 'r' });
-    await collab.snapshot.rm('alice.aid.com:/proj', '1.0.0');
-    await collab.snapshot.prune('alice.aid.com:/proj', { before: 123, keep_last: 2 });
+    await collab.tag.create('alice.aid.com:/proj', { message: 'm', major: true });
+    await collab.tag.list('alice.aid.com:/proj');
+    await collab.tag.show('alice.aid.com:/proj', '1.0.0');
+    await collab.tag.diff('alice.aid.com:/proj', '1.0.0', '1.0.1');
+    await collab.tag.restore('alice.aid.com:/proj', '1.0.0', { message: 'r' });
+    await collab.tag.rm('alice.aid.com:/proj', '1.0.0');
+    await collab.tag.prune('alice.aid.com:/proj', { before: 123, keep_last: 2 });
 
     expect(client.calls.map((call) => call.method)).toEqual([
-      'collab.ls',
+      'collab.ls-files',
       'collab.create',
-      'collab.read',
-      'collab.submit',
+      'collab.show',
+      'collab.commit',
       'collab.merge',
-      'collab.history',
-      'collab.get',
+      'collab.log',
+      'collab.show',
       'collab.diff',
-      'collab.export',
-      'collab.adopt',
+      'collab.clone',
+      'collab.clone',
       'collab.prune',
-      'collab.discover',
+      'collab.gc',
+      'collab.reflog',
+      'collab.revert',
+      'collab.ls-remote',
       'collab.unregister',
-      'collab.snapshot.create',
-      'collab.snapshot.list',
-      'collab.snapshot.show',
-      'collab.snapshot.diff',
-      'collab.snapshot.restore',
-      'collab.snapshot.rm',
-      'collab.snapshot.prune',
+      'collab.tag.create',
+      'collab.tag.list',
+      'collab.tag.show',
+      'collab.tag.diff',
+      'collab.tag.restore',
+      'collab.tag.rm',
+      'collab.tag.prune',
     ]);
     expect(client.calls.every((call) => call.method.startsWith('collab.'))).toBe(true);
     expect(client.calls.at(-1)?.params).toEqual({
@@ -93,19 +100,31 @@ describe('CollabClient Browser SDK 契约', () => {
     });
     expect(client.calls[9].params).toEqual({
       src: 'alice.aid.com:/proj',
-      new_root: 'alice.aid.com:/new',
+      dest: 'alice.aid.com:/new',
+      reroot: true,
+    });
+    expect(client.calls[12].params).toEqual({
+      collab_root: 'alice.aid.com:/proj',
+      doc: 'd.md',
+      limit: 5,
+    });
+    expect(client.calls[13].params).toEqual({
+      collab_root: 'alice.aid.com:/proj',
+      doc: 'd.md',
+      rev: 1,
+      message: 'reset',
     });
   });
 
-  it('snapshot.prune 会剔除空值参数并支持 keepLast 别名', async () => {
+  it('tag.prune 会剔除空值参数并支持 keepLast 别名', async () => {
     const client = new FakeClient();
     const collab = new CollabClient(client);
 
-    await collab.snapshot.prune('alice.aid.com:/proj', { before: null, keepLast: 3 });
+    await collab.tag.prune('alice.aid.com:/proj', { before: null, keepLast: 3 });
 
     expect(client.calls).toEqual([
       {
-        method: 'collab.snapshot.prune',
+        method: 'collab.tag.prune',
         params: {
           collab_root: 'alice.aid.com:/proj',
           keep_last: 3,
@@ -123,7 +142,7 @@ describe('CollabClient Browser SDK 契约', () => {
 
   it('冲突错误映射保留 current_version/current_target/hint', async () => {
     const client = new FakeClient();
-    client.responses['collab.submit'] = new AUNError('提交失败', {
+    client.responses['collab.commit'] = new AUNError('提交失败', {
       code: -32009,
       data: {
         current_version: 4,
@@ -133,7 +152,7 @@ describe('CollabClient Browser SDK 契约', () => {
     });
     const collab = new CollabClient(client);
 
-    await expect(collab.submit('alice.aid.com:/proj', 'd.md', 'S', 3))
+    await expect(collab.commit('alice.aid.com:/proj', 'd.md', 'S', 3))
       .rejects
       .toMatchObject({
         name: 'CollabConflictError',

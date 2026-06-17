@@ -424,6 +424,7 @@ describe('Storage: 分页与版本控制', () => {
         content: newContent,
         content_type: 'text/plain',
         is_private: false,
+        overwrite: true,
       }) as Record<string, unknown>;
       expect(overwriteResult).toBeDefined();
 

@@ -13,9 +13,9 @@ from aun_core.collab import CollabConflictError
 from aun_core.errors import AUNError, NotFoundError as AUNNotFoundError, PermissionError as AUNPermissionError, ValidationError
 
 
-collab_app = typer.Typer(name="collab", help="collab 协作层", no_args_is_help=True)
-snapshot_app = typer.Typer(name="snapshot", help="collab 快照操作", no_args_is_help=True)
-collab_app.add_typer(snapshot_app)
+collab_app = typer.Typer(name="collab", help="collab 协作层（Git 命令子集）", no_args_is_help=True)
+tag_app = typer.Typer(name="tag", help="collab 目录级标签（带内容快照）", no_args_is_help=True)
+collab_app.add_typer(tag_app)
 
 _REMOTE_RE = re.compile(r"^[^:/\\][^:]*:/")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -85,14 +85,16 @@ def _is_collab_user_error(exc: Exception) -> bool:
         return exc.code in {-32600, -32601, -32602, -32001, -32004, -32008, -32009, -32010, 4000, 403, 4030, 404, 4040}
     return False
 
+# APPEND_MARKER
 
-@collab_app.command("ls")
-def collab_ls(ctx: typer.Context, collab_root: str = typer.Argument(...)) -> None:
+
+@collab_app.command("ls-files")
+def collab_ls_files(ctx: typer.Context, collab_root: str = typer.Argument(...)) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.ls(collab_root)
+            return await client.collab.ls_files(collab_root)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -108,13 +110,19 @@ def collab_create(ctx: typer.Context, collab_root: str, doc: str, source: str) -
     _print_result(_run_collab(ctx, _run()))
 
 
-@collab_app.command("read")
-def collab_read(ctx: typer.Context, collab_root: str, doc: str, output: Optional[str] = typer.Option(None, "--output", "-o")) -> None:
+@collab_app.command("show")
+def collab_show(
+    ctx: typer.Context,
+    collab_root: str,
+    doc: str,
+    rev: Optional[int] = typer.Option(None, "--rev", help="指定历史版本号；省略则读当前版本"),
+    output: Optional[str] = typer.Option(None, "--output", "-o"),
+) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.read(collab_root, doc)
+            return await client.collab.show(collab_root, doc, rev)
 
     result = _run_collab(ctx, _run())
     if output:
@@ -124,20 +132,20 @@ def collab_read(ctx: typer.Context, collab_root: str, doc: str, output: Optional
         _print_result(result)
 
 
-@collab_app.command("submit")
-def collab_submit(
+@collab_app.command("commit")
+def collab_commit(
     ctx: typer.Context,
     collab_root: str,
     doc: str,
     source: str,
-    base_version: int = typer.Option(..., "--base-version"),
+    onto: int = typer.Option(..., "--onto", help="基线版本号（来自 show 响应的 version 字段）"),
     message: str = typer.Option("", "--message"),
 ) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.submit(collab_root, doc, _source_value(source), base_version, message=message)
+            return await client.collab.commit(collab_root, doc, _source_value(source), onto, message=message)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -148,14 +156,14 @@ def collab_merge(
     collab_root: str,
     doc: str,
     source: str,
-    base_version: int = typer.Option(..., "--base-version"),
+    onto: int = typer.Option(..., "--onto", help="基线版本号（来自 commit 失败响应的 currentVersion）"),
     output: Optional[str] = typer.Option(None, "--output", "-o"),
 ) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.merge(collab_root, doc, _source_value(source), base_version)
+            return await client.collab.merge(collab_root, doc, _source_value(source), onto)
 
     result = _run_collab(ctx, _run())
     if result is None:
@@ -169,31 +177,15 @@ def collab_merge(
         raise typer.Exit(1)
 
 
-@collab_app.command("history")
-def collab_history(ctx: typer.Context, collab_root: str, doc: str) -> None:
+@collab_app.command("log")
+def collab_log(ctx: typer.Context, collab_root: str, doc: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.history(collab_root, doc)
+            return await client.collab.log(collab_root, doc)
 
     _print_result(_run_collab(ctx, _run()))
-
-
-@collab_app.command("get")
-def collab_get(ctx: typer.Context, collab_root: str, doc: str, version: int = typer.Option(..., "--version"), output: Optional[str] = typer.Option(None, "--output", "-o")) -> None:
-    _set_json(ctx)
-
-    async def _run():
-        async with CLISession(ctx) as client:
-            return await client.collab.get(collab_root, doc, version)
-
-    result = _run_collab(ctx, _run())
-    if output:
-        Path(output).write_bytes(_decode_content(result))
-        output_success(f"Wrote: {output}")
-    else:
-        _print_result(result)
 
 
 @collab_app.command("diff")
@@ -208,24 +200,18 @@ def collab_diff(ctx: typer.Context, collab_root: str, doc: str, v_from: int = ty
     print(result.get("diff", "")) if not is_json_mode() else output_json(result)
 
 
-@collab_app.command("export")
-def collab_export(ctx: typer.Context, collab_root: str, dest: str) -> None:
+@collab_app.command("clone")
+def collab_clone(
+    ctx: typer.Context,
+    src: str,
+    dest: str,
+    reroot: bool = typer.Option(False, "--reroot", help="换 host 重建并转移授权方（原 adopt）；默认纯子树拷贝"),
+) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.export(collab_root, dest)
-
-    _print_result(_run_collab(ctx, _run()))
-
-
-@collab_app.command("adopt")
-def collab_adopt(ctx: typer.Context, src: str, new_root: str) -> None:
-    _set_json(ctx)
-
-    async def _run():
-        async with CLISession(ctx) as client:
-            return await client.collab.adopt(src, new_root)
+            return await client.collab.clone(src, dest, reroot=reroot)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -241,19 +227,19 @@ def collab_prune(ctx: typer.Context, collab_root: str, doc: str) -> None:
     _print_result(_run_collab(ctx, _run()))
 
 
-@collab_app.command("reset")
-def collab_reset(
+@collab_app.command("revert")
+def collab_revert(
     ctx: typer.Context,
     collab_root: str,
     doc: str,
-    version: int = typer.Option(..., "--version"),
+    rev: int = typer.Option(..., "--rev", help="要回退到的版本号"),
     message: str = typer.Option("", "--message"),
 ) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.reset(collab_root, doc, version, message=message)
+            return await client.collab.revert(collab_root, doc, rev, message=message)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -289,13 +275,13 @@ def collab_reflog(
     _print_result(_run_collab(ctx, _run()))
 
 
-@collab_app.command("discover")
-def collab_discover(ctx: typer.Context, group_aid: str) -> None:
+@collab_app.command("ls-remote")
+def collab_ls_remote(ctx: typer.Context, group_aid: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.discover(group_aid)
+            return await client.collab.ls_remote(group_aid)
 
     _print_result(_run_collab(ctx, _run()))
 
@@ -311,78 +297,78 @@ def collab_unregister(ctx: typer.Context, group_aid: str, collab_root: str) -> N
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("create")
-def snapshot_create(ctx: typer.Context, collab_root: str, message: str = typer.Option("", "--message"), major: bool = typer.Option(False, "--major")) -> None:
+@tag_app.command("create")
+def tag_create(ctx: typer.Context, collab_root: str, message: str = typer.Option("", "--message"), major: bool = typer.Option(False, "--major")) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.create(collab_root, message=message, major=major)
+            return await client.collab.tag.create(collab_root, message=message, major=major)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("list")
-def snapshot_list(ctx: typer.Context, collab_root: str) -> None:
+@tag_app.command("list")
+def tag_list(ctx: typer.Context, collab_root: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.list(collab_root)
+            return await client.collab.tag.list(collab_root)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("show")
-def snapshot_show(ctx: typer.Context, collab_root: str, version: str) -> None:
+@tag_app.command("show")
+def tag_show(ctx: typer.Context, collab_root: str, version: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.show(collab_root, version)
+            return await client.collab.tag.show(collab_root, version)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("diff")
-def snapshot_diff(ctx: typer.Context, collab_root: str, version_a: str, version_b: str) -> None:
+@tag_app.command("diff")
+def tag_diff(ctx: typer.Context, collab_root: str, version_a: str, version_b: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.diff(collab_root, version_a, version_b)
+            return await client.collab.tag.diff(collab_root, version_a, version_b)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("restore")
-def snapshot_restore(ctx: typer.Context, collab_root: str, version: str, message: str = typer.Option("", "--message")) -> None:
+@tag_app.command("restore")
+def tag_restore(ctx: typer.Context, collab_root: str, version: str, message: str = typer.Option("", "--message")) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.restore(collab_root, version, message=message)
+            return await client.collab.tag.restore(collab_root, version, message=message)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("rm")
-def snapshot_rm(ctx: typer.Context, collab_root: str, version: str) -> None:
+@tag_app.command("rm")
+def tag_rm(ctx: typer.Context, collab_root: str, version: str) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.rm(collab_root, version)
+            return await client.collab.tag.rm(collab_root, version)
 
     _print_result(_run_collab(ctx, _run()))
 
 
-@snapshot_app.command("prune")
-def snapshot_prune(ctx: typer.Context, collab_root: str, before: Optional[str] = typer.Option(None, "--before"), keep_last: Optional[int] = typer.Option(None, "--keep-last")) -> None:
+@tag_app.command("prune")
+def tag_prune(ctx: typer.Context, collab_root: str, before: Optional[str] = typer.Option(None, "--before"), keep_last: Optional[int] = typer.Option(None, "--keep-last")) -> None:
     _set_json(ctx)
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.collab.snapshot.prune(collab_root, before=before, keep_last=keep_last)
+            return await client.collab.tag.prune(collab_root, before=before, keep_last=keep_last)
 
     _print_result(_run_collab(ctx, _run()))

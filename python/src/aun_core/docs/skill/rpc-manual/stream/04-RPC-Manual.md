@@ -273,3 +273,5 @@ async with aiohttp.ClientSession() as session:
 | -33405 | Stream invalid params | 参数无效（如缺少 stream_id） |
 | -33406 | Stream rate limited | 速率限制 |
 | -33407 | Stream internal error | 服务内部错误 |
+
+

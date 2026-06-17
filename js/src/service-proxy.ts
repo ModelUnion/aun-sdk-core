@@ -49,6 +49,7 @@ const SENSITIVE_METADATA_KEYS = new Set([
 const SERVICE_NAME_RE = /^[a-z0-9_-]+$/;
 const STREAMING_SERVICE_TYPES = new Set(['mcp', 'mcp-sse', 'mcp-streamable-http', 'sse', 'stream', 'file', 'ws', 'websocket']);
 const VALID_STREAM_MODES = new Set(['auto', 'stream', 'always', 'no_stream']);
+const NON_SENDABLE_WS_CLOSE_CODES = new Set([1005, 1006, 1015]);
 const FILE_CONTENT_TYPES = new Set([
   'application/octet-stream',
   'application/pdf',
@@ -720,7 +721,7 @@ export class ServiceProxyClient {
         }
       });
       backend.addEventListener('close', (event) => {
-        tunnel.send({ type: 'ws_close', connection_id: connectionId, code: event.code || 1000, reason: '' }).catch(() => {});
+        tunnel.send({ type: 'ws_close', connection_id: connectionId, code: normalizeWsCloseCodeForSend(event.code), reason: '' }).catch(() => {});
         resolve();
       });
       backend.addEventListener('error', () => resolve());
@@ -742,7 +743,7 @@ export class ServiceProxyClient {
             }
           }
         } else if (msgType === 'ws_close' || msgType === 'ws_error') {
-          backend.close(Number(item.code ?? 1000), String(item.reason ?? ''));
+          backend.close(normalizeWsCloseCodeForSend(item.code), String(item.reason ?? ''));
           return;
         }
       }
@@ -1225,6 +1226,14 @@ function errorMessage(requestId: string, code: string, message: string): Dict {
 
 function wsErrorMessage(connectionId: string, code: string, message: string): Dict {
   return { type: 'ws_error', connection_id: connectionId, error: { code, message } };
+}
+
+function normalizeWsCloseCodeForSend(value: unknown): number {
+  const code = Number(value ?? 1000);
+  if (!Number.isInteger(code) || code < 1000 || code > 4999 || NON_SENDABLE_WS_CLOSE_CODES.has(code)) {
+    return 1000;
+  }
+  return code;
 }
 
 function streamMessage(requestId: string, index: number, status: number, headers: Record<string, string>, data: Uint8Array, done: boolean): Dict {

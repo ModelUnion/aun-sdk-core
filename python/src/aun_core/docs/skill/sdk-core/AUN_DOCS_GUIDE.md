@@ -11,10 +11,10 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - `AUNClient`：认证、连接、状态机、事件和 RPC。
 - `ServiceProxyClient`：Python SDK 的 Service Proxy provider 侧客户端，负责 Gateway 控制面注册和 proxy-server 数据面隧道注册。
 
-业务 RPC 的底层参数见 `09-*-rpc-manual.md`，可通过 `client.call(method, params)` 调用；Storage、Collab、Group resources、Service Proxy 等具备高层门面的能力以对应专项文档为准。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。在线轻量通知和跨域 federation notify 方案见 `Notify通知方案.md`。
+业务 RPC 的底层参数见 `09-*-rpc-manual.md`，可通过 `client.call(method, params)` 调用；Storage、Collab、Group FS、Service Proxy 等具备高层门面的能力以对应专项文档为准。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。在线轻量通知和跨域 federation notify 方案见 `Notify通知方案.md`。
 
 Storage 的 SDK VFS、控制面/数据面分离、direct backend 上传下载、类 Linux 权限、mount/symlink 和服务端分层见 `AUN Storage架构设计.md`。
-Group resources 的写操作计划、`execute_pending_ops`、`initialize_namespace` 和 memberdata 透明路由见 `09-group-rpc-manual.md`。Collab 的 `gc`、`reflog`、`reset` 及版本化文档/快照语义见 `09-collab-rpc-manual.md`。
+Group FS 的 `group.fs.*` RPC、`client.group.fs.*` 门面、`aun group fs` CLI、`cp/mv` 语义、群自有区 `group_aid` 写身份、`parents` 语义、JS string 差异和 memberdata 服务端映射见 `09-group-rpc-manual.md`。Collab 的 `gc`、`reflog`、`revert`、`clone` 及版本化文档/标签语义见 `09-collab-rpc-manual.md`。
 
 ## 渐进式查阅流程
 
@@ -31,8 +31,8 @@ Group resources 的写操作计划、`execute_pending_ops`、`initialize_namespa
 - E2EE：默认加密、ProtectedHeaders、P2P / Group V2
 - RPC 与事件：`client.call()`、`client.on()`、`client.notify()`、RPC 手册
 - Storage：SDK VFS、direct backend 数据面、`storage.*` low-level RPC、类 Linux 权限、mount/symlink、Storage Service 分层
-- 群资源：`group.resources.*` 写操作 `pending_ops`、`execute_pending_ops`、`initialize_namespace`、memberdata 透明路由（见 `09-group-rpc-manual.md`）
-- 协作（collab）：`collab.*` 版本化文档、乐观锁 CAS submit、三方合并、目录快照、GC、reflog、reset（见 `09-collab-rpc-manual.md`）
+- 群文件系统：`group.fs.*`、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载、群自有区 `group_aid` 写身份、`parents`、JS string 差异和 memberdata 服务端映射（见 `09-group-rpc-manual.md`）
+- 协作（collab）：`collab.*` 版本化文档、乐观锁 CAS commit、三方合并、标签、GC、reflog、revert（见 `09-collab-rpc-manual.md`）
 - Service Proxy：`ServiceProxyClient`、`proxy.register_services`、proxy-server `register_services`
 - agent.md：`AIDStore.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
 - 错误处理：Result、异常、错误码、重试
@@ -69,12 +69,14 @@ Group resources 的写操作计划、`execute_pending_ops`、`initialize_namespa
 | 状态机和重连 | [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md) |
 | 查方法签名 | [06-API手册](06-API手册.md) |
 | 查消息或群组 RPC | 对应 `09-*-rpc-manual.md` |
-| 查群资源写操作或命名空间初始化 | [09-group-rpc-manual.md](09-group-rpc-manual.md) |
+| 查群文件系统 RPC / SDK / CLI 入口、群自有区写身份、`parents` 和 JS string 差异 | [09-group-rpc-manual.md](09-group-rpc-manual.md)、[06-API手册](06-API手册.md) |
 | 查 Storage 架构、SDK VFS、权限模型、mount/symlink 和上传下载链路 | [AUN Storage架构设计.md](<AUN Storage架构设计.md>) |
 | 查 Storage RPC 参数 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) |
-| 查协作（版本化文档/乐观锁/快照/GC/reflog/reset）RPC | [09-collab-rpc-manual.md](09-collab-rpc-manual.md) |
+| 查协作（版本化文档/乐观锁/标签/GC/reflog/revert）RPC | [09-collab-rpc-manual.md](09-collab-rpc-manual.md) |
 | 查 notify 在线轻量通知 / 跨域 federation | [Notify通知方案.md](Notify通知方案.md) |
 | 查 Service Proxy 服务注册和路由 | [06-API手册](06-API手册.md)、[09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) |
 | 查 payload 格式 | [09-payload-reference.md](09-payload-reference.md) |
 | 排查错误 | [07-错误处理](07-错误处理.md) |
 | 写测试或 demo | [08-最佳实践](08-最佳实践.md) |
+
+

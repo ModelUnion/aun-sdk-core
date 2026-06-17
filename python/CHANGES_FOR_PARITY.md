@@ -1,10 +1,358 @@
-# Python SDK 变更清单（v0.3.3 → v0.4.13）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.5.0）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → `67d35b06` (v0.4.11) → `d85a6f62` (v0.4.12) → 工作区 (v0.4.13)。
+涉及提交：`5a962885` (v0.3.7) → `4b1364d2` (v0.4.0) → `009438db` (v0.4.2) → `2d1bce76` (v0.4.3a) → `dc380c86` (v0.4.3b) → `5144a71d` (v0.4.5) → `d50456d7` (v0.4.6) → `748e1be1` (v0.4.7) → `471675be` (v0.4.8) → `1d64d186` (v0.4.9) → `b45b9f15` + 工作区 (v0.4.10) → `67d35b06` (v0.4.11) → `d85a6f62` (v0.4.12) → `0d418563` (v0.4.13，对外发布基线) → `a474c632` → `c14436bd` → `38438b90` → `d3358ded` + 工作区 (v0.5.0)。
+
+---
+
+## v0.5.0 — 相对于对外发布 v0.4.13 的变更
+
+> 基线：`0d418563`（对外发布的 v0.4.13）vs 当前工作区（目标版本 v0.5.0，`pyproject.toml` / `version.py` 已标 0.5.0）。
+>
+> 行号说明：本节所有 `Lx` / `Lx~Ly` 均指**当前工作区文件行号**，用于 Go / TypeScript / JavaScript / C++ SDK 对齐实现时快速定位。相对路径默认以 `python/src/aun_core/` 或 `python/src/aun_cli/` 为基准。
+>
+> 六大变更块：**① 公开门面与导出面升级**、**② Storage VFS / LowLevel 子协议**、**③ `group.fs` POSIX 群文件系统（替代 `group.resources`）**、**④ Collab 协作编辑 RPC 门面与 CLI**、**⑤ Transport / 后台 RPC 公平性与关闭清理**、**⑥ CLI 与测试对齐**。
+
+### 块① 公开门面与导出面升级
+
+#### `client.py`（相对 `python/src/aun_core/`）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L609 | 新增字段 | `AUNClient._background_rpc_depth` | SDK 内部后台 RPC 深度计数；进入后台任务时置位，避免把 `_rpc_background` 泄漏为业务参数 |
+| L682~686 | 新增字段 | `_storage_vfs` / `_message_facade` / `_group_facade` / `_stream_facade` / `_collab_facade` | AUNClient 懒加载门面缓存 |
+| L707~712 | 新增属性 | `AUNClient.storage` | 懒加载并返回 `StorageVFS(self)`；这是属性，不是方法 |
+| L715~720 | 新增属性 | `AUNClient.collab` | 懒加载并返回 `CollabClient(self)` |
+| L723~728 | 新增属性 | `AUNClient.message` | 懒加载并返回 `MessageFacade(self)` |
+| L731~736 | 新增属性 | `AUNClient.group` | 懒加载并返回 `GroupFacade(self)`；`GroupFacade.__init__` 内挂载 `group.fs` |
+| L739~744 | 新增属性 | `AUNClient.stream` | 懒加载并返回 `StreamFacade(self)` |
+| L1056~1109 | 新增 | `async create_group(params=None, *, aid_store=None, **kwargs)` | `group_name` 为空时保持原 `group.create` 透传；命名群路径本地生成 group_aid 密钥、把 `public_key` / `curve` 注入 `group.create`，服务端返回 `aid_cert` 后调用 `AIDStore.import_group_identity()` 落盘私钥 + 证书 |
+| L1111~1157 | 新增 | `async bind_group_aid(params=None, *, aid_store=None, **kwargs)` | 为匿名群补齐 group_aid：本地生成密钥，调用 `group.bind_group_aid`，再导入群身份 |
+| L1159~1218 | 新增 | `async start_group_transfer(params=None, *, aid_store=None, **kwargs)` | 群主转让发起端：加载旧 `group_aid` 私钥，构造 canonical `aun-group-owner-transfer-v1|...`，签名后把 `transfer_auth` 注入 `group.transfer_owner` |
+| L1220~1308 | 新增 | `async complete_group_transfer(params=None, *, aid_store=None, **kwargs)` | 新群主完成 rekey：本地生成新 group_aid 密钥，用当前 AID 私钥签 `transfer_accept`，调用 `group.complete_transfer` 后导入新的 group_aid 身份 |
+| L206~236 | 修改 | `_NON_IDEMPOTENT_METHODS` | 新增 `storage.fs.*`、`storage.volume.*`、`group.fs.*`、`collab.*` 写侧方法；影响非幂等 RPC 超时策略 |
+| L990~1040 | 修改 | `_SIGNED_METHODS` | 同步新增 `storage.*` / `storage.fs.*` / `group.fs.*` / `collab.*` 写侧方法，确保 `client_signature` 注入覆盖新增写操作 |
+
+#### `aid_store.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L88~90 | 新增类型 | `ImportGroupIdentityResult` | `{"imported": bool}` 返回结构 |
+| L744~793 | 新增 | `AIDStore.import_group_identity(aid, *, private_key_pem, public_key_der_b64, curve, cert_pem)` | 校验证书 AID 与公钥匹配（L768~773），保存身份材料（L774~780），再通过 `load()` 做私钥/证书自检（L781~787）；供 `create_group` / `bind_group_aid` / `complete_group_transfer` 落盘 group_aid |
+
+#### `facades.py`（新文件）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L6~22 | 新增 | `_RpcFacade` | 通用 RPC 门面基类；`_params()` 合并 dict + kwargs 并剔除 None，`_call()` 拼接 `<prefix>.<method>` |
+| L25~30 | 新增 | `ThoughtFacade.put()` / `get()` | 封装 `message.thought.*` 与 `group.thought.*` |
+| L33~51 | 新增 | `MessageFacade` | 封装 `message.send` / `pull` / `ack` / `recall` / `query_online`，并挂载 `message.thought` |
+| L54~207 | 新增 | `GroupFacade` | 封装 group 管理、成员、邀请、消息、事件、公告、规则、在线成员等 RPC；L57~59 创建 `GroupFSVFS` 并挂到 `self.fs` |
+| L210~224 | 新增 | `StreamFacade` | 封装 `stream.create` / `close` / `get_info` / `list_active` |
+
+#### `__init__.py` / `storage/__init__.py` / `collab/__init__.py`
+| 文件 | 行号 | 类型 | 说明 |
+|------|------|------|------|
+| `__init__.py` | L8~11 | 新增导入 | 导出 `GroupFacade` / `MessageFacade` / `StreamFacade` / `ThoughtFacade`、`GroupFSVFS`、`StorageLowLevel` / `StorageVFS`、`CollabClient` / `CollabError` / `CollabConflictError` |
+| `__init__.py` | L49~58 | 修改 `__all__` | 将上述新增门面列入顶层公开 API |
+| `storage/__init__.py` | L1~40 | 新增 | 导出 storage 错误类型、`StorageLowLevel`、`StorageVFS`、`NodeView` / `ObjectView` / `DownloadResult` / `RemoveResult` / `UsageView` 与路径 helper |
+| `collab/__init__.py` | L1~9 | 新增 | 导出 `CollabClient`、`TagClient`、`CollabError`、`CollabConflictError` |
+
+**对齐要点**：四语言需保持 `client.storage` / `client.group.fs` / `client.collab` 这种“门面入口”语义一致。Python 当前是属性；TS/JS/Go 可按本语言惯例暴露，但不要把 storage 门面误做成低级 `StorageLowLevel`，Python 的 `client.storage` 返回的是 `StorageVFS`。
+
+---
+
+### 块② Storage VFS / LowLevel 子协议
+
+#### `storage/lowlevel.py`（新文件）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L12~22 | 新增 | `_AllMethodRedirectHandler.redirect_request()` | 允许 PUT/POST/DELETE/PATCH 在 301/302/303/307/308 时保持原 method 与 body 继续跳转 |
+| L25~34 | 新增 | `_build_opener(verify_ssl)` | 基于 `urllib.request` 构造 HTTP/HTTPS opener，`verify_ssl=False` 时关闭证书校验 |
+| L37~1058 | 新增类 | `StorageLowLevel` | Storage RPC + HTTP 数据面低级封装 |
+| L45~50 | 新增 | `_call(method, params=None, *, path="")` | 统一调用 `client.call()`，异常经 `map_storage_error()` 映射为 storage 错误 |
+| L53~59 | 新增 | `_params(owner=None, bucket="default", **kwargs)` | 统一把 `owner` 映射为 `owner_aid`，补 `bucket`，剔除 None |
+| L61~80 | 新增 | `get_limits()` / `get_quota()` / `check_upload()` | 上传限制、配额、上传预检 RPC |
+| L82~185 | 新增 | `put_object()` / `get_object()` / `create_upload_session()` / `complete_upload()` | 对象上传下载核心 RPC；`put_object()` 对 bytes 做 base64，`complete_upload()` 支持 `skip_blob` / `overwrite` |
+| L187~241 | 新增 | `create_download_ticket()` / `create_share_link()` / `list_share_links()` / `revoke_share_link()` / `get_by_share()` | 下载票据、分享链接与分享访问 |
+| L243~293 | 新增 | `http_put()` / `http_get()` | HTTP 数据面上传/下载；支持 headers 与进度回调 |
+| L295~344 | 新增 | `head_object()` / `list_objects()` / `list_prefixes()` / `delete_object()` | 对象元信息、分页列表、前缀列表、删除 |
+| L346~396 | 新增 | `set_object_meta()` / `append_object()` | 元数据更新与追加写 |
+| L398~455 | 新增 | `batch_delete()` / `move_object()` / `copy_object()` | 批量删除、移动、复制 |
+| L457~544 | 新增 | `create_folder()` / `get_folder()` / `list_children()` / `move_folder()` / `delete_folder()` | 目录树低级 RPC |
+| L546~611 | 新增 | `create_symlink()` / `readlink()` / `atomic_repoint()` / `rename_symlink()` / `delete_symlink()` | 软链创建、读取、CAS 改指向、改名、删除 |
+| L613~731 | 新增 | `set_acl()` / `remove_acl()` / `list_acl()` / `set_visibility()` / `check_access()` / `issue_token()` / `revoke_token()` / `list_tokens()` | ACL、可见性、访问检查与访问 token |
+| L733~991 | 新增 | `fs_list()` / `fs_stat()` / `fs_lstat()` / `fs_mkdir()` / `fs_remove()` / `fs_rename()` / `fs_copy()` / `fs_find()` / `fs_df()` / `fs_mount()` / `fs_approve()` / `fs_reject()` / `fs_unmount()` / `fs_invalidate_membership()` | `storage.fs.*` POSIX 层低级 RPC |
+| L993~1043 | 新增 | `volume_create()` / `volume_renew()` / `volume_expire_due()` | storage volume 生命周期 RPC |
+| L1045~1058 | 新增 | `resolve_path()` | 路径解析 RPC；支持 `expected_type` / `follow_symlinks` |
+
+#### `storage/vfs.py`（新文件）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L17~42 | 新增 helper | `normalize_path()` / `path_to_key()` / `key_to_path()` / `split_parent_name()` | POSIX 路径规范化，统一 `/` 与 object key 的转换 |
+| L49~66 | 新增 helper | `_is_remote_ref()` / `_split_remote_ref()` | 识别 `AID:/path` 远程引用；排除 Windows 盘符和 HTTP URL |
+| L69~977 | 新增类 | `StorageVFS` | 高级虚拟文件系统门面，默认走 `storage.fs.*` 权威 RPC，可通过 `use_fs_rpc=False` 回退旧对象/目录 RPC |
+| L83~234 | 新增 | `upload_file()` / `write_bytes()` / `_upload_bytes()` | 文件/bytes 上传；先 `check_upload`，命中 dedup/instant 时走 `complete_upload(skip_blob=True)`，否则创建 upload session + HTTP PUT |
+| L236~318 | 新增 | `download_file()` / `read_bytes()` | 下载文件或读取 bytes；输出文件默认拒绝覆盖，`overwrite=True` 时用临时文件原子替换 |
+| L320~392 | 新增 | `list()` / `_list_recursive()` | 默认调用 `storage.fs.list`，递归模式 breadth-first 展开 |
+| L394~448 | 新增 | `stat()` / `lstat()` / `_stat()` | `stat` 跟随软链，`lstat` 不跟随；回退路径用 `resolve_path` + `head_object/get_folder/readlink` |
+| L450~527 | 新增 | `symlink()` / `readlink()` / `repoint()` / `rename_symlink()` | 软链高级 API；CAS 冲突时映射为 `ConflictError` |
+| L529~580 | 新增 | `mkdir()` / `remove()` | 创建目录、删除文件/目录/软链；`remove(recursive=True)` 回退用 `batch_delete` |
+| L582~682 | 新增 | `rename()` / `copy()` | 文件、目录、软链统一移动/复制；fs RPC 不可用时按对象/目录回退 |
+| L684~719 | 新增 | `find()` / `df()` | 查找节点与用量视图 |
+| L721~860 | 新增 | `mount()` / `mount_volume()` / `approve_mount()` / `reject_mount()` / `unmount()` | mount 支持源 `AID:/path` 与 volume_id 两条路径；approve/reject 支持 mount_path/mount_id/request_id |
+| L862~977 | 新增 | `set_acl()` / `remove_acl()` / `list_acl()` / `set_visibility()` / `check_access()` / `issue_token()` / `revoke_token()` / `list_tokens()` / `get_usage()` | ACL、可见性、访问检查、访问 token、用量高级 API |
+
+#### `storage/types.py` / `storage/errors.py`
+| 文件 | 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|------|
+| `storage/types.py` | L26~37 | 新增 | `normalize_display_path()` / `name_from_path()` | 展示路径归一与 basename 提取 |
+| `storage/types.py` | L40~120 | 新增 dataclass | `NodeView` | 统一 file/dir/symlink/mount 视图；`from_object()` L60~76、`from_folder()` L79~92、`from_any()` L95~117 |
+| `storage/types.py` | L123~135 | 新增 dataclass | `ObjectView` | `NodeView` 扩展 `sha256` / `etag` |
+| `storage/types.py` | L138~156 | 新增 dataclass | `DownloadResult` / `RemoveResult` | 下载与删除结果视图 |
+| `storage/types.py` | L159~180 | 新增 dataclass | `UsageView` | 配额/用量视图；兼容 `quota_total_bytes` / `quota_used_bytes` |
+| `storage/types.py` | L183~192 | 新增 | `to_plain(value)` | dataclass/list/tuple/dict 递归转 plain dict/list，供 CLI JSON 输出 |
+| `storage/errors.py` | L10~55 | 新增错误类型 | `StorageError` 及 `NotFoundError` / `ExistsError` / `AccessDeniedError` / `ConflictError` / `QuotaError` / `SessionExpiredError` / `LoopError` / `DanglingSymlinkError` 等 | Storage 专用异常体系 |
+| `storage/errors.py` | L58~91 | 新增 | `map_storage_error(exc, *, path="")` | 远端 `AUNError.code` / 消息文本映射到 POSIX 风格错误码：`ENOENT`、`EEXIST`、`EACCES`、`ECONFLICT`、`ELOOP`、`EDANGLING`、`EQUOTA` 等 |
+
+**对齐要点**：Storage 对齐必须分两层实现：低级 `StorageLowLevel` 逐个 RPC 映射，高级 `StorageVFS` 负责路径归一、dedup 上传流程、软链/mount/ACL 语义与错误映射。`storage.fs.*` 是 0.5.0 的权威 POSIX 接口；旧对象/目录 RPC 仅作为兼容回退。
+
+---
+
+### 块③ `group.fs` POSIX 群文件系统（替代 `group.resources`）
+
+> 0.5.0 当前工作区已移除 `group.resources.*` 方向的 SDK 文档/测试入口，`rg "group.resources"` 在运行时代码中无命中；面向 SDK 的群文件能力统一收敛为 `group.fs.*`。
+
+#### `group_fs.py`（新文件，相对 `python/src/aun_core/`）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L20~45 | 新增 helper | `_is_explicit_local_path()` / `_strip_local_path_prefix()` / `_is_group_remote_copy_path()` / `is_group_remote_path()` | 区分本地路径、`local:` 显式本地路径、`group:`/`AID:/path` 远程路径；Windows 盘符不被误判为远程 |
+| L48~334 | 新增类 | `GroupFSVFS` | `client.group.fs` 的 POSIX 群文件系统门面 |
+| L53~61 | 新增 | `_params(params=None, **kwargs)` | 合并参数、调用 `_apply_signing_identity()`、剔除 None |
+| L63~88 | 新增 | `_apply_signing_identity(params)` | 支持 `sign_as` / `aid_store`：当写操作需用 group_aid 私钥签名时，从 `AIDStore.load(sign_as)` 取 AID 对象并注入内部 `_client_signature_identity` |
+| L90~98 | 新增 | `_call()` / `_bearer_headers()` | RPC 异常映射为 storage 错误；下载票据 HTTP GET 自动带当前 access token |
+| L100~120 | 新增 | `ls()` / `find()` / `stat()` / `lstat()` / `mkdir()` / `rm()` | POSIX 读写基础方法，对应 `group.fs.ls/find/stat/lstat/mkdir/rm` |
+| L122~184 | 新增 | `cp(src, dst, *, force=False, recursive=False, parents=True, ...)` | 三分支：远程→远程走 `group.fs.cp`；本地→远程走 `_upload_local_file()`；远程→本地走 `_download_remote_file()`；本地→本地抛 `StorageError(EINVAL)` |
+| L186~205 | 新增 | `mv(src, dst, *, force=False, **options)` | 仅支持 group remote path，调用 `group.fs.mv` |
+| L207~217 | 新增 | `df()` / `mount()` / `umount()` | 对应 `group.fs.df/mount/umount` |
+| L219~276 | 新增 | `_upload_local_file()` | 本地文件上传：读文件、算 sha256、`group.fs.check_upload`，命中 instant/dedup/skip_upload 则 `complete_upload(skip_blob=True)`，否则创建 upload session + HTTP PUT + complete |
+| L278~334 | 新增 | `_download_remote_file()` | 创建 `group.fs.create_download_ticket`，HTTP GET 下载，校验 sha256，写本地文件；`force=True` 时临时文件原子替换 |
+
+#### `client.py` / `aid_store.py`
+| 文件 | 行号 | 类型 | 说明 |
+|------|------|------|------|
+| `client.py` | L1028~1035 | 修改 `_SIGNED_METHODS` | 将 `group.fs.mkdir/rm/cp/mv/mount/umount/check_upload/create_upload_session/complete_upload/create_download_ticket` 纳入签名集合 |
+| `client.py` | L1056~1308 | 新增 group_aid 生命周期 | `create_group` / `bind_group_aid` / `start_group_transfer` / `complete_group_transfer` 为 group.fs 提供可签名 group_aid 身份与群主转让 rekey 流程 |
+| `aid_store.py` | L744~793 | 新增 `import_group_identity()` | group_aid 私钥由 SDK 本地生成，服务端只签证书；落盘后通过 `load()` 自检 |
+
+#### `aun_cli/commands/group.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L126~199 | 新增 helper | `_normalize_group_fs_bare_path()` / `_is_local_group_fs_path()` / `_classify_group_fs_cp_path()` / `_output_group_fs_nodes()` 等 | 裸路径默认绑定当前 active group；支持 `local:` 前缀和 Windows 盘符本地判定 |
+| L296~320 | 新增命令 | `group_fs_ls()` | `aun group fs ls`，裸路径用 active group，输出节点表 |
+| L324~355 | 新增命令 | `group_fs_find()` | `aun group fs find`，支持 name/type/size/mtime 过滤 |
+| L359~397 | 新增命令 | `group_fs_stat()` / `group_fs_lstat()` | stat/lstat |
+| L401~448 | 新增命令 | `group_fs_mkdir()` / `group_fs_rm()` | mkdir/rm；写侧支持 `--sign-as` 注入 group_aid 签名身份 |
+| L452~522 | 新增命令 | `group_fs_cp()` | 支持本地↔group、group↔group copy，处理 `--force` / `--recursive` / `--sign-as` |
+| L526~568 | 新增命令 | `group_fs_mv()` | group remote path move；拒绝本地路径 |
+| L572~633 | 新增命令 | `group_fs_df()` / `group_fs_mount()` / `group_fs_umount()` | 用量、挂载、卸载 |
+| L637~676 | 修改命令 | `group_create()` | 新增 `--group-name`；命名群路径调用 `client.create_group(..., aid_store=store)` |
+| L681~720 | 新增命令 | `group_bind()` / `bind-aid` | 匿名群补 group_aid |
+| L724~762 | 新增命令 | `group_transfer()` | 发起群主转让，旧群主用 group_aid 私钥签 `transfer_auth` |
+| L767~794 | 新增命令 | `group_transfer_complete()` | 新群主完成 rekey 并导入新的 group_aid 身份 |
+
+**对齐要点**：`group.fs.cp` 必须支持三种路径组合；`sign_as` 是 SDK 内部签名身份选择，不应透传给服务端。服务端收到的是普通 `client_signature`，签名者可能是当前 AID，也可能是本地 AIDStore 中的 group_aid。
+
+---
+
+### 块④ Collab 协作编辑 RPC 门面与 CLI
+
+#### `collab/client.py`（新文件）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L8~9 | 新增 helper | `_drop_none(params)` | tag prune 等可选参数剔除 None |
+| L12~53 | 新增类 | `TagClient` | 封装 `collab.tag.create/list/show/diff/restore/rm/prune` |
+| L58~61 | 新增 | `CollabClient.__init__()` | 保存底层 client 并创建 `self.tag = TagClient(self)` |
+| L63~70 | 新增 | `CollabClient._call()` | 调用 `client.call()`，异常经 `map_collab_error()` 转换；仅 `-32009` 映射为 `CollabConflictError` |
+| L72~127 | 新增 | `ls_files()` / `create()` / `show()` / `commit()` / `merge()` / `log()` / `diff()` / `clone()` / `prune()` / `gc()` / `reflog()` / `revert()` / `ls_remote()` / `unregister()` | 逐个映射 `collab.*` RPC；Python SDK 不在本地实现 diff3，只转发 RPC |
+
+#### `collab/errors.py` / `collab/types.py`
+| 文件 | 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|------|
+| `collab/errors.py` | L8~9 | 新增 | `CollabError(AUNError)` | Collab 错误基类 |
+| `collab/errors.py` | L12~27 | 新增 | `CollabConflictError` | 保存 `current_version` / `current_target` / `hint` / `data` / `trace_id` |
+| `collab/errors.py` | L30~47 | 新增 | `map_collab_error(exc)` | `code == -32009` 时从 `exc.data` 抽取冲突字段并返回 `CollabConflictError` |
+| `collab/types.py` | L1~7 | 新增 | `CollabResult` / `CollabList` | 类型别名 |
+
+#### `errors.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L157~194 | 修改 | `map_remote_error(error)` | `code in {4290, 429, -32029, -32429}` 映射为 `RateLimitError`（L177），并保持 `retryable=True` 判定（L192）；覆盖 gateway backpressure 新错误码 |
+
+#### `aun_cli/commands/collab.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L24~85 | 新增 helper | `_set_json()` / `_is_aid_path()` / `_source_value()` / `_decode_content()` / `_print_result()` / `_run_collab()` / `_is_collab_user_error()` | 本地文件内容转 base64；远程 AID:path 保持原样；冲突退出码 2，用户错误退出码 3 |
+| L91~177 | 新增命令 | `ls-files` / `create` / `show` / `commit` / `merge` | 基础文档读写；`show/merge` 可 `--output` 写文件 |
+| L180~259 | 新增命令 | `log` / `diff` / `clone` / `prune` / `revert` / `gc` | 版本历史、差异、克隆、清理、回退 |
+| L262~297 | 新增命令 | `reflog` / `ls-remote` / `unregister` | 维护与远程查询 |
+| L300~374 | 新增 tag 命令 | `tag create/list/show/diff/restore/rm/prune` | 目录级标签命令树 |
+
+**对齐要点**：Collab SDK 侧只做 RPC 门面、错误映射和 CLI 输入输出转换；不要在 SDK 内部实现 diff3 或快照算法。`CollabConflictError` 的 `hint/current_version/current_target` 需要从服务端 error data 透传。
+
+---
+
+### 块⑤ Transport / 后台 RPC 公平性与关闭清理
+
+#### `transport.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L292~300 | 新增字段 | `_pending_meta` / `_send_lock` / `_last_reader_closed_at` / `_last_reader_error` / `_foreground_waiters` / `_admission_cond` | 记录 pending RPC 诊断、串行化 websocket send、记录 reader 关闭原因，并实现前台优先 admission |
+| L351~368 | 修改 | `RPCTransport.close()` | close 时调用 `_fail_pending(ConnectionError("transport closed"))`，避免 pending RPC 永久挂起 |
+| L370~382 | 新增 | `cancel_event_tasks()` | 关闭时取消 transport 派生的事件发布 task |
+| L384~399 | 新增 | `_schedule_event_publish(event, params)` | 事件 publish 统一建 task 并登记 `_event_tasks`，完成后回收并吞掉 task 异常 |
+| L401~426 | 新增 | `_pending_snapshot()` / `_fail_pending(exc, *, context)` | 超时/断连日志携带 pending 快照；断连时批量置异常并清 `_pending_meta` |
+| L428~446 | 新增 | `_mark_foreground_waiter()` / `_unmark_foreground_waiter()` / `_wait_background_turn()` | 后台 RPC 在有前台等待者时让路；防止后台同步淹没前台调用 |
+| L448~490 | 修改 | `call(..., background=False)` | 后台 RPC 先取后台信号量再等 admission；前台 RPC 标记 waiter；队列超时释放已取信号量并抛 retryable `TimeoutError` |
+| L492~517 | 修改 | `notify()` | 发送 JSON-RPC notification 时使用 `_send_lock` 串行化 websocket send |
+| L523~560 | 修改 | `_call_inner()` | 写入 `_pending_meta[rpc_id]`，websocket send 使用 `_send_lock`，send 成功记录 `sent_at` |
+| L572~576 | 修改 | `_call_inner()` 超时/取消 | CancelledError 与 TimeoutError 都清理 `_pending` / `_pending_meta` |
+| L704~713 | 修改 | `_reader_loop()` finally | 记录 reader 关闭时间/错误；若仍有 pending RPC，按断连原因 `_fail_pending()` |
+| L723~773 | 修改 | `_route_message()` | 收到 response 时清 `_pending_meta`；收到 `event/*` 时用 `_schedule_event_publish()` 替代裸 `asyncio.create_task()` |
+
+#### `_client/rpc_pipeline.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L80~85 | 新增 | `call_after_pipeline()` 读取 `_rpc_background` | 弹出内部 `_rpc_background`，或从 `client._background_rpc_depth` 推断后台 RPC |
+| L87~103 | 修改 | pull gate 重入参数 | pull gate 递归调用时透传 `_skip_send_result_envelope` 与 `_rpc_background` |
+| L158~181 | 修改 | V2 pull/ack 路由 | `message.pull` / `message.ack` / `group.pull` / `group.ack_messages` 进入 V2 内部方法前透传 `_rpc_background` |
+| L224~230 | 修改 | transport call kwargs | 后台 RPC 设置 `background=True`，交给 `RPCTransport.call()` 走前台优先队列 |
+| L458~495 | 修改 | `raw_call(..., background=False)` | 内部裸 RPC 也支持 `background`；关闭中后台 RPC 直接抛 `ConnectionError("client is closing")` |
+
+#### `_client/delivery.py` / `_client/group_state.py` / `_client/v2_e2ee.py` / `_client/lifecycle.py`
+| 文件 | 行号 | 类型 | 说明 |
+|------|------|------|------|
+| `_client/delivery.py` | L907~925 | 新增 | `transport_call_background()` 与 `run_background_rpc()`：后台 ack 与补洞统一使用 transport background 通道，并用 `_background_rpc_depth` 标记嵌套 RPC |
+| `_client/delivery.py` | L198~213 | 修复 | `handle_group_changed_event()` 对重复/已覆盖的 group.changed push 也发送 `group.ack_events`，避免服务端 cursor 停滞 |
+| `_client/delivery.py` | L1202~1214 / L1314~1335 | 修改 | V2 群 push 触发的自动 pull 用 `run_background_rpc()`，不抢占前台 RPC |
+| `_client/delivery.py` | L1414~1469 / L1491~1503 | 修改 | P2P gap fill 与 group event gap fill 调 `client.call(..., "_rpc_background": True)` |
+| `_client/group_state.py` | L332~362 | 修改 | 自动 propose / 自动 confirm 调度包装进 `run_background_rpc()` |
+| `_client/group_state.py` | L724~730 / L747~764 | 修改 | pending proposal confirm/propose 与 state 事件响应均走后台 RPC |
+| `_client/v2_e2ee.py` | L403 / L583~611 / L764~783 / L1891~1945 / L2097~2121 | 修改 | V2 P2P / Group pull 和 ack 内部方法识别 `_rpc_background`，raw pull/ack 透传 `background=True` 或重注入 `_rpc_background` |
+| `_client/lifecycle.py` | L420~471 | 修改 | 停止后台任务时先取消 transport event tasks，再取消 heartbeat/token/online hint/auto state task，并等待 `_background_ack_tasks` 最多 1 秒后取消残留 |
+
+#### `service_proxy/client.py`
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L69~82 | 新增 | `_SendLockedWebSocket` | 包装后端 websocket，所有 `send()` 通过实例级 lock 串行化，避免并发 send 竞态 |
+| L898~932 | 新增/调整 | `register_services_with_proxy_server()` / `_auth_and_register()` | 数据面 tunnel 连接后先 `service_proxy_auth`，再发送 `register_services` |
+| L1676~1704 | 新增 | `_send_tunnel_message()` / `_is_websocket_connection_closed()` / `_ws_error_message()` | WS relay 关闭/错误处理辅助 |
+| L1706~1764 | 新增 | `create_admin_app(admin_token=...)` | holder 侧本地 admin API：`/health`、`/services` GET/POST/DELETE |
+
+**对齐要点**：后台 RPC 公平性是 0.5.0 的关键稳定性变更。所有 SDK 都需要区分前台业务 RPC 与 SDK 自动补洞/ack/propose 等后台 RPC；后台 RPC 不应长期占满全局 inflight，也不应在 client closing 后继续发起。
+
+---
+
+### 块⑥ CLI 增强与命令入口
+
+#### `aun_cli/commands/fs.py`（新文件）
+| 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|
+| L22~185 | 新增 helper | `_json_ready()` / `_remote_or_exit()` / `_remote_or_default()` / `_parse_acl_spec()` / `_match_size()` / `_match_mtime()` / `_filter_find_nodes()` / `_print_node_table()` 等 | 远程路径解析、输出转换、find 本地过滤、表格输出 |
+| L189~300 | 新增命令 | `fs_ls()` / `fs_stat()` / `fs_cat()` | list/stat/cat；`cat` 支持 token、文本/二进制识别 |
+| L304~417 | 新增命令 | `fs_cp()` / `fs_mv()` / `fs_rm()` | 本地/远程 copy、move、remove |
+| L421~500 | 新增命令 | `fs_ln()` / `fs_mkdir()` / `fs_df()` | 软链、目录、用量 |
+| L504~620 | 新增命令 | `fs_mount()` / `fs_approve()` / `fs_reject()` / `fs_umount()` | mount / approve / reject / unmount |
+| L624~662 | 新增命令 | `fs_find()` | name/type/size/mtime 过滤 |
+| L666~840 | 新增命令 | `fs_chmod()` / `fs_setfacl()` / `fs_getfacl()` / `fs_token_issue()` / `fs_token_revoke()` / `fs_token_ls()` | 可见性、ACL、访问 token 管理 |
+
+#### `aun_cli/commands/storage.py` / `aun_cli/storage_core.py`
+| 文件 | 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|------|
+| `commands/storage.py` | L29~30 | 新增 | `_normalize_object_key()` | 统一 `\` → `/`，去掉前导 `/` |
+| `commands/storage.py` | L33~81 | 新增命令 | `storage_list()` / alias `ls` | 列对象与直接子前缀，表格输出 |
+| `commands/storage.py` | L84~103 | 新增命令 | `storage_info()` | 调 `storage.head_object` 查看对象元信息 |
+| `commands/storage.py` | L106~142 | 修改命令 | `storage_upload()` | 新增 `--force`，透传 `overwrite=force` |
+| `commands/storage.py` | L145~185 | 修改命令 | `storage_download()` | 新增 `--force`，默认拒绝覆盖本地文件 |
+| `storage_core.py` | L66~117 | 修改 | `upload_object(..., overwrite=False)` | 先 `storage.check_upload`，处理超限/目标已存在/dedup/skip_upload；inline 时 `put_object(overwrite=overwrite)`，大文件 session/complete 均透传 overwrite |
+
+#### `aun_cli/adapter.py` / `aun_cli/fs_utils.py` / `aun_cli/main.py`
+| 文件 | 行号 | 类型 | 符号 | 说明 |
+|------|------|------|------|------|
+| `adapter.py` | L119~122 | 新增 | `_print_debug()` | debug 输出固定写 stderr，避免污染 CLI stdout/JSON |
+| `adapter.py` | L222 | 修改 | `CLISession.__aenter__()` | 用 AIDStore 加载身份后把 store 绑定到 `client._aid_store`，供 group.fs `sign_as` 与 group_aid 生命周期使用 |
+| `fs_utils.py` | L9~46 | 新增 | `is_remote()` / `normalize_path()` / `parse_remote()` / `format_remote()` | CLI 远程路径工具；排除 Windows 盘符和 HTTP URL |
+| `main.py` | L85~92 | 修改 | Typer app 注册 | 注册新增 `fs_app` 与 `collab_app` |
+
+---
+
+### 版本号
+
+| 文件 | 行号 | 类型 | 说明 |
+|------|------|------|------|
+| `pyproject.toml` | L7 | 修改 | `version = "0.4.13"` → `"0.5.0"` |
+| `src/aun_core/version.py` | L1 | 修改 | `__version__ = "0.4.13"` → `"0.5.0"` |
+
+---
+
+### 文档与生成物同步
+
+| 路径 | 类型 | 说明 |
+|------|------|------|
+| `CHANGELOG.md` | 修改 | 对外接口级摘要同步到 0.5.0；本文件继续作为 func/line 级实现清单 |
+| `src/aun_core/docs/skill/methods/group.fs.*.md` | 新增 | 新增 `group.fs` RPC 方法文档，替代已删除的 `group.resources.*` 方法文档 |
+| `src/aun_core/docs/skill/methods/storage.*.md` / `storage.fs.*.md` / `storage.volume.*.md` | 新增/修改 | Storage P1~P6、POSIX fs、ACL/token、volume 方法文档同步 |
+| `src/aun_core/docs/skill/rpc-manual/*/04-RPC-Manual.md` / `sdk-core/09-*-rpc-manual.md` | 新增/修改 | Collab/Group/Message/Proxy/Storage/Stream RPC 手册同步；这些文件是 SDK 文档生成物，不改变 Python 运行时代码路径 |
+
+### 测试新增/修改（按当前文件行号）
+
+| 文件 | 用例/行号 | 覆盖点 |
+|------|-----------|--------|
+| `tests/unit/test_storage_vfs_p1.py` | `test_upload_inline_dedup_skips_http_put` L35；`test_upload_large_uses_session_and_complete` L71；`test_upload_refuses_existing_remote_target_unless_overwrite` L107 | Storage VFS 上传预检、dedup、大文件 session、overwrite |
+| `tests/unit/test_storage_vfs_p2.py` | `test_vfs_symlink_and_readlink_call_lowlevel` L31；`test_vfs_repoint_cas_mismatch_maps_conflict` L78；`test_vfs_maps_loop_and_dangling_errors` L171 | 软链、CAS 冲突、ELOOP/EDANGLING 映射 |
+| `tests/unit/test_storage_vfs_p3.py` | `test_vfs_defaults_to_fs_list_and_preserves_authoritative_mode` L38；`test_vfs_can_fallback_to_p1_p2_paths_when_flag_disabled` L131 | `storage.fs.*` 权威路径与回退路径 |
+| `tests/unit/test_storage_vfs_p4.py` | `test_vfs_acl_and_token_methods_call_p4_rpc_contracts` L28；`test_vfs_read_methods_forward_token_to_read_rpc_paths` L68 | ACL/token/read token 透传 |
+| `tests/unit/test_storage_vfs_p6.py` | `test_lowlevel_fs_mount_unmount_rpc_contracts` L24；`test_vfs_mount_volume_uses_volume_id_branch` L221；`test_lowlevel_volume_lifecycle_and_membership_invalidation_rpc_contracts` L252 | mount/unmount、volume、membership invalidate |
+| `tests/unit/test_group_fs_contract.py` | `test_group_facade_exposes_posix_group_fs_namespace` L39；`test_group_fs_posix_methods_call_group_fs_rpc` L51；`test_group_fs_does_not_map_memberdata_to_groupdata_in_sdk` L90 | `client.group.fs` POSIX 合同与 memberdata 路由不在 SDK 改写 |
+| `tests/unit/test_group_fs_vfs.py` | `test_cp_local_to_group_uses_upload_control_plane` L60；`test_cp_group_to_local_sends_bearer_for_scoped_download_ticket` L236；`test_cp_group_to_group_uses_single_rpc` L296 | group.fs cp 三路径、Bearer 下载、远程单 RPC |
+| `tests/unit/test_cli_group_fs.py` | `test_cli_group_fs_write_can_sign_as_group_aid` L157；`test_cli_group_fs_cp_windows_drive_is_local` L180；`test_cli_group_fs_mount_and_umount_use_active_group` L295 | CLI group.fs active group、sign-as、Windows 路径 |
+| `tests/unit/test_cli_group_fs_contract.py` | `test_cli_group_fs_help_exposes_only_posix_commands` L34；`test_cli_group_help_recommends_fs_not_compat_resources` L47 | CLI 帮助不再推荐/暴露 `resources` |
+| `tests/unit/test_group_identity.py` | `test_import_group_identity_persists_and_loads` L34；`test_create_named_group_generates_key_and_persists` L149；`test_bind_group_aid_generates_key_and_persists_without_group_name` L200；`test_complete_group_transfer_generates_key_and_persists` L242 | group_aid 证书/私钥落盘、命名群、匿名群补绑、群主转让 rekey |
+| `tests/unit/test_collab_client.py` | `test_collab_methods_match_server_rpc_contract` L41；`test_python_sdk_does_not_implement_diff3` L118；`test_collab_conflict_error_preserves_server_fields` L137 | Collab RPC 门面、无本地 diff3、冲突错误字段透传 |
+| `tests/unit/test_collab_cli.py` | `test_collab_create_converts_local_file_to_base64` L115；`test_collab_commit_conflict_exit_code_and_hint` L181；`test_collab_tag_and_ls_remote_commands` L236 | Collab CLI 输入转换、退出码、tag 命令 |
+| `tests/unit/test_cli_collab_exit_codes.py` | `test_collab_no_change_is_user_error` L7；`test_collab_conflict_is_user_error` L14；`test_collab_internal_error_is_not_user_error` L32 | Collab CLI 用户错误/内部错误退出码分类 |
+| `tests/unit/test_collab_commit_message.py` | `test_commit_with_message` L7；`test_commit_without_message_defaults_empty` L42；`test_log_returns_message` L69 | Collab commit/log message 字段语义 |
+| `tests/unit/test_collab_create_transaction.py` | `test_create_delegates_transaction_to_collab_rpc` L18；`test_tag_create_delegates_transaction_to_collab_rpc` L38 | Collab create/tag create transaction 参数透传 |
+| `tests/unit/test_collab_gc.py` | `test_gc_defaults_to_dry_run` L24；`test_gc_can_request_cleanup` L37 | Collab GC dry-run 默认语义 |
+| `tests/unit/test_collab_revert.py` | `test_revert_calls_collab_revert_with_exact_params` L23；`test_revert_not_found_error_is_propagated` L44 | Collab revert 参数与错误透传 |
+| `tests/unit/test_cli_fs_p1.py` | `test_cli_fs_cp_upload_and_download` L100；`test_cli_fs_bare_paths_default_to_profile_aid` L212；`test_cli_debug_output_does_not_pollute_stdout` L297 | 全局 `aun fs` P1 路径分类、裸路径默认 AID、debug stderr |
+| `tests/unit/test_cli_fs_p2.py` | `test_cli_fs_ln_s_calls_vfs_symlink` L86；`test_cli_fs_ln_force_calls_vfs_repoint` L108；`test_cli_fs_stat_symlink_includes_target` L150 | `aun fs` 软链/repoint/stat 展示 |
+| `tests/unit/test_cli_fs_p4.py` | `test_cli_fs_chmod_calls_set_visibility` L74；`test_cli_fs_setfacl_getfacl_and_remove` L111；`test_cli_fs_token_commands` L131；`test_cli_fs_cat_forwards_token` L152 | `aun fs` visibility、ACL、token、cat token |
+| `tests/unit/test_cli_fs_p5.py` | `test_cli_fs_find_filters_name_type_and_size` L77；`test_cli_fs_find_filters_mtime_and_symlink` L93 | `aun fs find` 本地过滤语义 |
+| `tests/unit/test_cli_fs_p6.py` | `test_cli_fs_mount_source_calls_vfs_mount` L68；`test_cli_fs_mount_volume_calls_vfs_mount_volume` L119；`test_cli_fs_approve_reject_pass_request_id` L181 | `aun fs` mount/volume/approve/reject |
+| `tests/unit/test_cli_storage.py` | `test_upload_force_passes_overwrite_true` L100；`test_download_refuses_existing_file_without_force` L144；`test_list_calls_object_and_prefix_listing` L179；`test_info_calls_head_object` L204 | storage CLI force/list/info 行为 |
+| `tests/unit/test_sdk_facades.py` | `test_facades_accept_dict_and_omit_none` L21；`test_aun_client_exposes_cached_namespace_facades` L101；`test_low_level_group_rpcs_remain_accessible_through_call` L113 | 新门面参数合并、懒加载缓存、低级 RPC 兼容 |
+| `tests/unit/test_client_signature.py` | `test_storage_mutation_method_is_non_idempotent` L199；`test_group_fs_method_is_non_idempotent` L205；`test_collab_mutation_method_is_non_idempotent` L211 | 非幂等集合覆盖新增 storage/group.fs/collab 写操作 |
+| `tests/unit/test_client.py` | `test_background_rpc_depth_marks_public_calls_background` L3161；`test_background_rpc_does_not_call_transport_when_client_is_closing` L3260；`test_group_changed_covered_event_reconciles_server_cursor_without_fill` L3609 | 后台 RPC 标记、关闭中拒发、group.changed covered ack |
+| `tests/unit/test_errors.py` | `test_gateway_backpressure_32429_maps_to_rate_limit_error` L32 | `-32429` 映射为 retryable `RateLimitError` |
+| `tests/unit/test_service_proxy_send_lock.py` | `test_send_locked_websocket_serializes_concurrent_sends` L22 | service proxy websocket send 串行化 |
+| `tests/unit/test_service_proxy_tunnel_messages.py` | `test_service_proxy_client_registers_with_gateway_and_proxy_server_in_order` L181；`test_service_proxy_client_serve_once_dispatches_ws_connect` L466；`test_service_proxy_client_serve_once_demuxes_concurrent_ws_connections` L508 | proxy server auth/register 顺序与 WS tunnel demux |
+| `tests/unit/test_service_proxy_ws_backend_caller.py` | `test_service_proxy_client_ws_backend_relay_text_binary_and_close` L112；`test_service_proxy_client_ws_backend_normalizes_unsendable_close_code` L250 | WS 后端转发与 close code 归一 |
+| `tests/integration_test_fs_p1.py` | `test_roundtrip_small_and_large` L94；`test_list_stat_rm_df` L118 | Storage VFS P1 集成路径 |
+| `tests/integration_test_fs_p2.py` | `test_symlink_basic` L83；`test_repoint_and_remove` L100；`test_dangling_and_loop` L135 | Storage symlink/repoint/loop 集成路径 |
+| `tests/integration_test_fs_p3.py` | `test_authoritative_nodes` L93；`test_mutations` L113 | `storage.fs.*` 权威节点与 mutation 集成路径 |
+| `tests/integration_test_fs_p4.py` | `test_acl_and_visibility` L101；`test_token_reads` L122 | ACL/visibility/token 集成路径 |
+| `tests/e2e_test_fs_p1.py` / `p2.py` / `p3.py` / `p4.py` / `p6.py` | `test_cli_fs_p1_e2e` L198；`test_cli_fs_p2_e2e` L198；`test_cli_fs_p3_e2e` L197；`test_cli_fs_p4_e2e` L219；`test_cli_fs_p6_e2e` L232 | `aun fs` P1/P2/P3/P4/P6 CLI E2E |
+| `tests/e2e_test_group_fs_cli.py` | `test_cli_group_fs_e2e` L234 | `aun group fs` CLI E2E |
+| `tests/e2e_test_collab_docker.py` | `test_collab_create_show_commit_log_get_diff` L93；`test_collab_submit_conflict_hint_and_merge_modes` L135；`test_collab_group_discover_unregister_and_wrong_namespace` L241 | Collab Docker E2E 主流程、冲突提示、group discover/unregister |
+| `tests/integration/test_collab_gc_e2e.py` / `tests/integration_test_collab_group_acl.py` | `test_gc_basic_dry_run` L60；`test_gc_cleans_orphans` L76；`test_collab_read_non_member_with_acl` L129；`test_collab_read_non_member_without_acl` L141 | Collab GC 与 group ACL 集成路径 |
+
+### 跨 SDK 对齐优先级
+
+1. **P0**：`storage.fs.*` / `group.fs.*` RPC 方法名、签名集合、非幂等集合、错误映射必须一致；`group.resources.*` 不再作为 0.5.0 SDK 对齐目标。
+2. **P0**：后台 RPC 标记与 transport 前台优先 admission 必须对齐，否则补洞/ack/auto-propose 可能挤占业务 RPC。
+3. **P1**：`client.storage` / `client.group.fs` / `client.collab` 门面语义、Collab `-32009` 冲突错误映射、group_aid 本地私钥落盘流程需对齐。
+4. **P1**：CLI 行为可按语言生态调整命令框架，但路径分类、overwrite 默认拒绝、`local:` 前缀、Windows 盘符判定、JSON/stdout/stderr 分离语义需保持一致。
 
 ---
 

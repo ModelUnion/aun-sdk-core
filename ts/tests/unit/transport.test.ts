@@ -29,6 +29,30 @@ class MockWebSocket extends EventEmitter {
   }
 }
 
+class MockConnectingWebSocket extends EventEmitter {
+  readyState = 0; // CONNECTING
+  terminateCalls = 0;
+  errorListenerCountAtTerminate = -1;
+
+  close(): void {
+    this.terminate();
+  }
+
+  terminate(): void {
+    this.terminateCalls += 1;
+    this.errorListenerCountAtTerminate = this.listenerCount('error');
+    process.nextTick(() => {
+      this.emit('error', new Error('WebSocket was closed before the connection was established'));
+      this.readyState = 3; // CLOSED
+      this.emit('close', 1006);
+    });
+  }
+
+  send(_data: string, cb?: (err?: Error) => void): void {
+    cb?.();
+  }
+}
+
 // ── 辅助函数 ────────────────────────────────────────────────
 
 /**
@@ -146,6 +170,24 @@ describe('RPCTransport 连接超时', () => {
     // 推进时间超过超时值 — 不应抛出异常
     vi.advanceTimersByTime(2_000);
     // 如果定时器仍活着且未被 initialResolved 守卫，这里会报错
+  });
+
+  it('连接超时回滚 CONNECTING WebSocket 时应吸收 ws 异步 error', async () => {
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({
+      eventDispatcher: dispatcher,
+      timeout: 100,
+      verifySsl: false,
+    });
+    const ws = new MockConnectingWebSocket();
+
+    const connectPromise = (transport as any)._connectWithWs(ws);
+    vi.advanceTimersByTime(100);
+
+    await expect(connectPromise).rejects.toThrow(/timeout/i);
+    expect(ws.terminateCalls).toBe(1);
+    expect(ws.errorListenerCountAtTerminate).toBeGreaterThan(0);
+    await new Promise<void>((resolve) => process.nextTick(resolve));
   });
 });
 

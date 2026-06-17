@@ -212,3 +212,5 @@ notify 专项测试覆盖：
 - 单域集成：AID 在线实时投递、group 在线成员投递。
 - E2E：`device_id` / `slot_id` 精确投递、离线不存储不补发。
 - 双域跨域：Python / TypeScript / Go / 浏览器 JavaScript 从 `aid.com` 在线投递到 `aid.net`。
+
+

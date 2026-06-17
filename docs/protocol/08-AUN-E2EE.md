@@ -411,3 +411,5 @@ sign_payload = ciphertext_bytes + tag_bytes + aad_bytes
 | 2.0-draft-r1 | 2026-04 | 升级为 prekey_ecdh_v2（四路 ECDH）；HKDF info 改为 `aun-prekey-v2:{prekey_id}` |
 | 2.0-draft | 2026-04 | 简化为 prekey_ecdh_v2 + long_term_key 两级降级；移除在线协商（ephemeral_ecdh）；移除会话状态机；E2EEManager 退化为纯工具类 |
 | 1.0-draft | — | 初始版本，三级降级（ephemeral_ecdh + prekey + long_term_key） |
+
+

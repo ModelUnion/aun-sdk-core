@@ -752,7 +752,7 @@ class AIDStore:
     ) -> Result[ImportGroupIdentityResult]:
         """导入外部生成的群 AID 身份材料。
 
-        用于 group-storage：群主 SDK 本地生成 group_aid 私钥，服务端只签发证书。
+        用于 group.fs：群主 SDK 本地生成 group_aid 私钥，服务端只签发证书。
         这里校验证书属于目标 AID 且公钥匹配，再复用 load() 做私钥/证书自检。
         """
         target = str(aid or "").strip()

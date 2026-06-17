@@ -5,7 +5,8 @@ from .config import get_device_id
 from .e2ee import ProtectedHeaders
 from .result import ErrorInfo, Result, result_err, result_ok
 from .types import ConnectionOptions, ConnectionState
-from .facades import GroupFacade, GroupPendingOpsPartialFailure, GroupResourcesFacade, MessageFacade, StreamFacade, ThoughtFacade
+from .facades import GroupFacade, MessageFacade, StreamFacade, ThoughtFacade
+from .group_fs import GroupFSVFS
 from .storage import StorageLowLevel, StorageVFS
 from .collab import CollabClient, CollabConflictError, CollabError
 from .errors import (
@@ -46,8 +47,7 @@ __all__ = [
     "ConnectionOptions",
     "ConnectionState",
     "GroupFacade",
-    "GroupPendingOpsPartialFailure",
-    "GroupResourcesFacade",
+    "GroupFSVFS",
     "MessageFacade",
     "StreamFacade",
     "ThoughtFacade",

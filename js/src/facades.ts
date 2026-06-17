@@ -1,7 +1,7 @@
-import { GroupPendingOpsPartialFailure, GroupResourcesFacade } from './group-resources.js';
+import { GroupFSVFS } from './group-fs.js';
 import type { RpcParams, RpcResult } from './types.js';
 
-export { GroupPendingOpsPartialFailure, GroupResourcesFacade } from './group-resources.js';
+export { GroupFSVFS, isGroupRemotePath } from './group-fs.js';
 
 export interface FacadeRpcClient {
   call(method: string, params?: RpcParams): Promise<RpcResult>;
@@ -79,12 +79,12 @@ export class GroupThoughtFacade extends RpcFacade {
 }
 
 export class GroupFacade extends RpcFacade {
-  private _resources?: GroupResourcesFacade;
+  private _fs?: GroupFSVFS;
   private _thought?: GroupThoughtFacade;
 
-  get resources(): GroupResourcesFacade {
-    if (!this._resources) this._resources = new GroupResourcesFacade(this.client);
-    return this._resources;
+  get fs(): GroupFSVFS {
+    if (!this._fs) this._fs = new GroupFSVFS(this.client);
+    return this._fs;
   }
 
   get thought(): GroupThoughtFacade {

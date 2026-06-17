@@ -1,101 +1,107 @@
-"""测试 collab.gc E2E"""
-import asyncio
+"""collab.gc 单域集成测试。"""
+from __future__ import annotations
+
 import base64
-import tempfile
+import os
 import shutil
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any
+
 import pytest
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
+
+os.environ.setdefault("AUN_ENV", "development")
+
+_ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
+
+
+def _b64(value: bytes | str) -> str:
+    data = value.encode("utf-8") if isinstance(value, str) else value
+    return base64.b64encode(data).decode("ascii")
+
+
+async def _make_connected_client(tag: str) -> tuple[AUNClient, str, str]:
+    aun_path = tempfile.mkdtemp(prefix=f"aun-collab-gc-{tag}-")
+    aid = f"collab-gc-{tag}-{uuid.uuid4().hex[:8]}.{_ISSUER}"
+    client = make_client_for_path(aun_path, require_forward_secrecy=False)
+    await ensure_connected_identity(client, aid)
+    print(f"[collab-gc] connected aid={aid} aun_path={aun_path}")
+    return client, aid, aun_path
+
+
+async def _cleanup(client: AUNClient, aid: str, root_path: str, aun_path: str) -> None:
+    try:
+        await client.storage.remove(root_path, owner=aid, recursive=True)
+    except Exception as exc:
+        print(f"[collab-gc] cleanup remote skipped: {exc}")
+    await client.close()
+    shutil.rmtree(aun_path, ignore_errors=True)
+
+
+def _assert_gc_shape(result: dict[str, Any]) -> None:
+    for key in ("scanned", "reachable", "garbage", "deleted"):
+        assert key in result, f"gc 返回缺少字段 {key}: {result}"
 
 
 @pytest.mark.asyncio
-async def test_gc_basic_dry_run():
-    """gc dry_run 基础测试"""
-    aun_path = tempfile.mkdtemp(prefix="test-gc-")
-    alice = AUNClient(debug=False)
-    alice.init(aun_path=aun_path)
-    await alice.register("alice.agentid.pub")
-    await alice.connect("wss://gateway.agentid.pub:9500", verify_ssl=False)
-
+async def test_gc_basic_dry_run() -> None:
+    client, aid, aun_path = await _make_connected_client("dry")
+    root_path = f"/gc-test-{uuid.uuid4().hex[:10]}"
+    collab_root = f"{aid}:{root_path}"
     try:
-        # 创建群和协作根
-        group = await alice.create_group("test-gc-group")
-        group_aid = group["group_aid"]
+        await client.collab.create(collab_root, "doc1.md", _b64("test content"))
 
-        collab_root = f"{alice.aid}:/gc-test"
-        await alice.storage.vfs.mkdir("/gc-test", group_aid=group_aid)
-
-        # 创建文档
-        content_b64 = base64.b64encode(b"test content").decode()
-        await alice.collab.create(collab_root, "doc1.md", f"data:text/plain;base64,{content_b64}")
-
-        # 运行 gc dry_run
-        result = await alice.collab.gc(collab_root, dry_run=True)
-
-        # 验证返回字段
-        assert "scanned" in result
-        assert "reachable" in result
-        assert "garbage" in result
-        assert "deleted" in result
-        assert result["deleted"] == 0  # dry_run 不删除
-
-        print(f"✓ gc dry_run: scanned={result['scanned']}, reachable={result['reachable']}, garbage={result['garbage']}")
-
+        result = await client.collab.gc(collab_root, dry_run=True)
+        _assert_gc_shape(result)
+        assert result["deleted"] == 0
+        print(f"[collab-gc] dry_run result={result}")
     finally:
-        await alice.close()
-        shutil.rmtree(aun_path, ignore_errors=True)
+        await _cleanup(client, aid, root_path, aun_path)
 
 
 @pytest.mark.asyncio
-async def test_gc_cleans_orphans():
-    """gc 清理孤儿对象"""
-    aun_path = tempfile.mkdtemp(prefix="test-gc-orphans-")
-    alice = AUNClient(debug=False)
-    alice.init(aun_path=aun_path)
-    await alice.register("alice.agentid.pub")
-    await alice.connect("wss://gateway.agentid.pub:9500", verify_ssl=False)
-
+async def test_gc_cleans_orphans() -> None:
+    client, aid, aun_path = await _make_connected_client("orphan")
+    root_path = f"/gc-orphan-test-{uuid.uuid4().hex[:10]}"
+    collab_root = f"{aid}:{root_path}"
     try:
-        # 创建群和协作根
-        group = await alice.create_group("test-gc-orphans")
-        group_aid = group["group_aid"]
+        await client.collab.create(collab_root, "doc1.md", _b64("v1"))
 
-        collab_root = f"{alice.aid}:/gc-orphan-test"
-        await alice.storage.vfs.mkdir("/gc-orphan-test", group_aid=group_aid)
-
-        # 创建文档 v1
-        content_b64 = base64.b64encode(b"v1").decode()
-        await alice.collab.create(collab_root, "doc1.md", f"data:text/plain;base64,{content_b64}")
-
-        # 模拟孤儿：直接写一个对象到 .collab-versions/ 但不在 ledger 中
-        orphan_content = base64.b64encode(b"orphan content").decode()
-        orphan_path = f"/gc-orphan-test/.collab-versions/doc1.md/{alice.aid}/orphan-99.md"
-        await alice.storage.put_object(
+        orphan_path = f"{root_path}/.collab-versions/doc1.md/{aid}/orphan-99.md"
+        await client.storage.write_bytes(
             orphan_path,
-            content=orphan_content,
-            group_aid=group_aid
+            b"orphan content",
+            owner=aid,
+            content_type="text/plain",
         )
+        print(f"[collab-gc] orphan created path={orphan_path}")
 
-        # dry_run 应该发现孤儿
-        result_dry = await alice.collab.gc(collab_root, dry_run=True)
-        assert result_dry["garbage"] >= 1, f"应该发现至少1个孤儿，实际: {result_dry}"
+        result_dry = await client.collab.gc(collab_root, dry_run=True)
+        _assert_gc_shape(result_dry)
+        assert result_dry["garbage"] >= 1, f"应该发现至少 1 个孤儿对象: {result_dry}"
         assert result_dry["deleted"] == 0
+        print(f"[collab-gc] dry orphan result={result_dry}")
 
-        # 实际清理
-        result_clean = await alice.collab.gc(collab_root, dry_run=False)
-        assert result_clean["deleted"] >= 1, f"应该删除至少1个对象，实际: {result_clean}"
+        result_clean = await client.collab.gc(collab_root, dry_run=False)
+        _assert_gc_shape(result_clean)
+        assert result_clean["deleted"] >= 1, f"应该删除至少 1 个孤儿对象: {result_clean}"
+        print(f"[collab-gc] clean result={result_clean}")
 
-        # 再次 gc 应该没有垃圾
-        result_final = await alice.collab.gc(collab_root, dry_run=True)
-        assert result_final["garbage"] == 0, f"清理后应该无垃圾，实际: {result_final}"
-
-        print(f"✓ gc 清理孤儿: 删除了 {result_clean['deleted']} 个对象")
-
+        result_final = await client.collab.gc(collab_root, dry_run=True)
+        _assert_gc_shape(result_final)
+        assert result_final["garbage"] == 0, f"清理后不应再有垃圾: {result_final}"
     finally:
-        await alice.close()
-        shutil.rmtree(aun_path, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    asyncio.run(test_gc_basic_dry_run())
-    asyncio.run(test_gc_cleans_orphans())
-    print("\n✓ 所有 gc E2E 测试通过")
+        await _cleanup(client, aid, root_path, aun_path)
