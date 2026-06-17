@@ -115,7 +115,7 @@ export {
 // ── Collab 协作层 ───────────────────────────────────────────
 export {
   CollabClient,
-  CollabSnapshotClient,
+  CollabTagClient,
   CollabError,
   CollabConflictError,
   mapCollabError,
@@ -126,10 +126,16 @@ export {
   type CollabHistoryEntry,
   type CollabDiffResult,
   type CollabRegistryEntry,
+  type CollabTagEntry,
+  type CollabTag,
+  type CollabTagDiffResult,
+  type CollabTagPruneOptions,
+  type CollabTagRestoreResult,
   type CollabSnapshotEntry,
   type CollabSnapshot,
   type CollabSnapshotDiffResult,
   type CollabSnapshotPruneOptions,
+  type CollabSnapshotRestoreResult,
 } from './collab/index.js';
 
 // ── Service plane facades ───────────────────────────────────
@@ -138,12 +144,19 @@ export {
   MessageThoughtFacade,
   GroupFacade,
   GroupThoughtFacade,
-  GroupResourcesFacade,
-  GroupPendingOpsPartialFailure,
   StreamFacade,
   type FacadeParams,
   type FacadeRpcClient,
 } from './facades.js';
+export {
+  GroupFSVFS,
+  isGroupRemotePath,
+  type GroupFSCopyDestination,
+  type GroupFSCopyOptions,
+  type GroupFSCopySource,
+  type GroupFSDownloadResult,
+  type GroupFSRpcClient,
+} from './group-fs.js';
 
 // ── Gateway 发现 ─────────────────────────────────────────────
 export { GatewayDiscovery } from './discovery.js';

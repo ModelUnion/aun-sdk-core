@@ -56,7 +56,7 @@
 | 群消息收发（group.send/pull） | 10 §10.5 |
 | 群成员权限（owner/admin/member） | 10 §10.2 |
 | 邀请码（group.create_invite_code） | 10 §10.7 |
-| 群资源共享（group.resources.*） | 10 §10.9 |
+| 群文件系统（group.fs.*） | 10 §10.9 |
 | 对象存储（storage.*） | 11 |
 | 实时流传输（stream.*） | 12 |
 | 推流（WebSocket） | 12 §12.6 推流端点 |
@@ -122,3 +122,5 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 
 ### 15-离线推送通知协议
 目标 AID 全部设备离线时的推送机制。push_notify_aid 作为普通客户端 AID 连接 Gateway，通过 `event/push.offline_message` 事件接收推送摘要（仅元数据，不含正文），处理后回 `push.ack` RPC 释放 in-flight 槽位（默认 max_in_flight=1 串行确认，30s 超时不重试）。聚合机制：同一 target_aid 60s 冷却期内合并为一条推送（unread_count++、senders 去重追加）。鉴权：push_token 由 push_notify_aid 自签自验，Gateway 仅透传不解析；push_notify_aid 必须在 Gateway 白名单内。跨域：推送由目标 AID 所属域的 Gateway 触发，push_notify_aid 必须与目标 AID 同域。
+
+

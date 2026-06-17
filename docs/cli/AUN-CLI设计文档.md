@@ -2,534 +2,246 @@
 
 ## 1. 定位
 
-AUN CLI 是面向开发者和运维的命令行工具，提供与 AUN 网络交互的完整能力：身份管理、消息收发、群组操作、加密状态检查、故障诊断。
-
-核心价值：不写代码即可完成 AUN 协议的全部操作，同时作为 SDK 功能的验证工具和调试入口。
-
-## 2. 架构
-
-```
-┌─────────────────────────────────────────────┐
-│                  aun CLI                     │
-│  ┌─────────┐ ┌─────────┐ ┌──────────────┐  │
-│  │ typer   │ │ config  │ │ output fmt   │  │
-│  │ routing │ │ manager │ │ (table/json) │  │
-│  └────┬────┘ └────┬────┘ └──────┬───────┘  │
-│       │            │             │           │
-│  ┌────▼────────────▼─────────────▼────────┐ │
-│  │           SDK Adapter Layer             │ │
-│  │  (async → sync bridge, session mgmt)   │ │
-│  └────────────────┬───────────────────────┘ │
-└───────────────────┼─────────────────────────┘
-                    │
-┌───────────────────▼───────────────────────┐
-│              aun_core (SDK)                │
-│  AUNClient / AuthFlow / E2EE / Groups     │
-└───────────────────────────────────────────┘
-```
-
-### 2.1 关键设计决策
-
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 命令框架 | typer | 类型注解驱动，自动生成 help，比 click 更简洁 |
-| 异步桥接 | asyncio.run() 包装 | SDK 全异步，CLI 需要同步入口 |
-| 配置格式 | TOML | Python 生态标准，人类可读 |
-| 输出格式 | 默认 human-readable，`--json` 切换 | 兼顾交互和脚本管道 |
-| 状态持久化 | 复用 SDK 的 aun_path 目录 | 零额外存储概念 |
-| 分发方式 | pip + PyInstaller 独立二进制 | 覆盖开发者和终端用户 |
-
-### 2.2 目录结构
-
-```
-aun-sdk-core/python/
-├── src/
-│   ├── aun_core/              # 现有 SDK（不动）
-│   └── aun_cli/               # CLI 工具
-│       ├── __init__.py
-│       ├── __main__.py        # python -m aun_cli 入口
-│       ├── main.py            # typer app 定义 + 全局选项
-│       ├── adapter.py         # SDK 异步桥接 + 会话管理
-│       ├── config.py          # profile/配置 CRUD
-│       ├── output.py          # 输出格式化（table/json/plain）
-│       └── commands/
-│           ├── __init__.py
-│           ├── identity.py    # register / login / whoami / list
-│           ├── message.py     # send / pull / listen / ack
-│           ├── group.py       # create / send / invite / kick / ...
-│           ├── storage.py     # upload / download / delete
-│           ├── keys.py        # list / rotate / export / import
-│           └── diag.py        # doctor / status / ping / trace / logs
-└── pyproject.toml             # 新增 [project.scripts] aun = "aun_cli.main:app"
-```
-
-## 3. 全局选项
-
-```
-aun [全局选项] <command> [子选项] [参数]
-
-全局选项：
-  --profile, -p TEXT     使用指定 profile（默认 "default"）
-  --gateway, -g URL      覆盖网关地址
-  --json                 JSON 格式输出
-  --debug                启用 debug 日志
-  --no-color             禁用彩色输出
-  --timeout, -t INT      操作超时秒数（默认 30）
-  --version, -V          显示版本
-  --help, -h             显示帮助
-```
-
-## 4. 命令详细设计
-
-### 4.1 身份管理 (identity)
-
-#### `aun register`
-
-注册新 AID 并保存到本地 profile。
-
-```
-aun register <aid> --gateway <url> [--password <seed-password>]
-
-示例：
-  aun register alice@aid.com --gateway wss://gw.aid.com/ws
-  aun register bob@example.com -g wss://gw.example.com/ws -p work
-```
-
-流程：
-1. 生成 P-256 密钥对
-2. 连接网关，调用 `auth.create_aid()`
-3. 保存身份材料到 `~/.aun/profiles/{profile}/AIDs/{aid}/`
-4. 输出注册结果（AID、证书指纹、有效期）
-
-#### `aun login`
-
-登录已有 AID（验证本地密钥可用，刷新 token）。
-
-```
-aun login [aid]
-
-示例：
-  aun login                    # 登录当前 profile 的默认 AID
-  aun login alice@aid.com      # 指定 AID
-```
-
-#### `aun whoami`
-
-显示当前身份信息。
-
-```
-aun whoami
-
-输出：
-  AID:        alice@aid.com
-  Profile:    default
-  Gateway:    wss://gw.aid.com/ws
-  Cert:       SHA256:a1b2c3... (expires 2027-01-15)
-  State:      authenticated
-  Device ID:  d8f2...
-```
-
-#### `aun identity list`
-
-列出本地所有身份。
-
-```
-aun identity list
-
-输出：
-  PROFILE   AID                GATEWAY              STATUS
-  default   alice@aid.com      wss://gw.aid.com     active
-  work      bot@corp.com       wss://gw.corp.com    expired
-```
-
-### 4.2 消息 (message)
-
-#### `aun send`
-
-发送 P2P 消息。
-
-```
-aun send <target-aid> <message> [--no-encrypt] [--persist]
-
-示例：
-  aun send bob@aid.com "hello"
-  aun send bob@aid.com --no-encrypt "plaintext msg"
-  echo "piped content" | aun send bob@aid.com -
-```
-
-- 默认 E2EE 加密
-- 支持 stdin 管道输入（`-` 表示从 stdin 读取）
-- `--persist` 标志控制消息持久化
-
-#### `aun pull`
-
-拉取离线消息。
-
-```
-aun pull [--from <aid>] [--limit N] [--after-seq N]
-
-示例：
-  aun pull                         # 拉取所有未读
-  aun pull --from bob@aid.com      # 只拉某人的
-  aun pull --limit 10              # 最多 10 条
-```
-
-#### `aun listen`
-
-实时监听消息（长连接，类似 tail -f）。
-
-```
-aun listen [--from <aid>] [--include-group]
-
-示例：
-  aun listen                       # 监听所有 P2P 消息
-  aun listen --include-group       # 同时监听群消息
-  aun listen --from bob@aid.com    # 只监听某人
-
-输出（逐行）：
-  [2026-05-21 14:32:01] bob@aid.com → you: hello
-  [2026-05-21 14:32:05] group:abc123 carol@aid.com: meeting at 3pm
-```
-
-Ctrl+C 退出。
-
-#### `aun ack`
-
-确认消息。
-
-```
-aun ack <sender-aid> --seq <N>
-aun ack --all
-```
-
-### 4.3 群组 (group)
-
-#### `aun group create`
-
-```
-aun group create <name> [--members <aid1,aid2,...>]
-
-示例：
-  aun group create "Project Alpha"
-  aun group create "Team" --members bob@aid.com,carol@aid.com
-```
-
-#### `aun group list`
-
-```
-aun group list
-
-输出：
-  GROUP ID     NAME            MEMBERS  ROLE    EPOCH
-  g:abc123     Project Alpha   5        owner   3
-  g:def456     Team Chat       3        member  1
-```
-
-#### `aun group send`
-
-```
-aun group send <group-id> <message> [--no-encrypt]
-
-示例：
-  aun group send g:abc123 "hello team"
-```
-
-#### `aun group invite`
-
-```
-aun group invite <group-id> <aid> [<aid2> ...]
-
-示例：
-  aun group invite g:abc123 dave@aid.com eve@aid.com
-```
-
-#### `aun group kick`
-
-```
-aun group kick <group-id> <aid>
-```
-
-#### `aun group leave`
-
-```
-aun group leave <group-id>
-```
-
-#### `aun group dissolve`
-
-```
-aun group dissolve <group-id>
-```
-
-#### `aun group members`
-
-```
-aun group members <group-id>
-
-输出：
-  AID                ROLE     JOINED
-  alice@aid.com      owner    2026-05-01
-  bob@aid.com        admin    2026-05-02
-  carol@aid.com      member   2026-05-10
-```
-
-#### `aun group info`
-
-```
-aun group info <group-id>
-
-输出：
-  Name:         Project Alpha
-  ID:           g:abc123
-  Owner:        alice@aid.com
-  Members:      5
-  Epoch:        3
-  E2EE:         enabled (V2)
-  Created:      2026-05-01
-```
-
-#### `aun group listen`
-
-```
-aun group listen <group-id>
-
-输出（逐行）：
-  [14:32:01] bob@aid.com: let's sync
-  [14:32:05] carol@aid.com: sounds good
-```
-
-### 4.4 存储 (storage)
-
-#### `aun storage upload`
-
-```
-aun storage upload <local-path> [--name <remote-name>]
-
-示例：
-  aun storage upload ./report.pdf
-  aun storage upload ./img.png --name avatar.png
-```
-
-#### `aun storage download`
-
-```
-aun storage download <object-id> [--output <path>]
-```
-
-#### `aun storage delete`
-
-```
-aun storage delete <object-id>
-```
-
-### 4.5 密钥管理 (keys)
-
-#### `aun keys list`
-
-```
-aun keys list
-
-输出：
-  TYPE    ID/FINGERPRINT          CREATED      EXPIRES      STATUS
-  IK      SHA256:a1b2c3...        2026-05-01   2027-05-01   active
-  SPK     SHA256:d4e5f6...        2026-05-20   2026-06-20   active
-  SPK     SHA256:789abc...        2026-04-20   2026-05-20   expired
-```
-
-#### `aun keys rotate`
-
-```
-aun keys rotate [--type spk|ik]
-
-示例：
-  aun keys rotate              # 轮换 SPK
-  aun keys rotate --type ik    # 轮换 IK（需确认）
-```
-
-#### `aun keys export`
-
-导出身份（加密打包）。
-
-```
-aun keys export [aid] --output <path> --password <password>
-
-示例：
-  aun keys export alice@aid.com --output ./alice-backup.aun
-```
-
-#### `aun keys import`
-
-导入身份。
-
-```
-aun keys import <path> --password <password> [--profile <name>]
-```
-
-### 4.6 诊断 (diag)
-
-#### `aun doctor`
-
-一键健康检查。
-
-```
-aun doctor
-
-输出：
-  ✓ Profile "default" exists
-  ✓ Identity alice@aid.com found
-  ✓ Private key intact (P-256)
-  ✓ Certificate valid (expires 2027-01-15)
-  ✓ Gateway wss://gw.aid.com reachable (latency: 45ms)
-  ✓ Authentication successful
-  ✓ SPK valid (expires 2026-06-20)
-  ✗ Trust root CA not configured (optional)
-
-  7/8 checks passed
-```
-
-#### `aun status`
-
-连接状态概览。
-
-```
-aun status
-
-输出：
-  Gateway:     wss://gw.aid.com/ws
-  Protocol:    AUN/1.0
-  Connection:  connected
-  Latency:     42ms
-  Session:     active (expires in 23h)
-```
-
-#### `aun ping`
-
-验证目标 AID 可达性。
-
-```
-aun ping <target-aid> [--count N]
-
-示例：
-  aun ping bob@aid.com
-  aun ping bob@aid.com --count 5
-
-输出：
-  bob@aid.com is reachable (latency: 67ms)
-```
-
-#### `aun logs`
-
-查看本地 SDK 日志。
-
-```
-aun logs [--tail N] [--follow]
-
-示例：
-  aun logs --tail 50
-  aun logs --follow          # 实时跟踪
-```
-
-## 5. 配置系统
-
-### 5.1 配置文件
+AUN CLI 是 Python SDK 随包提供的命令行入口，用于在不编写业务代码的情况下完成身份管理、消息收发、群组操作、Storage / Group FS 文件操作、Collab 协作层操作、agent.md 管理、诊断和压测。
+
+当前实现位于：
+
+- 源码目录：`D:\modelunion\kite\aun-sdk-core\python\src\aun_cli`
+- 包内入口：`python/src/aun_cli/main.py`
+- 模块入口：`python -m aun_cli`
+- 安装后命令：`aun`
+- 脚本注册：`python/pyproject.toml` 中的 `[project.scripts] aun = "aun_cli.main:app"`
+
+CLI 是 SDK 的薄封装和调试入口，不直接实现协议状态机、E2EE、Gateway 发现或业务 RPC 语义；这些能力由 `aun_core` 提供。
+
+## 2. 当前架构
+
+```text
+aun CLI
+  ├─ main.py                 # Typer 根应用、全局选项、命令组注册
+  ├─ config.py               # cli.toml、profile、终端标签页状态
+  ├─ adapter.py              # AUNClient / AIDStore 生命周期桥接
+  ├─ output.py               # human / table / JSON 输出
+  ├─ storage_core.py         # storage object 上传下载数据面复用逻辑
+  ├─ fs_utils.py             # AID:path 远程路径解析
+  └─ commands/
+      ├─ identity.py         # identity list/check；根命令 register/login/whoami 复用这里
+      ├─ message.py          # send/pull/ack
+      ├─ listen.py           # listen 长连接监听
+      ├─ group.py            # group.* 与 group fs
+      ├─ fs.py               # storage VFS POSIX 风格 fs 命令
+      ├─ storage.py          # object storage 兼容命令
+      ├─ collab.py           # collab 与 collab tag
+      ├─ agentmd.py          # agent.md 上传、下载、检查
+      ├─ keys.py             # 本地密钥与 seed 迁移
+      ├─ diag.py             # status/ping/doctor/logs
+      ├─ config.py           # config/profile
+      └─ bench.py            # message/group 发送压测
+```
+
+核心调用链：
+
+```text
+Typer command
+  -> resolve_profile_config(ctx)
+  -> CLISession(ctx)
+  -> AIDStore.load(aid)
+  -> AUNClient.authenticate()
+  -> AUNClient.connect()
+  -> client.call(...) / client.storage.* / client.group.fs.* / client.collab.*
+  -> output_json / output_table / output_dict
+```
+
+## 3. 关键设计决策
+
+| 主题 | 当前实现 |
+|------|----------|
+| 命令框架 | 使用 Typer，根应用在 `main.py` 中注册 |
+| SDK 桥接 | `adapter.run_async()` 用 `asyncio.run()` 执行 SDK 异步调用 |
+| 会话生命周期 | 每个短命令创建一个 `CLISession`，完成后关闭 `AUNClient` 和 `AIDStore` |
+| Gateway | CLI 不提供 `--gateway` 覆盖；Gateway 发现交给 SDK |
+| Profile | 默认读取 `~/.aun/cli.toml`，支持终端标签页级 profile 状态 |
+| 输出 | 默认人类可读；`--json` 输出结构化 JSON |
+| RPC 统计 | 非 JSON 模式下输出本次 CLI 调用的 RPC / phase summary |
+| 长连接 | `aun listen` 使用 `background_sync=True`，监听 P2P 与群消息事件 |
+| 数据面 | Storage / Group FS 的上传下载由 SDK 高层或 `storage_core.py` 编排 |
+
+## 4. 全局选项
+
+当前根命令支持：
+
+```text
+aun [全局选项] <command> [参数]
+
+--profile, -p TEXT   仅本次命令使用指定 profile
+--json               JSON 格式输出
+--debug              启用 debug 日志
+--no-color           禁用彩色输出
+--timeout, -t INT    操作超时秒数，默认 30
+--version, -V        显示 CLI 版本
+--install-completion 安装当前 shell 的补全脚本，Typer 自动提供
+--show-completion    输出补全脚本，Typer 自动提供
+--help               显示帮助
+```
+
+注意：旧设计稿中的 `--gateway`、`-g` 不存在。当前 Gateway 路由由 SDK discovery 处理。
+
+## 5. 配置与 Profile
+
+配置文件默认路径为 `~/.aun/cli.toml`，可用 `AUN_CLI_CONFIG` 覆盖。配置结构：
 
 ```toml
-# ~/.aun/cli.toml
-
 [default]
-profile = "default"          # 默认 profile
-output = "table"             # 默认输出格式: table | json | plain
-color = true                 # 彩色输出
-timeout = 30                 # 默认超时（秒）
+profile = "default"
+output = "table"
+color = true
+timeout = 30
 
 [profiles.default]
-aid = "alice@aid.com"
-gateway = "wss://gw.aid.com/ws"
+aid = "alice.agentid.pub"
 aun_path = "~/.aun/profiles/default"
-
-[profiles.work]
-aid = "bot@corp.com"
-gateway = "wss://gw.corp.com/ws"
-aun_path = "~/.aun/profiles/work"
+active_group = "group.agentid.pub/10042"
 ```
 
-### 5.2 Profile 管理命令
+有效 profile 解析顺序：
 
-```
-aun config init                          # 初始化配置
-aun config set <key> <value>             # 设置配置项
-aun config get <key>                     # 读取配置项
-aun config profile create <name>         # 创建 profile
-aun config profile delete <name>         # 删除 profile
-aun config profile switch <name>         # 切换默认 profile
+```text
+--profile > AUN_PROFILE > 当前终端标签页状态 > [default].profile
 ```
 
-### 5.3 配置优先级
+`aun profile switch` 会写入当前终端标签页状态，同时更新新标签页默认 profile。终端标签页状态目录默认在 `~/.aun/cli-sessions/`，可用 `AUN_CLI_STATE_DIR` 覆盖。
 
-```
-命令行参数 > 环境变量 > cli.toml > 内置默认值
-```
+常用环境变量：
 
-环境变量映射：
-- `AUN_PROFILE` → `--profile`
-- `AUN_GATEWAY` → `--gateway`
-- `AUN_DEBUG` → `--debug`
-- `AUN_DATA_ROOT` → 覆盖 aun_path
+| 变量 | 用途 |
+|------|------|
+| `AUN_CLI_CONFIG` | 覆盖 CLI 配置文件路径 |
+| `AUN_PROFILE` | 覆盖本次命令 profile |
+| `AUN_CLI_SESSION_ID` | 显式指定终端标签页状态 ID |
+| `AUN_CLI_STATE_DIR` | 覆盖标签页状态目录 |
+| `AUN_DATA_ROOT` | 覆盖当前 profile 的 `aun_path` |
+| `AUN_DEBUG` | 开启 debug |
+| `AUN_ENCRYPTION_SEED` / `AUN_SEED_PASSWORD` | 本地身份材料加密 seed |
 
-## 6. 会话管理
+## 6. 命令注册面
 
-### 6.1 短命令模式（默认）
+根命令在 `main.py` 中注册：
 
-每次命令执行：连接 → 认证 → 操作 → 断开。
+| 命令 | 来源模块 | 说明 |
+|------|----------|------|
+| `register` / `login` / `whoami` | `commands.identity` | 根级身份快捷命令 |
+| `identity` | `commands.identity` | 身份列表和诊断 |
+| `send` / `pull` / `ack` | `commands.message` | P2P 消息 |
+| `listen` | `commands.listen` | P2P + 群消息实时监听 |
+| `group` | `commands.group` | 群组管理和 `group fs` |
+| `status` / `ping` / `doctor` / `logs` | `commands.diag` | 诊断 |
+| `config` / `profile` | `commands.config` | 配置和 profile 管理；`profile` 也挂在 `config profile` 下 |
+| `storage` | `commands.storage` | 对象存储兼容命令 |
+| `fs` | `commands.fs` | Storage VFS / POSIX 风格命令 |
+| `collab` | `commands.collab` | 版本化协作层 |
+| `agentmd` | `commands.agentmd` | agent.md 管理 |
+| `keys` | `commands.keys` | 本地密钥与 seed 管理 |
+| `bench` | `commands.bench` | 消息发送压测 |
 
-为避免每次都做完整握手，引入 session cache：
+## 7. 命令组职责
 
-```
-~/.aun/profiles/{profile}/.session.json
-{
-  "gateway": "wss://gw.aid.com/ws",
-  "token": "...",
-  "expires_at": "2026-05-22T14:00:00Z",
-  "device_id": "d8f2..."
-}
-```
+### 7.1 身份与连接
 
-- token 未过期：跳过认证，直接用 token 连接
-- token 过期：重新挑战-响应认证，更新 cache
+- `aun register <aid>`：注册 AID，并写入当前 profile 的 `aid` / `aun_path`。
+- `aun login [aid]`：加载本地身份、认证并连接一次，成功后更新当前 profile 的 AID。
+- `aun whoami`：显示当前 profile、AID 和数据目录。
+- `aun identity list`：列出本地身份。
+- `aun identity check <aid>`：检查本地身份材料和远端注册状态。
 
-### 6.2 长连接模式（listen）
+### 7.2 消息
 
-`aun listen` 和 `aun group listen` 保持 WebSocket 长连接：
-- 前台运行，Ctrl+C 优雅退出
-- 自动重连（SDK 内置机制）
-- 断线时输出提示，重连后继续
+- `aun send <target-aid> <message|-> [--no-encrypt]`：发送 P2P 消息，`-` 表示从 stdin 读取。
+- `aun pull [--from <aid>] [--limit N] [--after-seq N]`：拉取离线消息。
+- `aun ack <sender-aid> --seq N`：推进消息 ack。
+- `aun listen [--from <aid>] [--group <group-id>]`：监听 P2P 和群消息，Ctrl+C 退出。
 
-## 7. 输出格式
+### 7.3 群组
 
-### 7.1 Human-readable（默认）
+- `aun group create <name> [--members a,b] [--group-name name]`
+- `aun group use <group-id>` / `aun group current`
+- `aun group send [group-id] <message> [--no-encrypt]`
+- `aun group list` / `aun group info [group-id]` / `aun group members [group-id]`
+- `aun group invite [group-id] <aid...>`
+- `aun group add-member [group-id] <aid> [--role member|admin] [--member-type human|ai]`
+- `aun group kick [group-id] <aid>`
+- `aun group leave [group-id]`
+- `aun group dissolve [group-id]`
+- `aun group bind [group-id] [--group-name name]`
+- `aun group transfer [group-id] <new-owner>`
+- `aun group complete-transfer [group-id]`
 
-```
-aun group list
+公开兼容别名包括 `aun group bind-aid` 和 `aun group add_member`。
 
-  GROUP ID     NAME            MEMBERS  ROLE
-  g:abc123     Project Alpha   5        owner
-  g:def456     Team Chat       3        member
-```
+多数群命令省略 `group-id` 时使用当前 profile 的 `active_group`。`aun group create` 成功后会自动把新群设为 active group。
 
-### 7.2 JSON（`--json`）
+### 7.4 群文件系统
 
-```json
-[
-  {"group_id": "g:abc123", "name": "Project Alpha", "members": 5, "role": "owner"},
-  {"group_id": "g:def456", "name": "Team Chat", "members": 3, "role": "member"}
-]
-```
+`aun group fs` 面向 `group.fs.*` 和 SDK `client.group.fs`。裸路径会绑定当前 active group；完整 group path 可直接传入。
 
-JSON 模式适合脚本管道：`aun group list --json | jq '.[0].group_id'`
+主要命令：
 
-## 8. 错误处理
+- `ls` / `find` / `stat` / `lstat`
+- `mkdir` / `rm`
+- `cp` / `mv`
+- `df`
+- `mount` / `umount`
 
-### 8.1 退出码
+群自有区写入需要按服务端要求使用 `group_aid` 身份签名，CLI 通过 `--as` 传入操作者 AID。
+
+### 7.5 Storage VFS
+
+`aun fs` 面向 SDK Storage VFS，路径格式为 `<AID>:/path`。裸路径会补当前 profile AID。
+
+主要命令：
+
+- 读侧：`ls`、`stat`、`cat`、`find`、`df`
+- 写侧：`cp`、`mv`、`rm`、`mkdir`、`ln -s`
+- 权限：`chmod`、`setfacl`、`getfacl`
+- 挂载：`mount`、`approve`、`reject`、`umount`
+- token：`token issue`、`token revoke`、`token ls`
+
+### 7.6 对象存储兼容命令
+
+`aun storage` 保留对象级快捷入口：
+
+- `aun storage ls [prefix]`
+- `aun storage info <object-key>`
+- `aun storage upload <local-path> [--name key] [--public] [--force]`
+- `aun storage download <object-key> [-o path] [--force]`
+- `aun storage delete <object-key>`
+
+新应用优先使用 `aun fs`；对象命令主要用于兼容对象存储心智和低层调试。
+
+### 7.7 Collab
+
+`aun collab` 面向版本化协作目录：
+
+- 文档：`ls-files`、`create`、`show`、`commit`、`merge`、`log`、`diff`、`revert`
+- 运维：`clone`、`prune`、`gc`、`reflog`
+- 群发现：`ls-remote`、`unregister`
+- 标签：`tag create/list/show/diff/restore/rm/prune`
+
+`create` / `commit` / `merge` 的 `source` 支持 AID 远程路径、本地文件、base64 或普通文本。
+
+### 7.8 agent.md、keys、诊断与压测
+
+- `aun agentmd upload/download/check`
+- `aun keys list/rotate/change-seed`
+- `aun status` / `aun ping` / `aun doctor` / `aun logs`
+- `aun bench send` / `aun bench group-send` / `aun bench group send`
+
+公开兼容别名包括 `aun agentmd upload_agent_md/download_agent_md/check_agent_md` 和 `aun bench group_send`。
+
+当前没有 `keys export/import`、`group listen`、`config init`、`profile delete` 这些命令；需要新增时应先更新实现和本文档。
+
+## 8. 错误处理与退出码
+
+错误映射在 `adapter.handle_error()` 中：
 
 | 退出码 | 含义 |
 |--------|------|
@@ -537,150 +249,17 @@ JSON 模式适合脚本管道：`aun group list --json | jq '.[0].group_id'`
 | 1 | 通用错误 |
 | 2 | 参数错误 |
 | 3 | 认证失败 |
-| 4 | 连接失败（网关不可达） |
+| 4 | 连接失败 |
 | 5 | 超时 |
 | 6 | 权限不足 |
-| 7 | 目标不存在（AID/群组） |
+| 7 | 目标不存在 |
 
-### 8.2 错误输出
+JSON 模式下错误仍通过统一错误输出函数输出，便于脚本判断。
 
-```
-# 默认模式
-Error: Gateway wss://gw.aid.com unreachable (connection refused)
-Hint: Check network connectivity or verify gateway URL with `aun config get profiles.default.gateway`
+## 9. 当前实现边界
 
-# JSON 模式
-{"error": "connection_failed", "message": "Gateway unreachable", "code": 4}
-```
-
-## 9. SDK Adapter Layer
-
-CLI 与 SDK 之间的桥接层，解决以下问题：
-
-### 9.1 异步桥接
-
-```python
-# adapter.py 核心模式
-import asyncio
-from aun_core import AUNClient
-
-def run_async(coro):
-    """CLI 同步入口调用 SDK 异步方法"""
-    return asyncio.run(coro)
-
-class CLISession:
-    """管理 SDK client 生命周期"""
-
-    def __init__(self, profile: str, gateway: str = None, timeout: int = 30):
-        self.profile = profile
-        self.gateway = gateway
-        self.timeout = timeout
-
-    async def __aenter__(self):
-        # 加载配置 → 创建 client → 连接/认证
-        ...
-        return self.client
-
-    async def __aexit__(self, *exc):
-        await self.client.close()
-```
-
-### 9.2 命令实现模式
-
-```python
-# commands/message.py 示例模式
-@app.command()
-def send(target: str, message: str, no_encrypt: bool = False):
-    async def _send():
-        async with CLISession(profile) as client:
-            result = await client.call("message.send", {
-                "to": target,
-                "content": {"text": message},
-                "encrypt": not no_encrypt,
-            })
-            return result
-    result = run_async(_send())
-    output(result)
-```
-
-## 10. 分发策略
-
-### 10.1 开发阶段
-
-```bash
-# 直接运行
-python -m aun_cli send bob@aid.com "hello"
-
-# 或 editable install
-pip install -e ".[cli]"
-aun send bob@aid.com "hello"
-```
-
-### 10.2 正式发布
-
-**pip 包**（面向 Python 开发者）：
-```bash
-pip install fastaun[cli]
-```
-
-**独立二进制**（面向终端用户）：
-```bash
-# 构建
-pyinstaller --onefile src/aun_cli/main.py -n aun --hidden-import aun_core
-
-# 产出
-dist/aun        (Linux/Mac)
-dist/aun.exe    (Windows)
-```
-
-### 10.3 pyproject.toml 变更
-
-```toml
-[project.optional-dependencies]
-cli = ["typer>=0.9", "rich>=13.0"]
-
-[project.scripts]
-aun = "aun_cli.main:app"
-```
-
-## 11. 实现优先级
-
-### Phase 1：核心可用（MVP）
-
-- [ ] 项目骨架（typer app + 全局选项 + 配置加载）
-- [ ] `aun register` / `aun login` / `aun whoami`
-- [ ] `aun send` / `aun pull`
-- [ ] `aun status` / `aun ping`
-- [ ] 基本输出格式化（table + json）
-
-### Phase 2：完整通信
-
-- [ ] `aun listen`（长连接）
-- [ ] `aun group create/send/list/members/invite/kick/leave`
-- [ ] `aun group listen`
-- [ ] `aun ack`
-
-### Phase 3：管理与诊断
-
-- [ ] `aun keys list/rotate/export/import`
-- [ ] `aun doctor`
-- [ ] `aun logs`
-- [ ] `aun storage upload/download/delete`
-- [ ] `aun config` 子命令
-
-### Phase 4：体验优化
-
-- [ ] Shell 自动补全（typer 内置支持）
-- [ ] PyInstaller 打包流程
-- [ ] 交互式模式（`aun interactive` — REPL 风格）
-- [ ] `aun trace <message-id>` 消息追踪
-
-## 12. 与现有工具的关系
-
-| 工具 | 定位 | 用户 |
-|------|------|------|
-| **certool** | 服务端 CA 证书管理 | 运维 |
-| **aun CLI** | 客户端身份 + 通信 | 开发者/Agent |
-| **SDK** | 编程接口 | 应用开发者 |
-
-三者互补：certool 管服务端证书链，CLI 管客户端身份和消息，SDK 供应用集成。
+- CLI 不直接接受外部 Gateway URL，避免绕过 SDK discovery。
+- CLI 不维护独立协议实现；业务行为以 SDK 和服务端为准。
+- 默认短命令不启用长连接重连；`listen` 使用后台同步和自动重连。
+- `--json` 会关闭 banner 和 RPC summary，适合脚本管道。
+- `aun group fs` 是 Group FS 入口；`aun fs` 是普通 Storage VFS 入口，两者路径模型不同。

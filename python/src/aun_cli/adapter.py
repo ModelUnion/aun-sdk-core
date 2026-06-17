@@ -219,6 +219,7 @@ class CLISession:
                 message = loaded.error.message if loaded.error else "identity load failed"
                 raise StateError(message)
             self._client = AUNClient(loaded.data["aid"])
+            self._client._aid_store = self._store
         else:
             self._client = AUNClient()
         record_cli_phase("sdk_init", int((time.perf_counter() - phase_started) * 1000))

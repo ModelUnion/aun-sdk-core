@@ -570,117 +570,31 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ---
 
-## 10.9 资源管理
+## 10.9 群文件系统
 
-> **群存储新架构**：群文件不再是「指向他人对象的引用」，而是 **group_aid 命名空间下的真实对象**（群自有区 announce/public/archive + 成员挂载区 memberdata）。`storage` 是唯一文件系统与唯一鉴权器，`group.resources.*` 门面退化为「鉴权关卡 + 记账 + 索引镜像 + 群 df 视图」。门面名称（`group.resources.*`）保留以兼容，底层接 group storage。完整模型见 `docs/aun-fs/topics/group-space.md` 与 `docs/aun-fs/group-storage/`。
->
-> 写操作走「甲案」：群服务预鉴权 → 返回待签操作清单 → 群主以 group_aid 身份签名直调 storage → `confirm` 回调记账（最终一致 + 幂等）。成员挂载区由成员自助挂载（自己签名），无需群主审批。逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准。
+群文件系统统一使用 `group.fs.*`。群路径采用 `group_aid:/path` 或 `https://{group_aid}/path`，也可在 RPC 参数中同时传 `group_id` 与裸路径。群自有区包括 `announce`、`public`、`archive`；成员数据区为 `memberdata/{member_ref}`，服务端映射到成员自己的 `groupdata/{group_id}` 存储根。
 
-### `group.resources.put`
-
-分享资源到群组。需要 member 及以上权限。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
-| `resource_path` | string | ✅ | 资源路径 |
-| `title` | string | ✅ | 资源标题 |
-| `resource_type` | string | ❌ | `"file"` / `"folder"` / `"link"`，默认 `"file"` |
-| `storage_ref` | object | ❌ | 存储引用对象 |
-| `metadata` | object | ❌ | 自定义元数据 |
-| `visibility` | string | ❌ | `"members_only"` / `"public"`，默认 `"members_only"` |
-| `tags` | array | ❌ | 标签数组 |
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource": { ... }, "created": true }`（`created=false` 表示更新已有资源）
-
-### `group.resources.get`
-
-查看资源详情。**参数**：`group_id`, `resource_path`
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource": { ... } }`
-
-### `group.resources.list`
-
-列出群资源。**参数**：`group_id` (必填), `tag` / `resource_type` / `page` / `size` (可选)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "items": [ ... ], "total": 10 }`
-
-### `group.resources.update`
-
-更新资源元数据。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `resource_path` (必填), `title` / `metadata` / `tags` / `visibility` (可选)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource": { ... } }`
-
-### `group.resources.delete`
-
-删除资源链接。需要 admin 权限。**参数**：`group_id`, `resource_path`
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "resource_path": "/path/to/file" }`
-
-### `group.resources.get_access`
-
-获取资源访问令牌（用于下载）。
-
-**参数**：`group_id`, `resource_path`
-
-**响应**：`{ "resource": { ... }, "access_token": "tk_...", "token_type": "Bearer", "download": { ... } }`
-
-### `group.resources.resolve_access_ticket`
-
-使用访问票据换取下载令牌。
-
-**参数**：`ticket` (string, 必填)
-
-**响应**：`{ "resource": { ... }, "download": { ... } }`
-
-### 目录树与挂载方法
-
-群存储命名空间的目录树操作（与 `storage` 目录树语义一致，经群门面鉴权+记账）：
-
-| 方法 | 说明 | 权限 |
-|------|------|------|
-| `group.resources.create_folder` | 在群命名空间建目录（memberdata 下委托 `storage.fs.mkdir`） | owner/admin（自有区）；成员（自己 memberdata） |
-| `group.resources.list_children` | 列目录子节点（读镜像表，不扇出 storage） | member |
-| `group.resources.rename` | 重命名资源节点 | owner/admin（按 ACL） |
-| `group.resources.move` | 移动资源节点 | owner/admin（按 ACL） |
-| `group.resources.mount_object` | 挂载 storage 对象/子树为群资源 | 成员自助（memberdata）|
-| `group.resources.unmount` | 取消挂载 | 挂载者 / owner |
-| `group.resources.resolve_path` | 按路径解析资源节点 | member |
-
-### 命名空间初始化与回调记账（新增）
+群自有区写入必须满足双身份规则：连接身份 `_auth.aid` 是群 owner，签名身份 `_auth.client_signature_aid` 是当前 `group_aid`。`group_aid` 私钥由群主持有，gateway 仅允许 `group.fs.*` 出现签名身份与连接身份不一致。成员数据区写入只允许对应成员本人。
 
 | 方法 | 说明 |
 |------|------|
-| `group.resources.namespace_ready` | 群主建好基线目录（announce/public/archive/memberdata）后回调，group 服务将根节点镜像入表。入参 `group_id` + 可选 `folder_ids` |
-| `group.resources.confirm` | 甲案写操作完成回调，凭 `op_id` 幂等更新镜像节点 |
-| `group.resources.confirm_mount` | 成员挂载完成回调，凭 `mount_id` 标记槽位 active |
-| `group.resources.get_df` | 群存储 df 视图，聚合自有卷 + 各成员挂载卷的用量与状态 |
+| `group.fs.ls` | 列出目录 |
+| `group.fs.find` | 查找节点 |
+| `group.fs.stat` | 查看节点 |
+| `group.fs.lstat` | 查看链接本身 |
+| `group.fs.df` | 查看群文件系统用量 |
+| `group.fs.create_download_ticket` | 创建下载票据，SDK 使用票据执行数据面下载 |
+| `group.fs.mkdir` | 创建目录 |
+| `group.fs.rm` | 删除节点 |
+| `group.fs.cp` | group→group 远程复制；本地上传/下载由 SDK 数据面编排 |
+| `group.fs.mv` | group→group 远程移动 |
+| `group.fs.check_upload` | 上传前检查 |
+| `group.fs.create_upload_session` | 创建上传会话 |
+| `group.fs.complete_upload` | 完成上传 |
+| `group.fs.mount` | 挂载成员数据区 |
+| `group.fs.umount` | 卸载成员数据区 |
 
-### `group.resources.request_add`
-
-成员申请分享资源（需 owner 审批）。**参数**：同 `group.resources.put`（不需要 `storage_ref`）。
-
-> ⚠️ **已废弃**：`request_add` / `direct_add` / `list_pending` / `approve_request` / `reject_request` 属旧版「引用 + 审批流」模型。新群存储架构下成员挂载区为自助挂载（无审批流），自有区由群主以 group_aid 身份直传。保留仅为兼容，新代码不应依赖。
-
-### `group.resources.direct_add`
-
-Owner 直接添加资源（无需审批）。需要 **owner** 权限。（已废弃，见上）
-
-### `group.resources.list_pending`
-
-列出待审批的资源申请。需要 **owner** 权限。（已废弃，见上）
-
-### `group.resources.approve_request`
-
-批准资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)（已废弃，见上）
-
-### `group.resources.reject_request`
-
-拒绝资源申请。需要 **owner** 权限。**参数**：`request_id` (必填), `note` (可选)（已废弃，见上）
+逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准，详细设计见 `docs/aun-fs/group-fs/`。
 
 ---
 
@@ -827,5 +741,7 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 - **消息 seq 单调递增**：per-group 粒度，确保顺序一致性，`ack_seq` 仅增不减。
 - **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立；消息增量拉取使用 `group.pull`，事件增量拉取使用 `group.pull_events`。
 - **duty 模式**：`duty_mode` 非 `"none"` 且 `duty_human_message_policy = "dispatch"` 时，消息先推送给当班成员处理，回复后再广播；`group.pull` 始终可拉取全量消息。
-- **资源审批**：`group.resources.request_add` 提交申请后需 admin 通过 `group.resources.review_add` 审批；直接添加（owner/admin）使用 `group.resources.direct_add`。
+- **群文件系统写边界**：群自有区仅 owner 可写且必须使用 `group_aid` 签名；成员数据区仅对应成员可写。
 - **在线状态**：通过 `group.get_online_members` 查询当前在线成员列表。
+
+

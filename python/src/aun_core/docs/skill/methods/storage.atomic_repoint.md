@@ -1,6 +1,6 @@
 # storage.atomic_repoint
 
-原子重指软链 target（乐观锁 CAS）。**collab submit / snapshot 并发正确性的底层核心**。`expected_version` 为 null 时跳过 CAS（普通发布场景）。
+原子重指软链 target（乐观锁 CAS）。**collab commit / tag 并发正确性的底层核心**。`expected_version` 为 null 时跳过 CAS（普通发布场景）。
 
 ## 调用示例
 

@@ -885,7 +885,7 @@ share_url = result["url"]  # https://alice.agentid.pub/s/Ab3xK9mZ2q
 
 ## storage.fs.list
 
-列目录（POSIX `ls`）。混合返回子目录/对象/软链/可用挂载点，排序 dir < file < symlink < mount。群 owner 路径回退到群资源子节点。
+列目录（POSIX `ls`）。混合返回子目录/对象/软链/可用挂载点，排序 dir < file < symlink < mount。群 owner 路径回退到 Group FS 子节点。
 
 ### 参数
 
@@ -915,7 +915,7 @@ share_url = result["url"]  # https://alice.agentid.pub/s/Ab3xK9mZ2q
 
 ## storage.fs.find
 
-递归查找（POSIX `find`），支持 name/type/size/mtime 过滤与分页。群资源与 `.collab` 注册表有回退。
+递归查找（POSIX `find`），支持 name/type/size/mtime 过滤与分页。Group FS 与 `.collab` 注册表有回退。
 
 ### 参数
 
@@ -1219,7 +1219,7 @@ fs 目录节点视图。
 
 ## storage.atomic_repoint
 
-原子重指软链 target（乐观锁 CAS）。**collab submit / snapshot 并发正确性的底层核心**。
+原子重指软链 target（乐观锁 CAS）。**collab commit / tag 并发正确性的底层核心**。
 
 ### 参数
 

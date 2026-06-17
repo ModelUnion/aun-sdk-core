@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -281,6 +282,8 @@ func (a *CrossSdkGoAgent) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		a.handleInbox(res, req)
 	case req.Method == http.MethodPost && path == "/group/create":
 		a.handleGroupCreate(res, req)
+	case req.Method == http.MethodPost && path == "/group/call":
+		a.handleGroupCall(res, req)
 	case req.Method == http.MethodGet && path == "/group/ready":
 		a.handleGroupReady(res, req)
 	case req.Method == http.MethodPost && path == "/group/send":
@@ -289,16 +292,8 @@ func (a *CrossSdkGoAgent) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		a.handleGroupPull(res, req)
 	case req.Method == http.MethodPost && path == "/group/ack":
 		a.handleGroupAck(res, req)
-	case req.Method == http.MethodPost && path == "/group/resources/init":
-		a.handleGroupResourcesInit(res, req)
-	case req.Method == http.MethodPost && path == "/group/resources/put":
-		a.handleGroupResourcesPut(res, req)
-	case req.Method == http.MethodPost && path == "/group/resources/mkdir":
-		a.handleGroupResourcesMkdir(res, req)
-	case req.Method == http.MethodPost && path == "/group/resources/mount":
-		a.handleGroupResourcesMount(res, req)
-	case req.Method == http.MethodPost && path == "/group/resources/read":
-		a.handleGroupResourcesRead(res, req)
+	case req.Method == http.MethodPost && path == "/group/fs/call":
+		a.handleGroupFSCall(res, req)
 	case req.Method == http.MethodPost && path == "/collab/call":
 		a.handleCollabCall(res, req)
 	case req.Method == http.MethodPost && path == "/storage/call":
@@ -523,57 +518,6 @@ func (a *CrossSdkGoAgent) handleGroupCreate(res http.ResponseWriter, req *http.R
 	writeJSON(res, http.StatusOK, out)
 }
 
-func (a *CrossSdkGoAgent) handleGroupResourcesInit(res http.ResponseWriter, req *http.Request) {
-	body := readJSON(req)
-	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
-	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-	defer cancel()
-	store := a.aidStore()
-	defer store.Close()
-	body["aid_store"] = store
-	result, err := a.client.Group().Resources().InitializeNamespace(ctx, body)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_init_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "result": jsonSafe(result)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_resources_init", "result": out})
-	writeJSON(res, http.StatusOK, out)
-}
-
-func (a *CrossSdkGoAgent) handleGroupResourcesPut(res http.ResponseWriter, req *http.Request) {
-	body := readJSON(req)
-	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
-	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-	defer cancel()
-	pending, err := a.client.Group().Resources().Put(ctx, body)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_put_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	plan := asMap(pending)
-	var confirmed any
-	if plan != nil && pendingOpsLen(plan["pending_ops"]) > 0 {
-		store := a.aidStore()
-		defer store.Close()
-		plan["aid_store"] = store
-		confirmed, err = a.client.Group().Resources().ExecutePendingOps(ctx, plan)
-		if err != nil {
-			out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error(), "pending": jsonSafe(pending)}
-			a.recordTrace(traceID, map[string]any{"stage": "group_resources_put_error", "error": out})
-			writeJSON(res, http.StatusInternalServerError, out)
-			return
-		}
-	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "pending": jsonSafe(pending), "confirmed": jsonSafe(confirmed)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_resources_put", "result": out})
-	writeJSON(res, http.StatusOK, out)
-}
-
 func (a *CrossSdkGoAgent) handleCollabCall(res http.ResponseWriter, req *http.Request) {
 	body := readJSON(req)
 	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
@@ -618,6 +562,62 @@ func (a *CrossSdkGoAgent) handleStorageCall(res http.ResponseWriter, req *http.R
 	writeJSON(res, http.StatusOK, out)
 }
 
+func (a *CrossSdkGoAgent) handleGroupCall(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	method := strings.TrimSpace(stringValue(body["method"]))
+	action := strings.TrimSpace(stringValue(body["action"]))
+	if method == "" && action != "" {
+		if strings.HasPrefix(action, "group.") {
+			method = action
+		} else {
+			method = "group." + action
+		}
+	}
+	if method == "" {
+		writeJSON(res, http.StatusBadRequest, map[string]any{"ok": false, "trace_id": traceID, "error_code": "bad_request", "error_message": "method is required"})
+		return
+	}
+	params := asMap(body["params"])
+	if params == nil {
+		params = map[string]any{}
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	result, err := a.client.Call(ctx, method, params)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "method": method, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_call_error", "method": method, "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "method": method, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_call", "method": method, "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
+func (a *CrossSdkGoAgent) handleGroupFSCall(res http.ResponseWriter, req *http.Request) {
+	body := readJSON(req)
+	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
+	action := strings.TrimSpace(stringValue(body["action"]))
+	params := asMap(body["params"])
+	if params == nil {
+		params = map[string]any{}
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+	defer cancel()
+	result, err := a.callGroupFSAction(ctx, action, params)
+	if err != nil {
+		out := map[string]any{"ok": false, "trace_id": traceID, "action": action, "error_code": errorCode(err), "error_message": err.Error()}
+		a.recordTrace(traceID, map[string]any{"stage": "group_fs_call_error", "action": action, "error": out})
+		writeJSON(res, http.StatusInternalServerError, out)
+		return
+	}
+	out := map[string]any{"ok": true, "trace_id": traceID, "action": action, "result": jsonSafe(result)}
+	a.recordTrace(traceID, map[string]any{"stage": "group_fs_call", "action": action, "result": out})
+	writeJSON(res, http.StatusOK, out)
+}
+
 func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, params map[string]any) (any, error) {
 	collab := a.client.Collab()
 	root := firstNonEmpty(stringValue(params["collab_root"]), stringValue(params["collabRoot"]))
@@ -625,25 +625,83 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 	source := stringValue(params["source"])
 	switch action {
 	case "ls":
-		return collab.LS(ctx, root)
+		return collab.LsFiles(ctx, root)
+	case "ls-files":
+		return collab.LsFiles(ctx, root)
+	case "read":
+		return collab.Show(ctx, root, doc, nil)
+	case "show":
+		rev := optionalInt(firstNonNil(params["rev"]))
+		return collab.Show(ctx, root, doc, rev)
+	case "submit":
+		onto := intValue(firstNonNil(params["onto"], params["base_version"], params["baseVersion"]))
+		return collab.Commit(ctx, root, doc, source, onto, stringValue(params["message"]))
+	case "commit":
+		onto := intValue(firstNonNil(params["onto"], params["base_version"], params["baseVersion"]))
+		return collab.Commit(ctx, root, doc, source, onto, stringValue(params["message"]))
+	case "history":
+		return collab.Log(ctx, root, doc)
+	case "log":
+		return collab.Log(ctx, root, doc)
+	case "get":
+		rev := intValue(params["version"])
+		return collab.Show(ctx, root, doc, &rev)
+	case "export":
+		return collab.Clone(ctx, root, stringValue(params["dest"]), false)
+	case "adopt":
+		return collab.Clone(ctx, stringValue(params["src"]), firstNonEmpty(stringValue(params["new_root"]), stringValue(params["newRoot"])), true)
+	case "clone":
+		return collab.Clone(ctx, stringValue(params["src"]), stringValue(params["dest"]), boolValue(params["reroot"], false))
+	case "revert":
+		rev := intValue(firstNonNil(params["rev"], params["version"]))
+		return collab.Revert(ctx, root, doc, rev, stringValue(params["message"]))
+	case "reset":
+		return collab.Revert(ctx, root, doc, intValue(params["version"]), stringValue(params["message"]))
+	case "discover":
+		return collab.LsRemote(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
+	case "ls-remote":
+		return collab.LsRemote(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
+	case "unregister":
+		return collab.Unregister(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])), root)
+	case "tag.create":
+		return collab.Tag().Create(ctx, root, stringValue(params["message"]), boolValue(params["major"], false))
+	case "snapshot.create":
+		return collab.Tag().Create(ctx, root, stringValue(params["message"]), boolValue(params["major"], false))
+	case "tag.list":
+		return collab.Tag().List(ctx, root)
+	case "snapshot.list":
+		return collab.Tag().List(ctx, root)
+	case "tag.show":
+		return collab.Tag().Show(ctx, root, stringValue(params["version"]))
+	case "snapshot.show":
+		return collab.Tag().Show(ctx, root, stringValue(params["version"]))
+	case "tag.diff":
+		return collab.Tag().Diff(ctx, root, firstNonEmpty(stringValue(params["version_a"]), stringValue(params["versionA"])), firstNonEmpty(stringValue(params["version_b"]), stringValue(params["versionB"])))
+	case "snapshot.diff":
+		return collab.Tag().Diff(ctx, root, firstNonEmpty(stringValue(params["version_a"]), stringValue(params["versionA"])), firstNonEmpty(stringValue(params["version_b"]), stringValue(params["versionB"])))
+	case "tag.restore":
+		return collab.Tag().Restore(ctx, root, stringValue(params["version"]), stringValue(params["message"]))
+	case "snapshot.restore":
+		return collab.Tag().Restore(ctx, root, stringValue(params["version"]), stringValue(params["message"]))
+	case "tag.rm":
+		return collab.Tag().Rm(ctx, root, stringValue(params["version"]))
+	case "snapshot.rm":
+		return collab.Tag().Rm(ctx, root, stringValue(params["version"]))
+	case "tag.prune":
+		before := firstNonNil(params["before"])
+		keepLast := optionalInt(firstNonNil(params["keep_last"], params["keepLast"]))
+		return collab.Tag().Prune(ctx, root, before, keepLast)
+	case "snapshot.prune":
+		before := firstNonNil(params["before"])
+		keepLast := optionalInt(firstNonNil(params["keep_last"], params["keepLast"]))
+		return collab.Tag().Prune(ctx, root, before, keepLast)
 	case "create":
 		return collab.Create(ctx, root, doc, source)
-	case "read":
-		return collab.Read(ctx, root, doc)
-	case "submit":
-		return collab.Submit(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])), stringValue(params["message"]))
 	case "merge":
-		return collab.Merge(ctx, root, doc, source, intValue(firstNonNil(params["base_version"], params["baseVersion"])))
-	case "history":
-		return collab.History(ctx, root, doc)
-	case "get":
-		return collab.Get(ctx, root, doc, intValue(params["version"]))
+		onto := intValue(firstNonNil(params["onto"], params["base_version"], params["baseVersion"]))
+		return collab.Merge(ctx, root, doc, source, onto)
 	case "diff":
 		return collab.Diff(ctx, root, doc, intValue(params["from"]), intValue(params["to"]))
-	case "export":
-		return collab.Export(ctx, root, stringValue(params["dest"]))
-	case "adopt":
-		return collab.Adopt(ctx, stringValue(params["src"]), firstNonEmpty(stringValue(params["new_root"]), stringValue(params["newRoot"])))
 	case "prune":
 		return collab.Prune(ctx, root, doc)
 	case "gc":
@@ -660,30 +718,108 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 			limit = 100
 		}
 		return collab.Reflog(ctx, root, doc, limit)
-	case "reset":
-		return collab.Reset(ctx, root, doc, intValue(params["version"]), stringValue(params["message"]))
-	case "discover":
-		return collab.Discover(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
-	case "unregister":
-		return collab.Unregister(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])), root)
-	case "snapshot.create":
-		return collab.Snapshot().Create(ctx, root, stringValue(params["message"]), boolValue(params["major"], false))
-	case "snapshot.list":
-		return collab.Snapshot().List(ctx, root)
-	case "snapshot.show":
-		return collab.Snapshot().Show(ctx, root, stringValue(params["version"]))
-	case "snapshot.diff":
-		return collab.Snapshot().Diff(ctx, root, firstNonEmpty(stringValue(params["version_a"]), stringValue(params["versionA"])), firstNonEmpty(stringValue(params["version_b"]), stringValue(params["versionB"])))
-	case "snapshot.restore":
-		return collab.Snapshot().Restore(ctx, root, stringValue(params["version"]), stringValue(params["message"]))
-	case "snapshot.rm":
-		return collab.Snapshot().Remove(ctx, root, stringValue(params["version"]))
-	case "snapshot.prune":
-		before := optionalInt(firstNonNil(params["before"]))
-		keepLast := optionalInt(firstNonNil(params["keep_last"], params["keepLast"]))
-		return collab.Snapshot().Prune(ctx, root, before, keepLast)
 	default:
 		return nil, fmt.Errorf("unsupported collab action: %s", action)
+	}
+}
+
+func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, params map[string]any) (any, error) {
+	fs := a.client.Group().FS()
+	pathValue := strings.TrimSpace(stringValue(params["path"]))
+	switch action {
+	case "ls":
+		return fs.Ls(ctx, pathValue, &aun.GroupFSListOptions{
+			Page:      intValue(params["page"]),
+			Size:      intValue(params["size"]),
+			Marker:    stringValue(params["marker"]),
+			Token:     stringValue(params["token"]),
+			Long:      boolValue(params["long"], false),
+			Recursive: boolValue(params["recursive"], false),
+			Extra:     params,
+		})
+	case "find":
+		return fs.Find(ctx, pathValue, &aun.GroupFSFindOptions{
+			Pattern:  stringValue(params["pattern"]),
+			Name:     stringValue(params["name"]),
+			NodeType: firstNonEmpty(stringValue(params["type"]), stringValue(params["node_type"]), stringValue(params["nodeType"])),
+			Size:     stringValue(params["size"]),
+			MTime:    firstNonEmpty(stringValue(params["mtime"]), stringValue(params["m_time"]), stringValue(params["mTime"])),
+			Page:     intValue(params["page"]),
+			PageSize: intValue(firstNonNil(params["page_size"], params["pageSize"])),
+			Token:    stringValue(params["token"]),
+			Extra:    params,
+		})
+	case "stat":
+		return fs.Stat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), Extra: params})
+	case "lstat":
+		return fs.Lstat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), Extra: params})
+	case "mkdir":
+		return fs.Mkdir(ctx, pathValue, &aun.GroupFSMkdirOptions{Parents: boolValue(params["parents"], false), Extra: params})
+	case "rm":
+		return fs.Rm(ctx, pathValue, &aun.GroupFSRmOptions{
+			Recursive: boolValue(params["recursive"], false),
+			Force:     boolValue(params["force"], false),
+			Extra:     params,
+		})
+	case "cp":
+		src := stringValue(params["src"])
+		dst := stringValue(params["dst"])
+		cpExtra := copyMap(params)
+		delete(cpExtra, "src")
+		delete(cpExtra, "dst")
+		delete(cpExtra, "src_text")
+		delete(cpExtra, "dst_text")
+		if params["src_text"] != nil {
+			path, err := writeTempText(stringValue(params["src_text"]), ".txt")
+			if err != nil {
+				return nil, err
+			}
+			src = path
+		}
+		result, err := fs.Cp(ctx, src, dst, &aun.GroupFSCpOptions{
+			Force:      boolValue(params["force"], false),
+			Recursive:  boolValue(params["recursive"], false),
+			Parents:    boolValue(params["parents"], true),
+			GroupID:    stringValue(params["group_id"]),
+			SrcGroupID: stringValue(params["src_group_id"]),
+			DstGroupID: stringValue(params["dst_group_id"]),
+			Extra:      cpExtra,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return groupFSCpResponse(result, dst), nil
+	case "mv":
+		mvExtra := copyMap(params)
+		delete(mvExtra, "src")
+		delete(mvExtra, "dst")
+		return fs.Mv(ctx, stringValue(params["src"]), stringValue(params["dst"]), &aun.GroupFSMvOptions{
+			Force:      boolValue(params["force"], false),
+			GroupID:    stringValue(params["group_id"]),
+			SrcGroupID: stringValue(params["src_group_id"]),
+			DstGroupID: stringValue(params["dst_group_id"]),
+			Extra:      mvExtra,
+		})
+	case "df":
+		return fs.Df(ctx, pathValue, &aun.GroupFSDfOptions{
+			GroupID: stringValue(params["group_id"]),
+			Bucket:  stringValue(params["bucket"]),
+			Extra:   params,
+		})
+	case "mount":
+		readonly := optionalBool(params["readonly"])
+		return fs.Mount(ctx, pathValue, &aun.GroupFSMountOptions{
+			Readonly:        readonly,
+			RequireApproval: boolValue(firstNonNil(params["require_approval"], params["requireApproval"]), false),
+			SourceBucket:    stringValue(params["source_bucket"]),
+			ExpiresAt:       optionalInt64(params["expires_at"]),
+			VolumeID:        stringValue(params["volume_id"]),
+			Extra:           params,
+		})
+	case "umount":
+		return fs.Umount(ctx, pathValue, &aun.GroupFSUmountOptions{Extra: params})
+	default:
+		return nil, fmt.Errorf("unsupported group fs action: %s", action)
 	}
 }
 
@@ -741,7 +877,7 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 		if url == "" {
 			return nil, fmt.Errorf("download_text requires url")
 		}
-		content, err := downloadText(ctx, url)
+		content, err := downloadText(ctx, url, a.accessToken())
 		if err != nil {
 			return nil, err
 		}
@@ -766,87 +902,15 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 	}
 }
 
-func (a *CrossSdkGoAgent) handleGroupResourcesMkdir(res http.ResponseWriter, req *http.Request) {
-	body := readJSON(req)
-	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
-	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-	defer cancel()
-	result, err := a.client.Group().Resources().CreateFolder(ctx, body)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mkdir_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
+func (a *CrossSdkGoAgent) accessToken() string {
+	if a == nil || a.client == nil {
+		return ""
 	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "result": jsonSafe(result)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_resources_mkdir", "result": out})
-	writeJSON(res, http.StatusOK, out)
-}
-
-func (a *CrossSdkGoAgent) handleGroupResourcesMount(res http.ResponseWriter, req *http.Request) {
-	body := readJSON(req)
-	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
-	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-	defer cancel()
-	pending, err := a.client.Group().Resources().MountObject(ctx, body)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
+	identity := a.client.GetIdentity()
+	if identity == nil {
+		identity = a.client.AuthLoadIdentityOrNil(a.aid)
 	}
-	plan := asMap(pending)
-	if plan == nil || pendingOpsLen(plan["pending_ops"]) == 0 {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": "bad_pending", "error_message": fmt.Sprintf("group.resources.mount_object returned non-pending result: %v", jsonSafe(pending))}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	store := a.aidStore()
-	defer store.Close()
-	plan["aid_store"] = store
-	confirmed, err := a.client.Group().Resources().ExecutePendingOps(ctx, plan)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error(), "pending": jsonSafe(pending)}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "pending": jsonSafe(pending), "confirmed": jsonSafe(confirmed)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_resources_mount", "result": out})
-	writeJSON(res, http.StatusOK, out)
-}
-
-func (a *CrossSdkGoAgent) handleGroupResourcesRead(res http.ResponseWriter, req *http.Request) {
-	body := readJSON(req)
-	traceID := firstNonEmpty(stringValue(body["trace_id"]), compactUUID())
-	ctx, cancel := context.WithTimeout(req.Context(), 45*time.Second)
-	defer cancel()
-	access, err := a.client.Group().Resources().GetAccess(ctx, body)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	download := asMap(asMap(access)["download"])
-	downloadURL := strings.TrimSpace(firstNonEmpty(stringValue(download["download_url"]), stringValue(download["downloadUrl"])))
-	if downloadURL == "" {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": "missing_download_url", "error_message": fmt.Sprintf("group.resources.get_access did not return download_url: %v", jsonSafe(access))}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	content, err := downloadText(ctx, downloadURL)
-	if err != nil {
-		out := map[string]any{"ok": false, "trace_id": traceID, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_resources_read_error", "error": out})
-		writeJSON(res, http.StatusInternalServerError, out)
-		return
-	}
-	out := map[string]any{"ok": true, "trace_id": traceID, "content": content, "access": jsonSafe(access)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_resources_read", "result": map[string]any{"ok": true, "content_len": len(content)}})
-	writeJSON(res, http.StatusOK, out)
+	return strings.TrimSpace(stringValue(identity["access_token"]))
 }
 
 func (a *CrossSdkGoAgent) handleGroupReady(res http.ResponseWriter, req *http.Request) {
@@ -1198,6 +1262,14 @@ func optionalInt64(value any) *int64 {
 	return &n
 }
 
+func optionalBool(value any) *bool {
+	if value == nil {
+		return nil
+	}
+	v := boolValue(value, false)
+	return &v
+}
+
 func boolValue(value any, fallback bool) bool {
 	switch v := value.(type) {
 	case nil:
@@ -1310,6 +1382,14 @@ func stringSet(value any) map[string]bool {
 	return out
 }
 
+func copyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
 func allInSet(items []string, set map[string]bool) bool {
 	for _, item := range items {
 		if !set[item] {
@@ -1362,12 +1442,45 @@ func extractGroupAID(result any) string {
 	return stringValue(obj["group_aid"])
 }
 
-func downloadText(ctx context.Context, url string) (string, error) {
+func shouldForwardBearerOnRedirect(current *url.URL, next *url.URL) bool {
+	if current == nil || next == nil {
+		return false
+	}
+	if current.Scheme == next.Scheme && current.Host == next.Host {
+		return true
+	}
+	currentHost := strings.ToLower(current.Hostname())
+	nextHost := strings.ToLower(next.Hostname())
+	if !strings.HasPrefix(nextHost, "storage.") {
+		return false
+	}
+	issuer := strings.TrimPrefix(nextHost, "storage.")
+	return issuer != "" && (currentHost == issuer || strings.HasSuffix(currentHost, "."+issuer))
+}
+
+func downloadText(ctx context.Context, rawURL string, bearerToken string) (string, error) {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec
-	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	trimmedToken := strings.TrimSpace(bearerToken)
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if trimmedToken == "" || len(via) == 0 {
+				return nil
+			}
+			prev := via[len(via)-1]
+			if shouldForwardBearerOnRedirect(prev.URL, req.URL) {
+				req.Header.Set("Authorization", "Bearer "+trimmedToken)
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
+	}
+	if trimmedToken != "" {
+		req.Header.Set("Authorization", "Bearer "+trimmedToken)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1429,6 +1542,46 @@ func logFiles() []string {
 		files = files[len(files)-20:]
 	}
 	return files
+}
+
+func writeTempText(content, suffix string) (string, error) {
+	root := envString("AUN_CROSS_SDK_TMP", "/tmp/aun-cross-sdk")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(root, "*"+suffix)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if _, err := file.WriteString(content); err != nil {
+		return "", err
+	}
+	return file.Name(), nil
+}
+
+func groupFSCpResponse(result aun.GroupFSCpResult, dst string) map[string]any {
+	out := map[string]any{"raw": jsonSafe(result)}
+	candidates := []string{result.Download.LocalPath, dst}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		out["local_path"] = candidate
+		out["content"] = string(data)
+		out["content_base64"] = base64.StdEncoding.EncodeToString(data)
+		out["size_bytes"] = len(data)
+		break
+	}
+	return out
 }
 
 func min(a, b int) int {

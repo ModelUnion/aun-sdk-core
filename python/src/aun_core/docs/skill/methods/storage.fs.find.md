@@ -1,6 +1,6 @@
 # storage.fs.find
 
-POSIX `find`：递归查找，支持 name/type/size/mtime 过滤与分页。群资源与 `.collab` 注册表有回退。
+POSIX `find`：递归查找，支持 name/type/size/mtime 过滤与分页。Group FS 与 `.collab` 注册表有回退。
 
 ## 调用示例
 

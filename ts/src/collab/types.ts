@@ -52,7 +52,7 @@ export interface CollabRegistryEntry extends JsonObject {
   collab_root?: string;
 }
 
-export interface CollabSnapshotEntry extends JsonObject {
+export interface CollabTagEntry extends JsonObject {
   doc?: string;
   anchor?: string;
   version?: number;
@@ -61,7 +61,7 @@ export interface CollabSnapshotEntry extends JsonObject {
   target?: string;
 }
 
-export interface CollabSnapshot extends JsonObject {
+export interface CollabTag extends JsonObject {
   collab_root?: string;
   version?: string;
   message?: string;
@@ -69,10 +69,10 @@ export interface CollabSnapshot extends JsonObject {
   major?: boolean;
   bump?: string;
   changed?: string[];
-  entries?: CollabSnapshotEntry[];
+  entries?: CollabTagEntry[];
 }
 
-export interface CollabSnapshotDiffResult extends JsonObject {
+export interface CollabTagDiffResult extends JsonObject {
   collab_root?: string;
   version_a?: string;
   version_b?: string;
@@ -81,19 +81,25 @@ export interface CollabSnapshotDiffResult extends JsonObject {
   changed?: string[];
 }
 
-export interface CollabSnapshotPruneOptions {
+export interface CollabTagPruneOptions {
   before?: number | string | null;
   keep_last?: number | null;
   keepLast?: number | null;
 }
 
-export interface CollabSnapshotRestoreResult extends JsonObject {
+export interface CollabTagRestoreResult extends JsonObject {
   restored_from?: string;
   new_snapshot_version?: string;
   warnings?: string[];
   partial?: boolean;
   restored_docs?: string[];
 }
+
+export type CollabSnapshotEntry = CollabTagEntry;
+export type CollabSnapshot = CollabTag;
+export type CollabSnapshotDiffResult = CollabTagDiffResult;
+export type CollabSnapshotPruneOptions = CollabTagPruneOptions;
+export type CollabSnapshotRestoreResult = CollabTagRestoreResult;
 
 export interface CollabGCResult extends JsonObject {
   scanned?: number;

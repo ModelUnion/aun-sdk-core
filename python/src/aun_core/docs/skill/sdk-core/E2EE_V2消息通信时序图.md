@@ -169,3 +169,5 @@ sequenceDiagram
 | GROUP 明文 | `group.send(encrypt=false)` | `group_messages` + `group_events` | `group.v2.pull` 合并明文行 | 不解密 |
 | GROUP 加密 | `group.v2.send` 承载 `e2ee.group_encrypted` | `v2_group_messages` + `v2_group_wraps` | `group.v2.pull` | 接收方 SDK |
 
+
+

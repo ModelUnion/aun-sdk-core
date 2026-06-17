@@ -2,6 +2,7 @@ package aun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"sync"
@@ -34,20 +35,20 @@ type CollabDocumentResult struct {
 	CollabRoot    string `json:"collab_root,omitempty"`
 	Doc           string `json:"doc,omitempty"`
 	Anchor        string `json:"anchor,omitempty"`
-	Source        string `json:"source,omitempty"`
-	Content       string `json:"content,omitempty"`
 	Version       int    `json:"version,omitempty"`
 	Author        string `json:"author,omitempty"`
+	Content       string `json:"content,omitempty"`
 	CurrentTarget string `json:"current_target,omitempty"`
+	Target        string `json:"target,omitempty"`
 	Conflicts     bool   `json:"conflicts,omitempty"`
 }
 
-type CollabHistoryEntry struct {
+type CollabLogEntry struct {
 	Version int    `json:"version,omitempty"`
-	Target  string `json:"target,omitempty"`
 	Author  string `json:"author,omitempty"`
-	Message string `json:"message,omitempty"`
+	Target  string `json:"target,omitempty"`
 	Time    int64  `json:"time,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type CollabDiffResult struct {
@@ -74,165 +75,152 @@ type CollabActionResult struct {
 	Removed         int    `json:"removed,omitempty"`
 }
 
-type CollabSnapshotEntry struct {
+type CollabTagEntry struct {
 	Doc           string `json:"doc,omitempty"`
 	Anchor        string `json:"anchor,omitempty"`
 	Version       int    `json:"version,omitempty"`
-	Author        string `json:"author,omitempty"`
-	CurrentTarget string `json:"current_target,omitempty"`
 	Target        string `json:"target,omitempty"`
+	CurrentTarget string `json:"current_target,omitempty"`
 }
 
-type CollabSnapshot struct {
-	CollabRoot string                `json:"collab_root,omitempty"`
-	Version    string                `json:"version,omitempty"`
-	Message    string                `json:"message,omitempty"`
-	CreatedAt  int64                 `json:"created_at,omitempty"`
-	Major      bool                  `json:"major,omitempty"`
-	Bump       string                `json:"bump,omitempty"`
-	Changed    []string              `json:"changed,omitempty"`
-	Entries    []CollabSnapshotEntry `json:"entries,omitempty"`
+type CollabTag struct {
+	Version   string           `json:"version,omitempty"`
+	Author    string           `json:"author,omitempty"`
+	CreatedAt int64            `json:"created_at,omitempty"`
+	Message   string           `json:"message,omitempty"`
+	Entries   []CollabTagEntry `json:"entries,omitempty"`
 }
 
-type CollabSnapshotDiffResult struct {
-	CollabRoot string   `json:"collab_root,omitempty"`
-	VersionA   string   `json:"version_a,omitempty"`
-	VersionB   string   `json:"version_b,omitempty"`
-	Added      []string `json:"added,omitempty"`
-	Removed    []string `json:"removed,omitempty"`
-	Changed    []string `json:"changed,omitempty"`
+type CollabTagDiffResult struct {
+	VersionA string           `json:"version_a,omitempty"`
+	VersionB string           `json:"version_b,omitempty"`
+	Added    []CollabTagEntry `json:"added,omitempty"`
+	Removed  []CollabTagEntry `json:"removed,omitempty"`
+	Changed  []string         `json:"changed,omitempty"`
+	Modified []CollabTagEntry `json:"modified,omitempty"`
 }
 
-type CollabSnapshotRestoreResult struct {
-	RestoredFrom       string   `json:"restored_from,omitempty"`
-	NewSnapshotVersion string   `json:"new_snapshot_version,omitempty"`
-	Warnings           []string `json:"warnings,omitempty"`
-	Partial            bool     `json:"partial,omitempty"`
-	RestoredDocs       []string `json:"restored_docs,omitempty"`
+type CollabTagRestoreResult struct {
+	RestoredFrom       string `json:"restored_from,omitempty"`
+	NewSnapshotVersion string `json:"new_snapshot_version,omitempty"`
+	Warnings           []any  `json:"warnings,omitempty"`
+	RestoredDocs       []any  `json:"restored_docs,omitempty"`
 }
 
 type CollabGCResult struct {
-	Scanned    int `json:"scanned,omitempty"`
-	Reachable  int `json:"reachable,omitempty"`
-	Garbage    int `json:"garbage,omitempty"`
-	Deleted    int `json:"deleted,omitempty"`
-	FreedBytes int `json:"freed_bytes,omitempty"`
+	Scanned      int   `json:"scanned,omitempty"`
+	Garbage      int   `json:"garbage,omitempty"`
+	Deleted      int   `json:"deleted,omitempty"`
+	DryRun       bool  `json:"dry_run,omitempty"`
+	GarbageBytes int64 `json:"garbage_bytes,omitempty"`
+	DeletedBytes int64 `json:"deleted_bytes,omitempty"`
 }
 
 type CollabReflogEntry struct {
-	Seq          int               `json:"seq,omitempty"`
-	Action       string            `json:"action,omitempty"`
-	Requester    string            `json:"requester,omitempty"`
-	Doc          string            `json:"doc,omitempty"`
-	Version      int               `json:"version,omitempty"`
-	BaseVersion  int               `json:"base_version,omitempty"`
-	Target       string            `json:"target,omitempty"`
-	Status       string            `json:"status,omitempty"`
-	ErrorCode    int               `json:"error_code,omitempty"`
-	ErrorMsg     string            `json:"error_msg,omitempty"`
-	Metadata     map[string]any    `json:"metadata,omitempty"`
-	Timestamp    int64             `json:"timestamp,omitempty"`
+	Action        string `json:"action,omitempty"`
+	CollabRoot    string `json:"collab_root,omitempty"`
+	Doc           string `json:"doc,omitempty"`
+	Version       any    `json:"version,omitempty"`
+	BaseVersion   any    `json:"base_version,omitempty"`
+	Target        string `json:"target,omitempty"`
+	RequesterAID  string `json:"requester_aid,omitempty"`
+	Status        string `json:"status,omitempty"`
+	ErrorCode     any    `json:"error_code,omitempty"`
+	ErrorMsg      string `json:"error_msg,omitempty"`
+	CreatedAt     int64  `json:"created_at,omitempty"`
 }
 
 type CollabFacade struct {
-	rpcFacade
-	mu       sync.Mutex
-	snapshot *CollabSnapshotFacade
+	client       StorageRPCClient
+	tagOnce      sync.Once
+	tagFacade    *CollabTagFacade
 }
 
 func newCollabFacade(client StorageRPCClient) *CollabFacade {
-	return &CollabFacade{rpcFacade: newRPCFacade(client, "collab")}
+	return &CollabFacade{client: client}
 }
 
 func (f *CollabFacade) call(ctx context.Context, name string, params map[string]any) (any, error) {
-	result, err := f.rpcFacade.call(ctx, name, params)
+	raw, err := f.client.Call(ctx, name, params)
 	if err != nil {
 		return nil, mapCollabError(err)
 	}
-	return result, nil
+	return raw, nil
 }
 
-func (f *CollabFacade) Snapshot() *CollabSnapshotFacade {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.snapshot == nil {
-		f.snapshot = &CollabSnapshotFacade{parent: f}
-	}
-	return f.snapshot
+func (f *CollabFacade) Tag() *CollabTagFacade {
+	f.tagOnce.Do(func() {
+		f.tagFacade = &CollabTagFacade{parent: f}
+	})
+	return f.tagFacade
 }
 
-func (f *CollabFacade) LS(ctx context.Context, collabRoot string) ([]CollabDocumentEntry, error) {
-	result, err := f.call(ctx, "ls", map[string]any{"collab_root": collabRoot})
+func (f *CollabFacade) LsFiles(ctx context.Context, collabRoot string) ([]CollabDocumentEntry, error) {
+	raw, err := f.call(ctx, "collab.ls-files", map[string]any{"collab_root": collabRoot})
 	if err != nil {
 		return nil, err
 	}
-	return collabDocumentEntriesFromAny(result), nil
-}
-
-func (f *CollabFacade) Ls(ctx context.Context, collabRoot string) ([]CollabDocumentEntry, error) {
-	return f.LS(ctx, collabRoot)
+	return toTypedSlice[CollabDocumentEntry](raw)
 }
 
 func (f *CollabFacade) Create(ctx context.Context, collabRoot, doc, source string) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "create", map[string]any{"collab_root": collabRoot, "doc": doc, "source": source})
+	return f.callDocument(ctx, "collab.create", map[string]any{"collab_root": collabRoot, "doc": doc, "source": source})
 }
 
-func (f *CollabFacade) Read(ctx context.Context, collabRoot, doc string) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "read", map[string]any{"collab_root": collabRoot, "doc": doc})
+func (f *CollabFacade) Show(ctx context.Context, collabRoot, doc string, rev *int) (CollabDocumentResult, error) {
+	params := map[string]any{"collab_root": collabRoot, "doc": doc}
+	if rev != nil {
+		params["rev"] = *rev
+	}
+	return f.callDocument(ctx, "collab.show", params)
 }
 
-func (f *CollabFacade) Submit(ctx context.Context, collabRoot, doc, source string, baseVersion int, message string) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "submit", map[string]any{
-		"collab_root":  collabRoot,
-		"doc":          doc,
-		"source":       source,
-		"base_version": baseVersion,
-		"message":      message,
-	})
+func (f *CollabFacade) Commit(ctx context.Context, collabRoot, doc, source string, onto int, message string) (CollabDocumentResult, error) {
+	params := map[string]any{
+		"collab_root": collabRoot,
+		"doc":         doc,
+		"source":      source,
+		"onto":        onto,
+		"message":     message,
+	}
+	return f.callDocument(ctx, "collab.commit", params)
 }
 
-func (f *CollabFacade) Merge(ctx context.Context, collabRoot, doc, source string, baseVersion int) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "merge", map[string]any{"collab_root": collabRoot, "doc": doc, "source": source, "base_version": baseVersion})
+func (f *CollabFacade) Merge(ctx context.Context, collabRoot, doc, source string, onto int) (CollabDocumentResult, error) {
+	return f.callDocument(ctx, "collab.merge", map[string]any{"collab_root": collabRoot, "doc": doc, "source": source, "onto": onto})
 }
 
-func (f *CollabFacade) History(ctx context.Context, collabRoot, doc string) ([]CollabHistoryEntry, error) {
-	result, err := f.call(ctx, "history", map[string]any{"collab_root": collabRoot, "doc": doc})
+func (f *CollabFacade) Log(ctx context.Context, collabRoot, doc string) ([]CollabLogEntry, error) {
+	raw, err := f.call(ctx, "collab.log", map[string]any{"collab_root": collabRoot, "doc": doc})
 	if err != nil {
 		return nil, err
 	}
-	return collabHistoryEntriesFromAny(result), nil
-}
-
-func (f *CollabFacade) Get(ctx context.Context, collabRoot, doc string, version int) (CollabDocumentResult, error) {
-	return f.callDocument(ctx, "get", map[string]any{"collab_root": collabRoot, "doc": doc, "version": version})
+	return toTypedSlice[CollabLogEntry](raw)
 }
 
 func (f *CollabFacade) Diff(ctx context.Context, collabRoot, doc string, fromVersion, toVersion int) (CollabDiffResult, error) {
-	result, err := f.call(ctx, "diff", map[string]any{"collab_root": collabRoot, "doc": doc, "from": fromVersion, "to": toVersion})
+	params := map[string]any{"collab_root": collabRoot, "doc": doc, "from": fromVersion, "to": toVersion}
+	raw, err := f.call(ctx, "collab.diff", params)
 	if err != nil {
 		return CollabDiffResult{}, err
 	}
-	return collabDiffResultFromAny(result), nil
+	return toTyped[CollabDiffResult](raw)
 }
 
-func (f *CollabFacade) Export(ctx context.Context, collabRoot, dest string) (CollabActionResult, error) {
-	return f.callAction(ctx, "export", map[string]any{"collab_root": collabRoot, "dest": dest})
-}
-
-func (f *CollabFacade) Adopt(ctx context.Context, src, newRoot string) (CollabActionResult, error) {
-	return f.callAction(ctx, "adopt", map[string]any{"src": src, "new_root": newRoot})
+func (f *CollabFacade) Clone(ctx context.Context, src, dest string, reroot bool) (CollabActionResult, error) {
+	return f.callAction(ctx, "collab.clone", map[string]any{"src": src, "dest": dest, "reroot": reroot})
 }
 
 func (f *CollabFacade) Prune(ctx context.Context, collabRoot, doc string) (CollabActionResult, error) {
-	return f.callAction(ctx, "prune", map[string]any{"collab_root": collabRoot, "doc": doc})
+	return f.callAction(ctx, "collab.prune", map[string]any{"collab_root": collabRoot, "doc": doc})
 }
 
 func (f *CollabFacade) GC(ctx context.Context, collabRoot string, dryRun bool) (CollabGCResult, error) {
-	result, err := f.call(ctx, "gc", map[string]any{"collab_root": collabRoot, "dry_run": dryRun})
+	raw, err := f.call(ctx, "collab.gc", map[string]any{"collab_root": collabRoot, "dry_run": dryRun})
 	if err != nil {
 		return CollabGCResult{}, err
 	}
-	return collabGCResultFromAny(result), nil
+	return toTyped[CollabGCResult](raw)
 }
 
 func (f *CollabFacade) Reflog(ctx context.Context, collabRoot string, doc string, limit int) ([]CollabReflogEntry, error) {
@@ -240,408 +228,222 @@ func (f *CollabFacade) Reflog(ctx context.Context, collabRoot string, doc string
 	if doc != "" {
 		params["doc"] = doc
 	}
-	result, err := f.call(ctx, "reflog", params)
+	raw, err := f.call(ctx, "collab.reflog", params)
 	if err != nil {
 		return nil, err
 	}
-	return collabReflogEntriesFromAny(result), nil
+	return toTypedSlice[CollabReflogEntry](raw)
 }
 
-func (f *CollabFacade) Reset(ctx context.Context, collabRoot string, doc string, version int, message string) (CollabDocumentResult, error) {
-	params := map[string]any{"collab_root": collabRoot, "doc": doc, "version": version}
-	if message != "" {
-		params["message"] = message
+func (f *CollabFacade) Revert(ctx context.Context, collabRoot string, doc string, rev int, message string) (CollabDocumentResult, error) {
+	params := map[string]any{
+		"collab_root": collabRoot,
+		"doc":         doc,
+		"rev":         rev,
+		"message":     message,
 	}
-	return f.callDocument(ctx, "reset", params)
+	return f.callDocument(ctx, "collab.revert", params)
 }
 
-func (f *CollabFacade) Discover(ctx context.Context, groupAID string) ([]CollabRegistryEntry, error) {
-	result, err := f.call(ctx, "discover", map[string]any{"group_aid": groupAID})
+func (f *CollabFacade) LsRemote(ctx context.Context, groupAID string) ([]CollabRegistryEntry, error) {
+	raw, err := f.call(ctx, "collab.ls-remote", map[string]any{"group_aid": groupAID})
 	if err != nil {
 		return nil, err
 	}
-	return collabRegistryEntriesFromAny(result), nil
+	return toTypedSlice[CollabRegistryEntry](raw)
 }
 
 func (f *CollabFacade) Unregister(ctx context.Context, groupAID, collabRoot string) (CollabActionResult, error) {
-	return f.callAction(ctx, "unregister", map[string]any{"group_aid": groupAID, "collab_root": collabRoot})
+	return f.callAction(ctx, "collab.unregister", map[string]any{"group_aid": groupAID, "collab_root": collabRoot})
 }
 
 func (f *CollabFacade) callDocument(ctx context.Context, name string, params map[string]any) (CollabDocumentResult, error) {
-	result, err := f.call(ctx, name, params)
+	raw, err := f.call(ctx, name, params)
 	if err != nil {
 		return CollabDocumentResult{}, err
 	}
-	return collabDocumentResultFromAny(result), nil
+	return toTyped[CollabDocumentResult](raw)
 }
 
 func (f *CollabFacade) callAction(ctx context.Context, name string, params map[string]any) (CollabActionResult, error) {
-	result, err := f.call(ctx, name, params)
+	raw, err := f.call(ctx, name, params)
 	if err != nil {
 		return CollabActionResult{}, err
 	}
-	return collabActionResultFromAny(result), nil
+	return toTyped[CollabActionResult](raw)
 }
 
-type CollabSnapshotFacade struct {
+type CollabTagFacade struct {
 	parent *CollabFacade
 }
 
-func (f *CollabSnapshotFacade) Create(ctx context.Context, collabRoot, message string, major bool) (CollabSnapshot, error) {
-	result, err := f.parent.call(ctx, "snapshot.create", map[string]any{"collab_root": collabRoot, "message": message, "major": major})
-	if err != nil {
-		return CollabSnapshot{}, err
+func (f *CollabTagFacade) Create(ctx context.Context, collabRoot, message string, major bool) (CollabTag, error) {
+	params := map[string]any{
+		"collab_root": collabRoot,
+		"message":     message,
+		"major":       major,
 	}
-	return collabSnapshotFromAny(result), nil
+	raw, err := f.parent.call(ctx, "collab.tag.create", params)
+	if err != nil {
+		return CollabTag{}, err
+	}
+	return toTyped[CollabTag](raw)
 }
 
-func (f *CollabSnapshotFacade) List(ctx context.Context, collabRoot string) ([]CollabSnapshot, error) {
-	result, err := f.parent.call(ctx, "snapshot.list", map[string]any{"collab_root": collabRoot})
+func (f *CollabTagFacade) List(ctx context.Context, collabRoot string) ([]CollabTag, error) {
+	raw, err := f.parent.call(ctx, "collab.tag.list", map[string]any{"collab_root": collabRoot})
 	if err != nil {
 		return nil, err
 	}
-	return collabSnapshotsFromAny(result), nil
+	return toTypedSlice[CollabTag](raw)
 }
 
-func (f *CollabSnapshotFacade) Show(ctx context.Context, collabRoot, version string) (CollabSnapshot, error) {
-	result, err := f.parent.call(ctx, "snapshot.show", map[string]any{"collab_root": collabRoot, "version": version})
+func (f *CollabTagFacade) Show(ctx context.Context, collabRoot, version string) (CollabTag, error) {
+	raw, err := f.parent.call(ctx, "collab.tag.show", map[string]any{"collab_root": collabRoot, "version": version})
 	if err != nil {
-		return CollabSnapshot{}, err
+		return CollabTag{}, err
 	}
-	return collabSnapshotFromAny(result), nil
+	return toTyped[CollabTag](raw)
 }
 
-func (f *CollabSnapshotFacade) Diff(ctx context.Context, collabRoot, versionA, versionB string) (CollabSnapshotDiffResult, error) {
-	result, err := f.parent.call(ctx, "snapshot.diff", map[string]any{"collab_root": collabRoot, "version_a": versionA, "version_b": versionB})
+func (f *CollabTagFacade) Diff(ctx context.Context, collabRoot, versionA, versionB string) (CollabTagDiffResult, error) {
+	params := map[string]any{"collab_root": collabRoot, "version_a": versionA, "version_b": versionB}
+	raw, err := f.parent.call(ctx, "collab.tag.diff", params)
 	if err != nil {
-		return CollabSnapshotDiffResult{}, err
+		return CollabTagDiffResult{}, err
 	}
-	return collabSnapshotDiffResultFromAny(result), nil
+	return toTyped[CollabTagDiffResult](raw)
 }
 
-func (f *CollabSnapshotFacade) Restore(ctx context.Context, collabRoot, version, message string) (CollabSnapshotRestoreResult, error) {
-	result, err := f.parent.call(ctx, "snapshot.restore", map[string]any{"collab_root": collabRoot, "version": version, "message": message})
+func (f *CollabTagFacade) Restore(ctx context.Context, collabRoot, version, message string) (CollabTagRestoreResult, error) {
+	params := map[string]any{"collab_root": collabRoot, "version": version, "message": message}
+	raw, err := f.parent.call(ctx, "collab.tag.restore", params)
 	if err != nil {
-		return CollabSnapshotRestoreResult{}, err
+		return CollabTagRestoreResult{}, err
 	}
-	return collabSnapshotRestoreResultFromAny(result), nil
+	return toTyped[CollabTagRestoreResult](raw)
 }
 
-func (f *CollabSnapshotFacade) Remove(ctx context.Context, collabRoot, version string) (CollabActionResult, error) {
-	return f.parent.callAction(ctx, "snapshot.rm", map[string]any{"collab_root": collabRoot, "version": version})
+func (f *CollabTagFacade) Rm(ctx context.Context, collabRoot, version string) (CollabActionResult, error) {
+	raw, err := f.parent.call(ctx, "collab.tag.rm", map[string]any{"collab_root": collabRoot, "version": version})
+	if err != nil {
+		return CollabActionResult{}, err
+	}
+	return toTyped[CollabActionResult](raw)
 }
 
-func (f *CollabSnapshotFacade) Rm(ctx context.Context, collabRoot, version string) (CollabActionResult, error) {
-	return f.Remove(ctx, collabRoot, version)
-}
-
-func (f *CollabSnapshotFacade) Prune(ctx context.Context, collabRoot string, before any, keepLast *int) (CollabActionResult, error) {
+func (f *CollabTagFacade) Prune(ctx context.Context, collabRoot string, before any, keepLast *int) (CollabActionResult, error) {
 	params := map[string]any{"collab_root": collabRoot}
-	if value, ok := collabOptionalValue(before); ok {
-		params["before"] = value
+	if before != nil {
+		// Dereference pointer types for before
+		switch v := before.(type) {
+		case *int:
+			if v != nil {
+				params["before"] = *v
+			}
+		case *string:
+			if v != nil {
+				params["before"] = *v
+			}
+		default:
+			params["before"] = before
+		}
 	}
 	if keepLast != nil {
 		params["keep_last"] = *keepLast
 	}
-	return f.parent.callAction(ctx, "snapshot.prune", params)
-}
-
-func collabDocumentEntriesFromAny(value any) []CollabDocumentEntry {
-	rows := collabMapList(value)
-	out := make([]CollabDocumentEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, CollabDocumentEntry{
-			CollabRoot:    storageString(row["collab_root"], ""),
-			Doc:           storageString(row["doc"], ""),
-			Anchor:        storageString(row["anchor"], ""),
-			Version:       int(storageInt64(row["version"])),
-			Author:        storageString(row["author"], ""),
-			Target:        storageString(row["target"], ""),
-			CurrentTarget: storageString(row["current_target"], ""),
-			UpdatedAt:     storageInt64(row["updated_at"]),
-		})
+	raw, err := f.parent.call(ctx, "collab.tag.prune", params)
+	if err != nil {
+		return CollabActionResult{}, err
 	}
-	return out
-}
-
-func collabDocumentResultFromAny(value any) CollabDocumentResult {
-	row := storageMap(value)
-	return CollabDocumentResult{
-		OK:            storageBool(row["ok"], false),
-		CollabRoot:    storageString(row["collab_root"], ""),
-		Doc:           storageString(row["doc"], ""),
-		Anchor:        storageString(row["anchor"], ""),
-		Source:        storageString(row["source"], ""),
-		Content:       storageString(row["content"], ""),
-		Version:       int(storageInt64(row["version"])),
-		Author:        storageString(row["author"], ""),
-		CurrentTarget: storageString(row["current_target"], ""),
-		Conflicts:     storageBool(row["conflicts"], false),
-	}
-}
-
-func collabHistoryEntriesFromAny(value any) []CollabHistoryEntry {
-	rows := collabMapList(value)
-	out := make([]CollabHistoryEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, CollabHistoryEntry{
-			Version: int(storageInt64(row["version"])),
-			Target:  storageString(row["target"], ""),
-			Author:  storageString(row["author"], ""),
-			Message: storageString(row["message"], ""),
-			Time:    storageInt64(row["time"]),
-		})
-	}
-	return out
-}
-
-func collabDiffResultFromAny(value any) CollabDiffResult {
-	row := storageMap(value)
-	return CollabDiffResult{
-		CollabRoot: storageString(row["collab_root"], ""),
-		Doc:        storageString(row["doc"], ""),
-		From:       int(storageInt64(row["from"])),
-		To:         int(storageInt64(row["to"])),
-		Diff:       storageString(row["diff"], ""),
-	}
-}
-
-func collabRegistryEntriesFromAny(value any) []CollabRegistryEntry {
-	rows := collabMapList(value)
-	out := make([]CollabRegistryEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, CollabRegistryEntry{
-			GroupAID:     storageString(row["group_aid"], ""),
-			AuthorityAID: storageString(row["authority_aid"], ""),
-			CollabRoot:   storageString(row["collab_root"], ""),
-		})
-	}
-	return out
-}
-
-func collabGCResultFromAny(value any) CollabGCResult {
-	row := storageMap(value)
-	return CollabGCResult{
-		Scanned:    int(storageInt64(row["scanned"])),
-		Reachable:  int(storageInt64(row["reachable"])),
-		Garbage:    int(storageInt64(row["garbage"])),
-		Deleted:    int(storageInt64(row["deleted"])),
-		FreedBytes: int(storageInt64(row["freed_bytes"])),
-	}
-}
-
-func collabReflogEntriesFromAny(value any) []CollabReflogEntry {
-	rows := collabMapList(value)
-	out := make([]CollabReflogEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, CollabReflogEntry{
-			Seq:         int(storageInt64(row["seq"])),
-			Action:      storageString(row["action"], ""),
-			Requester:   storageString(row["requester"], ""),
-			Doc:         storageString(row["doc"], ""),
-			Version:     int(storageInt64(row["version"])),
-			BaseVersion: int(storageInt64(row["base_version"])),
-			Target:      storageString(row["target"], ""),
-			Status:      storageString(row["status"], ""),
-			ErrorCode:   int(storageInt64(row["error_code"])),
-			ErrorMsg:    storageString(row["error_msg"], ""),
-			Metadata:    storageMap(row["metadata"]),
-			Timestamp:   storageInt64(row["timestamp"]),
-		})
-	}
-	return out
-}
-
-func collabActionResultFromAny(value any) CollabActionResult {
-	row := storageMap(value)
-	return CollabActionResult{
-		OK:              storageBool(row["ok"], false),
-		Dest:            storageString(row["dest"], ""),
-		CopiedObjects:   int(storageInt64(row["copied_objects"])),
-		NewRoot:         storageString(row["new_root"], ""),
-		NewAuthorityAID: storageString(row["new_authority_aid"], ""),
-		Pruned:          int(storageInt64(row["pruned"])),
-		Removed:         int(storageInt64(row["removed"])),
-	}
-}
-
-func collabSnapshotFromAny(value any) CollabSnapshot {
-	row := storageMap(value)
-	return CollabSnapshot{
-		CollabRoot: storageString(row["collab_root"], ""),
-		Version:    storageString(row["version"], ""),
-		Message:    storageString(row["message"], ""),
-		CreatedAt:  storageInt64(row["created_at"]),
-		Major:      storageBool(row["major"], false),
-		Bump:       storageString(row["bump"], ""),
-		Changed:    collabStringList(row["changed"]),
-		Entries:    collabSnapshotEntriesFromAny(row["entries"]),
-	}
-}
-
-func collabSnapshotsFromAny(value any) []CollabSnapshot {
-	rows := collabMapList(value)
-	out := make([]CollabSnapshot, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, collabSnapshotFromAny(row))
-	}
-	return out
-}
-
-func collabSnapshotEntriesFromAny(value any) []CollabSnapshotEntry {
-	rows := collabMapList(value)
-	out := make([]CollabSnapshotEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, CollabSnapshotEntry{
-			Doc:           storageString(row["doc"], ""),
-			Anchor:        storageString(row["anchor"], ""),
-			Version:       int(storageInt64(row["version"])),
-			Author:        storageString(row["author"], ""),
-			CurrentTarget: storageString(row["current_target"], ""),
-			Target:        storageString(row["target"], ""),
-		})
-	}
-	return out
-}
-
-func collabSnapshotDiffResultFromAny(value any) CollabSnapshotDiffResult {
-	row := storageMap(value)
-	return CollabSnapshotDiffResult{
-		CollabRoot: storageString(row["collab_root"], ""),
-		VersionA:   storageString(row["version_a"], ""),
-		VersionB:   storageString(row["version_b"], ""),
-		Added:      collabStringList(row["added"]),
-		Removed:    collabStringList(row["removed"]),
-		Changed:    collabStringList(row["changed"]),
-	}
-}
-
-func collabSnapshotRestoreResultFromAny(value any) CollabSnapshotRestoreResult {
-	row := storageMap(value)
-	return CollabSnapshotRestoreResult{
-		RestoredFrom:       storageString(row["restored_from"], ""),
-		NewSnapshotVersion: storageString(row["new_snapshot_version"], ""),
-		Warnings:           collabStringList(row["warnings"]),
-		Partial:            storageBool(row["partial"], false),
-		RestoredDocs:       collabStringList(row["restored_docs"]),
-	}
-}
-
-func collabMapList(value any) []map[string]any {
-	switch rows := value.(type) {
-	case []map[string]any:
-		return rows
-	case []any:
-		out := make([]map[string]any, 0, len(rows))
-		for _, item := range rows {
-			out = append(out, storageMap(item))
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func collabStringList(value any) []string {
-	switch rows := value.(type) {
-	case []string:
-		return rows
-	case []any:
-		out := make([]string, 0, len(rows))
-		for _, item := range rows {
-			out = append(out, storageString(item, ""))
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func collabOptionalValue(value any) (any, bool) {
-	switch v := value.(type) {
-	case nil:
-		return nil, false
-	case *int:
-		if v == nil {
-			return nil, false
-		}
-		return *v, true
-	case *string:
-		if v == nil {
-			return nil, false
-		}
-		return *v, true
-	default:
-		return v, true
-	}
+	return toTyped[CollabActionResult](raw)
 }
 
 func mapCollabError(err error) error {
-	if err == nil {
-		return nil
+	// First check if it's already a specific error type with embedded AUNError
+	var versionConflict *VersionConflictError
+	if errors.As(err, &versionConflict) && versionConflict.Code == -32009 {
+		data, ok := versionConflict.Data.(map[string]any)
+		if !ok {
+			return &CollabConflictError{AUNError: versionConflict.AUNError}
+		}
+		conflict := &CollabConflictError{AUNError: versionConflict.AUNError}
+		if cv, ok := data["current_version"]; ok {
+			if n, ok := cv.(int); ok {
+				conflict.CurrentVersion = &n
+			} else if n, ok := cv.(float64); ok {
+				v := int(n)
+				conflict.CurrentVersion = &v
+			} else if s, ok := cv.(string); ok {
+				if n, err := strconv.Atoi(s); err == nil {
+					conflict.CurrentVersion = &n
+				}
+			}
+		}
+		if ct, ok := data["current_target"].(string); ok {
+			conflict.CurrentTarget = ct
+		}
+		if h, ok := data["hint"].(string); ok {
+			conflict.Hint = h
+		}
+		return conflict
 	}
-	var collabConflict *CollabConflictError
-	if errors.As(err, &collabConflict) {
+
+	// Fall back to generic AUNError check
+	var aunErr *AUNError
+	if !errors.As(err, &aunErr) {
 		return err
 	}
-
-	var versionConflict *VersionConflictError
-	if errors.As(err, &versionConflict) {
-		return newCollabConflictError(versionConflict.Message, versionConflict.Code, versionConflict.Data, versionConflict.TraceID, err)
+	if aunErr == nil || aunErr.Code != -32009 {
+		return &CollabError{AUNError: *aunErr}
 	}
-
-	var aunErr *AUNError
-	if errors.As(err, &aunErr) && aunErr.Code == -32009 {
-		return newCollabConflictError(aunErr.Message, aunErr.Code, aunErr.Data, aunErr.TraceID, err)
+	data, ok := aunErr.Data.(map[string]any)
+	if !ok {
+		return &CollabError{AUNError: *aunErr}
 	}
-
-	return err
+	conflict := &CollabConflictError{AUNError: *aunErr}
+	if cv, ok := data["current_version"]; ok {
+		if n, ok := cv.(int); ok {
+			conflict.CurrentVersion = &n
+		} else if n, ok := cv.(float64); ok {
+			v := int(n)
+			conflict.CurrentVersion = &v
+		} else if s, ok := cv.(string); ok {
+			if n, err := strconv.Atoi(s); err == nil {
+				conflict.CurrentVersion = &n
+			}
+		}
+	}
+	if ct, ok := data["current_target"].(string); ok {
+		conflict.CurrentTarget = ct
+	}
+	if h, ok := data["hint"].(string); ok {
+		conflict.Hint = h
+	}
+	return conflict
 }
 
-func newCollabConflictError(message string, code int, data any, traceID string, cause error) *CollabConflictError {
-	if message == "" {
-		message = "collab version conflict"
+func toTyped[T any](raw any) (T, error) {
+	var zero T
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return zero, err
 	}
-	if code == 0 {
-		code = -32009
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
+		return zero, err
 	}
-	payload := collabDataMap(data)
-	var currentVersion *int
-	if v, ok := collabInt(payload["current_version"]); ok {
-		currentVersion = intPtr(v)
-	}
-	return &CollabConflictError{
-		AUNError: AUNError{
-			Message:   message,
-			Code:      code,
-			Data:      data,
-			Retryable: false,
-			TraceID:   traceID,
-			Cause:     cause,
-		},
-		CurrentVersion: currentVersion,
-		CurrentTarget:  stringFromAny(payload["current_target"]),
-		Hint:           stringFromAny(payload["hint"]),
-	}
+	return result, nil
 }
 
-func collabDataMap(data any) map[string]any {
-	if data == nil {
-		return map[string]any{}
+func toTypedSlice[T any](raw any) ([]T, error) {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
 	}
-	if m, ok := data.(map[string]any); ok {
-		return m
+	var result []T
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
 	}
-	return map[string]any{}
-}
-
-func collabInt(value any) (int, bool) {
-	if n, ok := toInt(value); ok {
-		return n, true
-	}
-	if s, ok := value.(string); ok && s != "" {
-		n, err := strconv.Atoi(s)
-		return n, err == nil
-	}
-	return 0, false
+	return result, nil
 }

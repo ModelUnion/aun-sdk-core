@@ -16,6 +16,7 @@ class FakeWebSocket implements WebSocketLike {
   readyState = 1;
   binaryType: BinaryType = 'arraybuffer';
   readonly sent: Array<Record<string, unknown>> = [];
+  readonly closedCodes: number[] = [];
   private readonly listeners = new Map<string, Set<Listener>>();
 
   constructor() {
@@ -36,6 +37,7 @@ class FakeWebSocket implements WebSocketLike {
   }
 
   close(code?: number, reason?: string): void {
+    this.closedCodes.push(code ?? 1000);
     const event = typeof CloseEvent === 'function'
       ? new CloseEvent('close', { code: code ?? 1000, reason: reason ?? '' })
       : new Event('close') as CloseEvent;
@@ -149,5 +151,34 @@ describe('ServiceProxyClient browser tunnel', () => {
     expect(capturedOptions?.headers?.Authorization).toBe('Bearer fresh-token');
     expect(sockets[0]?.sent.map((message) => message.type)).toEqual(['service_proxy_auth', 'register_services', 'heartbeat']);
     expect(sockets[0]?.sent[0]).toMatchObject({ provider_aid: 'alice.agentid.pub', client_version: 'js' });
+  });
+
+  it('后端 WebSocket close 使用可发送 close code', async () => {
+    const backend = new FakeWebSocket();
+    const factory = vi.fn((): WebSocketLike => backend);
+    const client = new ServiceProxyClient({
+      providerAid: 'alice.agentid.pub',
+      webSocketFactory: factory,
+    });
+    client.registerService('chat', 'ws://127.0.0.1:8080/root', { serviceType: 'websocket', visibility: 'public' });
+    const sent: Array<Record<string, unknown>> = [];
+    const tunnel = { send: vi.fn(async (payload: Record<string, unknown>) => { sent.push(payload); }) };
+    let shifted = false;
+    const inboundQueue = {
+      async shift() {
+        if (shifted) return null;
+        shifted = true;
+        return { type: 'ws_close', connection_id: 'ws-1', code: 1006, reason: 'abnormal' };
+      },
+    };
+
+    await expect(client.handleWsConnectMessage(
+      { type: 'ws_connect', connection_id: 'ws-1', service_name: 'chat', path: '/socket' },
+      tunnel as any,
+      inboundQueue as any,
+    )).resolves.toBeUndefined();
+
+    expect(backend.closedCodes[0]).toBe(1000);
+    expect(sent[0]).toMatchObject({ type: 'ws_connected', connection_id: 'ws-1' });
   });
 });

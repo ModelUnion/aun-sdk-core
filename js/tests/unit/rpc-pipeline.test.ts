@@ -115,14 +115,14 @@ describe('RpcPipeline 组件边界', () => {
 
     client._signClientOperation.mockClear();
     client._transport.call.mockClear();
-    await pipeline.call('group.resources.resolve_access_ticket', { ticket: 'ticket-1' });
+    await pipeline.call('group.fs.create_download_ticket', { path: 'g1:/docs/a.txt' });
     expect(client._signClientOperation).toHaveBeenCalledWith(
-      'group.resources.resolve_access_ticket',
-      expect.objectContaining({ ticket: 'ticket-1', client_signature: { signed: true } }),
+      'group.fs.create_download_ticket',
+      expect.objectContaining({ path: 'g1:/docs/a.txt', client_signature: { signed: true } }),
     );
     expect(client._transport.call).toHaveBeenCalledWith(
-      'group.resources.resolve_access_ticket',
-      expect.objectContaining({ ticket: 'ticket-1', client_signature: { signed: true }, device_id: 'device-a', slot_id: 'slot-a' }),
+      'group.fs.create_download_ticket',
+      expect.objectContaining({ path: 'g1:/docs/a.txt', client_signature: { signed: true }, device_id: 'device-a', slot_id: 'slot-a' }),
       35,
       undefined,
       false,
@@ -132,19 +132,19 @@ describe('RpcPipeline 组件边界', () => {
   it('collab 写操作按签名和非幂等长超时发送', async () => {
     const { client, pipeline } = createPipeline();
 
-    await pipeline.call('collab.submit', {
+    await pipeline.call('collab.commit', {
       collab_root: 'alice.aid.com:/proj',
       doc: 'd.md',
       source: 'BASE64',
-      base_version: 1,
+      onto: 1,
     });
 
     expect(client._signClientOperation).toHaveBeenCalledWith(
-      'collab.submit',
+      'collab.commit',
       expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
     );
     expect(client._transport.call).toHaveBeenCalledWith(
-      'collab.submit',
+      'collab.commit',
       expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
       35,
       undefined,

@@ -300,7 +300,7 @@ func TestIntegration_GroupRolesAndTransfer(t *testing.T) {
 	}
 	transferMap, _ := transferResult.(map[string]any)
 	if status := stringFromAny(transferMap["status"]); status != "pending_rekey" {
-		t.Fatalf("group-storage 转让应进入 pending_rekey，实际 status=%q result=%#v", status, transferResult)
+		t.Fatalf("group.fs 转让应进入 pending_rekey，实际 status=%q result=%#v", status, transferResult)
 	}
 	if newOwner := stringFromAny(transferMap["new_owner"]); newOwner != bobAID {
 		t.Logf("transfer 返回 new_owner=%s (期望 %s)", newOwner, bobAID)

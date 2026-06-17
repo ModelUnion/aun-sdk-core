@@ -102,6 +102,16 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 		return map[string]any{"token": "tok-secret", "token_id": "tok-1"}, nil
 	case "storage.get_quota":
 		return map[string]any{"owner_aid": params["owner_aid"], "quota_bytes": 10, "used_bytes": 4, "object_count": 1}, nil
+	case "collab.ls-files":
+		return []map[string]any{{"doc": "a.md", "version": 1}}, nil
+	case "collab.log":
+		return []map[string]any{{"version": 1, "author": f.aid}}, nil
+	case "collab.ls-remote":
+		return []map[string]any{{"collab_root": "g.aid.com:/proj"}}, nil
+	case "collab.reflog":
+		return []map[string]any{{"action": "commit", "version": 1}}, nil
+	case "collab.tag.list":
+		return []map[string]any{{"version": "1.0.0"}}, nil
 	default:
 		return map[string]any{"ok": true}, nil
 	}

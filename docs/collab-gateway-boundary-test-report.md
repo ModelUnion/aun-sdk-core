@@ -160,3 +160,5 @@ await self._assert_write(requester_aid, owner, path, group_aid=group_aid)  # 3. 
 - Gateway 和 Auth 之间的通信异常
 
 需要你提供具体的失败日志才能进一步定位。
+
+

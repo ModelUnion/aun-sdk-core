@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestIntegration_CollabCreateReadSubmitDiff(t *testing.T) {
+func TestIntegration_CollabCreateShowCommitDiff(t *testing.T) {
 	rid := runID()
 	alice := makeClient(t)
 	defer alice.Close()
@@ -37,20 +37,20 @@ func TestIntegration_CollabCreateReadSubmitDiff(t *testing.T) {
 		t.Fatalf("collab.create current_target 应为完整 AID path: %#v", created)
 	}
 
-	read, err := alice.Collab().Read(ctx, root, doc)
+	shown, err := alice.Collab().Show(ctx, root, doc, nil)
 	if err != nil {
-		t.Fatalf("collab.read 调用失败: %v", err)
+		t.Fatalf("collab.show 调用失败: %v", err)
 	}
-	if read.Version != 1 || collabText(t, read.Content) != "a\n" {
-		t.Fatalf("collab.read 返回异常: %#v", read)
+	if shown.Version != 1 || collabText(t, shown.Content) != "a\n" {
+		t.Fatalf("collab.show 返回异常: %#v", shown)
 	}
 
-	submitted, err := alice.Collab().Submit(ctx, root, doc, collabB64("a\nb\n"), 1, "Update content")
+	committed, err := alice.Collab().Commit(ctx, root, doc, collabB64("a\nb\n"), 1, "Update content")
 	if err != nil {
-		t.Fatalf("collab.submit 调用失败: %v", err)
+		t.Fatalf("collab.commit 调用失败: %v", err)
 	}
-	if submitted.Version != 2 {
-		t.Fatalf("collab.submit version 异常: %#v", submitted)
+	if committed.Version != 2 {
+		t.Fatalf("collab.commit version 异常: %#v", committed)
 	}
 
 	diff, err := alice.Collab().Diff(ctx, root, doc, 1, 2)
@@ -61,7 +61,7 @@ func TestIntegration_CollabCreateReadSubmitDiff(t *testing.T) {
 		t.Fatalf("collab.diff 未返回新增行: %#v", diff)
 	}
 
-	_, err = alice.Call(ctx, "storage.collab.read", map[string]any{
+	_, err = alice.Call(ctx, "storage.collab.show", map[string]any{
 		"collab_root": root,
 		"doc":         doc,
 	})

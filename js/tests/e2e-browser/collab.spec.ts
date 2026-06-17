@@ -110,7 +110,7 @@ test.describe('collab 浏览器 SDK smoke', () => {
     await installCollabHelpers(page);
   });
 
-  test('collab create/read/submit/history 使用裸 collab.* RPC', async ({ page }) => {
+  test('collab create/show/commit/log 使用裸 collab.* RPC', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const { makeAndConnect, runId, b64, text, isCollabUnavailable, ISSUER } = (window as any).__collabSmoke;
       const rid = runId();
@@ -130,9 +130,9 @@ test.describe('collab 浏览器 SDK smoke', () => {
           throw err;
         }
 
-        const read = await alice.collab.read(collabRoot, doc);
-        const submitted = await alice.collab.submit(collabRoot, doc, b64(`v1-${rid}\nv2-${rid}\n`), 1);
-        const history = await alice.collab.history(collabRoot, doc);
+        const shown = await alice.collab.show(collabRoot, doc);
+        const committed = await alice.collab.commit(collabRoot, doc, b64(`v1-${rid}\nv2-${rid}\n`), 1);
+        const log = await alice.collab.log(collabRoot, doc);
 
         try {
           await alice.storage.remove(`/collab-smoke/${rid}`, { owner: aliceAid, recursive: true });
@@ -143,11 +143,11 @@ test.describe('collab 浏览器 SDK smoke', () => {
         return {
           skip: false,
           createdVersion: Number(created?.version ?? 0),
-          readVersion: Number(read?.version ?? 0),
-          readText: text(String(read?.content ?? '')),
-          submittedVersion: Number(submitted?.version ?? 0),
-          historyVersions: Array.isArray(history) ? history.map((item: any) => Number(item?.version ?? 0)) : [],
-          targetIsAidPath: String(submitted?.current_target ?? '').startsWith(`${aliceAid}:/`),
+          showVersion: Number(shown?.version ?? 0),
+          showText: text(String(shown?.content ?? '')),
+          commitVersion: Number(committed?.version ?? 0),
+          logVersions: Array.isArray(log) ? log.map((item: any) => Number(item?.version ?? 0)) : [],
+          targetIsAidPath: String(committed?.current_target ?? '').startsWith(`${aliceAid}:/`),
         };
       } finally {
         await alice.close();
@@ -161,10 +161,10 @@ test.describe('collab 浏览器 SDK smoke', () => {
     }
 
     expect((result as any).createdVersion).toBe(1);
-    expect((result as any).readVersion).toBe(1);
-    expect((result as any).readText).toContain('v1-');
-    expect((result as any).submittedVersion).toBe(2);
-    expect((result as any).historyVersions).toEqual([1, 2]);
+    expect((result as any).showVersion).toBe(1);
+    expect((result as any).showText).toContain('v1-');
+    expect((result as any).commitVersion).toBe(2);
+    expect((result as any).logVersions).toEqual([1, 2]);
     expect((result as any).targetIsAidPath).toBe(true);
   });
 });

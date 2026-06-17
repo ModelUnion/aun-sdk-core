@@ -17,108 +17,104 @@ func timeNowUnix() int64 { return time.Now().Unix() }
 
 // signedMethods 需要附加客户端 ECDSA 签名的方法集合
 var signedMethods = map[string]bool{
-	"message.send":                          true,
-	"message.v2.put_peer_pk":                true,
-	"message.v2.bootstrap":                  true,
-	"message.v2.group_bootstrap":            true,
-	"message.v2.pull":                       true,
-	"message.v2.ack":                        true,
-	"group.send":                            true,
-	"group.v2.put_group_pk":                 true,
-	"group.v2.bootstrap":                    true,
-	"group.v2.send":                         true,
-	"group.v2.pull":                         true,
-	"group.v2.ack":                          true,
-	"group.v2.propose_state":                true,
-	"group.v2.confirm_state":                true,
-	"group.v2.get_proposal":                 true,
-	"group.kick":                            true,
-	"group.add_member":                      true,
-	"group.leave":                           true,
-	"group.remove_member":                   true,
-	"group.update_rules":                    true,
-	"group.update":                          true,
-	"group.update_announcement":             true,
-	"group.update_join_requirements":        true,
-	"group.set_role":                        true,
-	"group.transfer_owner":                  true,
-	"group.bind_group_aid":                  true,
-	"group.complete_transfer":               true,
-	"group.review_join_request":             true,
-	"group.batch_review_join_request":       true,
-	"group.request_join":                    true,
-	"group.use_invite_code":                 true,
-	"group.thought.put":                     true,
-	"message.thought.put":                   true,
-	"group.set_settings":                    true,
-	"group.resources.put":                   true,
-	"group.resources.create_folder":         true,
-	"group.resources.rename":                true,
-	"group.resources.move":                  true,
-	"group.resources.mount_object":          true,
-	"group.resources.update":                true,
-	"group.resources.delete":                true,
-	"group.resources.namespace_ready":       true,
-	"group.resources.confirm":               true,
-	"group.resources.confirm_mount":         true,
-	"group.resources.get_df":                true,
-	"group.resources.unmount":               true,
-	"group.resources.get_access":            true,
-	"group.resources.resolve_access_ticket": true,
-	"storage.put_object":                    true,
-	"storage.delete_object":                 true,
-	"storage.create_share_link":             true,
-	"storage.revoke_share_link":             true,
-	"storage.get_by_share":                  true,
-	"storage.create_upload_session":         true,
-	"storage.complete_upload":               true,
-	"storage.create_folder":                 true,
-	"storage.rename_folder":                 true,
-	"storage.move_folder":                   true,
-	"storage.delete_folder":                 true,
-	"storage.move_object":                   true,
-	"storage.copy_object":                   true,
-	"storage.batch_delete":                  true,
-	"storage.set_object_meta":               true,
-	"storage.append_object":                 true,
-	"storage.set_acl":                       true,
-	"storage.remove_acl":                    true,
-	"storage.set_visibility":                true,
-	"storage.check_access":                  true,
-	"storage.issue_token":                   true,
-	"storage.revoke_token":                  true,
-	"storage.create_symlink":                true,
-	"storage.atomic_repoint":                true,
-	"storage.rename_symlink":                true,
-	"storage.delete_symlink":                true,
-	"storage.fs.mkdir":                      true,
-	"storage.fs.remove":                     true,
-	"storage.fs.rename":                     true,
-	"storage.fs.copy":                       true,
-	"storage.fs.mount":                      true,
-	"storage.fs.approve":                    true,
-	"storage.fs.reject":                     true,
-	"storage.fs.unmount":                    true,
-	"storage.fs.invalidate_membership":      true,
-	"storage.volume.create":                 true,
-	"storage.volume.renew":                  true,
-	"storage.volume.expire_due":             true,
-	"collab.create":                         true,
-	"collab.submit":                         true,
-	"collab.export":                         true,
-	"collab.adopt":                          true,
-	"collab.prune":                          true,
-	"collab.unregister":                     true,
-	"collab.snapshot.create":                true,
-	"collab.snapshot.restore":               true,
-	"collab.snapshot.rm":                    true,
-	"collab.snapshot.prune":                 true,
-	"group.commit_state":                    true,
-	"group.ban":                             true,
-	"group.unban":                           true,
-	"group.dissolve":                        true,
-	"group.suspend":                         true,
-	"group.resume":                          true,
+	"message.send":                     true,
+	"message.v2.put_peer_pk":           true,
+	"message.v2.bootstrap":             true,
+	"message.v2.group_bootstrap":       true,
+	"message.v2.pull":                  true,
+	"message.v2.ack":                   true,
+	"group.send":                       true,
+	"group.v2.put_group_pk":            true,
+	"group.v2.bootstrap":               true,
+	"group.v2.send":                    true,
+	"group.v2.pull":                    true,
+	"group.v2.ack":                     true,
+	"group.v2.propose_state":           true,
+	"group.v2.confirm_state":           true,
+	"group.v2.get_proposal":            true,
+	"group.kick":                       true,
+	"group.add_member":                 true,
+	"group.leave":                      true,
+	"group.remove_member":              true,
+	"group.update_rules":               true,
+	"group.update":                     true,
+	"group.update_announcement":        true,
+	"group.update_join_requirements":   true,
+	"group.set_role":                   true,
+	"group.transfer_owner":             true,
+	"group.bind_group_aid":             true,
+	"group.complete_transfer":          true,
+	"group.review_join_request":        true,
+	"group.batch_review_join_request":  true,
+	"group.request_join":               true,
+	"group.use_invite_code":            true,
+	"group.thought.put":                true,
+	"message.thought.put":              true,
+	"group.set_settings":               true,
+	"group.fs.mkdir":                   true,
+	"group.fs.rm":                      true,
+	"group.fs.cp":                      true,
+	"group.fs.mv":                      true,
+	"group.fs.mount":                   true,
+	"group.fs.umount":                  true,
+	"group.fs.check_upload":            true,
+	"group.fs.create_upload_session":   true,
+	"group.fs.complete_upload":         true,
+	"group.fs.create_download_ticket":  true,
+	"storage.put_object":               true,
+	"storage.delete_object":            true,
+	"storage.create_share_link":        true,
+	"storage.revoke_share_link":        true,
+	"storage.get_by_share":             true,
+	"storage.create_upload_session":    true,
+	"storage.complete_upload":          true,
+	"storage.create_folder":            true,
+	"storage.rename_folder":            true,
+	"storage.move_folder":              true,
+	"storage.delete_folder":            true,
+	"storage.move_object":              true,
+	"storage.copy_object":              true,
+	"storage.batch_delete":             true,
+	"storage.set_object_meta":          true,
+	"storage.append_object":            true,
+	"storage.set_acl":                  true,
+	"storage.remove_acl":               true,
+	"storage.set_visibility":           true,
+	"storage.check_access":             true,
+	"storage.issue_token":              true,
+	"storage.revoke_token":             true,
+	"storage.create_symlink":           true,
+	"storage.atomic_repoint":           true,
+	"storage.rename_symlink":           true,
+	"storage.delete_symlink":           true,
+	"storage.fs.mkdir":                 true,
+	"storage.fs.remove":                true,
+	"storage.fs.rename":                true,
+	"storage.fs.copy":                  true,
+	"storage.fs.mount":                 true,
+	"storage.fs.approve":               true,
+	"storage.fs.reject":                true,
+	"storage.fs.unmount":               true,
+	"storage.fs.invalidate_membership": true,
+	"storage.volume.create":            true,
+	"storage.volume.renew":             true,
+	"storage.volume.expire_due":        true,
+	"collab.create":                    true,
+	"collab.commit":                    true,
+	"collab.clone":                     true,
+	"collab.prune":                     true,
+	"collab.revert":                    true,
+	"collab.unregister":                true,
+	"collab.tag.create":                true,
+	"collab.tag.restore":               true,
+	"collab.tag.rm":                    true,
+	"collab.tag.prune":                 true,
+	"group.commit_state":               true,
+	"group.ban":                        true,
+	"group.unban":                      true,
+	"group.dissolve":                   true,
+	"group.suspend":                    true,
+	"group.resume":                     true,
 }
 
 type rpcPipeline struct {
@@ -552,11 +548,10 @@ func (p *rpcPipeline) signClientOperation(method string, params map[string]any) 
 	c.mu.RLock()
 	currentAID := c.currentAIDObj
 	c.mu.RUnlock()
-	if currentAID == nil || currentAID.PrivateKeyPem == "" {
+	aidStr, privPEM, certPEM := clientSignatureIdentityFromParams(params, currentAID)
+	if aidStr == "" || privPEM == "" {
 		return nil
 	}
-	privPEM := currentAID.PrivateKeyPem
-	aidStr := currentAID.Aid
 	ts := fmt.Sprintf("%d", timeNowUnix())
 
 	// 计算 params hash：签名覆盖所有非 _ 前缀且非 client_signature 的业务字段
@@ -582,7 +577,7 @@ func (p *rpcPipeline) signClientOperation(method string, params map[string]any) 
 
 	// 证书指纹：用于锁定签名时使用的证书版本
 	certFingerprint := ""
-	if certPEM := currentAID.CertPem; certPEM != "" {
+	if certPEM != "" {
 		block, _ := pem.Decode([]byte(certPEM))
 		if block != nil {
 			fp := sha256.Sum256(block.Bytes)
@@ -598,6 +593,36 @@ func (p *rpcPipeline) signClientOperation(method string, params map[string]any) 
 		"signature":        base64.StdEncoding.EncodeToString(sig),
 	}
 	return nil
+}
+
+func clientSignatureIdentityFromParams(params map[string]any, fallback *AID) (string, string, string) {
+	raw := params["_client_signature_identity"]
+	switch identity := raw.(type) {
+	case *AID:
+		if identity != nil {
+			return strings.TrimSpace(identity.Aid), identity.PrivateKeyPem, identity.CertPem
+		}
+	case AID:
+		return strings.TrimSpace(identity.Aid), identity.PrivateKeyPem, identity.CertPem
+	case map[string]any:
+		aid := strings.TrimSpace(storageAnyToString(firstNonNil(identity["aid"], identity["Aid"])))
+		privateKeyPEM := storageAnyToString(firstNonNil(
+			identity["private_key_pem"],
+			identity["privateKeyPem"],
+			identity["PrivateKeyPem"],
+		))
+		certPEM := storageAnyToString(firstNonNil(
+			identity["cert_pem"],
+			identity["certPem"],
+			identity["cert"],
+			identity["CertPem"],
+		))
+		return aid, privateKeyPEM, certPEM
+	}
+	if fallback == nil {
+		return "", "", ""
+	}
+	return strings.TrimSpace(fallback.Aid), fallback.PrivateKeyPem, fallback.CertPem
 }
 
 // applyClientSignature 统一执行 signed method 策略和 echo skip 规则。
@@ -737,6 +762,7 @@ func (p *rpcPipeline) rawCall(ctx context.Context, method string, params map[str
 			}
 		}
 	}
+	delete(payload, "_client_signature_identity")
 	if rpcBackground {
 		payload["_rpc_background"] = true
 	}

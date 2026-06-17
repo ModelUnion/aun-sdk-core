@@ -85,22 +85,22 @@ func (f *MessageFacade) QueryOnline(ctx context.Context, params map[string]any) 
 
 type GroupFacade struct {
 	rpcFacade
-	mu        sync.Mutex
-	resources *GroupResources
-	thought   *ThoughtFacade
+	mu      sync.Mutex
+	fs      *GroupFSVFS
+	thought *ThoughtFacade
 }
 
 func newGroupFacade(client StorageRPCClient) *GroupFacade {
 	return &GroupFacade{rpcFacade: newRPCFacade(client, "group")}
 }
 
-func (f *GroupFacade) Resources() *GroupResources {
+func (f *GroupFacade) FS() *GroupFSVFS {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.resources == nil {
-		f.resources = NewGroupResources(f.client)
+	if f.fs == nil {
+		f.fs = NewGroupFSVFS(f.client)
 	}
-	return f.resources
+	return f.fs
 }
 
 func (f *GroupFacade) Thought() *ThoughtFacade {

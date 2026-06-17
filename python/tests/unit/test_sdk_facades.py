@@ -3,7 +3,6 @@ import pytest
 from aun_core import (
     AUNClient,
     GroupFacade,
-    GroupResourcesFacade,
     MessageFacade,
     StreamFacade,
 )
@@ -19,79 +18,15 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_group_resources_facade_maps_all_public_methods():
-    client = _FakeClient()
-    resources = GroupResourcesFacade(client)
-
-    await resources.put(group_id="g1", resource_path="docs/a.txt", storage_ref={"owner_aid": "alice.agentid.pub"})
-    await resources.create_folder(group_id="g1", path="docs", mkdirs=True)
-    await resources.list_children(group_id="g1", path="docs", size=20)
-    await resources.rename(group_id="g1", resource_id="r1", new_name="b.txt")
-    await resources.move(group_id="g1", resource_id="r1", dst_parent_path="archive")
-    await resources.mount_object(group_id="g1", path="docs/a.txt", storage_ref={"object_key": "a.txt"})
-    await resources.unmount(group_id="g1", resource_id="r1")
-    await resources.resolve_path(group_id="g1", path="docs/a.txt")
-    await resources.get(group_id="g1", resource_id="r1")
-    await resources.list(group_id="g1", prefix="docs")
-    await resources.update(group_id="g1", resource_id="r1", title="A")
-    await resources.get_access(group_id="g1", resource_id="r1")
-    await resources.resolve_access_ticket(access_ticket="ticket-1")
-    await resources.delete(group_id="g1", resource_id="r1", recursive=True)
-    await resources.namespace_ready(group_id="g1", folder_ids={"announce": "folder-announce"})
-    await resources.confirm(group_id="g1", op_id="op1")
-    await resources.confirm_mount(group_id="g1", mount_id="mnt1")
-    await resources.get_df(group_id="g1")
-
-    assert [method for method, _ in client.calls] == [
-        "group.resources.put",
-        "group.resources.create_folder",
-        "group.resources.list_children",
-        "group.resources.rename",
-        "group.resources.move",
-        "group.resources.mount_object",
-        "group.resources.unmount",
-        "group.resources.resolve_path",
-        "group.resources.get",
-        "group.resources.list",
-        "group.resources.update",
-        "group.resources.get_access",
-        "group.resources.resolve_access_ticket",
-        "group.resources.delete",
-        "group.resources.namespace_ready",
-        "group.resources.confirm",
-        "group.resources.confirm_mount",
-        "group.resources.get_df",
-    ]
-    assert client.calls[0][1] == {
-        "group_id": "g1",
-        "resource_path": "docs/a.txt",
-        "storage_ref": {"owner_aid": "alice.agentid.pub"},
-    }
-    assert client.calls[1][1]["mkdirs"] is True
-    assert client.calls[13][1]["recursive"] is True
-    for removed in [
-        "list_refs_by_storage",
-        "cleanup_by_storage_ref",
-        "request_mount_object",
-        "request_add",
-        "direct_add",
-        "list_pending",
-        "approve_request",
-        "reject_request",
-    ]:
-        assert not hasattr(resources, removed)
-
-
-@pytest.mark.asyncio
 async def test_facades_accept_dict_and_omit_none():
     client = _FakeClient()
     group = GroupFacade(client)
 
-    await group.resources.get({"group_id": "g1", "resource_id": None}, resource_path="docs/a.txt", include_status=None)
+    await group.get({"group_id": "g1", "resource_id": None}, include_status=None)
     await group.send({"group_id": "g1", "payload": {"text": "hi"}, "encrypt": None})
 
     assert client.calls == [
-        ("group.resources.get", {"group_id": "g1", "resource_path": "docs/a.txt"}),
+        ("group.get", {"group_id": "g1"}),
         ("group.send", {"group_id": "g1", "payload": {"text": "hi"}}),
     ]
 
@@ -168,13 +103,10 @@ def test_aun_client_exposes_cached_namespace_facades():
 
     assert isinstance(client.message, MessageFacade)
     assert isinstance(client.group, GroupFacade)
-    assert isinstance(client.group.resources, GroupResourcesFacade)
     assert isinstance(client.stream, StreamFacade)
     assert client.message is client.message
     assert client.group is client.group
-    assert client.group.resources is client.group.resources
     assert client.stream is client.stream
-    assert not hasattr(client, "group_resources")
 
 
 @pytest.mark.asyncio

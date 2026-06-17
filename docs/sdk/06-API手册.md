@@ -316,15 +316,15 @@ headers = client.get_protected_headers()
 
 ## 业务门面
 
-除 `client.call(method, params)` 外，四语言 SDK 对 storage、collab 和 group resources 提供高层门面。普通应用优先用门面，只有需要精确控制底层参数时再直调 RPC。
+除 `client.call(method, params)` 外，四语言 SDK 对 storage、collab 和 group.fs 群文件系统提供高层门面。普通应用优先用门面，只有需要精确控制底层参数时再直调 RPC。
 
 | 能力 | Python | TS/JS | Go | 说明 |
 |------|--------|-------|----|------|
 | Storage VFS | `client.storage` | `client.storage` | `client.Storage()` | 类 POSIX 文件操作；上传自动选择 inline / session / 秒传，下载自动选择 inline / ticket |
-| Collab | `client.collab` | `client.collab` | `client.Collab()` | 版本化文档、快照、`gc` / `reflog` / `reset` |
-| Group resources | `client.group.resources` | `client.groupResources` / `client.group.resources` | `client.Group().Resources()` | 群 storage 镜像；写操作返回 `pending_ops`，用 `execute_pending_ops` / `ExecutePendingOps` 执行并 confirm |
+| Collab | `client.collab` | `client.collab` | `client.Collab()` | 版本化文档、标签、`gc` / `reflog` / `revert` |
+| Group FS | `client.group.fs` | `client.group.fs` | `client.Group().FS()` | POSIX 风格群文件系统；`ls/find/stat/lstat/mkdir/rm/cp/mv/df/mount/umount`，上传下载数据面由 SDK 编排 |
 
-群命名空间初始化使用 group resources helper：Python `initialize_namespace`，TS/JS `initializeNamespace`，Go `InitializeNamespace`。它会以 `group_aid` 身份创建 `announce`、`public`、`archive`、`memberdata` 基线目录，并调用 `group.resources.namespace_ready` 记账。
+群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `groupdata/{group_id}` 的映射只在服务端完成。群自有区写入必须使用群主持有的 `group_aid` 身份并通过当前 group_identity 签名；admin/member 个人 AID 不直接拥有写权限。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
 
 ---
 
@@ -423,9 +423,9 @@ sub.unsubscribe()
 | 领域 | 手册 | 关键方法 |
 |------|------|----------|
 | 消息 | [09-message-rpc-manual.md](09-message-rpc-manual.md) | `message.send` / `message.pull` / `message.ack` / `message.thought.*` |
-| 群组 | [09-group-rpc-manual.md](09-group-rpc-manual.md) | `group.create` / `group.send` / `group.v2.*` / `group.resources.*`（写操作返回 `pending_ops`） |
+| 群组 | [09-group-rpc-manual.md](09-group-rpc-manual.md) | `group.create` / `group.send` / `group.v2.*` / `group.fs.*` |
 | 存储 | [09-storage-rpc-manual.md](09-storage-rpc-manual.md) | `storage.put_object` / `storage.fs.*` / `storage.volume.*` / ACL / token / share link |
-| 协作 | [09-collab-rpc-manual.md](09-collab-rpc-manual.md) | `collab.submit` / `collab.snapshot.*` / `collab.gc` / `collab.reflog` / `collab.reset` |
+| 协作 | [09-collab-rpc-manual.md](09-collab-rpc-manual.md) | `collab.ls-files` / `collab.show` / `collab.commit` / `collab.merge` / `collab.log` / `collab.diff` / `collab.clone` / `collab.prune` / `collab.gc` / `collab.reflog` / `collab.revert` / `collab.tag.*` / `collab.ls-remote` / `collab.unregister` |
 | 元信息 | [09-meta-rpc-manual.md](09-meta-rpc-manual.md) | `meta.ping` / `meta.status` / `meta.trust_roots` |
 | Stream | [09-stream-rpc-manual.md](09-stream-rpc-manual.md) | `stream.create` / `stream.close` / `stream.list_active` |
 | Service Proxy | [09-proxy-rpc-manual.md](09-proxy-rpc-manual.md) | `proxy.register_services` / `proxy.unregister_services` / `proxy.list_services` |
@@ -454,3 +454,4 @@ info = await client.call("stream.get_info", {"stream_id": stream["stream_id"]})
 ```python
 await client.call("stream.close", {"stream_id": stream["stream_id"]})
 ```
+

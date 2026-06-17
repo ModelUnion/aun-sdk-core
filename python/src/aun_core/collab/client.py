@@ -9,36 +9,36 @@ def _drop_none(params: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value is not None}
 
 
-class SnapshotClient:
+class TagClient:
     def __init__(self, parent: "CollabClient") -> None:
         self._parent = parent
 
     async def create(self, collab_root: str, *, message: str = "", major: bool = False) -> dict[str, Any]:
         return await self._parent._call(
-            "collab.snapshot.create",
+            "collab.tag.create",
             {"collab_root": collab_root, "message": message, "major": major},
         )
 
     async def list(self, collab_root: str) -> list[dict[str, Any]]:
-        return await self._parent._call("collab.snapshot.list", {"collab_root": collab_root})
+        return await self._parent._call("collab.tag.list", {"collab_root": collab_root})
 
     async def show(self, collab_root: str, version: str) -> dict[str, Any]:
-        return await self._parent._call("collab.snapshot.show", {"collab_root": collab_root, "version": version})
+        return await self._parent._call("collab.tag.show", {"collab_root": collab_root, "version": version})
 
     async def diff(self, collab_root: str, version_a: str, version_b: str) -> dict[str, Any]:
         return await self._parent._call(
-            "collab.snapshot.diff",
+            "collab.tag.diff",
             {"collab_root": collab_root, "version_a": version_a, "version_b": version_b},
         )
 
     async def restore(self, collab_root: str, version: str, *, message: str = "") -> dict[str, Any]:
         return await self._parent._call(
-            "collab.snapshot.restore",
+            "collab.tag.restore",
             {"collab_root": collab_root, "version": version, "message": message},
         )
 
     async def rm(self, collab_root: str, version: str) -> dict[str, Any]:
-        return await self._parent._call("collab.snapshot.rm", {"collab_root": collab_root, "version": version})
+        return await self._parent._call("collab.tag.rm", {"collab_root": collab_root, "version": version})
 
     async def prune(
         self,
@@ -48,15 +48,17 @@ class SnapshotClient:
         keep_last: int | None = None,
     ) -> dict[str, Any]:
         return await self._parent._call(
-            "collab.snapshot.prune",
+            "collab.tag.prune",
             _drop_none({"collab_root": collab_root, "before": before, "keep_last": keep_last}),
         )
+
+# APPEND_MARKER
 
 
 class CollabClient:
     def __init__(self, client: Any) -> None:
         self._client = client
-        self.snapshot = SnapshotClient(self)
+        self.tag = TagClient(self)
 
     async def _call(self, method: str, params: dict[str, Any] | None = None):
         try:
@@ -67,32 +69,32 @@ class CollabClient:
                 raise
             raise mapped from exc
 
-    async def ls(self, collab_root: str) -> list[dict[str, Any]]:
-        return await self._call("collab.ls", {"collab_root": collab_root})
+    async def ls_files(self, collab_root: str) -> list[dict[str, Any]]:
+        return await self._call("collab.ls-files", {"collab_root": collab_root})
 
     async def create(self, collab_root: str, doc: str, source: str) -> dict[str, Any]:
         return await self._call("collab.create", {"collab_root": collab_root, "doc": doc, "source": source})
 
-    async def read(self, collab_root: str, doc: str) -> dict[str, Any]:
-        return await self._call("collab.read", {"collab_root": collab_root, "doc": doc})
+    async def show(self, collab_root: str, doc: str, rev: int | None = None) -> dict[str, Any]:
+        params = {"collab_root": collab_root, "doc": doc}
+        if rev is not None:
+            params["rev"] = rev
+        return await self._call("collab.show", params)
 
-    async def submit(self, collab_root: str, doc: str, source: str, base_version: int, *, message: str = "") -> dict[str, Any]:
+    async def commit(self, collab_root: str, doc: str, source: str, onto: int, *, message: str = "") -> dict[str, Any]:
         return await self._call(
-            "collab.submit",
-            {"collab_root": collab_root, "doc": doc, "source": source, "base_version": base_version, "message": message},
+            "collab.commit",
+            {"collab_root": collab_root, "doc": doc, "source": source, "onto": onto, "message": message},
         )
 
-    async def merge(self, collab_root: str, doc: str, source: str, base_version: int) -> dict[str, Any]:
+    async def merge(self, collab_root: str, doc: str, source: str, onto: int) -> dict[str, Any]:
         return await self._call(
             "collab.merge",
-            {"collab_root": collab_root, "doc": doc, "source": source, "base_version": base_version},
+            {"collab_root": collab_root, "doc": doc, "source": source, "onto": onto},
         )
 
-    async def history(self, collab_root: str, doc: str) -> list[dict[str, Any]]:
-        return await self._call("collab.history", {"collab_root": collab_root, "doc": doc})
-
-    async def get(self, collab_root: str, doc: str, version: int) -> dict[str, Any]:
-        return await self._call("collab.get", {"collab_root": collab_root, "doc": doc, "version": version})
+    async def log(self, collab_root: str, doc: str) -> list[dict[str, Any]]:
+        return await self._call("collab.log", {"collab_root": collab_root, "doc": doc})
 
     async def diff(self, collab_root: str, doc: str, v_from: int, v_to: int) -> dict[str, Any]:
         return await self._call(
@@ -100,11 +102,8 @@ class CollabClient:
             {"collab_root": collab_root, "doc": doc, "from": v_from, "to": v_to},
         )
 
-    async def export(self, collab_root: str, dest: str) -> dict[str, Any]:
-        return await self._call("collab.export", {"collab_root": collab_root, "dest": dest})
-
-    async def adopt(self, src: str, new_root: str) -> dict[str, Any]:
-        return await self._call("collab.adopt", {"src": src, "new_root": new_root})
+    async def clone(self, src: str, dest: str, *, reroot: bool = False) -> dict[str, Any]:
+        return await self._call("collab.clone", {"src": src, "dest": dest, "reroot": reroot})
 
     async def prune(self, collab_root: str, doc: str) -> dict[str, Any]:
         return await self._call("collab.prune", {"collab_root": collab_root, "doc": doc})
@@ -118,11 +117,11 @@ class CollabClient:
             params["doc"] = doc
         return await self._call("collab.reflog", params)
 
-    async def reset(self, collab_root: str, doc: str, version: int, *, message: str = "") -> dict[str, Any]:
-        return await self._call("collab.reset", {"collab_root": collab_root, "doc": doc, "version": version, "message": message})
+    async def revert(self, collab_root: str, doc: str, rev: int, *, message: str = "") -> dict[str, Any]:
+        return await self._call("collab.revert", {"collab_root": collab_root, "doc": doc, "rev": rev, "message": message})
 
-    async def discover(self, group_aid: str) -> list[dict[str, Any]]:
-        return await self._call("collab.discover", {"group_aid": group_aid})
+    async def ls_remote(self, group_aid: str) -> list[dict[str, Any]]:
+        return await self._call("collab.ls-remote", {"group_aid": group_aid})
 
     async def unregister(self, group_aid: str, collab_root: str) -> dict[str, Any]:
         return await self._call("collab.unregister", {"group_aid": group_aid, "collab_root": collab_root})

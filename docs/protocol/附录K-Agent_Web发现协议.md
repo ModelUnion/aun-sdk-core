@@ -128,3 +128,5 @@ https://{aid}.{issuer_domain}/{svc}
 - `index.html` 是 Agent 面向人类用户的默认首页
 
 这使 AUN 在保持去中心化身份体系的同时，也为 Agent 的公开发现、说明页、服务页和后续生态扩展提供了统一入口。
+
+

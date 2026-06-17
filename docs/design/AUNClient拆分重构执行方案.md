@@ -857,3 +857,5 @@ Docker 注意：
 1. SDK 拆分重构主体已收口，本地无服务验收已通过；后续不再新增组件拆分切片，除非单域/双域回归暴露新的 parity 缺口。
 2. 下一步如要继续发布前验收，应在用户确认单域 Docker 服务环境已启动后跑 Python/TS/JS/Go 单域集成/E2E；双域 federation 需确认 `docker-deploy/federation-test` 已启动后单独跑。
 3. 旧主类 shim 可按版本节奏继续保留；若后续清理 shim，需要先把对应兼容测试改成公开行为或组件测试，不新增公开 API。
+
+

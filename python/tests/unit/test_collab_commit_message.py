@@ -1,11 +1,11 @@
-"""测试 collab.submit 支持 message 参数"""
+"""测试 collab.commit 支持 message 参数"""
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
-async def test_submit_with_message():
-    """submit 应该接受 message 参数并记录到 ledger"""
+async def test_commit_with_message():
+    """commit 应该接受 message 参数并记录到 ledger"""
     from aun_core.collab.client import CollabClient
 
     mock_client = MagicMock()
@@ -17,21 +17,21 @@ async def test_submit_with_message():
 
     collab = CollabClient(mock_client)
 
-    result = await collab.submit(
+    result = await collab.commit(
         "alice.aid.com:/proj",
         "doc1.md",
         "alice.aid.com:/tmp/new.md",
-        base_version=1,
+        onto=1,
         message="Fix typo in introduction"
     )
 
     # 验证调用参数包含 message
     assert mock_client.call.called
     call_args = mock_client.call.call_args
-    assert call_args[0][0] == "collab.submit"
+    assert call_args[0][0] == "collab.commit"
     params = call_args[0][1]
     assert params["message"] == "Fix typo in introduction"
-    assert params["base_version"] == 1
+    assert params["onto"] == 1
 
     # 验证返回结果
     assert result["ok"] is True
@@ -39,8 +39,8 @@ async def test_submit_with_message():
 
 
 @pytest.mark.asyncio
-async def test_submit_without_message_defaults_empty():
-    """submit 不传 message 时应该默认为空字符串"""
+async def test_commit_without_message_defaults_empty():
+    """commit 不传 message 时应该默认为空字符串"""
     from aun_core.collab.client import CollabClient
 
     mock_client = MagicMock()
@@ -52,11 +52,11 @@ async def test_submit_without_message_defaults_empty():
 
     collab = CollabClient(mock_client)
 
-    result = await collab.submit(
+    result = await collab.commit(
         "alice.aid.com:/proj",
         "doc1.md",
         "alice.aid.com:/tmp/new.md",
-        base_version=1
+        onto=1
     )
 
     # 验证默认 message 为空字符串
@@ -66,8 +66,8 @@ async def test_submit_without_message_defaults_empty():
 
 
 @pytest.mark.asyncio
-async def test_history_returns_message():
-    """history 应该返回每个版本的 message"""
+async def test_log_returns_message():
+    """log 应该返回每个版本的 message"""
     from aun_core.collab.client import CollabClient
 
     mock_client = MagicMock()
@@ -90,7 +90,7 @@ async def test_history_returns_message():
 
     collab = CollabClient(mock_client)
 
-    history = await collab.history("alice.aid.com:/proj", "doc1.md")
+    history = await collab.log("alice.aid.com:/proj", "doc1.md")
 
     # 验证 message 字段存在
     assert len(history) == 2

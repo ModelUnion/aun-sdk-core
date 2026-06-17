@@ -265,3 +265,5 @@ AES-GCM + AAD 验证保证消息完整性。AAD 包含以下字段，按 Canonic
 ## L.7 兼容性说明
 
 - 发送端 **MUST** 使用 `prekey_ecdh_v2`（四路 ECDH）模式发送新消息
+
+

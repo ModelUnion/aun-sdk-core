@@ -126,21 +126,21 @@ describe('RpcPipeline 组件边界', () => {
     );
   });
 
-  it('resolve_access_ticket 实际走签名和非幂等 35 秒超时', async () => {
+  it('group.fs 下载 ticket 控制面实际走签名和非幂等 35 秒超时', async () => {
     const { client, pipeline } = createPipeline({
       _transport: { call: vi.fn().mockResolvedValue({ ok: true }) },
       _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
     });
 
-    await pipeline.call('group.resources.resolve_access_ticket', { access_ticket: 'ticket-1' });
+    await pipeline.call('group.fs.create_download_ticket', { path: 'g1:/docs/a.txt' });
 
     expect(client._signClientOperation).toHaveBeenCalledWith(
-      'group.resources.resolve_access_ticket',
-      expect.objectContaining({ access_ticket: 'ticket-1', client_signature: { signed: true } }),
+      'group.fs.create_download_ticket',
+      expect.objectContaining({ path: 'g1:/docs/a.txt', client_signature: { signed: true } }),
     );
     expect(client._transport.call).toHaveBeenCalledWith(
-      'group.resources.resolve_access_ticket',
-      expect.objectContaining({ access_ticket: 'ticket-1', client_signature: { signed: true } }),
+      'group.fs.create_download_ticket',
+      expect.objectContaining({ path: 'g1:/docs/a.txt', client_signature: { signed: true } }),
       35_000,
     );
   });
@@ -151,19 +151,19 @@ describe('RpcPipeline 组件边界', () => {
       _groupState: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
     });
 
-    await pipeline.call('collab.submit', {
+    await pipeline.call('collab.commit', {
       collab_root: 'alice.aid.com:/proj',
       doc: 'd.md',
       source: 'BASE64',
-      base_version: 1,
+      onto: 1,
     });
 
     expect(client._signClientOperation).toHaveBeenCalledWith(
-      'collab.submit',
+      'collab.commit',
       expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
     );
     expect(client._transport.call).toHaveBeenCalledWith(
-      'collab.submit',
+      'collab.commit',
       expect.objectContaining({ doc: 'd.md', client_signature: { signed: true } }),
       35_000,
     );

@@ -225,19 +225,14 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "auth.create_aid", "auth.renew_cert", "auth.rekey",
     "message.thought.put", "group.thought.put",
     "group.add_member", "group.bind_group_aid", "group.complete_transfer",
-    "group.resources.put", "group.resources.create_folder",
-    "group.resources.rename", "group.resources.move",
-    "group.resources.mount_object", "group.resources.update",
-    "group.resources.delete",
-    "group.resources.namespace_ready", "group.resources.confirm",
-    "group.resources.confirm_mount", "group.resources.get_df",
-    "group.resources.unmount",
-    "group.resources.get_access",
-    "group.resources.resolve_access_ticket",
-    "collab.create", "collab.submit", "collab.export", "collab.adopt",
-    "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
-    "collab.snapshot.create", "collab.snapshot.restore",
-    "collab.snapshot.rm", "collab.snapshot.prune",
+    "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+    "group.fs.mount", "group.fs.umount",
+    "group.fs.check_upload", "group.fs.create_upload_session",
+    "group.fs.complete_upload", "group.fs.create_download_ticket",
+    "collab.create", "collab.commit", "collab.clone",
+    "collab.prune", "collab.revert", "collab.gc", "collab.unregister",
+    "collab.tag.create", "collab.tag.restore",
+    "collab.tag.rm", "collab.tag.prune",
 })
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
@@ -1034,20 +1029,15 @@ class AUNClient:
         "storage.fs.mount", "storage.fs.approve", "storage.fs.reject", "storage.fs.unmount",
         "storage.fs.invalidate_membership",
         "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
-        "group.resources.put", "group.resources.create_folder",
-        "group.resources.rename", "group.resources.move",
-        "group.resources.mount_object", "group.resources.update",
-        "group.resources.delete",
-        "group.resources.namespace_ready", "group.resources.confirm",
-        "group.resources.confirm_mount", "group.resources.get_df",
-        "group.resources.unmount",
-        "group.resources.get_access",
-        "group.resources.resolve_access_ticket",
-    "collab.create", "collab.submit", "collab.export", "collab.adopt",
-    "collab.prune", "collab.reset", "collab.gc", "collab.unregister",
-    "collab.snapshot.create", "collab.snapshot.restore",
-    "collab.snapshot.rm", "collab.snapshot.prune",
-})
+        "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+        "group.fs.mount", "group.fs.umount",
+        "group.fs.check_upload", "group.fs.create_upload_session",
+        "group.fs.complete_upload", "group.fs.create_download_ticket",
+        "collab.create", "collab.commit", "collab.clone",
+        "collab.prune", "collab.revert", "collab.gc", "collab.unregister",
+        "collab.tag.create", "collab.tag.restore",
+        "collab.tag.rm", "collab.tag.prune",
+    })
 
     def _sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
         self._rpc().sign_client_operation(method, params)
@@ -1173,7 +1163,7 @@ class AUNClient:
         aid_store: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """发起 group-storage 群主转让：旧群主用旧 group_aid 私钥签名授权，传入 transfer_auth。
+        """发起 group.fs 群主转让：旧群主用旧 group_aid 私钥签名授权，传入 transfer_auth。
 
         aid_store 必须包含当前 group_aid 私钥（建命名群时落盘）。
         返回服务端的 pending_rekey 响应。
@@ -1234,7 +1224,7 @@ class AUNClient:
         aid_store: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """完成 group-storage 群主转让 rekey，并落盘新的 group_aid 身份。"""
+        """完成 group.fs 群主转让 rekey，并落盘新的 group_aid 身份。"""
         merged: dict[str, Any] = {}
         if params is not None:
             if not isinstance(params, dict):

@@ -139,3 +139,5 @@ trust_list = await client.call("meta.trust_roots", {})
 | 更新 issuer root | 校验证书为自签 Root CA，且指纹存在于已验签受信根列表后导入本地 |
 
 更新 issuer root 时不信任下载来源本身；必须以已验签的受信根列表为准，确认 `root.crt` 的 SHA-256 指纹已列入 `root_cas` 后才能写入本地信任锚。
+
+

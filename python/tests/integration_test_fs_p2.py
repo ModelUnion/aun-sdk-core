@@ -170,9 +170,9 @@ async def main() -> None:
     client = _make_client()
     try:
         await ensure_connected_identity(client, _ALICE_AID)
-        await test_symlink_basic(client, root)
-        await test_repoint_and_remove(client, root)
-        await test_dangling_and_loop(client, root)
+        await test_symlink_basic(client, f"{root}/basic")
+        await test_repoint_and_remove(client, f"{root}/repoint")
+        await test_dangling_and_loop(client, f"{root}/dangling")
     finally:
         try:
             await client.storage.remove(f"/{root}", owner=_ALICE_AID, recursive=True)

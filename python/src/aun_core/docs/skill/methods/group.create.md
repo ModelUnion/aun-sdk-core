@@ -14,16 +14,18 @@ gid = result["group"]["group_id"]
 
 ## Group ID 规则
 
-`group_id` 可选。不传时由服务端自动分配；传入自定义值时，短形式必须以 `g-` 开头，总长度 6 到 16 字符，`g-` 后面的 slug 为 4 到 14 位小写字母或数字，且不能被占用。
+`group_id` 可选。不传时由服务端自动分配纯数字群号，并返回 canonical 形式 `group.{issuer-domain}/{base}`，例如 `group.agentid.pub/10042`。
 
-服务端接受 `g-{slug}`、`g-{slug}@issuer-domain`、`g-{slug}.issuer-domain` 三种输入，并在内部和响应中统一为 canonical group_id。本域内 `g-{slug}` 只是输入别名；例如本域 issuer 为 `agentid.pub` 时，`g-abc123` 会规范化为 `g-abc123.agentid.pub`。
+传入自定义值时，服务端接受 canonical `group.{issuer-domain}/{base}`、本域简写 `{base}` / `g-{slug}`，以及旧跨域形式 `{base}@issuer-domain`、`{base}.issuer-domain`、`g-{slug}@issuer-domain`、`g-{slug}.issuer-domain`。输入会规范化为 canonical group_id；例如本域 issuer 为 `agentid.pub` 时，`team01` 会规范化为 `group.agentid.pub/team01`，`g-abc123@agentid.pub` 会规范化为 `group.agentid.pub/g-abc123`。
+
+自定义 `group_id` 不能是纯数字，且规范化后的 canonical group_id 不能被占用。base 支持 5 位及以上小写字母或数字，或 4 到 64 位 `[a-z0-9_-]` 风格名称；旧 `g-` 前缀形式继续兼容，`g-` 后为 4 到 32 位小写字母或数字。
 
 ## 参数
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `name` | string | 是 | — | 群组名称 |
-| `group_id` | string | 否 | 自动生成 | 自定义群组 ID，短形式必须以 `g-` 开头且总长度 6 到 16 字符 |
+| `group_id` | string | 否 | 自动生成 | 自定义群组 ID；不能是纯数字，服务端会规范化为 `group.{issuer-domain}/{base}` |
 | `visibility` | string | 否 | `"private"` | 可见性：`"public"` / `"invite_only"` / `"private"` |
 | `description` | string | 否 | `""` | 群组描述 |
 | `metadata` | object | 否 | `{}` | 群组元数据 |
@@ -34,7 +36,7 @@ gid = result["group"]["group_id"]
 ```json
 {
     "group": {
-        "group_id": "g-abc123.agentid.pub",
+        "group_id": "group.agentid.pub/10042",
         "name": "项目讨论组",
         "visibility": "public",
         "owner_aid": "my-agent.agentid.pub",

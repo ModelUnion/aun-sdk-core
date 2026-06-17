@@ -10,10 +10,10 @@ import type {
   CollabReflogEntry,
   CollabRegistryEntry,
   CollabRpcClient,
-  CollabSnapshot,
-  CollabSnapshotDiffResult,
-  CollabSnapshotPruneOptions,
-  CollabSnapshotRestoreResult,
+  CollabTag,
+  CollabTagDiffResult,
+  CollabTagPruneOptions,
+  CollabTagRestoreResult,
 } from './types.js';
 
 function stripNil(params: RpcParams): RpcParams {
@@ -24,7 +24,7 @@ function stripNil(params: RpcParams): RpcParams {
   return out;
 }
 
-export class CollabSnapshotClient {
+export class CollabTagClient {
   private readonly parent: CollabClient;
 
   constructor(parent: CollabClient) {
@@ -32,31 +32,31 @@ export class CollabSnapshotClient {
   }
 
   create(collabRoot: string, options: { message?: string; major?: boolean } = {}): Promise<CollabRaw> {
-    return this.parent._call('collab.snapshot.create', {
+    return this.parent._call('collab.tag.create', {
       collab_root: collabRoot,
       message: options.message ?? '',
       major: options.major ?? false,
     });
   }
 
-  list(collabRoot: string): Promise<CollabSnapshot[]> {
-    return this.parent._call('collab.snapshot.list', { collab_root: collabRoot });
+  list(collabRoot: string): Promise<CollabTag[]> {
+    return this.parent._call('collab.tag.list', { collab_root: collabRoot });
   }
 
-  show(collabRoot: string, version: string): Promise<CollabSnapshot> {
-    return this.parent._call('collab.snapshot.show', { collab_root: collabRoot, version });
+  show(collabRoot: string, version: string): Promise<CollabTag> {
+    return this.parent._call('collab.tag.show', { collab_root: collabRoot, version });
   }
 
-  diff(collabRoot: string, versionA: string, versionB: string): Promise<CollabSnapshotDiffResult> {
-    return this.parent._call('collab.snapshot.diff', {
+  diff(collabRoot: string, versionA: string, versionB: string): Promise<CollabTagDiffResult> {
+    return this.parent._call('collab.tag.diff', {
       collab_root: collabRoot,
       version_a: versionA,
       version_b: versionB,
     });
   }
 
-  restore(collabRoot: string, version: string, options: { message?: string } = {}): Promise<CollabSnapshotRestoreResult> {
-    return this.parent._call('collab.snapshot.restore', {
+  restore(collabRoot: string, version: string, options: { message?: string } = {}): Promise<CollabTagRestoreResult> {
+    return this.parent._call('collab.tag.restore', {
       collab_root: collabRoot,
       version,
       message: options.message ?? '',
@@ -64,11 +64,11 @@ export class CollabSnapshotClient {
   }
 
   rm(collabRoot: string, version: string): Promise<CollabRaw> {
-    return this.parent._call('collab.snapshot.rm', { collab_root: collabRoot, version });
+    return this.parent._call('collab.tag.rm', { collab_root: collabRoot, version });
   }
 
-  prune(collabRoot: string, options: CollabSnapshotPruneOptions = {}): Promise<CollabRaw> {
-    return this.parent._call('collab.snapshot.prune', stripNil({
+  prune(collabRoot: string, options: CollabTagPruneOptions = {}): Promise<CollabRaw> {
+    return this.parent._call('collab.tag.prune', stripNil({
       collab_root: collabRoot,
       before: options.before,
       keep_last: options.keep_last ?? options.keepLast,
@@ -77,12 +77,12 @@ export class CollabSnapshotClient {
 }
 
 export class CollabClient {
-  readonly snapshot: CollabSnapshotClient;
+  readonly tag: CollabTagClient;
   private readonly client: CollabRpcClient;
 
   constructor(client: CollabRpcClient) {
     this.client = client;
-    this.snapshot = new CollabSnapshotClient(this);
+    this.tag = new CollabTagClient(this);
   }
 
   async _call<T = unknown>(method: string, params: RpcParams = {}): Promise<T> {
@@ -94,50 +94,44 @@ export class CollabClient {
     }
   }
 
-  ls(collabRoot: string): Promise<CollabDocumentEntry[]> {
-    return this._call('collab.ls', { collab_root: collabRoot });
+  lsFiles(collabRoot: string): Promise<CollabDocumentEntry[]> {
+    return this._call('collab.ls-files', { collab_root: collabRoot });
   }
 
   create(collabRoot: string, doc: string, source: string): Promise<CollabDocumentResult> {
     return this._call('collab.create', { collab_root: collabRoot, doc, source });
   }
 
-  read(collabRoot: string, doc: string): Promise<CollabDocumentResult> {
-    return this._call('collab.read', { collab_root: collabRoot, doc });
+  show(collabRoot: string, doc: string, rev?: number): Promise<CollabDocumentResult> {
+    const params: RpcParams = { collab_root: collabRoot, doc };
+    if (rev !== undefined) params.rev = rev;
+    return this._call('collab.show', params);
   }
 
-  submit(collabRoot: string, doc: string, source: string, baseVersion: number, message = ''): Promise<CollabDocumentResult> {
-    return this._call('collab.submit', {
+  commit(collabRoot: string, doc: string, source: string, onto: number, message = ''): Promise<CollabDocumentResult> {
+    return this._call('collab.commit', {
       collab_root: collabRoot,
       doc,
       source,
-      base_version: baseVersion,
+      onto,
       message,
     });
   }
 
-  merge(collabRoot: string, doc: string, source: string, baseVersion: number): Promise<CollabDocumentResult> {
-    return this._call('collab.merge', { collab_root: collabRoot, doc, source, base_version: baseVersion });
+  merge(collabRoot: string, doc: string, source: string, onto: number): Promise<CollabDocumentResult> {
+    return this._call('collab.merge', { collab_root: collabRoot, doc, source, onto });
   }
 
-  history(collabRoot: string, doc: string): Promise<CollabHistoryEntry[]> {
-    return this._call('collab.history', { collab_root: collabRoot, doc });
-  }
-
-  get(collabRoot: string, doc: string, version: number): Promise<CollabDocumentResult> {
-    return this._call('collab.get', { collab_root: collabRoot, doc, version });
+  log(collabRoot: string, doc: string): Promise<CollabHistoryEntry[]> {
+    return this._call('collab.log', { collab_root: collabRoot, doc });
   }
 
   diff(collabRoot: string, doc: string, fromVersion: number, toVersion: number): Promise<CollabDiffResult> {
     return this._call('collab.diff', { collab_root: collabRoot, doc, from: fromVersion, to: toVersion });
   }
 
-  export(collabRoot: string, dest: string): Promise<CollabRaw> {
-    return this._call('collab.export', { collab_root: collabRoot, dest });
-  }
-
-  adopt(src: string, newRoot: string): Promise<CollabRaw> {
-    return this._call('collab.adopt', { src, new_root: newRoot });
+  clone(src: string, dest: string, reroot = false): Promise<CollabRaw> {
+    return this._call('collab.clone', { src, dest, reroot });
   }
 
   prune(collabRoot: string, doc: string): Promise<CollabRaw> {
@@ -154,12 +148,12 @@ export class CollabClient {
     return this._call('collab.reflog', params);
   }
 
-  reset(collabRoot: string, doc: string, version: number, message = ''): Promise<CollabDocumentResult> {
-    return this._call('collab.reset', { collab_root: collabRoot, doc, version, message });
+  revert(collabRoot: string, doc: string, rev: number, message = ''): Promise<CollabDocumentResult> {
+    return this._call('collab.revert', { collab_root: collabRoot, doc, rev, message });
   }
 
-  discover(groupAid: string): Promise<CollabRegistryEntry[]> {
-    return this._call('collab.discover', { group_aid: groupAid });
+  lsRemote(groupAid: string): Promise<CollabRegistryEntry[]> {
+    return this._call('collab.ls-remote', { group_aid: groupAid });
   }
 
   unregister(groupAid: string, collabRoot: string): Promise<CollabRaw> {

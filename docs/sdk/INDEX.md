@@ -19,11 +19,11 @@
 | [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · 测试数据保护 |
 | [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
-| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 group resources pending_ops 执行模型） |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group.fs.*` 群文件系统 RPC、群自有区写身份和 `parents` 语义） |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
-| [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 目录快照 / GC / reflog / reset） |
-| [group.fs POSIX 化详细设计](../aun-fs/group-storage/group.fs-POSIX化详细设计.md) | 下一版 `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计 |
-| [group.fs POSIX 化分阶段实施计划](../aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md) | group.fs 重构的 IPO、Step-by-step、用例集、Checklist、验收和回滚 |
+| [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 标签 / GC / reflog / revert） |
+| [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md) | 下一版 `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计，含群自有区写身份、`parents` 和 JS string 语义 |
+| [group.fs POSIX 化分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md) | group.fs 重构的 IPO、Step-by-step、用例集、Checklist、验收和回滚 |
 | [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 与关键时序 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
@@ -63,11 +63,11 @@
 - `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
-- Group RPC 与群资源 `pending_ops` 执行模型 → [09-group-rpc-manual](09-group-rpc-manual.md)
-- 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs` 和 `cp/mv` POSIX 化语义 → [group.fs POSIX 化详细设计](../aun-fs/group-storage/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-storage/group.fs-POSIX化分阶段实施计划.md)
+- Group RPC 与群文件系统 `group.fs.*` 控制面、群自有区写身份和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
+- 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs`、`cp/mv` POSIX 化语义和 JS string 差异 → [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
 - Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
-- Collab RPC（`collab.*` 版本化文档、乐观锁、快照、GC、reflog、reset）→ [09-collab-rpc-manual](09-collab-rpc-manual.md)
+- Collab RPC（`collab.*` 版本化文档、乐观锁、标签、GC、reflog、revert）→ [09-collab-rpc-manual](09-collab-rpc-manual.md)
 - Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)
 - Service Proxy RPC 和隧道注册 → [09-proxy-rpc-manual](09-proxy-rpc-manual.md)
@@ -118,7 +118,7 @@
 
 ### 09-*-rpc-manual
 
-各业务服务的 RPC 参数、响应和错误语义。Storage、Collab、Group resources、Service Proxy 等明确提供高层门面的能力应优先使用门面；需要精确控制底层参数时再通过 `client.call()` 调用业务 RPC。
+各业务服务的 RPC 参数、响应和错误语义。Storage、Collab、Group FS、Service Proxy 等明确提供高层门面的能力应优先使用门面；需要精确控制底层参数时再通过 `client.call()` 调用业务 RPC。
 
 ### AUN Storage架构设计
 
@@ -126,7 +126,7 @@
 
 ### 09-collab-rpc-manual
 
-定义协作层 `collab.*` RPC（共 23 个）：文档版本线（ls/create/read/submit/merge/history/get/diff/reset/prune）、运维备份迁移（gc/reflog/export/adopt）、目录级快照（snapshot.create/list/show/diff/restore/rm/prune）、群内发现（discover/unregister）。collab 编排并入 storage 服务进程，以调用者身份直调 storage 原语，授权下沉到 storage ACL。涵盖乐观锁 CAS submit 撞版本响应、三方合并冲突标记、forward-only 快照回滚、垃圾扫描和审计日志语义。
+定义协作层 `collab.*` RPC（共 21 个）：文档版本线（ls-files/create/show/commit/merge/log/diff/revert/prune）、运维备份迁移（gc/reflog/clone）、目录级标签（tag.create/list/show/diff/restore/rm/prune）、群内发现（ls-remote/unregister）。collab 编排并入 storage 服务进程，以调用者身份直调 storage 原语，授权下沉到 storage ACL。涵盖乐观锁 CAS commit 撞版本响应、三方合并冲突标记、forward-only 标签回滚、垃圾扫描和审计日志语义。
 
 ### 09-proxy-rpc-manual
 
@@ -135,3 +135,5 @@
 ### Notify通知方案
 
 定义 `client.notify()` 的在线轻量通知语义、服务端/AID/群路由方式、跨域 federation 在线转发、无离线存储边界、安全约束，以及与 `message.send` / `group.send` 可靠应用事件的分工。
+
+

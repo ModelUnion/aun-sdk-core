@@ -270,10 +270,17 @@ class StorageLowLevel:
         if on_progress:
             on_progress(len(payload), len(payload))
 
-    async def http_get(self, download_url: str, on_progress=None) -> bytes:
+    async def http_get(
+        self,
+        download_url: str,
+        headers: dict[str, str] | None = None,
+        on_progress=None,
+    ) -> bytes:
         def _run() -> bytes:
             opener = _build_opener(self.verify_ssl)
             req = urllib.request.Request(download_url, method="GET")
+            for key, value in (headers or {}).items():
+                req.add_header(key, value)
             with opener.open(req, timeout=120) as resp:
                 return resp.read()
 

@@ -9,7 +9,7 @@ from aun_core.errors import (
 def test_rpc_handler_timeout_maps_to_timeout_error():
     err = map_remote_error({
         "code": -32004,
-        "message": "RPC handler timeout (>30s): group.resources.resolve_access_ticket",
+        "message": "RPC handler timeout (>30s): group.fs.create_download_ticket",
         "data": {"trace_id": "trace-timeout"},
     })
 
@@ -39,5 +39,4 @@ def test_gateway_backpressure_32429_maps_to_rate_limit_error():
     assert isinstance(err, AUNRateLimitError)
     assert err.code == -32429
     assert err.retryable is True
-
 

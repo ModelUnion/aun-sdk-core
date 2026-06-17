@@ -229,3 +229,5 @@ proxy-server 收到 `https://proxy.{issuer}/{user_name}/{svc_name}` 或对应 We
 8. wakeup 已投递但本 proxy-server 等不到目标数据面隧道注册时，返回 `provider_wakeup_timeout`。
 
 因此，只向 Gateway 注册不足以承载请求；只有 proxy-server 数据面也注册了目标服务，访问才会真正转发。
+
+

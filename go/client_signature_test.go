@@ -122,20 +122,16 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.batch_review_join_request",
 		"group.thought.put",
 		"message.thought.put",
-		"group.resources.put",
-		"group.resources.create_folder",
-		"group.resources.rename",
-		"group.resources.move",
-		"group.resources.mount_object",
-		"group.resources.update",
-		"group.resources.delete",
-		"group.resources.namespace_ready",
-		"group.resources.confirm",
-		"group.resources.confirm_mount",
-		"group.resources.get_df",
-		"group.resources.unmount",
-		"group.resources.get_access",
-		"group.resources.resolve_access_ticket",
+		"group.fs.mkdir",
+		"group.fs.rm",
+		"group.fs.cp",
+		"group.fs.mv",
+		"group.fs.mount",
+		"group.fs.umount",
+		"group.fs.check_upload",
+		"group.fs.create_upload_session",
+		"group.fs.complete_upload",
+		"group.fs.create_download_ticket",
 		"storage.put_object",
 		"storage.delete_object",
 		"storage.create_share_link",
@@ -184,15 +180,15 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.suspend",
 		"group.resume",
 		"collab.create",
-		"collab.submit",
-		"collab.export",
-		"collab.adopt",
+		"collab.commit",
+		"collab.clone",
 		"collab.prune",
+		"collab.revert",
 		"collab.unregister",
-		"collab.snapshot.create",
-		"collab.snapshot.restore",
-		"collab.snapshot.rm",
-		"collab.snapshot.prune",
+		"collab.tag.create",
+		"collab.tag.restore",
+		"collab.tag.rm",
+		"collab.tag.prune",
 	}
 
 	if len(signedMethods) != len(expected) {
@@ -208,6 +204,16 @@ func TestSignedMethodsCoverage(t *testing.T) {
 
 func TestStorageMutationMethodsAreNonIdempotent(t *testing.T) {
 	methods := []string{
+		"group.fs.mkdir",
+		"group.fs.rm",
+		"group.fs.cp",
+		"group.fs.mv",
+		"group.fs.mount",
+		"group.fs.umount",
+		"group.fs.check_upload",
+		"group.fs.create_upload_session",
+		"group.fs.complete_upload",
+		"group.fs.create_download_ticket",
 		"storage.put_object",
 		"storage.delete_object",
 		"storage.create_share_link",
@@ -265,42 +271,17 @@ func TestGroupIdentitySideEffectMethodsAreNonIdempotent(t *testing.T) {
 	}
 }
 
-func TestGroupResourceSideEffectMethodsAreNonIdempotent(t *testing.T) {
-	methods := []string{
-		"group.resources.put",
-		"group.resources.create_folder",
-		"group.resources.rename",
-		"group.resources.move",
-		"group.resources.mount_object",
-		"group.resources.update",
-		"group.resources.delete",
-		"group.resources.namespace_ready",
-		"group.resources.confirm",
-		"group.resources.confirm_mount",
-		"group.resources.get_df",
-		"group.resources.unmount",
-		"group.resources.get_access",
-		"group.resources.resolve_access_ticket",
-	}
-	for _, method := range methods {
-		if !nonIdempotentMethods[method] {
-			t.Errorf("nonIdempotentMethods 缺少 group.resources 副作用方法: %s", method)
-		}
-	}
-}
-
 func TestCollabMutationMethodsAreNonIdempotent(t *testing.T) {
 	methods := []string{
 		"collab.create",
-		"collab.submit",
-		"collab.export",
-		"collab.adopt",
+		"collab.commit",
+		"collab.clone",
 		"collab.prune",
 		"collab.unregister",
-		"collab.snapshot.create",
-		"collab.snapshot.restore",
-		"collab.snapshot.rm",
-		"collab.snapshot.prune",
+		"collab.tag.create",
+		"collab.tag.restore",
+		"collab.tag.rm",
+		"collab.tag.prune",
 	}
 	for _, method := range methods {
 		if !nonIdempotentMethods[method] {

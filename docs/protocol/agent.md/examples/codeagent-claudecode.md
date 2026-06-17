@@ -59,3 +59,5 @@ npm install -g @anthropic-ai/claude-code
 ```
 
 需要 Node.js 18+ 和 Claude Pro/Max/Team/Enterprise 订阅。
+
+

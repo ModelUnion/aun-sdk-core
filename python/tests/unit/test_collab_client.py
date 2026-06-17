@@ -19,19 +19,19 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_collab_submit_calls_rpc_with_exact_params():
+async def test_collab_commit_calls_rpc_with_exact_params():
     client = _FakeClient()
     collab = CollabClient(client)
 
-    result = await collab.submit("alice.aid.com:/proj", "d.md", "BASE64", base_version=3)
+    result = await collab.commit("alice.aid.com:/proj", "d.md", "BASE64", onto=3)
 
-    assert result["method"] == "collab.submit"
+    assert result["method"] == "collab.commit"
     assert client.calls == [
-        ("collab.submit", {
+        ("collab.commit", {
             "collab_root": "alice.aid.com:/proj",
             "doc": "d.md",
             "source": "BASE64",
-            "base_version": 3,
+            "onto": 3,
             "message": "",
         })
     ]
@@ -42,68 +42,69 @@ async def test_collab_methods_match_server_rpc_contract():
     client = _FakeClient()
     collab = CollabClient(client)
 
-    await collab.ls("alice.aid.com:/proj")
+    await collab.ls_files("alice.aid.com:/proj")
     await collab.create("alice.aid.com:/proj", "d.md", "S")
-    await collab.read("alice.aid.com:/proj", "d.md")
-    await collab.submit("alice.aid.com:/proj", "d.md", "S", 1)
+    await collab.show("alice.aid.com:/proj", "d.md")
+    await collab.commit("alice.aid.com:/proj", "d.md", "S", 1)
     await collab.merge("alice.aid.com:/proj", "d.md", "S", 1)
-    await collab.history("alice.aid.com:/proj", "d.md")
-    await collab.get("alice.aid.com:/proj", "d.md", 1)
+    await collab.log("alice.aid.com:/proj", "d.md")
+    await collab.show("alice.aid.com:/proj", "d.md", rev=1)
     await collab.diff("alice.aid.com:/proj", "d.md", 1, 2)
-    await collab.export("alice.aid.com:/proj", "alice.aid.com:/copy")
-    await collab.adopt("alice.aid.com:/proj", "alice.aid.com:/new")
+    await collab.clone("alice.aid.com:/proj", "alice.aid.com:/copy")
+    await collab.clone("alice.aid.com:/proj", "alice.aid.com:/new", reroot=True)
     await collab.prune("alice.aid.com:/proj", "d.md")
     await collab.gc("alice.aid.com:/proj", dry_run=False)
     await collab.reflog("alice.aid.com:/proj", "d.md", limit=5)
-    await collab.reset("alice.aid.com:/proj", "d.md", 1, message="reset")
-    await collab.discover("g-team.aid.com")
+    await collab.revert("alice.aid.com:/proj", "d.md", 1, message="revert")
+    await collab.ls_remote("g-team.aid.com")
     await collab.unregister("g-team.aid.com", "g-team.aid.com:/proj")
-    await collab.snapshot.create("alice.aid.com:/proj", message="m", major=True)
-    await collab.snapshot.list("alice.aid.com:/proj")
-    await collab.snapshot.show("alice.aid.com:/proj", "1.0.0")
-    await collab.snapshot.diff("alice.aid.com:/proj", "1.0.0", "1.0.1")
-    await collab.snapshot.restore("alice.aid.com:/proj", "1.0.0", message="r")
-    await collab.snapshot.rm("alice.aid.com:/proj", "1.0.0")
-    await collab.snapshot.prune("alice.aid.com:/proj", before="2026-06-01", keep_last=2)
+    await collab.tag.create("alice.aid.com:/proj", message="m", major=True)
+    await collab.tag.list("alice.aid.com:/proj")
+    await collab.tag.show("alice.aid.com:/proj", "1.0.0")
+    await collab.tag.diff("alice.aid.com:/proj", "1.0.0", "1.0.1")
+    await collab.tag.restore("alice.aid.com:/proj", "1.0.0", message="r")
+    await collab.tag.rm("alice.aid.com:/proj", "1.0.0")
+    await collab.tag.prune("alice.aid.com:/proj", before="2026-06-01", keep_last=2)
 
     assert [method for method, _ in client.calls] == [
-        "collab.ls",
+        "collab.ls-files",
         "collab.create",
-        "collab.read",
-        "collab.submit",
+        "collab.show",
+        "collab.commit",
         "collab.merge",
-        "collab.history",
-        "collab.get",
+        "collab.log",
+        "collab.show",
         "collab.diff",
-        "collab.export",
-        "collab.adopt",
+        "collab.clone",
+        "collab.clone",
         "collab.prune",
         "collab.gc",
         "collab.reflog",
-        "collab.reset",
-        "collab.discover",
+        "collab.revert",
+        "collab.ls-remote",
         "collab.unregister",
-        "collab.snapshot.create",
-        "collab.snapshot.list",
-        "collab.snapshot.show",
-        "collab.snapshot.diff",
-        "collab.snapshot.restore",
-        "collab.snapshot.rm",
-        "collab.snapshot.prune",
+        "collab.tag.create",
+        "collab.tag.list",
+        "collab.tag.show",
+        "collab.tag.diff",
+        "collab.tag.restore",
+        "collab.tag.rm",
+        "collab.tag.prune",
     ]
     assert client.calls[-1][1] == {
         "collab_root": "alice.aid.com:/proj",
         "before": "2026-06-01",
         "keep_last": 2,
     }
+    assert client.calls[8][1] == {
+        "src": "alice.aid.com:/proj",
+        "dest": "alice.aid.com:/copy",
+        "reroot": False,
+    }
     assert client.calls[9][1] == {
         "src": "alice.aid.com:/proj",
-        "new_root": "alice.aid.com:/new",
-    }
-    assert client.calls[22][1] == {
-        "collab_root": "alice.aid.com:/proj",
-        "before": "2026-06-01",
-        "keep_last": 2,
+        "dest": "alice.aid.com:/new",
+        "reroot": True,
     }
 
 
@@ -137,7 +138,7 @@ async def test_collab_conflict_error_preserves_server_fields():
     from aun_core.errors import AUNError
 
     client = _FakeClient()
-    client.responses["collab.submit"] = AUNError(
+    client.responses["collab.commit"] = AUNError(
         "提交失败",
         code=-32009,
         data={"current_version": 4, "current_target": "alice.aid.com:/proj/v4", "hint": "merge first"},
@@ -145,7 +146,7 @@ async def test_collab_conflict_error_preserves_server_fields():
     collab = CollabClient(client)
 
     with pytest.raises(CollabConflictError) as exc:
-        await collab.submit("alice.aid.com:/proj", "d.md", "S", 3)
+        await collab.commit("alice.aid.com:/proj", "d.md", "S", 3)
 
     assert exc.value.current_version == 4
     assert exc.value.current_target == "alice.aid.com:/proj/v4"

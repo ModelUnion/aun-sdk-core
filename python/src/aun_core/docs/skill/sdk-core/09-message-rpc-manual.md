@@ -581,3 +581,5 @@ SDK 交付给应用层的撤回事件同样带 `envelope`。`envelope` 表示撤
 ```python
 client.on("message.recalled", lambda ev: print(f"{ev['from']} 撤回了 {len(ev['message_ids'])} 条消息"))
 ```
+
+

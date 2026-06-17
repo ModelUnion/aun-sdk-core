@@ -15,6 +15,7 @@ type ClientInternals = {
   _deviceId?: string;
   _slotId?: string;
   _identity?: JsonObject | null;
+  _sessionParams?: JsonObject | null;
   _auth?: {
     loadIdentityOrNone?: (aid?: string) => JsonObject | null | Promise<JsonObject | null>;
   };
@@ -48,6 +49,15 @@ function textOf(value: unknown): string {
 
 function jsonObjectOf(value: unknown): JsonObject | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : null;
+}
+
+function accessTokenFromClient(client: AUNClient): string {
+  const internals = client as unknown as ClientInternals & { accessToken?: unknown; access_token?: unknown };
+  const direct = textOf(internals.accessToken ?? internals.access_token).trim();
+  if (direct) return direct;
+  const identityToken = textOf(internals._identity?.access_token).trim();
+  if (identityToken) return identityToken;
+  return textOf(internals._sessionParams?.access_token).trim();
 }
 
 function jsonSafe(value: unknown): unknown {
@@ -322,6 +332,10 @@ class CrossSdkJsAgent {
         await this.groupCreate(req, res);
         return;
       }
+      if (req.method === 'POST' && url.pathname === '/group/call') {
+        await this.groupCall(req, res);
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/group/ready') {
         await this.groupReady(url, res);
         return;
@@ -338,24 +352,8 @@ class CrossSdkJsAgent {
         await this.groupAck(req, res);
         return;
       }
-      if (req.method === 'POST' && url.pathname === '/group/resources/init') {
-        await this.groupResourcesInit(req, res);
-        return;
-      }
-      if (req.method === 'POST' && url.pathname === '/group/resources/put') {
-        await this.groupResourcesPut(req, res);
-        return;
-      }
-      if (req.method === 'POST' && url.pathname === '/group/resources/mkdir') {
-        await this.groupResourcesMkdir(req, res);
-        return;
-      }
-      if (req.method === 'POST' && url.pathname === '/group/resources/mount') {
-        await this.groupResourcesMount(req, res);
-        return;
-      }
-      if (req.method === 'POST' && url.pathname === '/group/resources/read') {
-        await this.groupResourcesRead(req, res);
+      if (req.method === 'POST' && url.pathname === '/group/fs/call') {
+        await this.groupFsCall(req, res);
         return;
       }
       if (req.method === 'POST' && url.pathname === '/collab/call') {
@@ -439,6 +437,35 @@ class CrossSdkJsAgent {
     }
   }
 
+  async groupCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    let method = textOf(body.method).trim();
+    const action = textOf(body.action).trim();
+    if (!method && action) method = action.startsWith('group.') ? action : `group.${action}`;
+    const params = jsonObjectOf(body.params) ?? {};
+    if (!method) {
+      sendJson(res, 400, { ok: false, trace_id: traceId, error_code: 'bad_request', error_message: 'method is required' });
+      return;
+    }
+    try {
+      const result = await this.client.call(method, params as RpcParams);
+      const response: JsonObject = { ok: true, trace_id: traceId, method, result: jsonSafe(result) as never };
+      this.recordTrace(traceId, { stage: 'group_call', method, result: response });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        method,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_call_error', method, error });
+      sendJson(res, 500, error);
+    }
+  }
+
   async storageCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await readJson(req);
     const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
@@ -462,54 +489,91 @@ class CrossSdkJsAgent {
     }
   }
 
+  async groupFsCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
+    const action = textOf(body.action).trim();
+    const params = jsonObjectOf(body.params) ?? {};
+    try {
+      const result = await this.callGroupFsAction(action, params);
+      const response: JsonObject = { ok: true, trace_id: traceId, action, result: jsonSafe(result) as never };
+      this.recordTrace(traceId, { stage: 'group_fs_call', action, result: response });
+      sendJson(res, 200, response);
+    } catch (err) {
+      const error: JsonObject = {
+        ok: false,
+        trace_id: traceId,
+        action,
+        error_code: err instanceof Error ? err.name : 'Error',
+        error_message: err instanceof Error ? err.message : String(err),
+      };
+      this.recordTrace(traceId, { stage: 'group_fs_call_error', action, error });
+      sendJson(res, 500, error);
+    }
+  }
+
   async callCollabAction(action: string, params: JsonObject): Promise<unknown> {
     const collabRoot = textOf(params.collab_root ?? params.collabRoot);
     const doc = textOf(params.doc);
     const source = textOf(params.source);
     switch (action) {
       case 'ls':
-        return await this.client.collab.ls(collabRoot);
+      case 'ls-files':
+        return await this.client.collab.lsFiles(collabRoot);
       case 'create':
         return await this.client.collab.create(collabRoot, doc, source);
       case 'read':
-        return await this.client.collab.read(collabRoot, doc);
+        return await this.client.collab.show(collabRoot, doc);
+      case 'show':
+        return await this.client.collab.show(collabRoot, doc, params.rev == null ? undefined : Number(params.rev));
       case 'submit':
-        return await this.client.collab.submit(collabRoot, doc, source, Number(params.base_version ?? params.baseVersion ?? 0) || 0);
+        return await this.client.collab.commit(
+          collabRoot,
+          doc,
+          source,
+          Number(params.onto ?? params.base_version ?? params.baseVersion ?? 0) || 0,
+          textOf(params.message ?? ''),
+        );
+      case 'commit':
+        return await this.client.collab.commit(collabRoot, doc, source, Number(params.onto ?? params.base_version ?? params.baseVersion ?? 0) || 0, textOf(params.message ?? ''));
       case 'merge':
-        return await this.client.collab.merge(collabRoot, doc, source, Number(params.base_version ?? params.baseVersion ?? 0) || 0);
+        return await this.client.collab.merge(collabRoot, doc, source, Number(params.onto ?? params.base_version ?? params.baseVersion ?? 0) || 0);
       case 'history':
-        return await this.client.collab.history(collabRoot, doc);
+      case 'log':
+        return await this.client.collab.log(collabRoot, doc);
       case 'get':
-        return await this.client.collab.get(collabRoot, doc, Number(params.version ?? 0) || 0);
+        return await this.client.collab.show(collabRoot, doc, Number(params.version ?? 0) || 0);
       case 'diff':
         return await this.client.collab.diff(collabRoot, doc, Number(params.from ?? 0) || 0, Number(params.to ?? 0) || 0);
       case 'export':
-        return await this.client.collab.export(collabRoot, textOf(params.dest));
+        return await this.client.collab.clone(collabRoot, textOf(params.dest), false);
       case 'adopt':
-        return await this.client.collab.adopt(textOf(params.src), textOf(params.new_root ?? params.newRoot));
+        return await this.client.collab.clone(textOf(params.src), textOf(params.new_root ?? params.newRoot), true);
+      case 'clone':
+        return await this.client.collab.clone(textOf(params.src), textOf(params.dest), Boolean(params.reroot));
       case 'prune':
         return await this.client.collab.prune(collabRoot, doc);
-      case 'discover':
-        return await this.client.collab.discover(textOf(params.group_aid ?? params.groupAid));
+      case 'ls-remote':
+        return await this.client.collab.lsRemote(textOf(params.group_aid ?? params.groupAid));
       case 'unregister':
         return await this.client.collab.unregister(textOf(params.group_aid ?? params.groupAid), collabRoot);
-      case 'snapshot.create':
-        return await this.client.collab.snapshot.create(collabRoot, {
+      case 'tag.create':
+        return await this.client.collab.tag.create(collabRoot, {
           message: textOf(params.message),
           major: Boolean(params.major),
         });
-      case 'snapshot.list':
-        return await this.client.collab.snapshot.list(collabRoot);
-      case 'snapshot.show':
-        return await this.client.collab.snapshot.show(collabRoot, textOf(params.version));
-      case 'snapshot.diff':
-        return await this.client.collab.snapshot.diff(collabRoot, textOf(params.version_a ?? params.versionA), textOf(params.version_b ?? params.versionB));
-      case 'snapshot.restore':
-        return await this.client.collab.snapshot.restore(collabRoot, textOf(params.version), { message: textOf(params.message) });
-      case 'snapshot.rm':
-        return await this.client.collab.snapshot.rm(collabRoot, textOf(params.version));
-      case 'snapshot.prune':
-        return await this.client.collab.snapshot.prune(collabRoot, {
+      case 'tag.list':
+        return await this.client.collab.tag.list(collabRoot);
+      case 'tag.show':
+        return await this.client.collab.tag.show(collabRoot, textOf(params.version));
+      case 'tag.diff':
+        return await this.client.collab.tag.diff(collabRoot, textOf(params.version_a ?? params.versionA), textOf(params.version_b ?? params.versionB));
+      case 'tag.restore':
+        return await this.client.collab.tag.restore(collabRoot, textOf(params.version), { message: textOf(params.message) });
+      case 'tag.rm':
+        return await this.client.collab.tag.rm(collabRoot, textOf(params.version));
+      case 'tag.prune':
+        return await this.client.collab.tag.prune(collabRoot, {
           before: params.before == null ? null : Number(params.before),
           keep_last: params.keep_last == null && params.keepLast == null ? null : Number(params.keep_last ?? params.keepLast),
         });
@@ -518,10 +582,116 @@ class CrossSdkJsAgent {
       case 'reflog':
         return await this.client.collab.reflog(collabRoot, doc || undefined, Number(params.limit ?? 100) || 100);
       case 'reset':
-        return await this.client.collab.reset(collabRoot, doc, Number(params.version ?? 0) || 0, textOf(params.message) || '');
+        return await this.client.collab.revert(collabRoot, doc, Number(params.version ?? 0) || 0, textOf(params.message) || '');
+      case 'revert':
+        return await this.client.collab.revert(collabRoot, doc, Number(params.rev ?? params.version ?? 0) || 0, textOf(params.message) || '');
+      case 'discover':
+        return await this.client.collab.lsRemote(textOf(params.group_aid ?? params.groupAid));
+      case 'unregister':
+        return await this.client.collab.unregister(textOf(params.group_aid ?? params.groupAid), collabRoot);
+      case 'snapshot.create':
+        return await this.client.collab.tag.create(collabRoot, {
+          message: textOf(params.message),
+          major: Boolean(params.major),
+        });
+      case 'snapshot.list':
+        return await this.client.collab.tag.list(collabRoot);
+      case 'snapshot.show':
+        return await this.client.collab.tag.show(collabRoot, textOf(params.version));
+      case 'snapshot.diff':
+        return await this.client.collab.tag.diff(collabRoot, textOf(params.version_a ?? params.versionA), textOf(params.version_b ?? params.versionB));
+      case 'snapshot.restore':
+        return await this.client.collab.tag.restore(collabRoot, textOf(params.version), { message: textOf(params.message) });
+      case 'snapshot.rm':
+        return await this.client.collab.tag.rm(collabRoot, textOf(params.version));
+      case 'snapshot.prune':
+        return await this.client.collab.tag.prune(collabRoot, {
+          before: params.before == null ? null : Number(params.before),
+          keep_last: params.keep_last == null && params.keepLast == null ? null : Number(params.keep_last ?? params.keepLast),
+        });
       default:
         throw new Error(`unsupported collab action: ${action}`);
     }
+  }
+
+  async callGroupFsAction(action: string, params: JsonObject): Promise<unknown> {
+    const groupFs = this.client.group.fs;
+    const path = textOf(params.path).trim();
+    const options = { ...params } as JsonObject;
+    delete options.path;
+    switch (action) {
+      case 'ls':
+        return await groupFs.ls(path, options);
+      case 'find':
+        return await groupFs.find(path, options);
+      case 'stat':
+        return await groupFs.stat(path, options);
+      case 'lstat':
+        return await groupFs.lstat(path, options);
+      case 'mkdir':
+        return await groupFs.mkdir(path, { ...options, parents: Boolean(params.parents) });
+      case 'rm':
+        return await groupFs.rm(path, {
+          ...options,
+          recursive: Boolean(params.recursive),
+          force: Boolean(params.force),
+        });
+      case 'cp': {
+        let src: string | Uint8Array = textOf(params.src);
+        const dst = textOf(params.dst);
+        const cpOptions = { ...params } as JsonObject;
+        delete cpOptions.src;
+        delete cpOptions.dst;
+        delete cpOptions.src_text;
+        if (params.src_text != null) {
+          src = textOf(params.src_text);
+        }
+        const result = await groupFs.cp(src, dst || { type: 'bytes' }, cpOptions);
+        return this.groupFsCpResponse(result, dst);
+      }
+      case 'mv':
+        {
+          const mvOptions = { ...params } as JsonObject;
+          delete mvOptions.src;
+          delete mvOptions.dst;
+          return await groupFs.mv(textOf(params.src), textOf(params.dst), mvOptions);
+        }
+      case 'df':
+        return await groupFs.df(path || textOf(params.group_id), options);
+      case 'mount':
+        return await groupFs.mount(path, options);
+      case 'umount':
+        return await groupFs.umount(path, options);
+      default:
+        throw new Error(`unsupported group fs action: ${action}`);
+    }
+  }
+
+  groupFsCpResponse(result: unknown, dst: string): JsonObject {
+    const response: JsonObject = { raw: jsonSafe(result) as never };
+    const resultObj = jsonObjectOf(result);
+    const data: unknown = resultObj?.data;
+    if (data instanceof ArrayBuffer) {
+      const buffer = Buffer.from(new Uint8Array(data));
+      response.content = buffer.toString('utf-8');
+      response.content_base64 = buffer.toString('base64');
+      response.size_bytes = buffer.byteLength;
+    } else if (data instanceof Uint8Array || ArrayBuffer.isView(data)) {
+      const view = data as ArrayBufferView;
+      const buffer = Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+      response.content = buffer.toString('utf-8');
+      response.content_base64 = buffer.toString('base64');
+      response.size_bytes = buffer.byteLength;
+    }
+    const localPath = textOf(resultObj?.localPath ?? resultObj?.local_path ?? dst).trim();
+    if (localPath && fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
+      const buffer = fs.readFileSync(localPath);
+      response.local_path = localPath;
+      response.content = buffer.toString('utf-8');
+      response.content_base64 = buffer.toString('base64');
+      response.size_bytes = buffer.byteLength;
+    }
+    return response;
   }
 
   async callStorageAction(action: string, params: JsonObject): Promise<unknown> {
@@ -560,7 +730,7 @@ class CrossSdkJsAgent {
       case 'download_text': {
         const url = textOf(params.url ?? params.download_url ?? params.downloadUrl).trim();
         if (!url) throw new Error('download_text requires url');
-        return { content: await downloadText(url) };
+        return { content: await downloadText(url, accessTokenFromClient(this.client)) };
       }
       case 'set_acl':
         return await storage.setAcl(path, {
@@ -831,117 +1001,6 @@ class CrossSdkJsAgent {
     }
   }
 
-  async groupResourcesInit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await readJson(req);
-    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
-    try {
-      const store = this.aidStore();
-      try {
-        const result = await this.client.group.resources.initializeNamespace(body, {
-          aidStore: store,
-          connectOptions: { heartbeat_interval: 0 },
-        });
-        const response: JsonObject = { ok: true, trace_id: traceId, result: jsonSafe(result) as never };
-        this.recordTrace(traceId, { stage: 'group_resources_init', result: response });
-        sendJson(res, 200, response);
-      } finally {
-        store.close();
-      }
-    } catch (err) {
-      const error: JsonObject = { ok: false, trace_id: traceId, error_code: err instanceof Error ? err.name : 'Error', error_message: err instanceof Error ? err.message : String(err) };
-      this.recordTrace(traceId, { stage: 'group_resources_init_error', error });
-      sendJson(res, 500, error);
-    }
-  }
-
-  async groupResourcesPut(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await readJson(req);
-    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
-    try {
-      const store = this.aidStore();
-      try {
-        const pending = await this.client.group.resources.put(body);
-        const pendingObj = jsonObjectOf(pending);
-        const confirmed = Array.isArray(pendingObj?.pending_ops)
-          ? await this.client.group.resources.executePendingOps(pendingObj, {
-              aidStore: store,
-              connectOptions: { heartbeat_interval: 0 },
-            })
-          : null;
-        const response: JsonObject = { ok: true, trace_id: traceId, pending: jsonSafe(pending) as never, confirmed: jsonSafe(confirmed) as never };
-        this.recordTrace(traceId, { stage: 'group_resources_put', result: response });
-        sendJson(res, 200, response);
-      } finally {
-        store.close();
-      }
-    } catch (err) {
-      const error: JsonObject = { ok: false, trace_id: traceId, error_code: err instanceof Error ? err.name : 'Error', error_message: err instanceof Error ? err.message : String(err) };
-      this.recordTrace(traceId, { stage: 'group_resources_put_error', error });
-      sendJson(res, 500, error);
-    }
-  }
-
-  async groupResourcesMkdir(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await readJson(req);
-    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
-    try {
-      const result = await this.client.group.resources.createFolder(body);
-      const response: JsonObject = { ok: true, trace_id: traceId, result: jsonSafe(result) as never };
-      this.recordTrace(traceId, { stage: 'group_resources_mkdir', result: response });
-      sendJson(res, 200, response);
-    } catch (err) {
-      const error: JsonObject = { ok: false, trace_id: traceId, error_code: err instanceof Error ? err.name : 'Error', error_message: err instanceof Error ? err.message : String(err) };
-      this.recordTrace(traceId, { stage: 'group_resources_mkdir_error', error });
-      sendJson(res, 500, error);
-    }
-  }
-
-  async groupResourcesMount(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await readJson(req);
-    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
-    try {
-      const store = this.aidStore();
-      try {
-        const pending = await this.client.group.resources.mountObject(body);
-        const pendingObj = jsonObjectOf(pending);
-        if (!Array.isArray(pendingObj?.pending_ops)) {
-          throw new Error(`group.resources.mount_object did not return pending_ops: ${JSON.stringify(jsonSafe(pending))}`);
-        }
-        const confirmed = await this.client.group.resources.executePendingOps(pendingObj, {
-          aidStore: store,
-          connectOptions: { heartbeat_interval: 0 },
-        });
-        const response: JsonObject = { ok: true, trace_id: traceId, pending: jsonSafe(pending) as never, confirmed: jsonSafe(confirmed) as never };
-        this.recordTrace(traceId, { stage: 'group_resources_mount', result: response });
-        sendJson(res, 200, response);
-      } finally {
-        store.close();
-      }
-    } catch (err) {
-      const error: JsonObject = { ok: false, trace_id: traceId, error_code: err instanceof Error ? err.name : 'Error', error_message: err instanceof Error ? err.message : String(err) };
-      this.recordTrace(traceId, { stage: 'group_resources_mount_error', error });
-      sendJson(res, 500, error);
-    }
-  }
-
-  async groupResourcesRead(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await readJson(req);
-    const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
-    try {
-      const access = await this.client.group.resources.getAccess(body);
-      const download = jsonObjectOf(jsonObjectOf(access)?.download) ?? {};
-      const downloadUrl = textOf(download.download_url ?? download.downloadUrl).trim();
-      if (!downloadUrl) throw new Error(`group.resources.get_access did not return download_url: ${JSON.stringify(jsonSafe(access))}`);
-      const content = await downloadText(downloadUrl);
-      const response: JsonObject = { ok: true, trace_id: traceId, content, access: jsonSafe(access) as never };
-      this.recordTrace(traceId, { stage: 'group_resources_read', result: { ok: true, content_len: content.length } });
-      sendJson(res, 200, response);
-    } catch (err) {
-      const error: JsonObject = { ok: false, trace_id: traceId, error_code: err instanceof Error ? err.name : 'Error', error_message: err instanceof Error ? err.message : String(err) };
-      this.recordTrace(traceId, { stage: 'group_resources_read_error', error });
-      sendJson(res, 500, error);
-    }
-  }
 }
 
 function extractGroupId(result: unknown): string {
@@ -962,11 +1021,23 @@ function extractGroupAid(result: unknown): string {
   return textOf(group?.group_aid ?? obj.group_aid).trim();
 }
 
-function downloadText(url: string, redirects = 0): Promise<string> {
+function shouldForwardBearerOnRedirect(current: URL, next: URL): boolean {
+  if (current.origin === next.origin) return true;
+  const currentHost = current.hostname.toLowerCase();
+  const nextHost = next.hostname.toLowerCase();
+  if (!nextHost.startsWith('storage.')) return false;
+  const issuer = nextHost.slice('storage.'.length);
+  return Boolean(issuer) && (currentHost === issuer || currentHost.endsWith(`.${issuer}`));
+}
+
+function downloadText(url: string, bearerToken = '', redirects = 0): Promise<string> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const client = parsed.protocol === 'https:' ? https : http;
-    const options: https.RequestOptions = parsed.protocol === 'https:' ? { rejectUnauthorized: false } : {};
+    const headers = bearerToken ? { Authorization: `Bearer ${bearerToken}` } : undefined;
+    const options: https.RequestOptions = parsed.protocol === 'https:'
+      ? { rejectUnauthorized: false, headers }
+      : { headers };
     const req = client.get(parsed, options, (resp) => {
       const status = resp.statusCode ?? 0;
       const location = typeof resp.headers.location === 'string' ? resp.headers.location : '';
@@ -977,7 +1048,8 @@ function downloadText(url: string, redirects = 0): Promise<string> {
           return;
         }
         const nextUrl = new URL(location, parsed).toString();
-        downloadText(nextUrl, redirects + 1).then(resolve, reject);
+        const nextBearer = bearerToken && shouldForwardBearerOnRedirect(parsed, new URL(nextUrl)) ? bearerToken : '';
+        downloadText(nextUrl, nextBearer, redirects + 1).then(resolve, reject);
         return;
       }
       const chunks: Buffer[] = [];

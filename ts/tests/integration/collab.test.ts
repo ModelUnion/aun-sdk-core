@@ -35,7 +35,7 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
 }
 
 describe('Collab TypeScript Docker 集成', () => {
-  it('create/read/submit/history 使用真实 collab.* RPC', async () => {
+  it('create/show/commit/log 使用真实 collab.* RPC', async () => {
     const rid = runId();
     const aliceAid = `collabtsa${rid}.${ISSUER}`;
     const rootPath = `/collab-ts/${rid}/proj`;
@@ -50,21 +50,21 @@ describe('Collab TypeScript Docker 集成', () => {
       expect(created.version).toBe(1);
       expect(String(created.current_target ?? '')).toContain(`${aliceAid}:/`);
 
-      const read = await alice.collab.read(collabRoot, doc);
-      expect(read.version).toBe(1);
-      expect(decodeText(read)).toBe('a\n');
+      const show1 = await alice.collab.show(collabRoot, doc);
+      expect(show1.version).toBe(1);
+      expect(decodeText(show1)).toBe('a\n');
 
-      const submitted = await alice.collab.submit(collabRoot, doc, b64('a\nb\n'), 1);
-      expect(submitted.version).toBe(2);
-      expect(String(submitted.current_target ?? '')).toContain(`${aliceAid}:/`);
+      const committed = await alice.collab.commit(collabRoot, doc, b64('a\nb\n'), 1);
+      expect(committed.version).toBe(2);
+      expect(String(committed.current_target ?? '')).toContain(`${aliceAid}:/`);
 
-      const afterSubmit = await alice.collab.read(collabRoot, doc);
-      expect(afterSubmit.version).toBe(2);
-      expect(decodeText(afterSubmit)).toBe('a\nb\n');
+      const show2 = await alice.collab.show(collabRoot, doc);
+      expect(show2.version).toBe(2);
+      expect(decodeText(show2)).toBe('a\nb\n');
 
-      const history = await alice.collab.history(collabRoot, doc);
-      expect(history.map((item) => item.version)).toEqual([1, 2]);
-      expect(history.every((item) => String(item.target ?? '').startsWith(`${aliceAid}:/`))).toBe(true);
+      const log = await alice.collab.log(collabRoot, doc);
+      expect(log.map((item) => item.version)).toEqual([1, 2]);
+      expect(log.every((item) => String(item.target ?? '').startsWith(`${aliceAid}:/`))).toBe(true);
     } finally {
       await alice.storage.remove(rootPath, { owner: aliceAid, recursive: true }).catch(() => undefined);
       await alice.close();

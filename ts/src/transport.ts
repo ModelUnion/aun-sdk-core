@@ -412,11 +412,35 @@ export class RPCTransport {
     return new Promise<RpcMessage | null>((resolve, reject) => {
       let initialResolved = false;
 
+      const disposeHandshakeSocket = (): void => {
+        const absorbRollbackError = (err: Error): void => {
+          this._logger.debug(`ignored websocket error during handshake rollback: ${err.message}`);
+        };
+        const removeAbsorber = (): void => {
+          try { ws.removeListener('error', absorbRollbackError); } catch { /* noop */ }
+        };
+        try { ws.on('error', absorbRollbackError); } catch { /* noop */ }
+        try { ws.once('close', removeAbsorber); } catch { /* noop */ }
+        try {
+          if (ws.readyState === WebSocket.CLOSED) {
+            removeAbsorber();
+            return;
+          }
+          if (ws.readyState === WebSocket.CONNECTING && typeof ws.terminate === 'function') {
+            ws.terminate();
+          } else {
+            ws.close();
+          }
+        } catch {
+          removeAbsorber();
+        }
+      };
+
       /** 握手失败时回滚内部状态，避免半连接 */
       const rollback = (): void => {
         this._ws = null;
         this._closed = true;
-        try { ws.close(); } catch { /* noop */ }
+        disposeHandshakeSocket();
       };
 
       /** 清理握手阶段的临时监听器 */
