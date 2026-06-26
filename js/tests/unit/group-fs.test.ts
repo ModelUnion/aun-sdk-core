@@ -31,7 +31,7 @@ async function digestHex(data: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-const POSIX_METHODS = ['ls', 'find', 'stat', 'lstat', 'mkdir', 'setAcl', 'removeAcl', 'rm', 'cp', 'mv', 'df', 'mount', 'umount'] as const;
+const POSIX_METHODS = ['ls', 'find', 'stat', 'lstat', 'mkdir', 'setAcl', 'removeAcl', 'getAcl', 'listAcl', 'rm', 'cp', 'mv', 'df', 'mount', 'umount'] as const;
 const FORBIDDEN_MAIN_METHODS = ['read', 'write', 'put', 'get'] as const;
 
 describe('GroupFSVFS 浏览器 facade 契约', () => {
@@ -45,6 +45,15 @@ describe('GroupFSVFS 浏览器 facade 契约', () => {
     for (const method of FORBIDDEN_MAIN_METHODS) expect(method in client.group.fs).toBe(false);
   });
 
+  it('group.send/pull 缺少 group_id 时不发起 RPC', async () => {
+    const client = new FakeClient();
+    const group = new GroupFacade(client);
+
+    expect(() => group.send({ payload: { text: 'hi' } })).toThrow(/group_id cannot be empty/);
+    expect(() => group.pull({ group_id: '   ', limit: 10 })).toThrow(/group_id cannot be empty/);
+    expect(client.calls).toEqual([]);
+  });
+
   it('POSIX 方法映射到 group.fs.*，memberdata 路径原样透传', async () => {
     const client = new FakeClient();
     const fs = new GroupFacade(client).fs;
@@ -56,6 +65,8 @@ describe('GroupFSVFS 浏览器 facade 契约', () => {
     await fs.mkdir('g-team.agentid.pub:/docs/new', { parents: true });
     await fs.setAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin', perms: 'rwx' });
     await fs.removeAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin' });
+    await fs.getAcl('g-team.agentid.pub:/archive');
+    await fs.listAcl('g-team.agentid.pub:/archive');
     await fs.rm('g-team.agentid.pub:/docs/old.md', { recursive: false, force: true });
     await fs.cp('g-team.agentid.pub:/docs/a.md', 'g-team.agentid.pub:/docs/b.md', { force: true });
     await fs.mv('g-team.agentid.pub:/docs/b.md', 'g-team.agentid.pub:/docs/c.md');
@@ -71,6 +82,8 @@ describe('GroupFSVFS 浏览器 facade 契约', () => {
       'group.fs.mkdir',
       'group.fs.set_acl',
       'group.fs.remove_acl',
+      'group.fs.get_acl',
+      'group.fs.list_acl',
       'group.fs.rm',
       'group.fs.cp',
       'group.fs.mv',
@@ -90,7 +103,15 @@ describe('GroupFSVFS 浏览器 facade 契约', () => {
       method: 'group.fs.remove_acl',
       params: { path: 'g-team.agentid.pub:/archive', grantee_aid: 'role:admin' },
     });
-    expect(client.calls[8]?.params).toEqual({
+    expect(client.calls[7]).toEqual({
+      method: 'group.fs.get_acl',
+      params: { path: 'g-team.agentid.pub:/archive' },
+    });
+    expect(client.calls[8]).toEqual({
+      method: 'group.fs.list_acl',
+      params: { path: 'g-team.agentid.pub:/archive' },
+    });
+    expect(client.calls[10]?.params).toEqual({
       src: 'g-team.agentid.pub:/docs/a.md',
       dst: 'g-team.agentid.pub:/docs/b.md',
       force: true,

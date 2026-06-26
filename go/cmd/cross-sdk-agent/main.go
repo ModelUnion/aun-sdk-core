@@ -791,6 +791,10 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			AidStore:   signingStore,
 			Extra:      params,
 		})
+	case "get_acl":
+		return fs.GetACL(ctx, pathValue, &aun.GroupFSAclOptions{SignAs: asGroupAID, AidStore: signingStore, Extra: params})
+	case "list_acl":
+		return fs.ListACL(ctx, pathValue, &aun.GroupFSAclOptions{SignAs: asGroupAID, AidStore: signingStore, Extra: params})
 	case "rm":
 		return fs.Rm(ctx, pathValue, &aun.GroupFSRmOptions{
 			Recursive: boolValue(params["recursive"], false),
@@ -814,10 +818,16 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			}
 			src = path
 		}
+		var parentsSet *bool
+		if rawParents, ok := params["parents"]; ok && rawParents != nil {
+			value := boolValue(rawParents, true)
+			parentsSet = &value
+		}
 		result, err := fs.Cp(ctx, src, dst, &aun.GroupFSCpOptions{
 			Force:      boolValue(params["force"], false),
 			Recursive:  boolValue(params["recursive"], false),
 			Parents:    boolValue(params["parents"], true),
+			ParentsSet: parentsSet,
 			GroupID:    stringValue(params["group_id"]),
 			SrcGroupID: stringValue(params["src_group_id"]),
 			DstGroupID: stringValue(params["dst_group_id"]),
@@ -1005,6 +1015,15 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 		return storage.Lstat(ctx, path, &aun.StatOptions{Owner: owner, Bucket: bucket, Token: token})
 	case "mkdir":
 		return storage.Mkdir(ctx, path, &aun.MkdirOptions{Owner: owner, Bucket: bucket, Parents: boolValue(params["parents"], false)})
+	case "touch":
+		return storage.Touch(ctx, path, &aun.TouchOptions{
+			Owner:          owner,
+			Bucket:         bucket,
+			Parents:        boolValue(params["parents"], false),
+			NoCreate:       boolValue(firstNonNil(params["no_create"], params["noCreate"]), false),
+			MTime:          optionalInt64(params["mtime"]),
+			FollowSymlinks: boolValue(firstNonNil(params["follow_symlinks"], params["followSymlinks"]), false),
+		})
 	case "remove":
 		return storage.Remove(ctx, path, &aun.RemoveOptions{Owner: owner, Bucket: bucket, Recursive: boolValue(params["recursive"], false)})
 	case "rename":
@@ -1026,6 +1045,14 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 		})
 	case "df":
 		return storage.DF(ctx, &aun.UsageOptions{Owner: owner, Bucket: bucket})
+	case "du":
+		return storage.Du(ctx, path, &aun.DuOptions{
+			Owner:    owner,
+			Bucket:   bucket,
+			MaxDepth: optionalInt(firstNonNil(params["max_depth"], params["maxDepth"])),
+			PageSize: intValueDefault(firstNonNil(params["page_size"], params["pageSize"]), 1000),
+			Token:    token,
+		})
 	case "symlink":
 		return storage.Symlink(ctx, stringValue(params["target"]), path, &aun.SymlinkOptions{
 			Owner:     owner,

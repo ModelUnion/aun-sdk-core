@@ -344,6 +344,14 @@ export class GroupFSVFS {
     return this.call('group.fs.remove_acl', params, path);
   }
 
+  getAcl(path: string, options: GroupFSParams = {}): Promise<unknown> {
+    return this.call('group.fs.get_acl', { path, ...options }, path);
+  }
+
+  listAcl(path: string, options: GroupFSParams = {}): Promise<unknown> {
+    return this.call('group.fs.list_acl', { path, ...options }, path);
+  }
+
   rm(path: string, options: GroupFSParams & { recursive?: boolean; force?: boolean } = {}): Promise<unknown> {
     return this.call('group.fs.rm', {
       path,

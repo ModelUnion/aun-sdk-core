@@ -77,6 +77,29 @@ export interface StatOptions extends StorageOptions {
   token?: string;
 }
 
+export interface TouchOptions extends StorageOptions {
+  parents?: boolean;
+  noCreate?: boolean;
+  mtime?: number;
+  followSymlinks?: boolean;
+}
+
+export interface DuOptions extends StorageOptions {
+  maxDepth?: number;
+  pageSize?: number;
+  token?: string;
+}
+
+export interface DuResult {
+  path: string;
+  sizeBytes: number;
+  fileCount: number;
+  dirCount: number;
+  symlinkCount: number;
+  maxDepth?: number;
+  truncated: boolean;
+}
+
 export interface StoragePathRef {
   owner?: string | null;
   path: string;
@@ -290,6 +313,19 @@ export class StorageVFS {
     return nodeFromAny(raw.node ?? raw);
   }
 
+  async touch(path: string, options: TouchOptions = {}): Promise<NodeView> {
+    const raw = await this.lowlevel.fsTouch({
+      owner: this.owner(options.owner),
+      bucket: options.bucket ?? 'default',
+      path: pathToKey(path),
+      parents: options.parents,
+      noCreate: options.noCreate,
+      mtime: options.mtime,
+      followSymlinks: options.followSymlinks,
+    });
+    return nodeFromAny(raw.node ?? raw);
+  }
+
   async remove(path: string, options: StorageOptions & { recursive?: boolean } = {}): Promise<RemoveResult> {
     const raw = await this.lowlevel.fsRemove({ owner: this.owner(options.owner), bucket: options.bucket ?? 'default', path: pathToKey(path), recursive: options.recursive });
     return { path, removedCount: Number(raw.removed_count ?? raw.deleted_count ?? 0) };
@@ -336,6 +372,47 @@ export class StorageVFS {
     const owner = this.owner(options.owner);
     const raw = await this.lowlevel.fsDf({ owner, bucket: options.bucket ?? 'default' });
     return usageFromAny(raw, owner ?? undefined);
+  }
+
+  async du(path: string, options: DuOptions = {}): Promise<DuResult> {
+    const nodes = await this.find(path, {
+      owner: options.owner,
+      bucket: options.bucket,
+      page: 1,
+      pageSize: options.pageSize ?? 1000,
+      token: options.token,
+    });
+    const rootParts = pathToKey(path).split('/').filter(Boolean);
+    let sizeBytes = 0;
+    let fileCount = 0;
+    let dirCount = 0;
+    let symlinkCount = 0;
+    let truncated = false;
+    for (const node of nodes) {
+      const nodeParts = pathToKey(node.path).split('/').filter(Boolean);
+      const depth = Math.max(0, nodeParts.length - rootParts.length);
+      if (options.maxDepth !== undefined && depth > options.maxDepth) {
+        truncated = true;
+        continue;
+      }
+      if (node.type === 'file') {
+        fileCount += 1;
+        sizeBytes += node.size;
+      } else if (node.type === 'dir') {
+        dirCount += 1;
+      } else if (node.type === 'symlink') {
+        symlinkCount += 1;
+      }
+    }
+    return {
+      path,
+      sizeBytes,
+      fileCount,
+      dirCount,
+      symlinkCount,
+      maxDepth: options.maxDepth,
+      truncated,
+    };
   }
 
   async mount(source: StoragePathLike, mountPath: StoragePathLike, options: MountOptions = {}): Promise<NodeView> {

@@ -635,6 +635,8 @@ test.describe('Storage: VFS/软链（浏览器）', () => {
         const stat = await alice.storage.stat(filePath, { owner: aliceAid, bucket });
         const listed = await alice.storage.list(dirPath, { owner: aliceAid, bucket, long: true });
         const usage = await alice.storage.df({ owner: aliceAid, bucket });
+        const touched = await alice.storage.touch(`${dirPath}/empty.txt`, { owner: aliceAid, bucket, parents: true, mtime: 1700000000 });
+        const du = await alice.storage.du(dirPath, { owner: aliceAid, bucket, maxDepth: 2 });
 
         const token = String((await alice.storage.issueToken(filePath, { owner: aliceAid, bucket, maxReads: 1 })).token ?? '');
         const tokenRead = new TextDecoder().decode(await bob.storage.readBytes(filePath, { owner: aliceAid, bucket, token }));
@@ -669,6 +671,9 @@ test.describe('Storage: VFS/软链（浏览器）', () => {
           statType: stat?.type,
           listHasFile: listed.some((node: any) => node.name === 'a.txt'),
           usagePositive: Number(usage?.usedBytes ?? 0) > 0,
+          touchedPath: touched?.path,
+          duFileCount: Number(du?.fileCount ?? du?.file_count ?? 0),
+          duSizeBytes: Number(du?.sizeBytes ?? du?.size_bytes ?? 0),
           tokenRead,
           tokenSecondDenied,
           tokensCount: (tokens?.tokens ?? tokens?.items ?? []).length,
@@ -703,6 +708,9 @@ test.describe('Storage: VFS/软链（浏览器）', () => {
     expect(r.statType).toBe('file');
     expect(r.listHasFile).toBe(true);
     expect(r.usagePositive).toBe(true);
+    expect(r.touchedPath).toContain('/empty.txt');
+    expect(r.duFileCount).toBeGreaterThanOrEqual(2);
+    expect(r.duSizeBytes).toBeGreaterThanOrEqual(r.read.length);
     expect(r.tokenRead).toBe(r.read);
     expect(r.tokenSecondDenied).toBe(true);
     expect(r.tokensCount).toBeGreaterThan(0);

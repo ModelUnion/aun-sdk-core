@@ -6,6 +6,7 @@ from aun_core import (
     MessageFacade,
     StreamFacade,
 )
+from aun_core.errors import ValidationError
 
 
 class _FakeClient:
@@ -23,12 +24,25 @@ async def test_facades_accept_dict_and_omit_none():
     group = GroupFacade(client)
 
     await group.get({"group_id": "g1", "resource_id": None}, include_status=None)
-    await group.send({"group_id": "g1", "payload": {"text": "hi"}, "encrypt": None})
+    await group.send({"group_id": "g-test", "payload": {"text": "hi"}, "encrypt": None})
 
     assert client.calls == [
         ("group.get", {"group_id": "g1"}),
-        ("group.send", {"group_id": "g1", "payload": {"text": "hi"}}),
+        ("group.send", {"group_id": "g-test", "payload": {"text": "hi"}}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_group_send_pull_require_group_id_before_rpc():
+    client = _FakeClient()
+    group = GroupFacade(client)
+
+    with pytest.raises(ValidationError, match="group_id cannot be empty"):
+        await group.send(payload={"text": "hi"})
+    with pytest.raises(ValidationError, match="group_id cannot be empty"):
+        await group.pull({"group_id": "   ", "limit": 10})
+
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
@@ -54,8 +68,8 @@ async def test_message_group_stream_facades_use_client_call():
     await group.check_membership(group_id="g1", requester_aid="alice.agentid.pub")
     await group.transfer_owner(group_id="g1", aid="bob.agentid.pub")
     await group.complete_transfer(group_id="g1", public_key="PUB")
-    await group.send(group_id="g1", payload={"text": "hi"})
-    await group.pull(group_id="g1", limit=20)
+    await group.send(group_id="g-test", payload={"text": "hi"})
+    await group.pull(group_id="g-test", limit=20)
     await group.ack_messages(group_id="g1", up_to_seq=3)
     await group.ack_events(group_id="g1", up_to_event_seq=4)
     await group.thought.put(group_id="g1", thought_id="t2", payload={"x": 2})
@@ -92,7 +106,7 @@ async def test_message_group_stream_facades_use_client_call():
         "stream.close",
     ]
     assert client.calls[0][1]["to"] == "bob.agentid.pub"
-    assert client.calls[16][1]["group_id"] == "g1"
+    assert client.calls[16][1]["group_id"] == "g-test"
     assert not hasattr(group, "get_state")
     assert not hasattr(group, "commit_state")
     assert not hasattr(group, "get_cursor")

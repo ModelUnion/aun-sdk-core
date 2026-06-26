@@ -1,5 +1,6 @@
 import { GroupFSVFS } from './group-fs.js';
 import type { RpcParams, RpcResult } from './types.js';
+import { validateGroupIDFormat } from './validators.js';
 
 export { GroupFSVFS, isGroupRemotePath } from './group-fs.js';
 
@@ -225,6 +226,7 @@ export class GroupFacade extends RpcFacade {
   }
 
   send(params?: FacadeParams | null): Promise<RpcResult> {
+    validateGroupIDFormat(params?.group_id, 'group_id');
     return this.call('group.send', params);
   }
 
@@ -233,6 +235,7 @@ export class GroupFacade extends RpcFacade {
   }
 
   pull(params?: FacadeParams | null): Promise<RpcResult> {
+    validateGroupIDFormat(params?.group_id, 'group_id');
     return this.call('group.pull', params);
   }
 

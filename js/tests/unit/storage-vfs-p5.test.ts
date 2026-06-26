@@ -19,7 +19,13 @@ class FakeClient {
     }
     if (method === 'storage.fs.list') return { nodes: [{ type: 'file', path: 'docs/a.txt', name: 'a.txt', owner_aid: params?.owner_aid, mode: '0644' }] };
     if (method === 'storage.fs.stat') return { type: 'file', path: params?.path, owner_aid: params?.owner_aid, mode: '0644' };
-    if (method === 'storage.fs.find') return { items: [{ type: 'file', path: 'docs/a.txt', name: 'a.txt', owner_aid: params?.owner_aid, size: 5 }] };
+    if (method === 'storage.fs.touch') return { type: 'file', path: params?.path, owner_aid: params?.owner_aid, size: 0, mode: '0644' };
+    if (method === 'storage.fs.find') return { items: [
+      { type: 'file', path: 'docs/a.txt', name: 'a.txt', owner_aid: params?.owner_aid, size: 5 },
+      { type: 'dir', path: 'docs/sub', name: 'sub', owner_aid: params?.owner_aid },
+      { type: 'file', path: 'docs/sub/b.txt', name: 'b.txt', owner_aid: params?.owner_aid, size: 7 },
+      { type: 'symlink', path: 'docs/current.txt', name: 'current.txt', owner_aid: params?.owner_aid },
+    ] };
     if (method === 'storage.fs.df') return { owner_aid: params?.owner_aid, bucket: params?.bucket, used_bytes: 5, quota_bytes: 10, object_count: 1 };
     if (method === 'storage.fs.copy') return { type: 'file', path: params?.dst, owner_aid: params?.dst_owner_aid ?? params?.owner_aid, size_bytes: 5 };
     if (method === 'storage.create_symlink') return { type: 'symlink', path: params?.path, target: params?.target, owner_aid: params?.owner_aid };
@@ -216,26 +222,53 @@ describe('P5 StorageVFS Browser SDK 契约', () => {
     expect(client.calls[5].params).toMatchObject({ max_reads: 1 });
   });
 
-  it('封装服务端 find 和 df 方法', async () => {
+  it('封装 touch、服务端 find、df 和客户端 du 方法', async () => {
     const client = new FakeClient();
     const storage = new StorageVFS(client);
 
+    const touched = await storage.touch('/docs/empty.txt', { parents: true, noCreate: true, mtime: 1700000000, followSymlinks: true });
     const nodes = await storage.find('/docs', { name: '*.txt', nodeType: 'f', size: '+3', mtime: '-7', pageSize: 50, token: 'tok' });
     const usage = await storage.df();
+    const du = await storage.du('/docs', { maxDepth: 1, pageSize: 25, token: 'tok' });
 
-    expect(nodes.map((node) => node.path)).toEqual(['/docs/a.txt']);
+    expect(touched).toMatchObject({ path: '/docs/empty.txt', size: 0 });
+    expect(nodes.map((node) => node.path)).toEqual(['/docs/a.txt', '/docs/sub', '/docs/sub/b.txt', '/docs/current.txt']);
     expect(usage.availBytes).toBe(5);
+    expect(du).toEqual({
+      path: '/docs',
+      sizeBytes: 5,
+      fileCount: 1,
+      dirCount: 1,
+      symlinkCount: 1,
+      maxDepth: 1,
+      truncated: true,
+    });
     expect(client.calls.map((c) => c.method)).toEqual([
+      'storage.fs.touch',
       'storage.fs.find',
       'storage.fs.df',
+      'storage.fs.find',
     ]);
     expect(client.calls[0].params).toMatchObject({
+      path: 'docs/empty.txt',
+      parents: true,
+      no_create: true,
+      mtime: 1700000000,
+      follow_symlinks: true,
+    });
+    expect(client.calls[1].params).toMatchObject({
       path: 'docs',
       name: '*.txt',
       type: 'f',
       size: '+3',
       mtime: '-7',
       page_size: 50,
+      token: 'tok',
+    });
+    expect(client.calls[3].params).toMatchObject({
+      path: 'docs',
+      page: 1,
+      page_size: 25,
       token: 'tok',
     });
   });

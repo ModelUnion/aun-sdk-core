@@ -320,11 +320,11 @@ headers = client.get_protected_headers()
 
 | 能力 | Python | TS/JS | Go | 说明 |
 |------|--------|-------|----|------|
-| Storage VFS | `client.storage` | `client.storage` | `client.Storage()` | 类 POSIX 文件操作；上传自动选择 inline / session / 秒传，下载自动选择 inline / ticket |
+| Storage VFS | `client.storage` | `client.storage` | `client.Storage()` | 类 POSIX 文件操作；上传自动选择 inline / session / 秒传，下载自动选择 inline / ticket；支持 `touch`、`find`、`du`、`df`、ACL/token/软链/挂载门面 |
 | Collab | `client.collab` | `client.collab` | `client.Collab()` | 版本化文档、标签、`gc` / `reflog` / `revert` |
-| Group FS | `client.group.fs` | `client.group.fs` | `client.Group().FS()` | POSIX 风格群文件系统；`ls/find/stat/lstat/mkdir/rm/cp/mv/df/mount/umount`，上传下载数据面由 SDK 编排 |
+| Group FS | `client.group.fs` | `client.group.fs` | `client.Group().FS()` | POSIX 风格群文件系统；`ls/find/stat/lstat/mkdir/rm/cp/mv/df/mount/umount`，以及 `set_acl/remove_acl/get_acl/list_acl` 角色 ACL 门面，上传下载数据面由 SDK 编排 |
 
-群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `group_data/{group_aid}` 的映射只在服务端完成。群自有区写入允许当前 `group_aid` 证书签名、默认 `role:owner`、以及 owner 通过 `group.fs.set_acl` 显式授权后的 `role:admin`；撤销使用 `group.fs.remove_acl`。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
+群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `group_data/{group_aid}` 的映射只在服务端完成。群自有区写入允许当前 `group_aid` 证书签名、默认 `role:owner`、以及 owner 通过 `group.fs.set_acl` 显式授权后的 `role:admin`；撤销使用 `group.fs.remove_acl`，查询使用 `group.fs.get_acl/list_acl`，这些角色 ACL 操作都要求当前 group owner 调用且对外权限位显示为 `rwx`。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
 
 ---
 

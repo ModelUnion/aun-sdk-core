@@ -257,6 +257,9 @@ func (f *GroupFacade) UpdateAnnouncement(ctx context.Context, params map[string]
 }
 
 func (f *GroupFacade) Send(ctx context.Context, params map[string]any) (any, error) {
+	if _, err := ValidateGroupIDFormat(params["group_id"], "group_id"); err != nil {
+		return nil, err
+	}
 	return f.call(ctx, "send", params)
 }
 
@@ -265,6 +268,9 @@ func (f *GroupFacade) Recall(ctx context.Context, params map[string]any) (any, e
 }
 
 func (f *GroupFacade) Pull(ctx context.Context, params map[string]any) (any, error) {
+	if _, err := ValidateGroupIDFormat(params["group_id"], "group_id"); err != nil {
+		return nil, err
+	}
 	return f.call(ctx, "pull", params)
 }
 

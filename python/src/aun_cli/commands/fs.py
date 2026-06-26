@@ -185,6 +185,15 @@ def _print_node_table(nodes: list[Any], *, long: bool = False) -> None:
     )
 
 
+def _human_size(value: int) -> str:
+    size = float(max(0, int(value or 0)))
+    for unit in ("B", "K", "M", "G", "T"):
+        if size < 1024 or unit == "T":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024
+    return f"{int(value)}B"
+
+
 @fs_app.command("ls")
 def fs_ls(
     ctx: typer.Context,
@@ -241,6 +250,54 @@ def fs_stat(
         return
     data = _json_ready(result)
     output_json(data) if is_json_mode() else output_dict(data)
+
+
+@fs_app.command("lstat")
+def fs_lstat(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="远程路径"),
+    token: Optional[str] = typer.Option(None, "--token", help="访问令牌"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    _set_json(ctx)
+    owner, remote_path = _remote_or_default(ctx, path)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.storage.lstat(remote_path, owner=owner, token=token)
+
+    try:
+        result = run_async(_run())
+    except Exception as exc:
+        handle_error(exc)
+        return
+    data = _json_ready(result)
+    output_json(data) if is_json_mode() else output_dict(data)
+
+
+@fs_app.command("readlink")
+def fs_readlink(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="远程软链路径"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    _set_json(ctx)
+    owner, remote_path = _remote_or_default(ctx, path)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.storage.readlink(remote_path, owner=owner)
+
+    try:
+        result = run_async(_run())
+    except Exception as exc:
+        handle_error(exc)
+        return
+    data = _json_ready(result)
+    if is_json_mode():
+        output_json(data)
+    else:
+        typer.echo(str(data.get("target") or ""))
 
 
 @fs_app.command("cat")
@@ -478,6 +535,36 @@ def fs_mkdir(
     output_json(_json_ready(result)) if is_json_mode() else output_success("mkdir 完成")
 
 
+@fs_app.command("touch")
+def fs_touch(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="远程文件路径"),
+    parents: bool = typer.Option(False, "--parents", "-p", help="自动创建父目录"),
+    no_create: bool = typer.Option(False, "--no-create", "-c", help="不存在时不创建"),
+    mtime: Optional[int] = typer.Option(None, "--mtime", help="Unix 毫秒时间戳"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    _set_json(ctx)
+    owner, remote_path = _remote_or_default(ctx, path)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.storage.touch(
+                remote_path,
+                owner=owner,
+                parents=parents,
+                no_create=no_create,
+                mtime=mtime,
+            )
+
+    try:
+        result = run_async(_run())
+    except Exception as exc:
+        handle_error(exc)
+        return
+    output_json(_json_ready(result)) if is_json_mode() else output_success("touch 完成")
+
+
 @fs_app.command("df")
 def fs_df(
     ctx: typer.Context,
@@ -490,6 +577,30 @@ def fs_df(
     async def _run():
         async with CLISession(ctx, aid=as_aid) as client:
             return await client.storage.df(owner=owner)
+
+    try:
+        result = run_async(_run())
+    except Exception as exc:
+        handle_error(exc)
+        return
+    data = _json_ready(result)
+    output_json(data) if is_json_mode() else output_dict(data)
+
+
+@fs_app.command("quota")
+def fs_quota(
+    ctx: typer.Context,
+    target: Optional[str] = typer.Argument(None, help="远程主体，形如 aid:"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    _set_json(ctx)
+    owner = None
+    if target:
+        owner, _ = _remote_or_default(ctx, target)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.storage.get_usage(owner=owner)
 
     try:
         result = run_async(_run())
@@ -660,6 +771,36 @@ def fs_find(
     else:
         for item in result:
             typer.echo(format_remote(owner, str(item.get("path") or "")))
+
+
+@fs_app.command("du")
+def fs_du(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="远程路径"),
+    max_depth: Optional[int] = typer.Option(None, "--max-depth", help="最大递归深度"),
+    human_readable: bool = typer.Option(False, "--human-readable", "-h", help="人类可读大小"),
+    summarize: bool = typer.Option(False, "--summarize", "-s", help="仅显示总计"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    _set_json(ctx)
+    owner, remote_path = _remote_or_default(ctx, path)
+    _ = summarize
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.storage.du(remote_path, owner=owner, max_depth=max_depth)
+
+    try:
+        result = run_async(_run())
+    except Exception as exc:
+        handle_error(exc)
+        return
+    data = _json_ready(result)
+    if is_json_mode():
+        output_json(data)
+    else:
+        size = int(data.get("size_bytes") or 0)
+        typer.echo(f"{_human_size(size) if human_readable else size}\t{format_remote(owner, remote_path)}")
 
 
 @fs_app.command("chmod")

@@ -789,6 +789,30 @@ class StorageLowLevel:
             path=path,
         )
 
+    async def fs_touch(
+        self,
+        *,
+        owner: str | None = None,
+        bucket: str = "default",
+        path: str,
+        parents: bool = False,
+        no_create: bool = False,
+        mtime: int | None = None,
+        follow_symlinks: bool = False,
+    ) -> dict[str, Any]:
+        params = self._params(
+            owner,
+            bucket,
+            path=path,
+            parents=parents,
+            no_create=no_create,
+        )
+        if mtime is not None:
+            params["mtime"] = mtime
+        if follow_symlinks:
+            params["follow_symlinks"] = True
+        return await self._call("storage.fs.touch", params, path=path)
+
     async def fs_remove(
         self,
         *,

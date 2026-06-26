@@ -142,12 +142,13 @@ export class GroupFacade extends RpcFacade {
   ban(params?: FacadeParams): Promise<RpcResult> { return this.call('group.ban', params); }
   unban(params?: FacadeParams): Promise<RpcResult> { return this.call('group.unban', params); }
   send(params?: FacadeParams): Promise<RpcResult> {
-    if (params?.group_id) {
-      validateGroupIDFormat(params.group_id, 'group_id');
-    }
+    validateGroupIDFormat(params?.group_id, 'group_id');
     return this.call('group.send', params);
   }
-  pull(params?: FacadeParams): Promise<RpcResult> { return this.call('group.pull', params); }
+  pull(params?: FacadeParams): Promise<RpcResult> {
+    validateGroupIDFormat(params?.group_id, 'group_id');
+    return this.call('group.pull', params);
+  }
   recall(params?: FacadeParams): Promise<RpcResult> { return this.call('group.recall', params); }
   pullEvents(params?: FacadeParams): Promise<RpcResult> { return this.call('group.pull_events', params); }
   ackMessages(params?: FacadeParams): Promise<RpcResult> { return this.call('group.ack_messages', params); }

@@ -49,6 +49,10 @@ describe('P5 TypeScript StorageVFS Docker 集成', () => {
       expect(stat.type).toBe('file');
       expect(stat.mode).toBeTruthy();
 
+      const touched = await alice.storage.touch(`/docs/${rid}/empty.txt`, { owner: aliceAid, bucket, parents: true, mtime: 1700000000 });
+      expect(touched.type).toBe('file');
+      expect(touched.path).toBe(`/docs/${rid}/empty.txt`);
+
       const listed = await alice.storage.list(`/docs/${rid}`, { owner: aliceAid, bucket, long: true });
       expect(listed.map((node) => node.name)).toContain('a.txt');
 
@@ -100,6 +104,10 @@ describe('P5 TypeScript StorageVFS Docker 集成', () => {
       const usage = await alice.storage.df({ owner: aliceAid, bucket });
       expect(usage.owner).toBeTruthy();
       expect(usage.usedBytes).toBeGreaterThan(0);
+
+      const du = await alice.storage.du(`/docs/${rid}`, { owner: aliceAid, bucket, maxDepth: 2 });
+      expect(Number(du.fileCount ?? 0)).toBeGreaterThanOrEqual(2);
+      expect(Number(du.sizeBytes ?? 0)).toBeGreaterThanOrEqual(body.length);
 
       const copiedPath = `/docs/${rid}/copied.txt`;
       const copied = await alice.storage.copy(filePath, copiedPath, { owner: aliceAid, bucket, overwrite: true });

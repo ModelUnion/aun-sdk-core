@@ -215,6 +215,21 @@ async def main() -> None:
             _ok("cli_group_fs_mkdir_cp_ls_stat_download_rm")
         except Exception as exc:
             _fail("cli_group_fs_mkdir_cp_ls_stat_download_rm", str(exc))
+
+        try:
+            acl_dir = f"{group_aid}:/archive/cli-acl-{tag}"
+            _cmd(env, "group", "fs", "mkdir", "--parents", acl_dir, "--as", group_aid)
+            grant = _cmd(env, "group", "fs", "setfacl", "-m", "role:admin:rwx", acl_dir)
+            listed = _cmd(env, "group", "fs", "getfacl", acl_dir)
+            revoke = _cmd(env, "group", "fs", "setfacl", "-x", "role:admin", acl_dir)
+            acls = listed.get("acls") if isinstance(listed, dict) else []
+            if grant.get("acl_action") != "set_acl" or revoke.get("acl_action") != "remove_acl":
+                raise AssertionError(f"setfacl 返回异常: grant={grant} revoke={revoke}")
+            if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:admin" and item.get("perms") == "rwx" for item in acls):
+                raise AssertionError(f"getfacl 未返回 role:admin:rwx: {listed}")
+            _ok("cli_group_fs_setfacl_getfacl")
+        except Exception as exc:
+            _fail("cli_group_fs_setfacl_getfacl", str(exc))
     finally:
         try:
             _cmd(env, "group", "fs", "rm", "--recursive", "--force", remote_dir_ref, "--as", group_aid)

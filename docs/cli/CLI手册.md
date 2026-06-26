@@ -171,6 +171,9 @@ aun group add-member dave.agentid.pub --role member
 | `aun group fs cp <src> <dst> [-r] [--force]` | 上传、下载或远程复制 |
 | `aun group fs mv <src> <dst> [--force]` | 远程移动 |
 | `aun group fs df [path]` | 查看用量 |
+| `aun group fs setfacl <path> -m role:admin:<perms>` | 群主授予群自有区 admin 角色 ACL |
+| `aun group fs setfacl <path> -x role:admin` | 群主撤销群自有区 admin 角色 ACL |
+| `aun group fs getfacl <path>` | 查看群自有区角色 ACL |
 | `aun group fs mount <path> [--readonly/--readwrite]` | 挂载成员数据区 |
 | `aun group fs umount <path>` | 卸载成员数据区 |
 
@@ -180,10 +183,12 @@ aun group add-member dave.agentid.pub --role member
 aun group fs mkdir /docs -p
 aun group fs cp .\README.md /docs/README.md
 aun group fs ls /docs -l
+aun group fs setfacl /docs -m role:admin:rwx
+aun group fs getfacl /docs
 aun group fs cp /docs/README.md .\downloaded.md
 ```
 
-群自有区写入需要使用当前 `group_identity` 对应的 `group_aid` 身份签名时，可通过 `--as <group-aid>` 指定操作者。
+群自有区写入需要使用当前 `group_identity` 对应的 `group_aid` 身份签名时，可通过 `--as <group-aid>` 指定操作者。`setfacl/getfacl` 只允许当前 group owner 调用；当前只支持 `role:admin` 角色 ACL，权限位对外显示为 POSIX 视图 `rwx`。
 
 ## Storage VFS 命令
 
@@ -199,10 +204,13 @@ aun group fs cp /docs/README.md .\downloaded.md
 | `aun fs rm <path> [-r]` | 删除 |
 | `aun fs ln -s <target> <link-path>` | 创建软链 |
 | `aun fs mkdir <path> [-p]` | 创建目录 |
+| `aun fs touch <path> [-p] [--no-create] [--mtime TS]` | 创建空文件或更新时间戳 |
 | `aun fs df <aid:>` | 查看用量 |
+| `aun fs quota [aid:]` | 查看配额 |
+| `aun fs du <path> [-h] [--max-depth N]` | 汇总路径占用 |
 | `aun fs find <path> [--name PATTERN] [--type f|d|l]` | 查找 |
 | `aun fs chmod +r <path>` / `aun fs chmod o-r <path>` | 设置 public/private |
-| `aun fs setfacl <path> -m aid:<AID>:<perms>` | 设置 ACL |
+| `aun fs setfacl <path> -m aid:<AID>:<perms>` / `-x aid:<AID>` | 设置或移除 ACL |
 | `aun fs getfacl <path>` | 查看 ACL |
 | `aun fs mount/approve/reject/umount ...` | 挂载生命周期 |
 | `aun fs token issue/revoke/ls ...` | 访问 token 管理 |
@@ -211,6 +219,7 @@ aun group fs cp /docs/README.md .\downloaded.md
 
 ```powershell
 aun fs mkdir alice.agentid.pub:/docs -p
+aun fs touch alice.agentid.pub:/docs/empty.txt --mtime 1700000000
 aun fs cp .\a.txt alice.agentid.pub:/docs/a.txt
 aun fs cat alice.agentid.pub:/docs/a.txt
 aun fs token issue alice.agentid.pub:/docs/a.txt

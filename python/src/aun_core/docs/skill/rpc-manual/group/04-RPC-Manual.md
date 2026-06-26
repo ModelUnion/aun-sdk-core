@@ -130,6 +130,8 @@
 | [group.fs.create_download_ticket](#groupfscreate_download_ticket) | 创建下载票据 |
 | [group.fs.set_acl](#groupfsset_acl) | 授予群自有区角色写 ACL |
 | [group.fs.remove_acl](#groupfsremove_acl) | 撤销群自有区角色写 ACL |
+| [group.fs.get_acl](#groupfsget_acl) | 查询群自有区角色 ACL |
+| [group.fs.list_acl](#groupfslist_acl) | 查询群自有区角色 ACL（别名） |
 | [group.fs.mkdir](#groupfsmkdir) | 创建目录 |
 | [group.fs.rm](#groupfsrm) | 删除节点 |
 | [group.fs.cp](#groupfscp) | 远程复制 |
@@ -1463,7 +1465,7 @@ result = await client.call("group.thought.get", {
 权限与签名约束：
 
 - 群自有区是除 `memberdata` 等系统保留路径外的整个 `group_aid` namespace。`group_aid` 当前证书签名可写；`role:owner` 默认可写；`role:admin` 需要 owner 通过 `group.fs.set_acl` 显式授权后才可写。
-- `group.fs.set_acl` / `group.fs.remove_acl` 只能由当前 group owner 调用，且当前只允许管理 `grantee_aid="role:admin"`；成员升降级、退群、踢出不会联动授权或撤销。
+- `group.fs.set_acl` / `group.fs.remove_acl` / `group.fs.get_acl` / `group.fs.list_acl` 只能由当前 group owner 调用，且当前只允许管理或查询 `grantee_aid="role:admin"` 的群自有区角色 ACL；成员升降级、退群、踢出不会联动授权或撤销。
 - `memberdata/{member_ref}` 写入默认只允许该成员本人；SDK 只传 group path，不拼接真实 storage 路径。
 - 上传控制面会透传 `parents` 到 storage：默认 `parents=true` 时可递归创建父目录，显式 `parents=false` 时父目录必须已存在。
 - JavaScript 浏览器版 `cp(string, group)` 默认把 string 当文本内容上传；Node 本地路径需显式传 `sourceType: "path"`、`localPath: true` 或使用 `local:` 前缀。Python、TypeScript 和 Go 默认把 string 当本地路径。
@@ -1496,13 +1498,23 @@ result = await client.call("group.thought.get", {
 
 授予群自有区角色 ACL。需要当前 group owner 身份签名调用；底层由 group 服务以内部门面写入 `storage.set_acl`。
 
-参数：`path` 必填，指向群自有区路径；`grantee_aid` 只能为 `role:admin`；`perms` 默认 `rwx`，必须包含写权限。`path` 可传 `group_aid:/archive` 等 group path。
+参数：`path` 必填，指向群自有区路径；`grantee_aid` 只能为 `role:admin`；`perms` 默认 `rwx`，必须包含写权限。`path` 可传 `group_aid:/archive` 等 group path。服务端写入 storage 内部权限位时会把 POSIX 删除位 `x` 映射为内部 `d`，对外响应仍显示 `rwx`。
 
 ### group.fs.remove_acl
 
 撤销群自有区角色 ACL。需要当前 group owner 身份签名调用；底层由 group 服务以内部门面写入 `storage.remove_acl`。
 
 参数：`path` 必填，指向群自有区路径；`grantee_aid` 只能为 `role:admin`。撤销后，当前 admin 角色成员不再因该路径的 `role:admin` ACL 获得写权限。
+
+### group.fs.get_acl
+
+查询群自有区角色 ACL。需要当前 group owner 身份签名调用；普通 admin/member 不能查询。参数：`path` 必填，指向群自有区路径；可传裸路径 + `group_id`，也可传完整 `group_aid:/...`。
+
+响应包含 `group_id`、`group_aid`、`path`、`area`、`storage` 和 `acls`。`acls[].perms` 使用 POSIX 视图，删除权限显示为 `x`，因此 owner 授权 `role:admin:rwx` 后查询也返回 `rwx`。
+
+### group.fs.list_acl
+
+`group.fs.get_acl` 的别名，参数、权限和返回结构完全相同。
 
 ### group.fs.mkdir
 

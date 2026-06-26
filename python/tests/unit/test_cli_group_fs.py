@@ -52,6 +52,18 @@ class _FakeGroupFS:
         self.calls.append(("umount", path, kwargs))
         return {"unmounted": True, "path": path}
 
+    async def set_acl(self, path, **kwargs):
+        self.calls.append(("set_acl", path, kwargs))
+        return {"acl_action": "set_acl", "path": path, "grantee_aid": kwargs.get("grantee_aid")}
+
+    async def remove_acl(self, path, **kwargs):
+        self.calls.append(("remove_acl", path, kwargs))
+        return {"acl_action": "remove_acl", "path": path, "grantee_aid": kwargs.get("grantee_aid")}
+
+    async def get_acl(self, path, **kwargs):
+        self.calls.append(("get_acl", path, kwargs))
+        return {"path": path, "acls": [{"grantee_aid": "role:admin", "perms": "rwx"}]}
+
 
 class _FakeClient:
     def __init__(self):
@@ -260,6 +272,25 @@ def test_cli_group_fs_cp_bare_to_bare_defaults_group_to_group_when_source_missin
                 "content_type": None,
             },
         )
+    ]
+
+
+def test_cli_group_fs_setfacl_getfacl(monkeypatch, tmp_path):
+    _write_profile_config(tmp_path, monkeypatch, active_group="group.agentid.pub/team")
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, client)
+
+    add = _invoke(["--json", "group", "fs", "setfacl", "-m", "role:admin:rwx", "/docs"])
+    listed = _invoke(["--json", "group", "fs", "getfacl", "/docs"])
+    remove = _invoke(["--json", "group", "fs", "setfacl", "-x", "role:admin", "/docs"])
+
+    assert add.exit_code == 0, add.output
+    assert listed.exit_code == 0, listed.output
+    assert remove.exit_code == 0, remove.output
+    assert client.group_fs.calls[-3:] == [
+        ("set_acl", "/docs", {"group_id": "group.agentid.pub/team", "grantee_aid": "role:admin", "perms": "rwx"}),
+        ("get_acl", "/docs", {"group_id": "group.agentid.pub/team"}),
+        ("remove_acl", "/docs", {"group_id": "group.agentid.pub/team", "grantee_aid": "role:admin"}),
     ]
 
 

@@ -81,7 +81,6 @@ export interface DownloadResult {
   size: number;
   sha256: string;
   verified: boolean;
-  data?: Uint8Array;
 }
 
 export interface RemoveResult {

@@ -150,6 +150,12 @@ class GroupFSVFS:
             path=path,
         )
 
+    async def get_acl(self, path: str, **options: Any) -> Any:
+        return await self._call("group.fs.get_acl", self._params(path=path, **options), path=path)
+
+    async def list_acl(self, path: str, **options: Any) -> Any:
+        return await self._call("group.fs.list_acl", self._params(path=path, **options), path=path)
+
     async def rm(self, path: str, *, recursive: bool = False, force: bool = False, **options: Any) -> Any:
         return await self._call(
             "group.fs.rm",

@@ -114,6 +114,12 @@ async def test_mutations(client: AUNClient, root: str) -> None:
     name = "fs_p3_mutations"
     try:
         await client.storage.write_bytes(f"/{root}/work/src.txt", b"P3-COPY", owner=_ALICE_AID, content_type="text/plain")
+        touched = await client.storage.touch(f"/{root}/work/empty.txt", owner=_ALICE_AID, parents=True, mtime=1_700_000_000)
+        if touched.type != "file" or touched.path != f"/{root}/work/empty.txt" or int(touched.size or 0) != 0:
+            raise AssertionError(f"touch 创建空文件异常: {touched}")
+        du = await client.storage.du(f"/{root}/work", owner=_ALICE_AID, max_depth=2)
+        if int(du.get("file_count") or 0) < 2 or int(du.get("size_bytes") or 0) < len(b"P3-COPY"):
+            raise AssertionError(f"du 聚合异常: {du}")
         copied = await client.storage.copy(f"/{root}/work/src.txt", f"/{root}/work/copy.txt", owner=_ALICE_AID)
         if copied.type != "file" or copied.path != f"/{root}/work/copy.txt":
             raise AssertionError(f"copy 异常: {copied}")

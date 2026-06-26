@@ -62,6 +62,8 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 		return map[string]any{"type": "symlink", "path": params["path"], "target": "/docs/a.txt", "owner_aid": params["owner_aid"], "mode": "0777"}, nil
 	case "storage.fs.mkdir":
 		return map[string]any{"node": map[string]any{"type": "dir", "path": params["path"], "owner_aid": params["owner_aid"], "mode": "0755"}}, nil
+	case "storage.fs.touch":
+		return map[string]any{"node": map[string]any{"type": "file", "path": params["path"], "owner_aid": params["owner_aid"], "size": 0, "mode": "0644"}}, nil
 	case "storage.fs.remove":
 		return map[string]any{"removed_count": 1}, nil
 	case "storage.fs.rename":
@@ -69,7 +71,15 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 	case "storage.fs.copy":
 		return map[string]any{"node": map[string]any{"type": "file", "path": params["dst"], "owner_aid": firstNonNil(params["dst_owner_aid"], params["owner_aid"]), "mode": "0644"}}, nil
 	case "storage.fs.find":
-		return map[string]any{"items": []any{map[string]any{"type": "file", "path": "docs/a.txt", "name": "a.txt", "owner_aid": params["owner_aid"], "size": 5}}}, nil
+		if params["name"] != nil || params["type"] != nil || params["size"] != nil || params["mtime"] != nil {
+			return map[string]any{"items": []any{map[string]any{"type": "file", "path": "docs/a.txt", "name": "a.txt", "owner_aid": params["owner_aid"], "size": 5}}}, nil
+		}
+		return map[string]any{"items": []any{
+			map[string]any{"type": "file", "path": "docs/a.txt", "name": "a.txt", "owner_aid": params["owner_aid"], "size": 5},
+			map[string]any{"type": "dir", "path": "docs/sub", "name": "sub", "owner_aid": params["owner_aid"]},
+			map[string]any{"type": "file", "path": "docs/sub/b.txt", "name": "b.txt", "owner_aid": params["owner_aid"], "size": 7},
+			map[string]any{"type": "symlink", "path": "docs/current.txt", "name": "current.txt", "owner_aid": params["owner_aid"]},
+		}}, nil
 	case "storage.fs.df":
 		return map[string]any{"owner_aid": params["owner_aid"], "bucket": params["bucket"], "used_bytes": 5, "quota_bytes": 10, "object_count": 1}, nil
 	case "storage.fs.mount":
@@ -222,6 +232,9 @@ func TestStorageVFSUploadAndDownloadFile(t *testing.T) {
 	if downloaded.Path != "/docs/a.txt" || downloaded.LocalPath != localDownload || downloaded.Size != 5 || downloaded.Verified != true {
 		t.Fatalf("DownloadResult 不正确: %#v", downloaded)
 	}
+	if len(downloaded.Data) != 0 {
+		t.Fatalf("DownloadFile 写入本地文件时不应在结果中保留内存数据: %d bytes", len(downloaded.Data))
+	}
 	if client.calls[1].method != "storage.put_object" || client.calls[1].params["content_type"] != "text/plain" {
 		t.Fatalf("UploadFile 未正确复用 WriteBytes: %#v", client.calls)
 	}
@@ -332,6 +345,11 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mkdir 失败: %v", err)
 	}
+	mtime := int64(1700000000)
+	touched, err := storage.Touch(ctx, "/docs/empty.txt", &TouchOptions{Parents: true, NoCreate: true, MTime: &mtime, FollowSymlinks: true})
+	if err != nil {
+		t.Fatalf("Touch 失败: %v", err)
+	}
 	removed, err := storage.Remove(ctx, "/docs/old", &RemoveOptions{Recursive: true})
 	if err != nil {
 		t.Fatalf("Remove 失败: %v", err)
@@ -361,14 +379,15 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 		t.Fatalf("RenameSymlink 失败: %v", err)
 	}
 
-	if folder.Type != "dir" || removed.RemovedCount != 1 || renamed.Path != "/docs/b.txt" || copied.Path != "/docs/c.txt" {
-		t.Fatalf("fs mutation 返回异常: folder=%#v removed=%#v renamed=%#v copied=%#v", folder, removed, renamed, copied)
+	if folder.Type != "dir" || touched.Path != "/docs/empty.txt" || touched.Size != 0 || removed.RemovedCount != 1 || renamed.Path != "/docs/b.txt" || copied.Path != "/docs/c.txt" {
+		t.Fatalf("fs mutation 返回异常: folder=%#v touched=%#v removed=%#v renamed=%#v copied=%#v", folder, touched, removed, renamed, copied)
 	}
 	if link.Type != "symlink" || link.Target != "/docs/a.txt" || readlink.Target != "/docs/a.txt" || repointed.Target != "/docs/b.txt" || renamedLink.Path != "/links/latest.txt" {
 		t.Fatalf("symlink 返回异常: link=%#v readlink=%#v repointed=%#v renamed=%#v", link, readlink, repointed, renamedLink)
 	}
 	want := []string{
 		"storage.fs.mkdir",
+		"storage.fs.touch",
 		"storage.fs.remove",
 		"storage.fs.rename",
 		"storage.fs.copy",
@@ -382,14 +401,17 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 			t.Fatalf("第 %d 次调用方法不正确: got=%s want=%s", i, client.calls[i].method, method)
 		}
 	}
-	if client.calls[2].params["expected_version"] != 7 || client.calls[6].params["expected_version"] != 7 {
-		t.Fatalf("expected_version 未正确透传: rename=%#v repoint=%#v", client.calls[2].params, client.calls[6].params)
+	if client.calls[1].params["path"] != "docs/empty.txt" || client.calls[1].params["parents"] != true || client.calls[1].params["no_create"] != true || client.calls[1].params["mtime"] != mtime || client.calls[1].params["follow_symlinks"] != true {
+		t.Fatalf("touch 参数不正确: %#v", client.calls[1].params)
 	}
-	if client.calls[7].params["new_path"] != "links/latest.txt" || client.calls[7].params["overwrite"] != true || client.calls[7].params["expected_version"] != 7 {
-		t.Fatalf("rename_symlink 参数不正确: %#v", client.calls[7].params)
+	if client.calls[3].params["expected_version"] != 7 || client.calls[7].params["expected_version"] != 7 {
+		t.Fatalf("expected_version 未正确透传: rename=%#v repoint=%#v", client.calls[3].params, client.calls[7].params)
 	}
-	if client.calls[3].params["follow_symlinks"] != true || client.calls[3].params["recursive"] != true {
-		t.Fatalf("copy 参数未正确透传: %#v", client.calls[3].params)
+	if client.calls[8].params["new_path"] != "links/latest.txt" || client.calls[8].params["overwrite"] != true || client.calls[8].params["expected_version"] != 7 {
+		t.Fatalf("rename_symlink 参数不正确: %#v", client.calls[8].params)
+	}
+	if client.calls[4].params["follow_symlinks"] != true || client.calls[4].params["recursive"] != true {
+		t.Fatalf("copy 参数未正确透传: %#v", client.calls[4].params)
 	}
 }
 
@@ -430,18 +452,30 @@ func TestStorageVFSFindAndDFContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DF 失败: %v", err)
 	}
+	maxDepth := 1
+	du, err := storage.Du(ctx, "/docs", &DuOptions{MaxDepth: &maxDepth, PageSize: 25, Token: "tok"})
+	if err != nil {
+		t.Fatalf("Du 失败: %v", err)
+	}
 	if len(nodes) != 1 || nodes[0].Path != "/docs/a.txt" {
 		t.Fatalf("Find 返回异常: %#v", nodes)
 	}
 	if usage.UsedBytes != 5 || usage.AvailBytes != 5 {
 		t.Fatalf("DF 返回异常: %#v", usage)
 	}
-	if client.calls[0].method != "storage.fs.find" || client.calls[1].method != "storage.fs.df" {
+	if du["path"] != "/docs" || du["size_bytes"] != int64(5) || du["file_count"] != 1 || du["dir_count"] != 1 || du["symlink_count"] != 1 || du["max_depth"] != 1 || du["truncated"] != true {
+		t.Fatalf("Du 聚合结果不正确: %#v", du)
+	}
+	if client.calls[0].method != "storage.fs.find" || client.calls[1].method != "storage.fs.df" || client.calls[2].method != "storage.fs.find" {
 		t.Fatalf("RPC 方法不正确: %#v", client.calls)
 	}
 	findParams := client.calls[0].params
 	if findParams["path"] != "docs" || findParams["name"] != "*.txt" || findParams["type"] != "f" || findParams["size"] != "+3" || findParams["mtime"] != "-7" || findParams["page_size"] != 50 || findParams["token"] != "tok" {
 		t.Fatalf("Find 参数不正确: %#v", findParams)
+	}
+	duParams := client.calls[2].params
+	if duParams["path"] != "docs" || duParams["page"] != 1 || duParams["page_size"] != 25 || duParams["token"] != "tok" {
+		t.Fatalf("Du Find 参数不正确: %#v", duParams)
 	}
 }
 

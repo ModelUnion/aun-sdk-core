@@ -65,6 +65,8 @@ async def test_group_fs_role_acl_facade_maps_to_control_rpcs():
 
     await fs.set_acl("g-team.agentid.pub:/archive", grantee_aid="role:admin", perms="rwx")
     await fs.remove_acl("g-team.agentid.pub:/archive", grantee_aid="role:admin")
+    await fs.get_acl("g-team.agentid.pub:/archive")
+    await fs.list_acl("g-team.agentid.pub:/archive", include_inherited=True)
 
     assert client.calls == [
         (
@@ -80,6 +82,19 @@ async def test_group_fs_role_acl_facade_maps_to_control_rpcs():
             {
                 "path": "g-team.agentid.pub:/archive",
                 "grantee_aid": "role:admin",
+            },
+        ),
+        (
+            "group.fs.get_acl",
+            {
+                "path": "g-team.agentid.pub:/archive",
+            },
+        ),
+        (
+            "group.fs.list_acl",
+            {
+                "path": "g-team.agentid.pub:/archive",
+                "include_inherited": True,
             },
         ),
     ]

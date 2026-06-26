@@ -39,7 +39,7 @@ func TestGroupFSEntryIsCachedAndExposesOnlyPOSIXMainMethods(t *testing.T) {
 	}
 
 	fsType := reflect.TypeOf(client.Group().FS())
-	for _, method := range []string{"Ls", "Find", "Stat", "Lstat", "Mkdir", "SetACL", "RemoveACL", "Rm", "Cp", "Mv", "Df", "Mount", "Umount"} {
+	for _, method := range []string{"Ls", "Find", "Stat", "Lstat", "Mkdir", "SetACL", "RemoveACL", "GetACL", "ListACL", "Rm", "Cp", "Mv", "Df", "Mount", "Umount"} {
 		if _, ok := fsType.MethodByName(method); !ok {
 			t.Fatalf("GroupFS 缺少 POSIX 方法: %s", method)
 		}
@@ -77,6 +77,12 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 	if _, err := fs.RemoveACL(ctx, "g-team.agentid.pub:/archive", &GroupFSAclOptions{GranteeAID: "role:admin"}); err != nil {
 		t.Fatalf("RemoveACL 失败: %v", err)
 	}
+	if _, err := fs.GetACL(ctx, "g-team.agentid.pub:/archive", nil); err != nil {
+		t.Fatalf("GetACL 失败: %v", err)
+	}
+	if _, err := fs.ListACL(ctx, "g-team.agentid.pub:/archive", nil); err != nil {
+		t.Fatalf("ListACL 失败: %v", err)
+	}
 	if _, err := fs.Rm(ctx, "g-team.agentid.pub:/docs/old.md", &GroupFSRmOptions{Force: true}); err != nil {
 		t.Fatalf("Rm 失败: %v", err)
 	}
@@ -104,6 +110,8 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 		"group.fs.mkdir",
 		"group.fs.set_acl",
 		"group.fs.remove_acl",
+		"group.fs.get_acl",
+		"group.fs.list_acl",
 		"group.fs.rm",
 		"group.fs.cp",
 		"group.fs.mv",
@@ -131,8 +139,8 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 	if client.calls[6].params["path"] != "g-team.agentid.pub:/archive" || client.calls[6].params["grantee_aid"] != "role:admin" {
 		t.Fatalf("RemoveACL 参数不正确: %#v", client.calls[6].params)
 	}
-	if client.calls[8].params["src"] != "g-team.agentid.pub:/docs/a.md" || client.calls[8].params["dst"] != "g-team.agentid.pub:/docs/b.md" || client.calls[8].params["force"] != true {
-		t.Fatalf("Cp 参数不正确: %#v", client.calls[8].params)
+	if client.calls[10].params["src"] != "g-team.agentid.pub:/docs/a.md" || client.calls[10].params["dst"] != "g-team.agentid.pub:/docs/b.md" || client.calls[10].params["force"] != true {
+		t.Fatalf("Cp 参数不正确: %#v", client.calls[10].params)
 	}
 }
 
@@ -386,6 +394,33 @@ func TestGroupFSCpLocalToGroupDefaultsParentsTrue(t *testing.T) {
 	}
 }
 
+func TestGroupFSCpLocalToGroupCanDisableParents(t *testing.T) {
+	ctx := context.Background()
+	localPath := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(localPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("写入本地测试文件失败: %v", err)
+	}
+	parents := false
+	client := &fakeGroupFSClient{
+		aid: "alice.agentid.pub",
+		responses: map[string]any{
+			"group.fs.check_upload":    map[string]any{"instant": true, "session_id": "instant-no-parents"},
+			"group.fs.complete_upload": map[string]any{"type": "file", "path": "g-team.agentid.pub:/nested/a.txt"},
+		},
+	}
+	fs := NewGroupFSVFS(client)
+
+	if _, err := fs.Cp(ctx, localPath, "g-team.agentid.pub:/nested/a.txt", &GroupFSCpOptions{ParentsSet: &parents}); err != nil {
+		t.Fatalf("Cp local->group 显式 parents=false 失败: %v", err)
+	}
+	if client.calls[0].params["parents"] != false {
+		t.Fatalf("Go group.fs local->group 显式 parents=false 未生效: %#v", client.calls[0].params)
+	}
+	if _, ok := client.calls[0].params["parentsSet"]; ok {
+		t.Fatalf("SDK 内部 parentsSet 不应透传到 RPC: %#v", client.calls[0].params)
+	}
+}
+
 func TestGroupFSCpLocalToGroupRejectsExistingTargetWithoutForce(t *testing.T) {
 	ctx := context.Background()
 	localPath := filepath.Join(t.TempDir(), "a.txt")
@@ -449,6 +484,9 @@ func TestGroupFSCpGroupToLocalDownloadsTicketAndWritesFile(t *testing.T) {
 	}
 	if string(body) != string(data) || result.Download.LocalPath != target || !result.Download.Verified {
 		t.Fatalf("下载结果不正确: result=%#v body=%q", result, string(body))
+	}
+	if len(result.Download.Data) != 0 {
+		t.Fatalf("group->local 下载写入本地文件时不应在结果中保留内存数据: %d bytes", len(result.Download.Data))
 	}
 	if len(client.calls) != 1 || client.calls[0].method != "group.fs.create_download_ticket" || client.calls[0].params["path"] != "g-team.agentid.pub:/docs/a.md" {
 		t.Fatalf("group->local 调用不正确: %#v", client.calls)

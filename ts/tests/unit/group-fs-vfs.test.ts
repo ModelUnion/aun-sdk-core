@@ -17,6 +17,8 @@ const GROUP_FS_POSIX_METHODS = [
   'mkdir',
   'setAcl',
   'removeAcl',
+  'getAcl',
+  'listAcl',
   'rm',
   'cp',
   'mv',
@@ -78,6 +80,15 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
     }
   });
 
+  it('group.send/pull 缺少 group_id 时不发起 RPC', async () => {
+    const client = new FakeClient();
+    const group = new GroupFacade(client);
+
+    expect(() => group.send({ payload: { text: 'hi' } })).toThrow(/group_id cannot be empty/);
+    expect(() => group.pull({ group_id: '   ', limit: 10 })).toThrow(/group_id cannot be empty/);
+    expect(client.calls).toEqual([]);
+  });
+
   it('POSIX 方法调用 group.fs.* 并过滤 null/undefined', async () => {
     const client = new FakeClient();
     const fs = new GroupFacade(client).fs;
@@ -89,6 +100,8 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
     await fs.mkdir('g-team.agentid.pub:/docs/new', { parents: true });
     await fs.setAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin', perms: 'rwx' });
     await fs.removeAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin' });
+    await fs.getAcl('g-team.agentid.pub:/archive');
+    await fs.listAcl('g-team.agentid.pub:/archive');
     await fs.rm('g-team.agentid.pub:/docs/old.md', { recursive: false, force: true });
     await fs.cp('g-team.agentid.pub:/docs/a.md', 'g-team.agentid.pub:/docs/b.md', { force: true });
     await fs.mv('g-team.agentid.pub:/docs/b.md', 'g-team.agentid.pub:/docs/c.md');
@@ -104,6 +117,8 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
       'group.fs.mkdir',
       'group.fs.set_acl',
       'group.fs.remove_acl',
+      'group.fs.get_acl',
+      'group.fs.list_acl',
       'group.fs.rm',
       'group.fs.cp',
       'group.fs.mv',
@@ -119,9 +134,17 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
       method: 'group.fs.remove_acl',
       params: { path: 'g-team.agentid.pub:/archive', grantee_aid: 'role:admin' },
     });
+    expect(client.calls[7]).toEqual({
+      method: 'group.fs.get_acl',
+      params: { path: 'g-team.agentid.pub:/archive' },
+    });
+    expect(client.calls[8]).toEqual({
+      method: 'group.fs.list_acl',
+      params: { path: 'g-team.agentid.pub:/archive' },
+    });
     expect(client.calls[0].params).toEqual({ path: 'g-team.agentid.pub:/docs', page: 1, size: 20 });
     expect(client.calls[4].params).toEqual({ path: 'g-team.agentid.pub:/docs/new', parents: true });
-    expect(client.calls[8].params).toEqual({
+    expect(client.calls[10].params).toEqual({
       src: 'g-team.agentid.pub:/docs/a.md',
       dst: 'g-team.agentid.pub:/docs/b.md',
       force: true,
@@ -308,35 +331,16 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
     }
   });
 
-  it('cp blob -> group 走同一上传控制面但不读取本地路径', async () => {
-    const data = new Blob(['blob group'], { type: 'text/plain' });
-    const digest = sha256Hex(new TextEncoder().encode('blob group'));
+  it('cp 非字符串源不属于 TS Node SDK 能力', async () => {
     const client = new FakeClient();
-    client.responses = {
-      'group.fs.check_upload': { instant: true, session_id: 'instant-1' },
-      'group.fs.complete_upload': { type: 'file', path: 'g-team.agentid.pub:/blob.txt' },
-    };
-    const lowlevel = new FakeLowLevel();
     const fs = new GroupFacade(client).fs;
-    fs.lowlevel = lowlevel;
 
-    await fs.cp(data, 'g-team.agentid.pub:/blob.txt', { contentType: 'text/plain' });
+    await expect(
+      // @ts-expect-error TS Node SDK 的 group.fs.cp 源必须是本地路径或 group 路径字符串
+      fs.cp(new TextEncoder().encode('node bytes'), 'g-team.agentid.pub:/bytes.txt'),
+    ).rejects.toThrow();
 
-    expect(client.calls.map((c) => c.method)).toEqual([
-      'group.fs.check_upload',
-      'group.fs.complete_upload',
-    ]);
-    expect(client.calls[0].params).toMatchObject({
-      path: 'g-team.agentid.pub:/blob.txt',
-      size_bytes: 10,
-      sha256: digest,
-      content_type: 'text/plain',
-    });
-    expect(client.calls[1].params).toMatchObject({
-      skip_blob: true,
-      session_id: 'instant-1',
-    });
-    expect(lowlevel.puts).toEqual([]);
+    expect(client.calls).toEqual([]);
   });
 
   it('cp local -> group 默认拒绝已存在目标，overwrite=true 才继续', async () => {
@@ -414,38 +418,6 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
-
-  it('cp group -> blob 返回内存数据，不把目标当成本地路径', async () => {
-    const data = new TextEncoder().encode('blob download');
-    const digest = sha256Hex(data);
-    const client = new FakeClient();
-    client.responses = {
-      'group.fs.create_download_ticket': {
-        download_url: 'https://download.example.test/blob-1',
-        sha256: digest,
-        content_type: 'text/plain',
-      },
-    };
-    const lowlevel = new FakeLowLevel(data);
-    const fs = new GroupFacade(client).fs;
-    fs.lowlevel = lowlevel;
-
-    const result = await fs.cp('g-team.agentid.pub:/docs/blob.txt', { kind: 'blob' });
-
-    expect(result).toMatchObject({
-      path: 'g-team.agentid.pub:/docs/blob.txt',
-      size: data.byteLength,
-      sha256: digest,
-      verified: true,
-    });
-    expect(result.data).toEqual(data);
-    expect(result.blob).toBeInstanceOf(Blob);
-    await expect(result.blob?.text()).resolves.toBe('blob download');
-    expect(client.calls).toEqual([{
-      method: 'group.fs.create_download_ticket',
-      params: { path: 'g-team.agentid.pub:/docs/blob.txt' },
-    }]);
   });
 
   it('cp group -> local 默认拒绝覆盖已有文件', async () => {

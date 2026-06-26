@@ -284,6 +284,8 @@ test.describe('Group FS 浏览器 SDK smoke', () => {
         }
 
         const grant = await owner.group.fs.setAcl(baseDir, { granteeAid: 'role:admin', perms: 'rwx' });
+        const acl = await owner.group.fs.getAcl(baseDir);
+        const listedAcl = await owner.group.fs.listAcl(baseDir);
         const body = `admin write after grant ${rid}`;
         const uploaded = await admin.group.fs.cp(body, `${baseDir}/granted.txt`, {
           force: true,
@@ -308,6 +310,8 @@ test.describe('Group FS 浏览器 SDK smoke', () => {
           skip: false,
           beforeGrantDenied,
           grantAction: (grant as any)?.acl_action,
+          aclHasAdmin: (((acl as any)?.acls ?? []) as any[]).some((item: any) => item?.grantee_aid === 'role:admin' && item?.perms === 'rwx'),
+          listedAclHasAdmin: (((listedAcl as any)?.acls ?? []) as any[]).some((item: any) => item?.grantee_aid === 'role:admin' && item?.perms === 'rwx'),
           uploadedType: (uploaded as any)?.type,
           downloadedText: textFromBytes((downloaded as any)?.data),
           revokeAction: (revoke as any)?.acl_action,
@@ -332,6 +336,8 @@ test.describe('Group FS 浏览器 SDK smoke', () => {
     expect(r.error ?? '').toBe('');
     expect(r.beforeGrantDenied).toBe(true);
     expect(r.grantAction).toBe('set_acl');
+    expect(r.aclHasAdmin).toBe(true);
+    expect(r.listedAclHasAdmin).toBe(true);
     expect(r.uploadedType).toBe('file');
     expect(r.downloadedText).toContain('admin write after grant');
     expect(r.revokeAction).toBe('remove_acl');

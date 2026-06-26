@@ -151,3 +151,67 @@ async def test_vfs_read_bytes_forwards_range_options():
             "bucket": "default",
         })
     ]
+
+
+@pytest.mark.asyncio
+async def test_vfs_touch_calls_fs_touch_contract():
+    client = _FakeClient({
+        "storage.fs.touch": {"type": "file", "path": "docs/empty.txt", "name": "empty.txt", "size": 0},
+    })
+    vfs = StorageVFS(client)
+
+    node = await vfs.touch("/docs/empty.txt", owner="alice.agentid.pub", parents=True, no_create=False, mtime=123)
+
+    assert node.path == "/docs/empty.txt"
+    assert client.calls == [
+        (
+            "storage.fs.touch",
+            {
+                "path": "docs/empty.txt",
+                "parents": True,
+                "no_create": False,
+                "mtime": 123,
+                "owner_aid": "alice.agentid.pub",
+                "bucket": "default",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vfs_du_aggregates_find_results_without_server_rpc():
+    client = _FakeClient({
+        "storage.fs.find": {
+            "nodes": [
+                {"type": "dir", "path": "docs/sub", "size": 0},
+                {"type": "file", "path": "docs/a.txt", "size_bytes": 3},
+                {"type": "file", "path": "docs/sub/b.txt", "size": 4},
+                {"type": "symlink", "path": "docs/latest", "size": 0},
+            ]
+        },
+    })
+    vfs = StorageVFS(client)
+
+    usage = await vfs.du("/docs", owner="alice.agentid.pub", max_depth=2)
+
+    assert usage == {
+        "path": "/docs",
+        "size_bytes": 7,
+        "file_count": 2,
+        "dir_count": 1,
+        "symlink_count": 1,
+        "max_depth": 2,
+        "truncated": False,
+    }
+    assert client.calls == [
+        (
+            "storage.fs.find",
+            {
+                "path": "docs",
+                "page": 1,
+                "page_size": 1000,
+                "owner_aid": "alice.agentid.pub",
+                "bucket": "default",
+            },
+        )
+    ]

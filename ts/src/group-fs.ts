@@ -35,18 +35,9 @@ export interface GroupFSLowLevel {
   httpGet(url: string, headers?: Record<string, string>): Promise<Uint8Array>;
 }
 
-export type GroupFSBlobSource = Blob | Uint8Array | ArrayBuffer;
-
-export interface GroupFSBlobTarget {
-  kind: 'blob';
-}
-
-export type GroupFSCopySource = string | GroupFSBlobSource;
-export type GroupFSCopyDestination = string | GroupFSBlobTarget;
-
-export interface GroupFSDownloadResult extends DownloadResult {
-  blob?: Blob;
-}
+export type GroupFSCopySource = string;
+export type GroupFSCopyDestination = string;
+export type GroupFSDownloadResult = DownloadResult;
 
 export interface GroupFSCopyOptions {
   [key: string]: unknown;
@@ -172,12 +163,6 @@ function sha256Hex(data: Uint8Array): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
-function toArrayBuffer(data: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(data);
-  return copy.buffer;
-}
-
 function contentTypeForPath(path: string): string {
   const ext = extname(path).toLowerCase();
   const known: Record<string, string> = {
@@ -202,36 +187,13 @@ function filenameFromGroupPath(path: string): string {
   return last && !last.includes(':') ? last : 'download';
 }
 
-function isBlobLike(value: unknown): value is Blob {
-  return typeof Blob !== 'undefined' && value instanceof Blob;
-}
-
-function isByteSource(value: unknown): value is GroupFSBlobSource {
-  return value instanceof Uint8Array || value instanceof ArrayBuffer || isBlobLike(value);
-}
-
-function isBlobTarget(value: unknown): value is GroupFSBlobTarget {
-  return isRecord(value) && value.kind === 'blob';
-}
-
 async function bytesFromSource(source: GroupFSCopySource): Promise<{ data: Uint8Array; contentType?: string; localPath?: string }> {
-  if (typeof source === 'string') {
-    const localPath = stripLocalPathPrefix(source);
-    const info = await stat(localPath);
-    if (info.isDirectory()) {
-      throw new StorageIsADirectoryError('directory upload is not supported by group.fs.cp yet', 'EISDIR', localPath);
-    }
-    return { data: new Uint8Array(await readFile(localPath)), localPath };
+  const localPath = stripLocalPathPrefix(source);
+  const info = await stat(localPath);
+  if (info.isDirectory()) {
+    throw new StorageIsADirectoryError('directory upload is not supported by group.fs.cp yet', 'EISDIR', localPath);
   }
-  if (source instanceof Uint8Array) return { data: new Uint8Array(source), contentType: 'application/octet-stream' };
-  if (source instanceof ArrayBuffer) return { data: new Uint8Array(source), contentType: 'application/octet-stream' };
-  if (isBlobLike(source)) {
-    return {
-      data: new Uint8Array(await source.arrayBuffer()),
-      contentType: source.type || 'application/octet-stream',
-    };
-  }
-  throw new StorageError('unsupported group.fs.cp source', 'EINVAL');
+  return { data: new Uint8Array(await readFile(localPath)), localPath };
 }
 
 async function statOrNull(path: string) {
@@ -345,6 +307,14 @@ export class GroupFSVFS {
     return this.call('group.fs.remove_acl', { ...rest, path, grantee_aid: grantee }, path);
   }
 
+  getAcl(path: string, options: GroupFSParams = {}): Promise<RpcResult> {
+    return this.call('group.fs.get_acl', { ...options, path }, path);
+  }
+
+  listAcl(path: string, options: GroupFSParams = {}): Promise<RpcResult> {
+    return this.call('group.fs.list_acl', { ...options, path }, path);
+  }
+
   rm(path: string, options: GroupFSParams & { recursive?: boolean; force?: boolean } = {}): Promise<RpcResult> {
     return this.call('group.fs.rm', {
       ...options,
@@ -359,11 +329,11 @@ export class GroupFSVFS {
     const srcGroupId = stringValue(options.src_group_id ?? options.srcGroupId);
     const dstGroupId = stringValue(options.dst_group_id ?? options.dstGroupId);
     const force = Boolean(options.force ?? options.overwrite ?? false);
-    const srcRemote = typeof src === 'string' && isGroupRemoteCopyPath(src, srcGroupId, sharedGroupId);
-    const dstRemote = typeof dst === 'string' && isGroupRemoteCopyPath(dst, dstGroupId, sharedGroupId);
+    const srcRemote = isGroupRemoteCopyPath(src, srcGroupId, sharedGroupId);
+    const dstRemote = isGroupRemoteCopyPath(dst, dstGroupId, sharedGroupId);
     const rest = remainingCopyOptions(options);
 
-    if (srcRemote && dstRemote && typeof src === 'string' && typeof dst === 'string') {
+    if (srcRemote && dstRemote) {
       const params: RpcParams = { ...rest, src, dst };
       if (sharedGroupId) params.group_id = sharedGroupId;
       if (srcGroupId) params.src_group_id = srcGroupId;
@@ -375,10 +345,7 @@ export class GroupFSVFS {
       return this.call('group.fs.cp', params, src);
     }
 
-    if (!srcRemote && dstRemote && typeof dst === 'string') {
-      if (!isByteSource(src) && typeof src !== 'string') {
-        throw new StorageError('unsupported group.fs.cp source', 'EINVAL');
-      }
+    if (!srcRemote && dstRemote) {
       return this.uploadSource(src, dst, {
         ...rest,
         group_id: dstGroupId || sharedGroupId || undefined,
@@ -391,7 +358,7 @@ export class GroupFSVFS {
       });
     }
 
-    if (srcRemote && typeof src === 'string' && (!dstRemote || isBlobTarget(dst))) {
+    if (srcRemote && !dstRemote) {
       return this.downloadRemote(src, dst, {
         ...rest,
         group_id: srcGroupId || sharedGroupId || undefined,
@@ -401,7 +368,7 @@ export class GroupFSVFS {
       });
     }
 
-    throw new StorageError('local-to-local copy is not handled by group.fs', 'EINVAL', typeof src === 'string' ? src : '');
+    throw new StorageError('local-to-local copy is not handled by group.fs', 'EINVAL', src);
   }
 
   async mv(src: string, dst: string, options: GroupFSParams & {
@@ -520,21 +487,17 @@ export class GroupFSVFS {
 
   private async downloadRemote(
     groupPath: string,
-    localPathOrBlob: GroupFSCopyDestination,
+    localPath: GroupFSCopyDestination,
     options: Record<string, unknown> & {
       force: boolean;
       verify_hash: boolean;
       onProgress?: (loaded: number, total: number) => void;
     },
   ): Promise<GroupFSDownloadResult> {
-    const localPath = typeof localPathOrBlob === 'string' ? stripLocalPathPrefix(localPathOrBlob) : localPathOrBlob;
-    if (typeof localPath === 'string') {
-      const existing = await statOrNull(localPath);
-      if (existing && !existing.isDirectory() && !options.force) {
-        throw new StorageExistsError(`local path already exists: ${localPath}`, 'EEXIST', localPath);
-      }
-    } else if (!isBlobTarget(localPath)) {
-      throw new StorageError('unsupported group.fs.cp destination', 'EINVAL', groupPath);
+    const initialTargetPath = stripLocalPathPrefix(localPath);
+    const existing = await statOrNull(initialTargetPath);
+    if (existing && !existing.isDirectory() && !options.force) {
+      throw new StorageExistsError(`local path already exists: ${initialTargetPath}`, 'EEXIST', initialTargetPath);
     }
 
     const ticketParams = stripNil({
@@ -553,16 +516,14 @@ export class GroupFSVFS {
       throw new StorageError('group.fs.create_download_ticket did not return download_url', 'ESTORAGE', groupPath, ticket);
     }
 
-    let targetPath = typeof localPath === 'string' ? localPath : '';
-    if (targetPath) {
-      const targetInfo = await statOrNull(targetPath);
-      if (targetInfo?.isDirectory()) {
-        const fileName = stringValue(ticket.file_name ?? ticket.name) || filenameFromGroupPath(groupPath);
-        targetPath = join(targetPath, fileName);
-        const fileInfo = await statOrNull(targetPath);
-        if (fileInfo && !options.force) {
-          throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
-        }
+    let targetPath = initialTargetPath;
+    const targetInfo = await statOrNull(targetPath);
+    if (targetInfo?.isDirectory()) {
+      const fileName = stringValue(ticket.file_name ?? ticket.name) || filenameFromGroupPath(groupPath);
+      targetPath = join(targetPath, fileName);
+      const fileInfo = await statOrNull(targetPath);
+      if (fileInfo && !options.force) {
+        throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
       }
     }
 
@@ -573,18 +534,6 @@ export class GroupFSVFS {
     const verified = !options.verify_hash || !expectedSha || actualSha.toLowerCase() === expectedSha.toLowerCase();
     if (options.verify_hash && !verified) {
       throw new StorageConflictError('download hash verification failed', 'ECONFLICT', groupPath, ticket);
-    }
-
-    if (!targetPath) {
-      const contentType = stringValue(ticket.content_type) || 'application/octet-stream';
-      return {
-        path: groupPath,
-        size: data.byteLength,
-        sha256: expectedSha || actualSha,
-        verified,
-        data,
-        blob: typeof Blob !== 'undefined' ? new Blob([toArrayBuffer(data)], { type: contentType }) : undefined,
-      };
     }
 
     await mkdir(dirname(targetPath), { recursive: true });
@@ -622,7 +571,6 @@ export class GroupFSVFS {
       size: data.byteLength,
       sha256: expectedSha || actualSha,
       verified,
-      data,
     };
   }
 }

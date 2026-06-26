@@ -582,7 +582,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 `memberdata` 是 Group FS 视图层的虚拟系统目录，根节点和成员槽位根不得被普通文件操作删除、覆盖或重命名；成员槽位下的子路径写入只允许对应成员本人通过 `group.fs.*` 完成。完整保护规则见 [16-系统目录保护方案.md](16-系统目录保护方案.md)。
 
-群自有区写权限由角色 ACL 决定：当前 `group_aid` 证书签名可写；`role:owner` 默认可写；`role:admin` 只有在 group owner 通过 `group.fs.set_acl` 显式授权后才可写。授权和撤销的是 `role:admin` 角色策略，不与某个 admin 成员绑定；成员升降级、退群、踢出不会联动 ACL。成员数据区写入只允许对应成员本人。
+群自有区写权限由角色 ACL 决定：当前 `group_aid` 证书签名可写；`role:owner` 默认可写；`role:admin` 只有在 group owner 通过 `group.fs.set_acl` 显式授权后才可写。授权、撤销和查询的是 `role:admin` 角色策略，不与某个 admin 成员绑定；成员升降级、退群、踢出不会联动 ACL。成员数据区写入只允许对应成员本人。角色 ACL 对外使用 POSIX 权限位，删除权限显示为 `x`。
 
 | 方法 | 说明 |
 |------|------|
@@ -594,6 +594,8 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `group.fs.create_download_ticket` | 创建下载票据，SDK 使用票据执行数据面下载 |
 | `group.fs.set_acl` | owner 授予群自有区 `role:admin` 写 ACL |
 | `group.fs.remove_acl` | owner 撤销群自有区 `role:admin` 写 ACL |
+| `group.fs.get_acl` | owner 查询群自有区角色 ACL |
+| `group.fs.list_acl` | owner 查询群自有区角色 ACL（别名） |
 | `group.fs.mkdir` | 创建目录 |
 | `group.fs.rm` | 删除节点 |
 | `group.fs.cp` | group→group 远程复制；本地上传/下载由 SDK 数据面编排 |
@@ -604,7 +606,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `group.fs.mount` | 挂载成员数据区 |
 | `group.fs.umount` | 卸载成员数据区 |
 
-`group.fs.set_acl/remove_acl` 只允许当前 group owner 调用，`grantee_aid` 当前只允许 `role:admin`；底层由 group 服务以内部门面调用 storage ACL，不允许客户端直接对 `group_aid` 空间设置 `role:*`。逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准，详细设计见 `docs/aun-fs/group-fs/`。
+`group.fs.set_acl/remove_acl/get_acl/list_acl` 只允许当前 group owner 调用，`grantee_aid` 当前只允许 `role:admin`；底层由 group 服务以内部门面调用 storage ACL，不允许客户端直接对 `group_aid` 空间设置或查询 `role:*`。逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准，详细设计见 `docs/aun-fs/group-fs/`。
 
 ---
 

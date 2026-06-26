@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .validators import validate_group_id_format
+
 
 class _RpcFacade:
     def __init__(self, client: Any, prefix: str) -> None:
@@ -168,13 +170,17 @@ class GroupFacade(_RpcFacade):
         return await self._call("info", params, **kwargs)
 
     async def send(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("send", params, **kwargs)
+        merged = self._params(params, **kwargs)
+        validate_group_id_format(merged.get("group_id"))
+        return await self._call("send", merged)
 
     async def recall(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("recall", params, **kwargs)
 
     async def pull(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("pull", params, **kwargs)
+        merged = self._params(params, **kwargs)
+        validate_group_id_format(merged.get("group_id"))
+        return await self._call("pull", merged)
 
     async def pull_events(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("pull_events", params, **kwargs)

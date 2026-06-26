@@ -689,6 +689,10 @@ class CrossSdkJsAgent {
             ...options,
             grantee_aid: textOf(params.grantee_aid ?? params.granteeAid).trim() || 'role:admin',
           });
+        case 'get_acl':
+          return await groupFs.getAcl(path, options);
+        case 'list_acl':
+          return await groupFs.listAcl(path, options);
         case 'rm':
           return await groupFs.rm(path, {
             ...options,
@@ -851,6 +855,15 @@ class CrossSdkJsAgent {
         return await storage.lstat(path, { owner, bucket, token });
       case 'mkdir':
         return await storage.mkdir(path, { owner, bucket, parents: Boolean(params.parents) });
+      case 'touch':
+        return await storage.touch(path, {
+          owner,
+          bucket,
+          parents: Boolean(params.parents),
+          noCreate: Boolean(params.no_create ?? params.noCreate),
+          mtime: params.mtime == null ? undefined : Number(params.mtime),
+          followSymlinks: Boolean(params.follow_symlinks ?? params.followSymlinks),
+        });
       case 'remove':
         return await storage.remove(path, { owner, bucket, recursive: Boolean(params.recursive) });
       case 'rename':
@@ -872,6 +885,14 @@ class CrossSdkJsAgent {
         });
       case 'df':
         return await storage.df({ owner, bucket });
+      case 'du':
+        return await storage.du(path, {
+          owner,
+          bucket,
+          maxDepth: params.max_depth == null && params.maxDepth == null ? undefined : Number(params.max_depth ?? params.maxDepth),
+          pageSize: Number(params.page_size ?? params.pageSize ?? 1000) || 1000,
+          token,
+        });
       case 'symlink':
         return await storage.symlink(textOf(params.target), path, { owner, bucket, overwrite: Boolean(params.overwrite) });
       case 'readlink':

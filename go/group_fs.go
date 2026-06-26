@@ -176,6 +176,7 @@ type GroupFSCpOptions struct {
 	Force           bool
 	Recursive       bool
 	Parents         bool
+	ParentsSet      *bool
 	FollowSymlinks  *bool
 	ContentType     string
 	Metadata        map[string]any
@@ -377,6 +378,24 @@ func (v *GroupFSVFS) RemoveACL(ctx context.Context, p string, opts *GroupFSAclOp
 	return v.call(ctx, "group.fs.remove_acl", params, p)
 }
 
+func (v *GroupFSVFS) GetACL(ctx context.Context, p string, opts *GroupFSAclOptions) (map[string]any, error) {
+	params := map[string]any{"path": p}
+	if opts != nil {
+		params = groupFSParams(params, opts.Extra)
+		groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
+	}
+	return v.call(ctx, "group.fs.get_acl", params, p)
+}
+
+func (v *GroupFSVFS) ListACL(ctx context.Context, p string, opts *GroupFSAclOptions) (map[string]any, error) {
+	params := map[string]any{"path": p}
+	if opts != nil {
+		params = groupFSParams(params, opts.Extra)
+		groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
+	}
+	return v.call(ctx, "group.fs.list_acl", params, p)
+}
+
 func (v *GroupFSVFS) Rm(ctx context.Context, p string, opts *GroupFSRmOptions) (GroupFSRemoveResult, error) {
 	params := map[string]any{"path": p, "recursive": false, "force": false}
 	if opts != nil {
@@ -558,13 +577,19 @@ func (v *GroupFSVFS) uploadLocalFile(ctx context.Context, localPath, groupPath s
 	sum := sha256.Sum256(data)
 	shaHex := fmt.Sprintf("%x", sum[:])
 	contentTyp := firstNonEmpty(opts.ContentType, groupFSContentTypeForPath(localPath))
+	parents := true
+	if opts.ParentsSet != nil {
+		parents = *opts.ParentsSet
+	} else if opts.Parents {
+		parents = true
+	}
 	baseParams := map[string]any{
 		"path":         groupPath,
 		"size_bytes":   len(data),
 		"sha256":       shaHex,
 		"content_type": contentTyp,
 		"force":        opts.Force,
-		"parents":      true,
+		"parents":      parents,
 		"metadata":     opts.Metadata,
 	}
 	if opts.ExpectedVersion != nil {
@@ -574,6 +599,8 @@ func (v *GroupFSVFS) uploadLocalFile(ctx context.Context, localPath, groupPath s
 		groupFSAddGroupParams(baseParams, opts.GroupID, "", opts.DstGroupID)
 	}
 	baseParams = groupFSParams(baseParams, opts.Extra)
+	delete(baseParams, "parentsSet")
+	delete(baseParams, "parents_set")
 	groupFSAddSigningParams(baseParams, opts.SignAs, opts.AidStore)
 
 	check, err := v.call(ctx, "group.fs.check_upload", mapCopy(baseParams), groupPath)
@@ -701,7 +728,6 @@ func (v *GroupFSVFS) downloadRemoteFile(ctx context.Context, groupPath, localPat
 		Size:      int64(len(data)),
 		SHA256:    firstNonEmpty(expectedSHA, actualSHA),
 		Verified:  verified,
-		Data:      data,
 	}, nil
 }
 

@@ -65,6 +65,15 @@ type MkdirOptions struct {
 	Parents bool
 }
 
+type TouchOptions struct {
+	Owner          string
+	Bucket         string
+	Parents        bool
+	NoCreate       bool
+	MTime          *int64
+	FollowSymlinks bool
+}
+
 type RemoveOptions struct {
 	Owner     string
 	Bucket    string
@@ -96,6 +105,14 @@ type FindOptions struct {
 	Size     string
 	MTime    string
 	Page     int
+	PageSize int
+	Token    string
+}
+
+type DuOptions struct {
+	Owner    string
+	Bucket   string
+	MaxDepth *int
 	PageSize int
 	Token    string
 }
@@ -455,7 +472,6 @@ func (v *StorageVFS) DownloadFile(ctx context.Context, remotePath, localPath str
 		Size:      int64(len(data)),
 		SHA256:    firstNonEmpty(expectedSHA, actualSHA),
 		Verified:  verified,
-		Data:      data,
 	}, nil
 }
 
@@ -537,6 +553,17 @@ func (v *StorageVFS) Mkdir(ctx context.Context, p string, opts *MkdirOptions) (N
 	return NodeViewFromAny(firstNonNil(raw["node"], raw)), nil
 }
 
+func (v *StorageVFS) Touch(ctx context.Context, p string, opts *TouchOptions) (NodeView, error) {
+	if opts == nil {
+		opts = &TouchOptions{}
+	}
+	raw, err := v.low.FSTouch(ctx, v.owner(opts.Owner), bucket(opts.Bucket), StoragePathToKey(p), opts.Parents, opts.NoCreate, opts.MTime, opts.FollowSymlinks)
+	if err != nil {
+		return NodeView{}, err
+	}
+	return NodeViewFromAny(firstNonNil(raw["node"], raw)), nil
+}
+
 func (v *StorageVFS) Remove(ctx context.Context, p string, opts *RemoveOptions) (RemoveResult, error) {
 	if opts == nil {
 		opts = &RemoveOptions{}
@@ -587,6 +614,61 @@ func (v *StorageVFS) Find(ctx context.Context, p string, opts *FindOptions) ([]N
 		nodes = append(nodes, NodeViewFromAny(item))
 	}
 	return nodes, nil
+}
+
+func (v *StorageVFS) Du(ctx context.Context, p string, opts *DuOptions) (map[string]any, error) {
+	if opts == nil {
+		opts = &DuOptions{}
+	}
+	pageSize := opts.PageSize
+	if pageSize <= 0 {
+		pageSize = 1000
+	}
+	nodes, err := v.Find(ctx, p, &FindOptions{Owner: opts.Owner, Bucket: opts.Bucket, Page: 1, PageSize: pageSize, Token: opts.Token})
+	if err != nil {
+		return nil, err
+	}
+	root := strings.Trim(NormalizeStoragePath(p), "/")
+	rootDepth := 0
+	if root != "" {
+		rootDepth = len(strings.Split(root, "/"))
+	}
+	var sizeBytes int64
+	fileCount, dirCount, symlinkCount := 0, 0, 0
+	truncated := false
+	for _, node := range nodes {
+		nodePath := strings.Trim(NormalizeStoragePath(node.Path), "/")
+		depth := 0
+		if nodePath != "" {
+			depth = len(strings.Split(nodePath, "/")) - rootDepth
+		}
+		if opts.MaxDepth != nil && depth > *opts.MaxDepth {
+			truncated = true
+			continue
+		}
+		switch node.Type {
+		case "file":
+			fileCount++
+			sizeBytes += node.Size
+		case "dir":
+			dirCount++
+		case "symlink":
+			symlinkCount++
+		}
+	}
+	var maxDepth any
+	if opts.MaxDepth != nil {
+		maxDepth = *opts.MaxDepth
+	}
+	return map[string]any{
+		"path":          NormalizeStoragePath(p),
+		"size_bytes":    sizeBytes,
+		"file_count":    fileCount,
+		"dir_count":     dirCount,
+		"symlink_count": symlinkCount,
+		"max_depth":     maxDepth,
+		"truncated":     truncated,
+	}, nil
 }
 
 func (v *StorageVFS) DF(ctx context.Context, opts *UsageOptions) (UsageView, error) {

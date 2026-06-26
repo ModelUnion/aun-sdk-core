@@ -470,6 +470,16 @@ export class StorageLowLevel {
     }), options.path);
   }
 
+  fsTouch(options: LowLevelBaseOptions & { path: string; parents?: boolean; noCreate?: boolean; mtime?: number; followSymlinks?: boolean }): Promise<StorageRaw> {
+    return this.call('storage.fs.touch', params(options.owner, options.bucket, {
+      path: options.path,
+      parents: options.parents ?? false,
+      no_create: options.noCreate ?? false,
+      mtime: options.mtime,
+      follow_symlinks: options.followSymlinks ?? false,
+    }), options.path);
+  }
+
   fsRemove(options: LowLevelBaseOptions & { path: string; recursive?: boolean }): Promise<StorageRaw> {
     return this.call('storage.fs.remove', params(options.owner, options.bucket, {
       path: options.path,

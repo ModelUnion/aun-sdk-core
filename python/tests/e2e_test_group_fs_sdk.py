@@ -169,6 +169,12 @@ async def test_group_fs_admin_role_acl_grant_and_revoke(tmp_path: Path) -> None:
         grant = await owner.group.fs.set_acl(base_dir, grantee_aid="role:admin", perms="rwx")
         if grant.get("acl_action") != "set_acl":
             raise AssertionError(f"group.fs.set_acl 返回异常: {grant}")
+        acl = await owner.group.fs.get_acl(base_dir)
+        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:admin" and item.get("perms") == "rwx" for item in acl.get("acls", [])):
+            raise AssertionError(f"group.fs.get_acl 未返回 role:admin:rwx: {acl}")
+        listed_acl = await owner.group.fs.list_acl(base_dir)
+        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:admin" and item.get("perms") == "rwx" for item in listed_acl.get("acls", [])):
+            raise AssertionError(f"group.fs.list_acl 未返回 role:admin:rwx: {listed_acl}")
 
         uploaded = await admin.group.fs.cp(str(granted), f"{base_dir}/granted.txt", force=True, parents=True)
         if str(uploaded.get("type") or "") != "file":

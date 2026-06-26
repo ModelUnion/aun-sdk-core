@@ -19,10 +19,10 @@
 | [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · 测试数据保护 |
 | [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
-| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group.fs.*` 群文件系统 RPC、群自有区写授权和 `parents` 语义） |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group.fs.*` 群文件系统 RPC、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义） |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
 | [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 标签 / GC / reflog / revert） |
-| [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md) | 下一版 `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计，含群自有区写授权、`parents` 和 JS string 语义 |
+| [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md) | `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计，含群自有区角色 ACL、`parents` 和 JS string 语义 |
 | [group.fs POSIX 化分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md) | group.fs 重构的 IPO、Step-by-step、用例集、Checklist、验收和回滚 |
 | [AUN Storage架构设计](<AUN Storage架构设计.md>) | Storage SDK VFS、控制面/数据面分离、服务端分层、类 Linux 权限、mount/symlink 与关键时序 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
@@ -63,10 +63,10 @@
 - `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
-- Group RPC 与群文件系统 `group.fs.*` 控制面、群自有区写授权和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
+- Group RPC 与群文件系统 `group.fs.*` 控制面、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
 - 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs`、`cp/mv` POSIX 化语义和 JS string 差异 → [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
-- Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
+- Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / `storage.fs.touch` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
 - Collab RPC（`collab.*` 版本化文档、乐观锁、标签、GC、reflog、revert）→ [09-collab-rpc-manual](09-collab-rpc-manual.md)
 - Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)

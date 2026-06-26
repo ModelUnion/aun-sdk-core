@@ -3,9 +3,9 @@ Storage POSIX VFS
 =================
 
 演示 client.storage（StorageVFS 门面）的类 Linux 文件系统操作：
-write_bytes / list / stat / mkdir / symlink / set_acl / df。
+write_bytes / list / stat / lstat / touch / mkdir / symlink / set_acl / df。
 
-VFS 在对象存储之上提供 ls/find/df/stat/mkdir/rm/mv/cp/mount 语义，
+VFS 在对象存储之上提供 ls/find/df/du/stat/lstat/touch/mkdir/rm/mv/cp/mount 语义，
 寻址统一为 <AID>:<Unix 绝对路径>。
 """
 

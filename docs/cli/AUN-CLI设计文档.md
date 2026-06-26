@@ -189,9 +189,10 @@ active_group = "group.agentid.pub/10042"
 - `mkdir` / `rm`
 - `cp` / `mv`
 - `df`
+- `setfacl` / `getfacl`
 - `mount` / `umount`
 
-群自有区写入需要按服务端要求使用 `group_aid` 身份签名，CLI 通过 `--as` 传入操作者 AID。
+群自有区写入需要按服务端要求使用 `group_aid` 身份签名，CLI 通过 `--as` 传入操作者 AID。角色 ACL 命令只管理 `role:admin`：`setfacl -m role:admin:rwx` 授权，`setfacl -x role:admin` 撤销，`getfacl` 查询。
 
 ### 7.5 Storage VFS
 
@@ -199,8 +200,8 @@ active_group = "group.agentid.pub/10042"
 
 主要命令：
 
-- 读侧：`ls`、`stat`、`cat`、`find`、`df`
-- 写侧：`cp`、`mv`、`rm`、`mkdir`、`ln -s`
+- 读侧：`ls`、`stat`、`cat`、`find`、`df`、`quota`、`du`
+- 写侧：`cp`、`mv`、`rm`、`mkdir`、`touch`、`ln -s`
 - 权限：`chmod`、`setfacl`、`getfacl`
 - 挂载：`mount`、`approve`、`reject`、`umount`
 - token：`token issue`、`token revoke`、`token ls`

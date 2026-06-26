@@ -290,6 +290,14 @@ func (l *StorageLowLevel) FSMkdir(ctx context.Context, owner, bucket, p string, 
 	return l.call(ctx, "storage.fs.mkdir", storageParams(owner, bucket, map[string]any{"path": p, "parents": parents}), p)
 }
 
+func (l *StorageLowLevel) FSTouch(ctx context.Context, owner, bucket, p string, parents, noCreate bool, mtime *int64, followSymlinks bool) (map[string]any, error) {
+	extra := map[string]any{"path": p, "parents": parents, "no_create": noCreate, "follow_symlinks": followSymlinks}
+	if mtime != nil {
+		extra["mtime"] = *mtime
+	}
+	return l.call(ctx, "storage.fs.touch", storageParams(owner, bucket, extra), p)
+}
+
 func (l *StorageLowLevel) FSRemove(ctx context.Context, owner, bucket, p string, recursive bool) (map[string]any, error) {
 	return l.call(ctx, "storage.fs.remove", storageParams(owner, bucket, map[string]any{"path": p, "recursive": recursive}), p)
 }

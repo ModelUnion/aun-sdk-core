@@ -174,6 +174,19 @@ async def main() -> None:
             _ok("cp_mv_rm_via_fs_rpc")
         except Exception as exc:
             _fail("cp_mv_rm_via_fs_rpc", str(exc))
+
+        try:
+            touched = _cmd(env, "fs", "touch", "--parents", "--mtime", "1700000000", f"{_ALICE_AID}:/{root}/docs/touched.txt")
+            stat = _cmd(env, "fs", "stat", f"{_ALICE_AID}:/{root}/docs/touched.txt")
+            du = _cmd(env, "fs", "du", f"{_ALICE_AID}:/{root}/docs")
+            quota = _cmd(env, "fs", "quota", f"{_ALICE_AID}:/")
+            if touched.get("type") != "file" or stat.get("mtime") != 1_700_000_000_000:
+                raise AssertionError(f"touch/stat 返回异常: touched={touched} stat={stat}")
+            if int(du.get("file_count") or 0) < 2 or int(quota.get("used_bytes") or 0) < 0:
+                raise AssertionError(f"du/quota 返回异常: du={du} quota={quota}")
+            _ok("touch_du_quota_via_fs_rpc")
+        except Exception as exc:
+            _fail("touch_du_quota_via_fs_rpc", str(exc))
     finally:
         try:
             _cmd(env, "fs", "rm", "-r", f"{_ALICE_AID}:/{root}")

@@ -90,7 +90,7 @@ describe('Group FS TypeScript Docker 集成', () => {
       expect((found.items ?? []).some((item: any) => item.name === 'renamed.txt')).toBe(true);
 
       const result = await owner.group.fs.cp(`${baseDir}/note.txt`, downloaded, { force: true }) as Record<string, any>;
-      expect(Buffer.from(result.data ?? []).toString('utf-8')).toBe(body);
+      expect(result.localPath ?? result.local_path).toBe(downloaded);
       expect(fs.readFileSync(downloaded, 'utf-8')).toBe(body);
 
       const removed = await owner.group.fs.rm(baseDir, { recursive: true, force: true, ...signOptions }) as Record<string, any>;
@@ -142,6 +142,10 @@ describe('Group FS TypeScript Docker 集成', () => {
 
       const grant = await owner.group.fs.setAcl(baseDir, { granteeAid: 'role:admin', perms: 'rwx' }) as Record<string, any>;
       expect(grant.acl_action).toBe('set_acl');
+      const acl = await owner.group.fs.getAcl(baseDir) as Record<string, any>;
+      expect((acl.acls ?? []).some((item: any) => item.grantee_aid === 'role:admin' && item.perms === 'rwx')).toBe(true);
+      const listedAcl = await owner.group.fs.listAcl(baseDir) as Record<string, any>;
+      expect((listedAcl.acls ?? []).some((item: any) => item.grantee_aid === 'role:admin' && item.perms === 'rwx')).toBe(true);
       const uploaded = await admin.group.fs.cp(granted, `${baseDir}/granted.txt`, { force: true, parents: true }) as Record<string, any>;
       expect(uploaded.type).toBe('file');
 

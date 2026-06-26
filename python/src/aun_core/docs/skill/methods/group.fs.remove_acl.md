@@ -25,4 +25,5 @@ ACL 操作结果，包含 `acl_action="remove_acl"`、`removed`、`group_aid`、
 ## 相关方法
 
 - [group.fs.set_acl](group.fs.set_acl.md) — 授予 admin 角色写 ACL
+- [group.fs.get_acl](group.fs.get_acl.md) — 查询 admin 角色 ACL
 - [storage.remove_acl](storage.remove_acl.md) — AID storage 写授权撤销

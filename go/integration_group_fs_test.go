@@ -137,7 +137,7 @@ func TestIntegration_GroupFSFacadeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Group().FS().Cp 下载失败: %v", err)
 	}
-	if downloaded.Direction != "group_to_local" || !bytes.Equal(downloaded.Download.Data, body) {
+	if downloaded.Direction != "group_to_local" || downloaded.Download.LocalPath != downloadPath || len(downloaded.Download.Data) != 0 {
 		t.Fatalf("Cp 下载返回异常: %#v", downloaded)
 	}
 	localRead, err := os.ReadFile(downloadPath)
@@ -244,8 +244,9 @@ func TestIntegration_GroupFSAdminRoleACLGrantAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("owner 读取 admin 写入失败: %v", err)
 	}
-	if !bytes.Equal(downloaded.Download.Data, body) {
-		t.Fatalf("owner 读取 admin 写入内容异常: %#v", downloaded)
+	localRead, err := os.ReadFile(downloadPath)
+	if err != nil || !bytes.Equal(localRead, body) || len(downloaded.Download.Data) != 0 {
+		t.Fatalf("owner 读取 admin 写入内容异常: downloaded=%#v body=%q err=%v", downloaded, string(localRead), err)
 	}
 
 	revoked, err := owner.Group().FS().RemoveACL(ctx, baseDir, &GroupFSAclOptions{GranteeAID: "role:admin"})

@@ -176,7 +176,7 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			return err
 		}, "group.update_announcement"},
 		{"send", func() error {
-			_, err := group.Send(ctx, map[string]any{"group_id": "g1", "payload": map[string]any{"text": "hi"}})
+			_, err := group.Send(ctx, map[string]any{"group_id": "g-test", "payload": map[string]any{"text": "hi"}})
 			return err
 		}, "group.send"},
 		{"recall", func() error {
@@ -184,7 +184,7 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			return err
 		}, "group.recall"},
 		{"pull", func() error {
-			_, err := group.Pull(ctx, map[string]any{"group_id": "g1", "after_message_seq": 1})
+			_, err := group.Pull(ctx, map[string]any{"group_id": "g-test", "after_message_seq": 1})
 			return err
 		}, "group.pull"},
 		{"pull_events", func() error {
@@ -232,6 +232,26 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.calls[6].params, map[string]any{}) {
 		t.Fatalf("nil params 应转换为空 map: %#v", client.calls[6].params)
+	}
+}
+
+func TestGroupFacadeSendPullRequireGroupIDBeforeRPC(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeStorageClient{aid: "alice.agentid.pub"}
+	group := newGroupFacade(client)
+
+	if _, err := group.Send(ctx, map[string]any{"payload": map[string]any{"text": "hi"}}); err == nil {
+		t.Fatal("group.Send 缺少 group_id 应直接返回 ValidationError")
+	} else if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("group.Send 错误类型应为 ValidationError: %T %v", err, err)
+	}
+	if _, err := group.Pull(ctx, map[string]any{"group_id": "   ", "limit": 10}); err == nil {
+		t.Fatal("group.Pull 空 group_id 应直接返回 ValidationError")
+	} else if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("group.Pull 错误类型应为 ValidationError: %T %v", err, err)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("缺少 group_id 时不应发起 RPC: %#v", client.calls)
 	}
 }
 

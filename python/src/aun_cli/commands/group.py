@@ -589,6 +589,69 @@ def group_fs_df(
     output_json(_json_ready(result)) if is_json_mode() else output_dict(_json_ready(result))
 
 
+def _parse_group_acl_spec(spec: str, *, require_perms: bool) -> tuple[str, str | None]:
+    value = str(spec or "").strip()
+    parts = value.split(":")
+    if require_perms:
+        if len(parts) != 3 or parts[0] != "role" or parts[1] != "admin" or not parts[2]:
+            raise ValueError("group fs setfacl -m 格式应为 role:admin:<perms>")
+        return "role:admin", parts[2]
+    if value != "role:admin":
+        raise ValueError("group fs setfacl -x 格式应为 role:admin")
+    return "role:admin", None
+
+
+@fs_app.command("setfacl")
+def group_fs_setfacl(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="群 FS 路径"),
+    modify: Optional[str] = typer.Option(None, "-m", help="新增/更新 ACL，如 role:admin:rwx"),
+    remove: Optional[str] = typer.Option(None, "-x", help="移除 ACL，如 role:admin"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    set_json_mode(ctx.obj.get("json", False))
+    if bool(modify) == bool(remove):
+        output_error("group fs setfacl 必须且只能指定 -m 或 -x")
+        raise typer.Exit(2)
+    resolved_path, options = _resolve_group_fs_single_path(ctx, path)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            if modify:
+                grantee, perms = _parse_group_acl_spec(modify, require_perms=True)
+                return await client.group.fs.set_acl(resolved_path, grantee_aid=grantee, perms=perms or "rwx", **options)
+            grantee, _ = _parse_group_acl_spec(remove or "", require_perms=False)
+            return await client.group.fs.remove_acl(resolved_path, grantee_aid=grantee, **options)
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+    output_json(_json_ready(result)) if is_json_mode() else output_success("group fs setfacl 完成")
+
+
+@fs_app.command("getfacl")
+def group_fs_getfacl(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="群 FS 路径"),
+    as_aid: Optional[str] = typer.Option(None, "--as", help="操作者 AID"),
+) -> None:
+    set_json_mode(ctx.obj.get("json", False))
+    resolved_path, options = _resolve_group_fs_single_path(ctx, path)
+
+    async def _run():
+        async with CLISession(ctx, aid=as_aid) as client:
+            return await client.group.fs.get_acl(resolved_path, **options)
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+    output_json(_json_ready(result)) if is_json_mode() else output_dict(_json_ready(result))
+
+
 @fs_app.command("mount")
 def group_fs_mount(
     ctx: typer.Context,

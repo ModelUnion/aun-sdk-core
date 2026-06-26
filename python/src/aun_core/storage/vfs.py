@@ -542,6 +542,29 @@ class StorageVFS:
         result = await self.lowlevel.create_folder(owner=owner, bucket=bucket, path=key, parents=parents)
         return NodeView.from_folder(result.get("folder") or result)
 
+    async def touch(
+        self,
+        path: str,
+        *,
+        owner: str | None = None,
+        bucket: str = "default",
+        parents: bool = False,
+        no_create: bool = False,
+        mtime: int | None = None,
+        follow_symlinks: bool = False,
+    ) -> NodeView:
+        owner = self._owner(owner)
+        result = await self.lowlevel.fs_touch(
+            owner=owner,
+            bucket=bucket,
+            path=path_to_key(path),
+            parents=parents,
+            no_create=no_create,
+            mtime=mtime,
+            follow_symlinks=follow_symlinks,
+        )
+        return NodeView.from_any(result.get("node") or result)
+
     async def remove(
         self,
         path: str,
@@ -710,6 +733,48 @@ class StorageVFS:
         )
         items = result.get("nodes") or result.get("items") or []
         return [NodeView.from_any(item) for item in items]
+
+    async def du(
+        self,
+        path: str,
+        *,
+        owner: str | None = None,
+        bucket: str = "default",
+        max_depth: int | None = None,
+        page_size: int = 1000,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        nodes = await self.find(path, owner=owner, bucket=bucket, page_size=page_size, token=token)
+        root = normalize_path(path).rstrip("/")
+        root_depth = 0 if root == "" else len([part for part in root.split("/") if part])
+        size_bytes = 0
+        file_count = 0
+        dir_count = 0
+        symlink_count = 0
+        truncated = False
+        for node in nodes:
+            node_path = normalize_path(node.path)
+            depth = len([part for part in node_path.split("/") if part]) - root_depth
+            if max_depth is not None and depth > max_depth:
+                truncated = True
+                continue
+            node_type = str(node.type or "").lower()
+            if node_type == "file":
+                file_count += 1
+                size_bytes += int(node.size or 0)
+            elif node_type == "dir":
+                dir_count += 1
+            elif node_type == "symlink":
+                symlink_count += 1
+        return {
+            "path": normalize_path(path),
+            "size_bytes": size_bytes,
+            "file_count": file_count,
+            "dir_count": dir_count,
+            "symlink_count": symlink_count,
+            "max_depth": max_depth,
+            "truncated": truncated,
+        }
 
     async def df(self, *, owner: str | None = None, bucket: str = "default") -> UsageView:
         owner = self._owner(owner)

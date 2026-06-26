@@ -23,6 +23,26 @@ class _FakeStorage:
         self.calls.append(("list_acl", path, kwargs))
         return {"acls": [{"grantee_aid": "bob.agentid.pub", "perms": "r"}]}
 
+    async def lstat(self, path, **kwargs):
+        self.calls.append(("lstat", path, kwargs))
+        return {"type": "symlink", "path": path, "target": "/docs/a.txt"}
+
+    async def readlink(self, path, **kwargs):
+        self.calls.append(("readlink", path, kwargs))
+        return {"type": "symlink", "path": path, "target": "/docs/a.txt"}
+
+    async def touch(self, path, **kwargs):
+        self.calls.append(("touch", path, kwargs))
+        return {"type": "file", "path": path, "size": 0, "created": True}
+
+    async def get_usage(self, **kwargs):
+        self.calls.append(("get_usage", kwargs))
+        return {"owner_aid": kwargs.get("owner"), "used_bytes": 4, "quota_bytes": 10, "object_count": 1}
+
+    async def du(self, path, **kwargs):
+        self.calls.append(("du", path, kwargs))
+        return {"path": path, "size_bytes": 7, "file_count": 2, "dir_count": 1, "symlink_count": 0}
+
     async def issue_token(self, path, **kwargs):
         self.calls.append(("issue_token", path, kwargs))
         return {"token": "tok_secret", "token_id": "tok-1"}
@@ -181,4 +201,31 @@ def test_cli_fs_cat_binary_reads_only_requested_head(monkeypatch):
     assert client.storage.calls == [
         ("stat", "/docs/a.bin", {"owner": "alice.agentid.pub", "token": None}),
         ("read_bytes", "/docs/a.bin", {"owner": "alice.agentid.pub", "token": None, "offset": 0, "limit": 2}),
+    ]
+
+
+def test_cli_fs_lstat_readlink_touch_quota_du(monkeypatch):
+    from aun_cli.commands import fs as fs_commands
+
+    client = _FakeClient()
+    _install_fake_session(monkeypatch, fs_commands, client)
+
+    lstat = _invoke(["--json", "fs", "lstat", "--token", "tok", "alice.agentid.pub:/links/current"])
+    readlink = _invoke(["fs", "readlink", "alice.agentid.pub:/links/current"])
+    touch = _invoke(["--json", "fs", "touch", "--parents", "alice.agentid.pub:/docs/empty.txt"])
+    quota = _invoke(["--json", "fs", "quota", "alice.agentid.pub:/"])
+    du = _invoke(["--json", "fs", "du", "--max-depth", "2", "alice.agentid.pub:/docs"])
+
+    assert lstat.exit_code == 0, lstat.output
+    assert readlink.exit_code == 0, readlink.output
+    assert touch.exit_code == 0, touch.output
+    assert quota.exit_code == 0, quota.output
+    assert du.exit_code == 0, du.output
+    assert readlink.output.strip().splitlines()[-1] == "/docs/a.txt"
+    assert client.storage.calls == [
+        ("lstat", "/links/current", {"owner": "alice.agentid.pub", "token": "tok"}),
+        ("readlink", "/links/current", {"owner": "alice.agentid.pub"}),
+        ("touch", "/docs/empty.txt", {"owner": "alice.agentid.pub", "parents": True, "no_create": False, "mtime": None}),
+        ("get_usage", {"owner": "alice.agentid.pub"}),
+        ("du", "/docs", {"owner": "alice.agentid.pub", "max_depth": 2}),
     ]

@@ -106,6 +106,29 @@ export interface StatOptions extends StorageOptions {
   token?: string;
 }
 
+export interface TouchOptions extends StorageOptions {
+  parents?: boolean;
+  noCreate?: boolean;
+  mtime?: number;
+  followSymlinks?: boolean;
+}
+
+export interface DuOptions extends StorageOptions {
+  maxDepth?: number;
+  pageSize?: number;
+  token?: string;
+}
+
+export interface DuResult {
+  path: string;
+  sizeBytes: number;
+  fileCount: number;
+  dirCount: number;
+  symlinkCount: number;
+  maxDepth?: number;
+  truncated: boolean;
+}
+
 export interface StoragePathRef {
   owner?: string | null;
   path: string;
@@ -262,74 +285,51 @@ export class StorageVFS {
     };
   }
 
-  async downloadFile(path: string, options?: ReadOptions & { verifyHash?: boolean }): Promise<DownloadResult>;
   async downloadFile(path: string, localPath: string, options?: ReadOptions & { verifyHash?: boolean }): Promise<DownloadResult>;
-  async downloadFile(path: string, localPathOrOptions: string | (ReadOptions & { verifyHash?: boolean }) = {}, maybeOptions: ReadOptions & { verifyHash?: boolean } = {}): Promise<DownloadResult> {
-    if (typeof localPathOrOptions === 'string') {
-      const localPath = localPathOrOptions;
-      const options = maybeOptions;
-      const owner = this.owner(options.owner);
-      const bucket = options.bucket ?? 'default';
-      const objectKey = pathToKey(path);
-      const ticket = await this.lowlevel.createDownloadTicket({ owner, bucket, objectKey, token: options.token });
-      const downloadUrl = String(ticket.download_url ?? '');
-      if (!downloadUrl) throw new StorageError(`create_download_ticket did not return download_url`, 'ESTORAGE', path);
-      let targetPath = localPath;
-      const localInfo = await statOrNull(targetPath);
-      if (localInfo?.isDirectory()) {
-        targetPath = join(targetPath, textValue(ticket.file_name) || basename(objectKey));
-      }
-      const targetInfo = await statOrNull(targetPath);
-      const overwrite = options.overwrite ?? false;
-      if (targetInfo) {
-        if (targetInfo.isDirectory()) throw new StorageError(`local path is a directory: ${targetPath}`, 'EISDIR', targetPath);
-        if (!overwrite) throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
-      }
-      const data = await this.lowlevel.httpGet(downloadUrl);
-      const actualSha = await sha256Hex(data);
-      const expectedSha = textValue(ticket.sha256);
-      const expected = expectedSha.toLowerCase();
-      const verified = !expected || actualSha.toLowerCase() === expected;
-      if (!verified && (options.verifyHash ?? true)) {
-        throw new StorageError(
-          `hash mismatch: expected=${expected} actual=${actualSha.toLowerCase()}`,
-          'EHASH', path,
-        );
-      }
-      await mkdir(dirname(targetPath), { recursive: true });
-      try {
-        await writeFile(targetPath, data, { flag: overwrite ? 'w' : 'wx' });
-      } catch (exc) {
-        if (!overwrite && (exc as NodeJS.ErrnoException)?.code === 'EEXIST') {
-          throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
-        }
-        throw exc;
-      }
-      return {
-        path,
-        localPath: targetPath,
-        size: data.length,
-        sha256: expectedSha || actualSha,
-        verified,
-      };
+  async downloadFile(path: string, localPath: string, options: ReadOptions & { verifyHash?: boolean } = {}): Promise<DownloadResult> {
+    const owner = this.owner(options.owner);
+    const bucket = options.bucket ?? 'default';
+    const objectKey = pathToKey(path);
+    const ticket = await this.lowlevel.createDownloadTicket({ owner, bucket, objectKey, token: options.token });
+    const downloadUrl = String(ticket.download_url ?? '');
+    if (!downloadUrl) throw new StorageError(`create_download_ticket did not return download_url`, 'ESTORAGE', path);
+    let targetPath = localPath;
+    const localInfo = await statOrNull(targetPath);
+    if (localInfo?.isDirectory()) {
+      targetPath = join(targetPath, textValue(ticket.file_name) || basename(objectKey));
     }
-    const options = localPathOrOptions;
-    const { data, sha256: expectedSha } = await this.readBytesWithMetadata(path, options);
+    const targetInfo = await statOrNull(targetPath);
+    const overwrite = options.overwrite ?? false;
+    if (targetInfo) {
+      if (targetInfo.isDirectory()) throw new StorageError(`local path is a directory: ${targetPath}`, 'EISDIR', targetPath);
+      if (!overwrite) throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
+    }
+    const data = await this.lowlevel.httpGet(downloadUrl);
     const actualSha = await sha256Hex(data);
+    const expectedSha = textValue(ticket.sha256);
     const expected = expectedSha.toLowerCase();
-    const verified = Boolean(expected) && actualSha.toLowerCase() === expected;
-    if (!verified && expected && (options.verifyHash ?? true)) {
+    const verified = !expected || actualSha.toLowerCase() === expected;
+    if (!verified && (options.verifyHash ?? true)) {
       throw new StorageError(
         `hash mismatch: expected=${expected} actual=${actualSha.toLowerCase()}`,
         'EHASH', path,
       );
     }
+    await mkdir(dirname(targetPath), { recursive: true });
+    try {
+      await writeFile(targetPath, data, { flag: overwrite ? 'w' : 'wx' });
+    } catch (exc) {
+      if (!overwrite && (exc as NodeJS.ErrnoException)?.code === 'EEXIST') {
+        throw new StorageExistsError(`local path already exists: ${targetPath}`, 'EEXIST', targetPath);
+      }
+      throw exc;
+    }
     return {
       path,
+      localPath: targetPath,
       size: data.length,
       sha256: expectedSha || actualSha,
       verified,
-      data,
     };
   }
 
@@ -375,6 +375,19 @@ export class StorageVFS {
 
   async mkdir(path: string, options: StorageOptions & { parents?: boolean } = {}): Promise<NodeView> {
     const raw = await this.lowlevel.fsMkdir({ owner: this.owner(options.owner), bucket: options.bucket ?? 'default', path: pathToKey(path), parents: options.parents });
+    return nodeFromAny(raw.node ?? raw);
+  }
+
+  async touch(path: string, options: TouchOptions = {}): Promise<NodeView> {
+    const raw = await this.lowlevel.fsTouch({
+      owner: this.owner(options.owner),
+      bucket: options.bucket ?? 'default',
+      path: pathToKey(path),
+      parents: options.parents,
+      noCreate: options.noCreate,
+      mtime: options.mtime,
+      followSymlinks: options.followSymlinks,
+    });
     return nodeFromAny(raw.node ?? raw);
   }
 
@@ -424,6 +437,47 @@ export class StorageVFS {
     const owner = this.owner(options.owner);
     const raw = await this.lowlevel.fsDf({ owner, bucket: options.bucket ?? 'default' });
     return usageFromAny(raw, owner ?? undefined);
+  }
+
+  async du(path: string, options: DuOptions = {}): Promise<DuResult> {
+    const nodes = await this.find(path, {
+      owner: options.owner,
+      bucket: options.bucket,
+      page: 1,
+      pageSize: options.pageSize ?? 1000,
+      token: options.token,
+    });
+    const rootParts = pathToKey(path).split('/').filter(Boolean);
+    let sizeBytes = 0;
+    let fileCount = 0;
+    let dirCount = 0;
+    let symlinkCount = 0;
+    let truncated = false;
+    for (const node of nodes) {
+      const nodeParts = pathToKey(node.path).split('/').filter(Boolean);
+      const depth = Math.max(0, nodeParts.length - rootParts.length);
+      if (options.maxDepth !== undefined && depth > options.maxDepth) {
+        truncated = true;
+        continue;
+      }
+      if (node.type === 'file') {
+        fileCount += 1;
+        sizeBytes += node.size;
+      } else if (node.type === 'dir') {
+        dirCount += 1;
+      } else if (node.type === 'symlink') {
+        symlinkCount += 1;
+      }
+    }
+    return {
+      path,
+      sizeBytes,
+      fileCount,
+      dirCount,
+      symlinkCount,
+      maxDepth: options.maxDepth,
+      truncated,
+    };
   }
 
   async mount(source: StoragePathLike, mountPath: StoragePathLike, options: MountOptions = {}): Promise<NodeView> {
