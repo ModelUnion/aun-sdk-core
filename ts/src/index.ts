@@ -44,6 +44,9 @@ export {
   mapRemoteError,
 } from './errors.js';
 
+// ── 校验工具 ─────────────────────────────────────────────────
+export { validateAIDFormat, validateGroupIDFormat } from './validators.js';
+
 // ── 事件 ─────────────────────────────────────────────────────
 export { EventDispatcher, Subscription, type EventHandler } from './events.js';
 

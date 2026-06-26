@@ -1107,34 +1107,43 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 		}
 	}
 
-	for _, msg := range messages {
-		seq := toInt64(msg["seq"])
-		if seq <= 0 {
-			continue
-		}
-
-		if v2AsString(msg["version"]) == "v1" {
-			if legacy, ok := v2BuildLegacyP2PMessage(msg, myAID); ok {
-				decrypted = append(decrypted, legacy)
-				c.logE2.Debug("message.v2.pull plaintext V1 decrypted: seq=%d ns=%s", seq, ns)
-			} else {
-				c.logE2.Debug("V2 pull skipped legacy V1 encrypted/empty message: seq=%d", seq)
+	if v.canParallelDecryptV2Page(messages, "", true) {
+		for _, plaintext := range v.decryptV2PageParallel(ctx, state, messages, "", true) {
+			if plaintext != nil {
+				decrypted = append(decrypted, plaintext)
+				c.logMessageDebug("decrypt-ok", "message.v2.pull", "message.received", plaintext, nil)
 			}
-			continue
 		}
+	} else {
+		for _, msg := range messages {
+			seq := toInt64(msg["seq"])
+			if seq <= 0 {
+				continue
+			}
 
-		// 跟踪每个旧 SPK 引用的最大 seq（用于消费后销毁）
-		msgSpkID := v2AsString(msg["spk_id"])
-		if msgSpkID != "" && !state.session.IsCurrentSPK(msgSpkID) {
-			state.session.TrackOldSPKMaxSeq(msgSpkID, seq)
-		}
+			if v2AsString(msg["version"]) == "v1" {
+				if legacy, ok := v2BuildLegacyP2PMessage(msg, myAID); ok {
+					decrypted = append(decrypted, legacy)
+					c.logE2.Debug("message.v2.pull plaintext V1 decrypted: seq=%d ns=%s", seq, ns)
+				} else {
+					c.logE2.Debug("V2 pull skipped legacy V1 encrypted/empty message: seq=%d", seq)
+				}
+				continue
+			}
 
-		plaintext := c.decryptV2Message(ctx, state, msg)
-		if plaintext != nil {
-			decrypted = append(decrypted, plaintext)
-			c.logMessageDebug("decrypt-ok", "message.v2.pull", "message.received", plaintext, nil)
-		} else {
-			c.logE2.Debug("message.v2.pull decrypt returned nil: seq=%d ns=%s", seq, ns)
+			// 跟踪每个旧 SPK 引用的最大 seq（用于消费后销毁）
+			msgSpkID := v2AsString(msg["spk_id"])
+			if msgSpkID != "" && !state.session.IsCurrentSPK(msgSpkID) {
+				state.session.TrackOldSPKMaxSeq(msgSpkID, seq)
+			}
+
+			plaintext := c.decryptV2Message(ctx, state, msg)
+			if plaintext != nil {
+				decrypted = append(decrypted, plaintext)
+				c.logMessageDebug("decrypt-ok", "message.v2.pull", "message.received", plaintext, nil)
+			} else {
+				c.logE2.Debug("message.v2.pull decrypt returned nil: seq=%d ns=%s", seq, ns)
+			}
 		}
 	}
 
@@ -1156,7 +1165,7 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 			}
 		}
 		if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
-			c.saveSeqTrackerState()
+			c.persistSeq(ns)
 		}
 	}
 
@@ -1240,6 +1249,326 @@ func (v *v2E2EECoordinator) ackV2(ctx context.Context, upToSeq int64) (map[strin
 	}
 	c.logE2.Debug("message.v2.ack ok: ns=%s requested=%d effective=%d result=%v", ns, seq, actualAckSeq, result)
 	return result, nil
+}
+
+type v2DecryptPageJob struct {
+	seq                int64
+	msg                map[string]any
+	envelope           map[string]any
+	spkID              string
+	recipientKeySource string
+	groupIDForKeys     string
+	fromAID            string
+	senderDeviceID     string
+	ikPriv             []byte
+	spkPriv            []byte
+	senderPubDER       []byte
+	e2eeMeta           map[string]any
+	undecryptableEvent string
+}
+
+type v2DecryptPageResult struct {
+	job       v2DecryptPageJob
+	plaintext map[string]any
+	err       error
+}
+
+func decodeV2EnvelopeJSON(msg map[string]any) (map[string]any, error) {
+	envJSON := v2AsString(msg["envelope_json"])
+	if envJSON == "" {
+		return nil, errors.New("missing envelope_json")
+	}
+	dec := json.NewDecoder(strings.NewReader(envJSON))
+	dec.UseNumber()
+	var envelope map[string]any
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, err
+	}
+	return envelope, nil
+}
+
+func v2EnvelopeGroupID(msg map[string]any, envelope map[string]any) string {
+	if aad, ok := envelope["aad"].(map[string]any); ok {
+		if gid := strings.TrimSpace(v2AsString(aad["group_id"])); gid != "" {
+			return gid
+		}
+	}
+	if gid := strings.TrimSpace(v2AsString(msg["group_id"])); gid != "" {
+		return gid
+	}
+	return strings.TrimSpace(v2AsString(envelope["group_id"]))
+}
+
+func (v *v2E2EECoordinator) canParallelDecryptV2Page(messages []map[string]any, expectedGroupID string, p2p bool) bool {
+	if len(messages) <= 1 {
+		return false
+	}
+	for _, msg := range messages {
+		if toInt64(msg["seq"]) <= 0 {
+			return false
+		}
+		if v2AsString(msg["version"]) == "v1" {
+			return false
+		}
+		envelope, err := decodeV2EnvelopeJSON(msg)
+		if err != nil {
+			return false
+		}
+		groupIDForKeys := v2EnvelopeGroupID(msg, envelope)
+		if p2p {
+			if groupIDForKeys != "" {
+				return false
+			}
+		} else if groupIDForKeys != expectedGroupID {
+			return false
+		}
+	}
+	return true
+}
+
+func (v *v2E2EECoordinator) prepareDecryptPageJob(ctx context.Context, state *v2P2PState, msg map[string]any, expectedGroupID string, p2p bool) (v2DecryptPageJob, bool) {
+	c := v.runtime.client
+	seq := toInt64(msg["seq"])
+	envelope, err := decodeV2EnvelopeJSON(msg)
+	if err != nil {
+		c.logE2.Warn("V2 decrypt: invalid envelope_json for msg seq=%v: %v", msg["seq"], err)
+		return v2DecryptPageJob{}, false
+	}
+	e2eeMeta := v2MessageE2EEMetadata(envelope)
+	c.observeAgentMDFromEnvelope(envelope)
+
+	c.mu.RLock()
+	selfAID := c.aid
+	selfDeviceID := c.deviceID
+	c.mu.RUnlock()
+
+	spkID := ""
+	recipientKeySource := ""
+	if r, ok := envelope["recipient"].(map[string]any); ok {
+		spkID = v2AsString(r["spk_id"])
+		recipientKeySource = v2AsString(r["key_source"])
+	} else if rows, ok := envelope["recipients"]; ok {
+		spkID = v2AsString(msg["spk_id"])
+		if recipients, ok := rows.([]any); ok {
+			for _, row := range recipients {
+				cells, ok := row.([]any)
+				if !ok || len(cells) < 6 {
+					continue
+				}
+				if v2AsString(cells[0]) != selfAID || v2AsString(cells[1]) != selfDeviceID {
+					continue
+				}
+				if spkID == "" {
+					spkID = v2AsString(cells[5])
+				}
+				if len(cells) > 3 {
+					recipientKeySource = v2AsString(cells[3])
+				}
+				break
+			}
+		}
+	}
+
+	groupIDForKeys := v2EnvelopeGroupID(msg, envelope)
+	if p2p {
+		if groupIDForKeys != "" {
+			return v2DecryptPageJob{}, false
+		}
+	} else if groupIDForKeys != expectedGroupID {
+		return v2DecryptPageJob{}, false
+	}
+	undecryptableEvent := "message.undecryptable"
+	if groupIDForKeys != "" {
+		undecryptableEvent = "group.message_undecryptable"
+	}
+	c.logE2.Debug("V2 decrypt start: seq=%v message_id=%s group=%s from=%s spk_id=%s key_source=%s has_recipient=%v has_recipients=%v",
+		msg["seq"], v2AsString(msg["message_id"]), valueOrDefault(groupIDForKeys, "<p2p>"), v2AsString(msg["from_aid"]), valueOrDefault(spkID, "<empty>"), valueOrDefault(recipientKeySource, "<empty>"),
+		envelope["recipient"] != nil, envelope["recipients"] != nil)
+
+	var ikPriv, spkPriv []byte
+	if groupIDForKeys != "" {
+		ikPriv, spkPriv, err = state.session.GetGroupDecryptKeys(groupIDForKeys, spkID)
+	} else {
+		ikPriv, spkPriv, err = state.session.GetDecryptKeys(spkID)
+	}
+	if err != nil {
+		c.logE2.Warn("V2 decrypt: GetDecryptKeys 失败 seq=%v group=%s: %v", msg["seq"], groupIDForKeys, err)
+		event := map[string]any{
+			"message_id":     v2AsString(msg["message_id"]),
+			"from":           v2AsString(msg["from_aid"]),
+			"to":             v2AsString(msg["to"]),
+			"seq":            msg["seq"],
+			"timestamp":      msg["t_server"],
+			"device_id":      v2AsString(msg["device_id"]),
+			"slot_id":        v2AsString(msg["slot_id"]),
+			"_decrypt_error": err.Error(),
+			"_decrypt_stage": "spk_lookup",
+			"_envelope_type": v2AsString(envelope["type"]),
+			"_suite":         v2AsString(envelope["suite"]),
+			"_spk_id":        spkID,
+		}
+		attachV2EnvelopeMetadata(event, e2eeMeta)
+		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
+		c.publishAppEventSync(undecryptableEvent, event)
+		return v2DecryptPageJob{}, false
+	}
+	c.logE2.Debug("V2 decrypt key lookup ok: seq=%v group=%s ik_len=%d spk_len=%d", msg["seq"], valueOrDefault(groupIDForKeys, "<p2p>"), len(ikPriv), len(spkPriv))
+
+	if p2p {
+		msgSpkID := v2AsString(msg["spk_id"])
+		if msgSpkID != "" && !state.session.IsCurrentSPK(msgSpkID) {
+			state.session.TrackOldSPKMaxSeq(msgSpkID, seq)
+		}
+	}
+
+	fromAID := v2AsString(msg["from_aid"])
+	senderDeviceID := ""
+	if aad, ok := envelope["aad"].(map[string]any); ok {
+		senderDeviceID = v2AsString(aad["from_device"])
+	}
+	senderCertFingerprint := strings.TrimSpace(stringFromAny(envelope["sender_cert_fingerprint"]))
+	senderPubDER := c.getV2SenderPubDER(ctx, state, fromAID, senderDeviceID, senderCertFingerprint)
+	if len(senderPubDER) == 0 {
+		c.logE2.Warn("V2 decrypt: no sender IK for %s device=%s", fromAID, senderDeviceID)
+		c.scheduleV2SenderIKPending(msg, fromAID, senderDeviceID, groupIDForKeys)
+		return v2DecryptPageJob{}, false
+	}
+
+	return v2DecryptPageJob{
+		seq:                seq,
+		msg:                msg,
+		envelope:           envelope,
+		spkID:              spkID,
+		recipientKeySource: recipientKeySource,
+		groupIDForKeys:     groupIDForKeys,
+		fromAID:            fromAID,
+		senderDeviceID:     senderDeviceID,
+		ikPriv:             ikPriv,
+		spkPriv:            spkPriv,
+		senderPubDER:       senderPubDER,
+		e2eeMeta:           e2eeMeta,
+		undecryptableEvent: undecryptableEvent,
+	}, true
+}
+
+func (v *v2E2EECoordinator) decryptV2PageParallel(ctx context.Context, state *v2P2PState, messages []map[string]any, expectedGroupID string, p2p bool) []map[string]any {
+	c := v.runtime.client
+	jobs := make([]v2DecryptPageJob, 0, len(messages))
+	for _, msg := range messages {
+		if toInt64(msg["seq"]) <= 0 {
+			continue
+		}
+		job, ok := v.prepareDecryptPageJob(ctx, state, msg, expectedGroupID, p2p)
+		if ok {
+			jobs = append(jobs, job)
+		}
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	c.mu.RLock()
+	selfAID := c.aid
+	selfDeviceID := c.deviceID
+	c.mu.RUnlock()
+
+	results := make([]v2DecryptPageResult, len(jobs))
+	var wg sync.WaitGroup
+	wg.Add(len(jobs))
+	for i, job := range jobs {
+		go func(i int, job v2DecryptPageJob) {
+			defer wg.Done()
+			plaintext, err := e2ee.DecryptMessage(job.envelope, selfAID, selfDeviceID, job.ikPriv, job.spkPriv, job.senderPubDER)
+			results[i] = v2DecryptPageResult{job: job, plaintext: plaintext, err: err}
+		}(i, job)
+	}
+	wg.Wait()
+
+	decrypted := make([]map[string]any, 0, len(results))
+	for _, item := range results {
+		job := item.job
+		msg := job.msg
+		if item.err != nil {
+			c.logE2.Warn("V2 decrypt failed for msg seq=%v: %v", msg["seq"], item.err)
+			event := map[string]any{
+				"message_id":     v2AsString(msg["message_id"]),
+				"from":           job.fromAID,
+				"to":             v2AsString(msg["to"]),
+				"seq":            msg["seq"],
+				"timestamp":      msg["t_server"],
+				"device_id":      v2AsString(msg["device_id"]),
+				"slot_id":        v2AsString(msg["slot_id"]),
+				"_decrypt_error": item.err.Error(),
+				"_decrypt_stage": "decrypt",
+				"_envelope_type": v2AsString(job.envelope["type"]),
+				"_suite":         v2AsString(job.envelope["suite"]),
+			}
+			attachV2EnvelopeMetadata(event, job.e2eeMeta)
+			c.logMessageDebug("decrypt-fail", "v2.decrypt", job.undecryptableEvent, event, nil)
+			c.publishAppEventSync(job.undecryptableEvent, event)
+			continue
+		}
+		if item.plaintext == nil {
+			c.logE2.Debug("V2 decrypt returned nil plaintext: seq=%v group=%s", msg["seq"], valueOrDefault(job.groupIDForKeys, "<p2p>"))
+			continue
+		}
+
+		if job.groupIDForKeys != "" && job.recipientKeySource == "group_device_prekey" && state.session.IsLastUploadedGroupSPK(job.groupIDForKeys, job.spkID) {
+			c.getV2E2EECoordinator().scheduleGroupSpkRotation(job.groupIDForKeys, "group_spk_consumed")
+		} else if job.groupIDForKeys != "" && job.recipientKeySource == "peer_device_prekey" {
+			c.getV2E2EECoordinator().scheduleGroupSpkRegistrationAfterPeerFallback(job.groupIDForKeys)
+		} else if job.groupIDForKeys == "" && state.session.IsLastUploadedSPK(job.spkID) {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						c.logE2.Warn("V2 SPK rotation panic: %v", r)
+					}
+				}()
+				rotateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := state.session.RotateSPK(rotateCtx, c.v2CallFn()); err != nil {
+					c.logE2.Warn("V2 SPK rotation failed (non-fatal): %v", err)
+				} else {
+					c.logE2.Debug("V2 SPK rotated after consumption: aid=%s", selfAID)
+				}
+			}()
+		}
+
+		result := map[string]any{
+			"message_id": v2AsString(msg["message_id"]),
+			"from":       job.fromAID,
+			"to":         selfAID,
+			"seq":        msg["seq"],
+			"t_server":   msg["t_server"],
+			"payload":    item.plaintext,
+			"encrypted":  true,
+			"e2ee":       job.e2eeMeta,
+		}
+		direction := strings.TrimSpace(v2AsString(msg["direction"]))
+		if direction == "" {
+			if job.fromAID != "" && job.fromAID == selfAID {
+				direction = "outbound_sync"
+			} else {
+				direction = "inbound"
+			}
+		}
+		result["direction"] = direction
+		if v, ok := msg["device_id"]; ok {
+			result["device_id"] = v
+		}
+		if v, ok := msg["slot_id"]; ok {
+			result["slot_id"] = v
+		}
+		attachGatewayProximity(result, msg)
+		attachV2EnvelopeMetadata(result, job.e2eeMeta)
+		if job.groupIDForKeys != "" {
+			c.logMessageDebug("decrypt-ok", "v2.decrypt", "group.message_created", result, nil)
+		} else {
+			c.logMessageDebug("decrypt-ok", "v2.decrypt", "message.received", result, nil)
+		}
+		decrypted = append(decrypted, result)
+	}
+	return decrypted
 }
 
 // decryptV2Message 解密单条 V2 P2P 消息（pull 内部使用）。

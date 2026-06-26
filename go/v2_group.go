@@ -90,7 +90,7 @@ func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID str
 func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
 	c := v.runtime.client
 	c.logE2.Debug("group.v2.send attempt: group=%s use_cache=%v", groupID, useCache)
-	allDevices, epoch, sc, auditRaw, wrapPolicy, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, usedCachedBootstrap, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +125,13 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 	}
 
 	if len(targets) == 0 {
+		if usedCachedBootstrap {
+			return nil, NewAUNError(
+				fmt.Sprintf("V2 group: no target devices for group %s; bootstrap may be stale", groupID),
+				WithCode(-33054),
+				WithData(map[string]any{"expected_peer_aids": []string{}}),
+			)
+		}
 		return nil, fmt.Errorf("V2 group: no target devices for group %s", groupID)
 	}
 	// 监管 AID：audit_recipients 加入 targets（role="audit"）
@@ -190,14 +197,14 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 }
 
 // v2ResolveGroupBootstrap 解析群 bootstrap（缓存优先）。
-// 返回 (devices, epoch, stateCommitment, auditRecipients, wrapPolicy, error)。
-func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
+// 返回 (devices, epoch, stateCommitment, auditRecipients, wrapPolicy, usedCachedBootstrap, error)。
+func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, bool, error) {
 	c := v.runtime.client
 	if useCache {
 		entry, ok := v.getGroupBootstrapCache(state, groupID)
 		if ok && time.Since(entry.CachedAt) < v2GroupBootstrapTTL {
 			c.logE2.Debug("group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%d", groupID, len(entry.Devices), len(entry.AuditRecipients), entry.Epoch)
-			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, entry.WrapPolicy, nil
+			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, entry.WrapPolicy, true, nil
 		}
 	}
 
@@ -206,7 +213,7 @@ func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *
 		"e2ee_wrap_capabilities": v2WrapCapabilities(),
 	})
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("V2 group bootstrap: %w", err)
+		return nil, 0, nil, nil, nil, false, fmt.Errorf("V2 group bootstrap: %w", err)
 	}
 	bs, _ := raw.(map[string]any)
 	devices := v2ToMapList(bs["devices"])
@@ -217,7 +224,7 @@ func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *
 
 	c.v2CheckFork(ctx, groupID, v2AsString(bs["state_chain"]))
 	if err := c.v2VerifyStateSignature(ctx, groupID, bs); err != nil {
-		return nil, 0, nil, nil, nil, err
+		return nil, 0, nil, nil, nil, false, err
 	}
 	c.getGroupStateCoordinator().publishGroupSecurityLevel(groupID, bs)
 
@@ -246,7 +253,7 @@ func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *
 	if len(pendingAdds) > 0 {
 		c.v2MaybeTriggerAutoPropose(groupID)
 	}
-	return devices, epoch, sc, auditRecipients, wrapPolicy, nil
+	return devices, epoch, sc, auditRecipients, wrapPolicy, false, nil
 }
 
 type groupV2PullOptions struct {
@@ -319,31 +326,41 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 		}
 	}
 
-	for _, msg := range messages {
-		seq := toInt64(msg["seq"])
-		if seq <= 0 {
-			continue
-		}
-
-		if v2AsString(msg["version"]) == "v1" {
-			if legacy, ok := v2BuildLegacyGroupMessage(msg, groupID); ok {
-				decrypted = append(decrypted, legacy)
-				c.logE2.Debug("group.v2.pull plaintext V1 decrypted: group=%s seq=%d", groupID, seq)
-			} else {
-				c.logE2.Debug("V2 group pull skipped legacy V1 encrypted/empty message: group=%s seq=%d", groupID, seq)
+	if v.canParallelDecryptV2Page(messages, groupID, false) {
+		for _, plaintext := range v.decryptV2PageParallel(ctx, state, messages, groupID, false) {
+			if plaintext != nil {
+				plaintext["group_id"] = groupID
+				decrypted = append(decrypted, plaintext)
+				c.logMessageDebug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext, nil)
 			}
-			continue
 		}
+	} else {
+		for _, msg := range messages {
+			seq := toInt64(msg["seq"])
+			if seq <= 0 {
+				continue
+			}
 
-		plaintext := c.decryptV2Message(ctx, state, msg)
-		if plaintext != nil {
-			plaintext["group_id"] = groupID
-			decrypted = append(decrypted, plaintext)
-			c.logMessageDebug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext, nil)
-		} else {
-			c.logE2.Debug("group.v2.pull decrypt returned nil: group=%s seq=%d", groupID, seq)
+			if v2AsString(msg["version"]) == "v1" {
+				if legacy, ok := v2BuildLegacyGroupMessage(msg, groupID); ok {
+					decrypted = append(decrypted, legacy)
+					c.logE2.Debug("group.v2.pull plaintext V1 decrypted: group=%s seq=%d", groupID, seq)
+				} else {
+					c.logE2.Debug("V2 group pull skipped legacy V1 encrypted/empty message: group=%s seq=%d", groupID, seq)
+				}
+				continue
+			}
+
+			plaintext := c.decryptV2Message(ctx, state, msg)
+			if plaintext != nil {
+				plaintext["group_id"] = groupID
+				decrypted = append(decrypted, plaintext)
+				c.logMessageDebug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext, nil)
+			} else {
+				c.logE2.Debug("group.v2.pull decrypt returned nil: group=%s seq=%d", groupID, seq)
+			}
+			// Group 不跟踪旧 SPK（不触发 PFS 销毁）
 		}
-		// Group 不跟踪旧 SPK（不触发 PFS 销毁）
 	}
 
 	if maxSeq > 0 {
@@ -363,7 +380,7 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 		}
 	}
 	if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
-		c.saveSeqTrackerState()
+		c.persistSeq(ns)
 	}
 
 	c.logE2.Debug("group.v2.pull done: group=%s requested_after_seq=%d raw_count=%d decrypted=%d ns=%s", groupID, afterSeq, len(messages), len(decrypted), ns)
@@ -449,7 +466,8 @@ func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, pay
 }
 
 func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
-	return c.getV2E2EECoordinator().v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	devices, epoch, sc, audit, wrapPolicy, _, err := c.getV2E2EECoordinator().v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	return devices, epoch, sc, audit, wrapPolicy, err
 }
 
 func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {

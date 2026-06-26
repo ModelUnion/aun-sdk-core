@@ -159,6 +159,8 @@ async def main() -> None:
     work.mkdir(parents=True, exist_ok=True)
     src = work / "secret.txt"
     src.write_text("P4-CLI", encoding="utf-8")
+    writer_src = work / "writer.txt"
+    writer_src.write_text("BOB-WRITE", encoding="utf-8")
 
     await _ensure_identities()
     try:
@@ -168,14 +170,40 @@ async def main() -> None:
             denied = _text_cmd(env, "fs", "cat", "--as", _BOB_AID, f"{_ALICE_AID}:/{root}/docs/a.txt", expect_ok=False)
             if "rc=0" in denied:
                 raise AssertionError("bob 未授权时不应能读取")
-            _cmd(env, "fs", "setfacl", "-m", f"aid:{_BOB_AID}:r", f"{_ALICE_AID}:/{root}/docs")
-            got = _text_cmd(env, "fs", "cat", "--as", _BOB_AID, f"{_ALICE_AID}:/{root}/docs/a.txt")
-            if got.strip().splitlines()[-1] != "P4-CLI":
-                raise AssertionError(f"bob ACL 读取异常: {got!r}")
+            denied_write = _cmd(
+                env,
+                "fs",
+                "cp",
+                "--as",
+                _BOB_AID,
+                str(writer_src),
+                f"{_ALICE_AID}:/{root}/docs/bob.txt",
+                expect_ok=False,
+            )
+            if int(denied_write.get("returncode") or 0) == 0:
+                raise AssertionError("bob 未授权时不应能写入")
+            _cmd(env, "fs", "setfacl", "-m", f"aid:{_BOB_AID}:w", f"{_ALICE_AID}:/{root}/docs")
+            _cmd(env, "fs", "cp", "--as", _BOB_AID, str(writer_src), f"{_ALICE_AID}:/{root}/docs/bob.txt")
+            got = _text_cmd(env, "fs", "cat", f"{_ALICE_AID}:/{root}/docs/bob.txt")
+            if got.strip().splitlines()[-1] != "BOB-WRITE":
+                raise AssertionError(f"owner 读取 bob 写入内容异常: {got!r}")
             _cmd(env, "fs", "setfacl", "-x", f"aid:{_BOB_AID}", f"{_ALICE_AID}:/{root}/docs")
-            _ok("cli_setfacl_bob_read")
+            denied_after_revoke = _cmd(
+                env,
+                "fs",
+                "cp",
+                "--as",
+                _BOB_AID,
+                "--force",
+                str(writer_src),
+                f"{_ALICE_AID}:/{root}/docs/bob.txt",
+                expect_ok=False,
+            )
+            if int(denied_after_revoke.get("returncode") or 0) == 0:
+                raise AssertionError("bob ACL 撤销后不应能继续写入")
+            _ok("cli_setfacl_bob_write_revoke")
         except Exception as exc:
-            _fail("cli_setfacl_bob_read", str(exc))
+            _fail("cli_setfacl_bob_write_revoke", str(exc))
 
         try:
             issued = _cmd(env, "fs", "token", "issue", "--max-reads", "1", f"{_ALICE_AID}:/{root}/docs/a.txt")

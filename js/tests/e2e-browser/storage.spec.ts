@@ -592,3 +592,131 @@ test.describe('Storage: 配额（浏览器）', () => {
     }
   });
 });
+
+// ── Storage: VFS/软链（浏览器） ─────────────────────────────
+
+test.describe('Storage: VFS/软链（浏览器）', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto(testPageUrl());
+    await page.waitForFunction(() => (window as any).testReady === true, null, { timeout: 10_000 });
+    await installP0Helpers(page);
+  });
+
+  test('write/read/list/stat/df/token/copy/rename/symlink/find/remove', async ({ page }) => {
+    test.setTimeout(90_000);
+
+    const result = await page.evaluate(async (iss: string) => {
+      const { makeAndConnect, ensureConnected, runId } = (window as any).__aunP0;
+      const rid = runId();
+      const aliceAid = `stovfs${rid}.${iss}`;
+      const bobAid = `stovfsb${rid}.${iss}`;
+      const bucket = `vfs-${rid}`;
+      const dirPath = `/docs/${rid}`;
+      const filePath = `${dirPath}/a.txt`;
+      const body = `browser-vfs-${rid}`;
+      const alice = await makeAndConnect(`sto-vfs-alice-${rid}`);
+      const bob = await makeAndConnect(`sto-vfs-bob-${rid}`);
+
+      try {
+        await ensureConnected(alice, aliceAid);
+        await ensureConnected(bob, bobAid);
+
+        let written: any;
+        try {
+          written = await alice.storage.writeBytes(filePath, body, { owner: aliceAid, bucket, contentType: 'text/plain' });
+        } catch (err: any) {
+          const message = String(err?.message ?? '').toLowerCase();
+          if (message.includes('not implement') || message.includes('method not found')) {
+            return { skip: true, reason: `storage VFS 不可用: ${err?.message ?? String(err)}` };
+          }
+          throw err;
+        }
+        const read = new TextDecoder().decode(await alice.storage.readBytes(filePath, { owner: aliceAid, bucket }));
+        const stat = await alice.storage.stat(filePath, { owner: aliceAid, bucket });
+        const listed = await alice.storage.list(dirPath, { owner: aliceAid, bucket, long: true });
+        const usage = await alice.storage.df({ owner: aliceAid, bucket });
+
+        const token = String((await alice.storage.issueToken(filePath, { owner: aliceAid, bucket, maxReads: 1 })).token ?? '');
+        const tokenRead = new TextDecoder().decode(await bob.storage.readBytes(filePath, { owner: aliceAid, bucket, token }));
+        let tokenSecondDenied = false;
+        try {
+          await bob.storage.readBytes(filePath, { owner: aliceAid, bucket, token });
+        } catch {
+          tokenSecondDenied = true;
+        }
+        const tokens = await alice.storage.listTokens(filePath, { owner: aliceAid, bucket });
+
+        const copiedPath = `${dirPath}/copied.txt`;
+        const copied = await alice.storage.copy(filePath, copiedPath, { owner: aliceAid, bucket, overwrite: true });
+        const renamedPath = `${dirPath}/renamed.txt`;
+        const renamed = await alice.storage.rename(copiedPath, renamedPath, { owner: aliceAid, bucket, overwrite: true });
+        const linkPath = `${dirPath}/current.txt`;
+        const link = await alice.storage.symlink(renamedPath, linkPath, { owner: aliceAid, bucket, overwrite: true });
+        const lstat = await alice.storage.lstat(linkPath, { owner: aliceAid, bucket });
+        const statLink = await alice.storage.stat(linkPath, { owner: aliceAid, bucket });
+        const readlink = await alice.storage.readlink(linkPath, { owner: aliceAid, bucket });
+        const repointed = await alice.storage.repoint(linkPath, filePath, { owner: aliceAid, bucket });
+        const renamedLinkPath = `${dirPath}/latest.txt`;
+        const renamedLink = await alice.storage.renameSymlink(linkPath, renamedLinkPath, { owner: aliceAid, bucket, overwrite: true });
+        const found = await alice.storage.find(dirPath, { owner: aliceAid, bucket, name: 'latest.txt', nodeType: 'symlink' });
+        const removedLink = await alice.storage.remove(renamedLinkPath, { owner: aliceAid, bucket });
+        const removedFile = await alice.storage.remove(renamedPath, { owner: aliceAid, bucket });
+
+        return {
+          skip: false,
+          writtenType: written?.type,
+          read,
+          statType: stat?.type,
+          listHasFile: listed.some((node: any) => node.name === 'a.txt'),
+          usagePositive: Number(usage?.usedBytes ?? 0) > 0,
+          tokenRead,
+          tokenSecondDenied,
+          tokensCount: (tokens?.tokens ?? tokens?.items ?? []).length,
+          copiedPath: copied?.path,
+          renamedPath: renamed?.path,
+          linkType: link?.type,
+          linkTarget: link?.target,
+          lstatType: lstat?.type,
+          statLinkType: statLink?.type,
+          readlinkTarget: readlink?.target,
+          repointedTarget: repointed?.target,
+          renamedLinkPath: renamedLink?.path,
+          foundNames: found.map((node: any) => node.name),
+          removedLinkCount: removedLink?.removedCount,
+          removedFileCount: removedFile?.removedCount,
+        };
+      } finally {
+        await alice.close();
+        await bob.close();
+      }
+    }, ISSUER);
+
+    if ((result as any).skip) {
+      console.log((result as any).reason);
+      test.skip();
+      return;
+    }
+
+    const r = result as any;
+    expect(r.writtenType).toBe('file');
+    expect(r.read).toContain('browser-vfs-');
+    expect(r.statType).toBe('file');
+    expect(r.listHasFile).toBe(true);
+    expect(r.usagePositive).toBe(true);
+    expect(r.tokenRead).toBe(r.read);
+    expect(r.tokenSecondDenied).toBe(true);
+    expect(r.tokensCount).toBeGreaterThan(0);
+    expect(r.copiedPath).toContain('/copied.txt');
+    expect(r.renamedPath).toContain('/renamed.txt');
+    expect(r.linkType).toBe('symlink');
+    expect(r.linkTarget).toContain('/renamed.txt');
+    expect(r.lstatType).toBe('symlink');
+    expect(r.statLinkType).toBe('file');
+    expect(r.readlinkTarget).toContain('/renamed.txt');
+    expect(r.repointedTarget).toContain('/a.txt');
+    expect(r.renamedLinkPath).toContain('/latest.txt');
+    expect(r.foundNames).toContain('latest.txt');
+    expect(r.removedLinkCount).toBeGreaterThan(0);
+    expect(r.removedFileCount).toBeGreaterThan(0);
+  });
+});

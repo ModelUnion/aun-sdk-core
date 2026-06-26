@@ -39,7 +39,7 @@ def test_bench_send_respects_count_and_concurrency(monkeypatch):
 
     class FakeSession:
         def __init__(self, ctx, **kwargs):
-            sessions.append(ctx)
+            sessions.append(ctx.obj.get("trace"))
 
         async def __aenter__(self):
             return FakeClient()
@@ -83,6 +83,7 @@ def test_bench_send_respects_count_and_concurrency(monkeypatch):
     assert all(params["to"] == "bob.agentid.pub" for _, params in calls)
     assert all(params["encrypt"] is False for _, params in calls)
     assert all(len(params["payload"]["text"]) == 16 for _, params in calls)
+    assert sessions[0] == "off"
 
 
 def test_bench_group_send_nested_command_calls_group_send(monkeypatch):

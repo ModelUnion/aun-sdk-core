@@ -300,7 +300,7 @@ func TestP2PRecallTombstonePublishesRecalledEvent(t *testing.T) {
 	event, payload := p2pAppEventForMessage(map[string]any{
 		"message_id": "recall-1",
 		"from":       "alice.agentid.pub",
-		"to":         "bob.agentid.pub",
+		"to":         "bob1.agentid.pub",
 		"seq":        int64(9),
 		"type":       "message.recalled",
 		"payload": map[string]any{
@@ -339,7 +339,7 @@ func TestP2PRecallTombstonePublishesRecalledEvent(t *testing.T) {
 	if published["message_id"] != "recall-1" || toInt64(published["seq"]) != 9 {
 		t.Fatalf("撤回事件旧顶层字段应继续保留: %#v", published)
 	}
-	if envelope["from"] != "alice.agentid.pub" || envelope["to"] != "bob.agentid.pub" ||
+	if envelope["from"] != "alice.agentid.pub" || envelope["to"] != "bob1.agentid.pub" ||
 		envelope["type"] != "message.recalled" || envelope["kind"] != "message.recalled" ||
 		toInt64(envelope["timestamp"]) != 123 {
 		t.Fatalf("撤回事件 envelope 不正确: %#v", published["envelope"])
@@ -420,7 +420,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if !c.publishOrderedMessage("message.received", p2pNS, 1, map[string]any{
 		"message_id": "m-1",
 		"seq":        1,
-		"from":       "bob.example.com",
+		"from":       "bob1.example.com",
 		"to":         "alice.example.com",
 		"payload":    map[string]any{"type": "text"},
 		"e2ee":       map[string]any{"payload_type": "text"},
@@ -431,7 +431,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 		"group_id":     "g1",
 		"message_id":   "gm-1",
 		"seq":          1,
-		"sender_aid":   "bob.example.com",
+		"sender_aid":   "bob1.example.com",
 		"message_type": "group.message",
 		"payload":      map[string]any{"type": "text"},
 	}) {
@@ -447,7 +447,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if !ok {
 		t.Fatalf("P2P 事件应包含 envelope: %#v", p2pEvent)
 	}
-	if p2pEnvelope["from"] != "bob.example.com" || p2pEnvelope["to"] != "alice.example.com" ||
+	if p2pEnvelope["from"] != "bob1.example.com" || p2pEnvelope["to"] != "alice.example.com" ||
 		p2pEnvelope["type"] != "text" {
 		t.Fatalf("P2P envelope 不正确: %#v", p2pEnvelope)
 	}
@@ -466,7 +466,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if !ok {
 		t.Fatalf("群消息事件应包含 envelope: %#v", groupEvent)
 	}
-	if groupEnvelope["from"] != "bob.example.com" || groupEnvelope["group_id"] != "g1" ||
+	if groupEnvelope["from"] != "bob1.example.com" || groupEnvelope["group_id"] != "g1" ||
 		groupEnvelope["type"] != "text" {
 		t.Fatalf("群消息 envelope 不正确: %#v", groupEnvelope)
 	}
@@ -483,7 +483,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 		"event_type": "group.member_added",
 		"action":     "member_added",
 		"actor_aid":  "alice.example.com",
-		"member_aid": "bob.example.com",
+		"member_aid": "bob1.example.com",
 	})
 	if groupChangedEvent["group_id"] != "g1" || toInt64(groupChangedEvent["event_seq"]) != 2 ||
 		groupChangedEvent["action"] != "member_added" {
@@ -499,7 +499,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	if groupChangedEnvelope["module_id"] != "group" || groupChangedEnvelope["group_id"] != "g1" ||
 		toInt64(groupChangedEnvelope["event_seq"]) != 2 || groupChangedEnvelope["event_type"] != "group.member_added" ||
 		groupChangedEnvelope["action"] != "member_added" || groupChangedEnvelope["actor_aid"] != "alice.example.com" ||
-		groupChangedEnvelope["member_aid"] != "bob.example.com" ||
+		groupChangedEnvelope["member_aid"] != "bob1.example.com" ||
 		groupChangedEnvelope["device_id"] != "dev-1" || groupChangedEnvelope["slot_id"] != "slot-a" {
 		t.Fatalf("群事件 envelope 不正确: %#v", groupChangedEnvelope)
 	}
@@ -525,7 +525,7 @@ func TestAppMessageEnvelopeKeepsForwardableMetadata(t *testing.T) {
 		"message_id": "m-1",
 		"seq":        9,
 		"from_aid":   "alice.example.com",
-		"to_aid":     "bob.example.com",
+		"to_aid":     "bob1.example.com",
 		"created_at": int64(1234567890000),
 		"payload":    map[string]any{"type": "text", "text": "hello"},
 		"headers":    map[string]any{"trace_id": "trace-1", "_auth": "drop"},
@@ -536,7 +536,7 @@ func TestAppMessageEnvelopeKeepsForwardableMetadata(t *testing.T) {
 
 	want := map[string]any{
 		"from":              "alice.example.com",
-		"to":                "bob.example.com",
+		"to":                "bob1.example.com",
 		"type":              "text",
 		"timestamp":         int64(1234567890000),
 		"context":           map[string]any{"run_id": "run-1"},
@@ -619,7 +619,7 @@ func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
 
 	c.processAndPublishMessage(map[string]any{
 		"message_id": "m-other-slot",
-		"from":       "bob.example.com",
+		"from":       "bob1.example.com",
 		"to":         "alice.example.com",
 		"slot_id":    "slot-b",
 		"payload":    map[string]any{"type": "text", "text": "wrong slot"},
@@ -647,7 +647,7 @@ func TestGroupPushAcceptsOtherSlotContext(t *testing.T) {
 	c.processAndPublishGroupMessage(map[string]any{
 		"message_id": "gm-other-slot",
 		"group_id":   "g1",
-		"from":       "bob.example.com",
+		"from":       "bob1.example.com",
 		"device_id":  "dev-2",
 		"slot_id":    "slot-b",
 		"payload":    map[string]any{"type": "text", "text": "group"},
@@ -1423,7 +1423,7 @@ func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
 	c.mu.Unlock()
 
 	_, err := c.Call(context.Background(), "message.send", map[string]any{
-		"to":            "bob.example.com",
+		"to":            "bob1.example.com",
 		"payload":       map[string]any{"type": "text", "text": "hello"},
 		"encrypt":       false,
 		"delivery_mode": map[string]any{"mode": "queue"},
@@ -2125,7 +2125,7 @@ func TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline(t *testing.T) {
 		t.Fatalf("Connect 失败: %v", err)
 	}
 	c.mu.Lock()
-	c.aid = "bob.example.com"
+	c.aid = "bob1.example.com"
 	c.mu.Unlock()
 
 	published := make(chan int64, 1)
@@ -2140,7 +2140,7 @@ func TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline(t *testing.T) {
 		"group_id":   groupID,
 		"event_seq":  5,
 		"action":     "member_added",
-		"joined_aid": "bob.example.com",
+		"joined_aid": "bob1.example.com",
 	})
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -2192,7 +2192,7 @@ func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
 		case "group.get_members":
 			return map[string]any{"members": []any{
 				map[string]any{"aid": "alice.example.com", "role": "owner"},
-				map[string]any{"aid": "bob.example.com", "role": "member"},
+				map[string]any{"aid": "bob1.example.com", "role": "member"},
 			}}
 		default:
 			return map[string]any{"ok": true}
@@ -2206,8 +2206,8 @@ func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
 	c.onRawGroupChanged(map[string]any{
 		"group_id":   groupID,
 		"action":     "invite_code_used",
-		"member_aid": "bob.example.com",
-		"actor_aid":  "bob.example.com",
+		"member_aid": "bob1.example.com",
+		"actor_aid":  "bob1.example.com",
 	})
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -2322,7 +2322,7 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 	}
 
 	if _, err := c.Call(ctx, "message.send", map[string]any{
-		"to":      "bob.example.com",
+		"to":      "bob1.example.com",
 		"payload": map[string]any{"type": "text", "text": "hello"},
 		"encrypt": false,
 	}); err != nil {
@@ -2366,7 +2366,7 @@ func TestCallNormalizesOutboundMessagePayload(t *testing.T) {
 	}
 
 	if _, err := c.Call(ctx, "message.send", map[string]any{
-		"to":      "bob.example.com",
+		"to":      "bob1.example.com",
 		"content": map[string]any{"text": "hello"},
 		"encrypt": false,
 	}); err != nil {
@@ -2436,7 +2436,7 @@ func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
 		t.Fatalf("创建 protected headers 失败: %v", err)
 	}
 	if _, err := c.Call(ctx, "message.send", map[string]any{
-		"to":                "bob.example.com",
+		"to":                "bob1.example.com",
 		"payload":           map[string]any{"type": "text", "text": "hello"},
 		"encrypt":           false,
 		"protected_headers": headers,
@@ -2486,7 +2486,7 @@ func TestCallPlaintextMessageThoughtPutPassesThrough(t *testing.T) {
 	}
 
 	if _, err := c.Call(ctx, "message.thought.put", map[string]any{
-		"to":                "bob.example.com",
+		"to":                "bob1.example.com",
 		"payload":           map[string]any{"type": "thought", "text": "明文 thought"},
 		"encrypt":           false,
 		"protected_headers": map[string]any{"trace": "t1"},
@@ -2866,7 +2866,7 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 			return map[string]any{
 				"members": []any{
 					map[string]any{"aid": "owner.example.com", "role": "owner"},
-					map[string]any{"aid": "bob.example.com", "role": "member"},
+					map[string]any{"aid": "bob1.example.com", "role": "member"},
 				},
 			}
 		default:
@@ -2880,7 +2880,7 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 	})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
-	c.aid = "bob.example.com"
+	c.aid = "bob1.example.com"
 	c.state = StateConnected
 	c.gatewayURL = wsURL
 	c.mu.Unlock()
@@ -2909,13 +2909,13 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 func TestThoughtSelectorValidation(t *testing.T) {
 	c := newClient(nil)
 	valid := map[string]any{
-		"to":      "bob.example.com",
+		"to":      "bob1.example.com",
 		"context": map[string]any{"type": "run", "id": "run-1"},
 	}
 	if err := c.validateOutboundCall("message.thought.put", valid); err != nil {
 		t.Fatalf("context selector 应通过校验: %v", err)
 	}
-	missing := map[string]any{"to": "bob.example.com"}
+	missing := map[string]any{"to": "bob1.example.com"}
 	if err := c.validateOutboundCall("message.thought.put", missing); err == nil || !strings.Contains(err.Error(), "context.type") {
 		t.Fatalf("缺少 context selector 应报 context.type，实际: %v", err)
 	}
@@ -2956,7 +2956,7 @@ func TestGroupDispatchModeDefaultsToBroadcast(t *testing.T) {
 	msg := attachGroupDispatchModeToPayload(map[string]any{
 		"message_id": "group-plain-default",
 		"group_id":   "g-1.example.com",
-		"from":       "bob.example.com",
+		"from":       "bob1.example.com",
 		"payload":    map[string]any{"type": "text", "text": "hello"},
 	})
 	if msg["dispatch_mode"] != "broadcast" {

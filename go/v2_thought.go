@@ -133,7 +133,7 @@ func (v *v2E2EECoordinator) buildV2GroupEnvelope(
 	useCache bool,
 ) (map[string]any, error) {
 	c := v.runtime.client
-	allDevices, epoch, sc, auditRaw, wrapPolicy, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, _, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}

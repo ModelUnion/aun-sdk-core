@@ -33,7 +33,7 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
   it('legacy group.e2ee RPC 应被客户端拦截，不透传 transport', async () => {
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
 
-    await expect(client.call('group.e2ee.get_epoch', { group_id: 'g1' }))
+    await expect(client.call('group.e2ee.get_epoch', { group_id: 'grp01' }))
       .rejects.toThrow('legacy E2EE method is removed');
 
     expect((client as any)._transport.call).not.toHaveBeenCalled();
@@ -44,17 +44,17 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await expect(client.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: { type: 'text', text: 'hello' },
     })).rejects.toThrow('V2 session not initialized');
 
     await expect(client.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: { type: 'text', text: 'plain' },
       encrypt: false,
     })).resolves.toMatchObject({ ok: true });
     expect(transportCall).toHaveBeenCalledWith('group.send', expect.objectContaining({
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: { type: 'text', text: 'plain' },
     }), expect.any(Number), undefined, false);
     expect(transportCall.mock.calls.map(([method]) => method)).not.toContain('group.e2ee.get_epoch');
@@ -70,7 +70,7 @@ describe('ISSUE-SDK-JS-003: AIDStore.list()', () => {
 
   it('AIDStore.list 应返回已存储身份摘要列表', async () => {
     const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
-    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.aid.com', 'bob.aid.com']);
+    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.aid.com', 'bob1.aid.com']);
     (store as any).load = vi.fn(async (aid: string) => ({
       ok: true,
       data: {
@@ -86,7 +86,7 @@ describe('ISSUE-SDK-JS-003: AIDStore.list()', () => {
     expect(result.ok).toBe(true);
     expect((result as any).data?.identities).toEqual([
       { aid: 'alice.aid.com', certFingerprint: 'fp-alice.aid.com' },
-      { aid: 'bob.aid.com', certFingerprint: 'fp-bob.aid.com' },
+      { aid: 'bob1.aid.com', certFingerprint: 'fp-bob1.aid.com' },
     ]);
   });
 
@@ -121,7 +121,7 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._delivery.fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('grp01');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
@@ -131,7 +131,7 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._delivery.fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('grp01');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
@@ -140,7 +140,7 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     const callSpy = vi.fn();
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
-    await (client as any)._delivery.fillGroupEventGap('g1');
+    await (client as any)._delivery.fillGroupEventGap('grp01');
     expect(callSpy).not.toHaveBeenCalled();
   });
 
@@ -158,8 +158,8 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
     (client as any)._closing = false;
     const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([]);
 
-    await (client as any)._delivery.fillGroupGap('g1');
-    expect(pullGroupV2Spy).toHaveBeenCalledWith('g1', 5, 50);
+    await (client as any)._delivery.fillGroupGap('grp01');
+    expect(pullGroupV2Spy).toHaveBeenCalledWith('grp01', 5, 50);
   });
 });
 
@@ -189,7 +189,7 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
       return [];
     });
 
-    await (client as any)._delivery.fillGroupGap('g1');
+    await (client as any)._delivery.fillGroupGap('grp01');
     expect(captured).toBe(true);
     // 完成后应重置
     expect((client as any)._gapFillActive).toBe(false);
@@ -247,8 +247,8 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
     });
 
     const result = await client.call('group.add_member', {
-      group_id: 'g1',
-      aid: 'bob.aid.com',
+      group_id: 'grp01',
+      aid: 'bob1.aid.com',
     });
 
     // result 包含 error
@@ -263,15 +263,15 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
 
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       ok: true,
-      member: { aid: 'bob.aid.com' },
+      member: { aid: 'bob1.aid.com' },
     });
 
     await client.call('group.add_member', {
-      group_id: 'g1',
-      aid: 'bob.aid.com',
+      group_id: 'grp01',
+      aid: 'bob1.aid.com',
     });
 
-    expect(proposeSpy).toHaveBeenCalledWith('g1');
+    expect(proposeSpy).toHaveBeenCalledWith('grp01');
     expect((client as any)._maybeLeadRotateGroupEpoch).toBeUndefined();
   });
 });

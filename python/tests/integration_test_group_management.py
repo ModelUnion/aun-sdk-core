@@ -24,7 +24,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient, AuthError, RateLimitError
+from aun_core import AIDStore, AUNClient, AuthError, RateLimitError
 from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
@@ -44,6 +44,7 @@ _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 _CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
 _DAVE_AID = os.environ.get("AUN_TEST_DAVE_AID", f"dave.{_ISSUER}").strip()
 _ERIN_AID = os.environ.get("AUN_TEST_ERIN_AID", f"erin.{_ISSUER}").strip()
+_SEED = os.environ.get("AUN_TEST_ENCRYPTION_SEED", "")
 
 _passed = 0
 _failed = 0
@@ -65,6 +66,10 @@ def _fail(name: str, reason: str):
 
 def _make_client() -> AUNClient:
     return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
+
+
+def _make_store() -> AIDStore:
+    return AIDStore(_TEST_AUN_PATH, encryption_seed=_SEED, verify_ssl=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
@@ -91,6 +96,18 @@ async def _create_group(client: AUNClient, name: str, **extra) -> str:
     if not group_id:
         raise AssertionError(f"group.create 未返回 group_id: {result}")
     return group_id
+
+
+async def _create_named_group(client: AUNClient, name: str, group_name: str, store: AIDStore, **extra) -> tuple[str, str]:
+    params = {"name": name, "group_name": group_name, "visibility": "private"}
+    params.update(extra)
+    result = await client.create_group(params, aid_store=store)
+    group = result.get("group") or {}
+    group_id = str(group.get("group_id") or "")
+    group_aid = str(group.get("group_aid") or "")
+    if not group_id or not group_aid:
+        raise AssertionError(f"group.create 未返回 group_id/group_aid: {result}")
+    return group_id, group_aid
 
 
 async def _close_all(*clients: AUNClient):
@@ -123,7 +140,9 @@ async def test_roles_transfer_and_lifecycle():
     alice = _make_client()
     bobb = _make_client()
     charlie = _make_client()
+    store = _make_store()
     group_id = ""
+    group_aid = ""
     cleanup_owner = alice
 
     try:
@@ -131,7 +150,12 @@ async def test_roles_transfer_and_lifecycle():
         await _ensure_connected(bobb, _BOBB_AID)
         await _ensure_connected(charlie, _CHARLIE_AID)
 
-        group_id = await _create_group(alice, f"mgmt-roles-{rid}")
+        group_id, group_aid = await _create_named_group(
+            alice,
+            f"mgmt-roles-{rid}",
+            f"mgmtroles{rid}",
+            store,
+        )
         _ok("创建私有群")
 
         member = (await alice.call("group.add_member", {
@@ -190,12 +214,25 @@ async def test_roles_transfer_and_lifecycle():
         )
         _ok("admin 不能管理 owner")
 
-        transfer = await alice.call("group.transfer_owner", {
-            "group_id": group_id,
-            "new_owner": _BOBB_AID,
-        })
-        if transfer.get("old_owner") != _ALICE_AID or transfer.get("new_owner") != _BOBB_AID:
-            raise AssertionError(f"群主转让返回异常: {transfer}")
+        transfer = await alice.start_group_transfer(
+            {
+                "group_id": group_id,
+                "new_owner": _BOBB_AID,
+                "group_aid": group_aid,
+            },
+            aid_store=store,
+        )
+        if transfer.get("status") != "pending_rekey":
+            raise AssertionError(f"群主转让 pending 返回异常: {transfer}")
+        completed = await bobb.complete_group_transfer(
+            {
+                "group_id": group_id,
+                "group_aid": group_aid,
+            },
+            aid_store=store,
+        )
+        if completed.get("old_owner") != _ALICE_AID or completed.get("new_owner") != _BOBB_AID:
+            raise AssertionError(f"群主转让完成返回异常: {completed}")
         cleanup_owner = bobb
         _ok("owner 可转让群主")
 
@@ -241,6 +278,7 @@ async def test_roles_transfer_and_lifecycle():
         _ok("owner resume 幂等")
     finally:
         await _cleanup_group(cleanup_owner, group_id)
+        store.close()
         await _close_all(alice, bobb, charlie)
 
 

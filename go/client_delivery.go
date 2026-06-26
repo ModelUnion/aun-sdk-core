@@ -537,7 +537,7 @@ func (d *messageDeliveryEngine) publishGroupRecallTombstone(groupID string, seq 
 // 内部再按 (group_id, message_ids) 去重，确保应用层只回调一次。
 //
 // 对齐 Python _apply_group_recall_push；Go 无 ns lock（单 goroutine 处理 + seqTracker 各方法自带
-// mutex），且用 RepairContiguousSeq + saveSeqTrackerState 取代 Python 的 repair_push_contiguous_bound +
+// mutex），且用 RepairContiguousSeq + persistRepairedSeq 取代 Python 的 repair_push_contiguous_bound +
 // persist_seq，与同文件普通群消息 push 的 recall 分支保持一致。
 func (c *AUNClient) onRawGroupMessageRecalled(data any) {
 	dataMap, ok := data.(map[string]any)
@@ -579,7 +579,7 @@ func (c *AUNClient) onRawGroupMessageRecalled(data any) {
 		// contiguous 越界（脏数据）：倒退修复至 seq-1，与普通 push 路径一致。
 		c.logEG.Warn("group recall push: contiguous_seq 越界（> push_seq=%d），脏数据修复倒退至 %d", seq, seq-1)
 		c.seqTracker.RepairContiguousSeq(ns, seq-1)
-		c.saveSeqTrackerState()
+		c.persistRepairedSeq(ns)
 	}
 	if c.isPushedSeq(ns, seq) || c.delivery().isPendingOrderedSeq(ns, seq) {
 		// 该 notice_seq 已由 pull 路径处理过，去重发布兜底后返回。
@@ -587,7 +587,7 @@ func (c *AUNClient) onRawGroupMessageRecalled(data any) {
 		return
 	}
 	c.seqTracker.OnMessageSeq(ns, seq)
-	c.saveSeqTrackerState()
+	c.persistSeq(ns)
 	c.delivery().publishGroupRecallTombstone(groupID, seq, wrapped)
 	c.markPushedSeq(ns, seq)
 	contig := c.seqTracker.GetContiguousSeq(ns)
@@ -728,8 +728,7 @@ func (d *messageDeliveryEngine) processAndPublishMessage(data any) {
 				}
 			}()
 		}
-		// 即时持久化 cursor，异常断连后不回退
-		c.saveSeqTrackerState()
+		c.persistSeq(p2pNS)
 	}
 
 	if isEncryptedPushMessage(msg) {
@@ -812,7 +811,7 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 				c.logEG.Warn("group message notification: contiguous_seq=%d 越界（> push_seq=%d），脏数据修复倒退至 %d",
 					contigBefore, seq, seq-1)
 				c.seqTracker.RepairContiguousSeq(ns, seq-1)
-				c.saveSeqTrackerState()
+				c.persistRepairedSeq(ns)
 			}
 		}
 		c.autoPullGroupMessages(msg)
@@ -852,7 +851,7 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 						}
 					}()
 				}
-				c.saveSeqTrackerState()
+				c.persistSeq(ns)
 			} else {
 				c.delivery().publishGroupRecallTombstone(groupID, seq, msg)
 			}
@@ -897,7 +896,7 @@ func (d *messageDeliveryEngine) processAndPublishGroupMessage(data any) {
 				}
 			}()
 		}
-		c.saveSeqTrackerState()
+		c.persistSeq(ns)
 	}
 
 	if encryptedPush {
@@ -1091,7 +1090,7 @@ func (d *messageDeliveryEngine) lazySyncGroup(groupID string) {
 		}
 	}
 	if len(messages) > 0 {
-		c.saveSeqTrackerState()
+		c.persistSeq(ns)
 		c.logEG.Warn("lazy sync group %s: pulled %d messages, after_seq=%d", groupID, len(messages), afterSeq)
 	}
 }
@@ -1196,7 +1195,7 @@ func (d *messageDeliveryEngine) fillGroupEventGap(groupID string) {
 		ackContig := c.seqTracker.GetContiguousSeq(ns)
 		d.drainOrderedMessages(ns)
 		if ackContig != pageContigBefore && !hasDissolvedEvent {
-			c.saveSeqTrackerState()
+			c.persistSeq(ns)
 		}
 		if len(pullEvts) > 0 && ackContig > 0 && ackContig != pageContigBefore {
 			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(ackContig))
@@ -1258,7 +1257,7 @@ func (d *messageDeliveryEngine) handleGroupChangedEventSeq(data map[string]any, 
 	d.drainOrderedMessages(ns)
 	if ackContig > 0 && ackContig != contigBefore {
 		if data["action"] != "dissolved" {
-			c.saveSeqTrackerState()
+			c.persistSeq(ns)
 		}
 		if c.transport != nil {
 			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(ackContig))
@@ -1373,7 +1372,7 @@ func (d *messageDeliveryEngine) onV2PushNotification(data any) {
 			c.logE2.Warn("onV2PushNotification: contiguous_seq=%d 越界（> push_seq=%d），脏数据修复倒退至 %d",
 				contigBefore, pushSeq, pushSeq-1)
 			c.seqTracker.RepairContiguousSeq(ns, int(pushSeq-1))
-			c.saveSeqTrackerState()
+			c.persistRepairedSeq(ns)
 			contigBefore = int(pushSeq - 1)
 		}
 	}
@@ -1387,7 +1386,7 @@ func (d *messageDeliveryEngine) onV2PushNotification(data any) {
 			published := c.publishOrderedMessage("message.received", ns, int(pushSeq), decrypted)
 			newContig := c.seqTracker.GetContiguousSeq(ns)
 			if newContig != contigBefore {
-				c.saveSeqTrackerState()
+				c.persistSeq(ns)
 			}
 			if newContig > 0 && newContig != contigBefore {
 				ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(newContig))
@@ -1497,7 +1496,7 @@ func (d *messageDeliveryEngine) onV2GroupPushNotification(data any) {
 		c.logEG.Warn("onV2GroupPushNotification: contiguous_seq=%d 越界（> push_seq=%d），脏数据修复倒退至 %d",
 			contigBefore, seq, seq-1)
 		c.seqTracker.RepairContiguousSeq(ns, seq-1)
-		c.saveSeqTrackerState()
+		c.persistRepairedSeq(ns)
 		contigBefore = seq - 1
 	}
 	if c.isPushedSeq(ns, seq) {
@@ -1908,12 +1907,20 @@ func (d *messageDeliveryEngine) isPendingOrderedSeq(ns string, seq int) bool {
 	return ok
 }
 
+func (d *messageDeliveryEngine) pendingOrderedEmpty(ns string) bool {
+	c := d.runtime.client
+	c.pendingOrderedMsgsMu.Lock()
+	defer c.pendingOrderedMsgsMu.Unlock()
+	return len(c.pendingOrderedMsgs[ns]) == 0
+}
+
 func (d *messageDeliveryEngine) drainOrderedMessages(ns string, beforeSeq ...int) {
 	c := d.runtime.client
 	limit := 0
 	if len(beforeSeq) > 0 {
 		limit = beforeSeq[0]
 	}
+	delivered := false
 	for _, ready := range c.popReadyOrderedMessages(ns, limit) {
 		if c.isPushedSeq(ns, ready.seq) {
 			c.log.Debug("publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
@@ -1921,7 +1928,11 @@ func (d *messageDeliveryEngine) drainOrderedMessages(ns string, beforeSeq ...int
 		}
 		d.publishOrderedQueueItem(ns, ready.item.event, ready.seq, ready.item.payload)
 		c.markPushedSeq(ns, ready.seq)
+		delivered = true
 		c.log.Debug("publish ordered drain delivered: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
+	}
+	if delivered && d.pendingOrderedEmpty(ns) {
+		c.saveSeqTrackerState()
 	}
 }
 
@@ -1975,6 +1986,9 @@ func (d *messageDeliveryEngine) publishOrderedMessage(event, ns string, seq int,
 	c.markPushedSeq(ns, seq)
 	c.log.Debug("publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq)
 	c.drainOrderedMessages(ns)
+	if d.pendingOrderedEmpty(ns) {
+		c.saveSeqTrackerState()
+	}
 	return true
 }
 
@@ -2043,6 +2057,130 @@ func (d *messageDeliveryEngine) publishGapFillGroupMessages(ns string, messages 
 }
 
 // ── seq tracker 持久化 ──────────────────────────────────────
+
+const seqTrackerPersistFlushDelay = 200 * time.Millisecond
+
+func (d *messageDeliveryEngine) currentSeqTrackerContext() string {
+	c := d.runtime.client
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.aid == "" {
+		return ""
+	}
+	return buildSeqTrackerContext(c.aid, c.deviceID, c.slotID)
+}
+
+func (d *messageDeliveryEngine) currentSeqTrackerIdentity() (string, string, string, string) {
+	c := d.runtime.client
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.aid == "" {
+		return "", "", "", ""
+	}
+	aid := c.aid
+	deviceID := c.deviceID
+	slotID := c.slotID
+	return buildSeqTrackerContext(aid, deviceID, slotID), aid, deviceID, slotID
+}
+
+func (d *messageDeliveryEngine) writeSeqTrackerValues(aid, deviceID, slotID string, values map[string]int) {
+	c := d.runtime.client
+	if aid == "" || len(values) == 0 {
+		return
+	}
+	store, ok := c.tokenStore.(keystore.SeqTrackerStore)
+	if !ok {
+		c.log.Warn("keystore does not support SeqTrackerStore, seq_tracker_state not persisted")
+		return
+	}
+	for ns, seq := range values {
+		if ns == "" || seq <= 0 {
+			continue
+		}
+		_ = store.SaveSeq(aid, deviceID, slotID, ns, seq)
+	}
+}
+
+func (d *messageDeliveryEngine) flushSeqTrackerPending() {
+	c := d.runtime.client
+	c.seqTrackerPersistMu.Lock()
+	if c.seqTrackerFlushTimer != nil {
+		c.seqTrackerFlushTimer.Stop()
+		c.seqTrackerFlushTimer = nil
+	}
+	aid := c.seqTrackerPendingAid
+	deviceID := c.seqTrackerPendingDevice
+	slotID := c.seqTrackerPendingSlot
+	values := make(map[string]int, len(c.seqTrackerPendingPersist))
+	for ns, seq := range c.seqTrackerPendingPersist {
+		values[ns] = seq
+	}
+	c.seqTrackerPendingPersist = make(map[string]int)
+	c.seqTrackerPendingContext = ""
+	c.seqTrackerPendingAid = ""
+	c.seqTrackerPendingDevice = ""
+	c.seqTrackerPendingSlot = ""
+	c.seqTrackerPersistMu.Unlock()
+	d.writeSeqTrackerValues(aid, deviceID, slotID, values)
+}
+
+func (d *messageDeliveryEngine) mergeSeqTrackerPending(context string, values map[string]int) {
+	c := d.runtime.client
+	c.seqTrackerPersistMu.Lock()
+	if c.seqTrackerPendingPersist == nil {
+		c.seqTrackerPendingPersist = make(map[string]int)
+	}
+	needFlush := c.seqTrackerPendingContext != "" && c.seqTrackerPendingContext != context && len(c.seqTrackerPendingPersist) > 0
+	c.seqTrackerPersistMu.Unlock()
+	if needFlush {
+		d.flushSeqTrackerPending()
+	}
+	c.seqTrackerPersistMu.Lock()
+	if c.seqTrackerPendingPersist == nil {
+		c.seqTrackerPendingPersist = make(map[string]int)
+	}
+	_, aid, deviceID, slotID := d.currentSeqTrackerIdentity()
+	c.seqTrackerPendingContext = context
+	c.seqTrackerPendingAid = aid
+	c.seqTrackerPendingDevice = deviceID
+	c.seqTrackerPendingSlot = slotID
+	for ns, seq := range values {
+		if ns != "" && seq > 0 {
+			c.seqTrackerPendingPersist[ns] = seq
+		}
+	}
+	c.seqTrackerPersistMu.Unlock()
+}
+
+func (d *messageDeliveryEngine) scheduleSeqTrackerFlush() {
+	c := d.runtime.client
+	c.seqTrackerPersistMu.Lock()
+	if len(c.seqTrackerPendingPersist) == 0 || c.seqTrackerFlushTimer != nil {
+		c.seqTrackerPersistMu.Unlock()
+		return
+	}
+	c.seqTrackerFlushTimer = time.AfterFunc(seqTrackerPersistFlushDelay, func() {
+		d.flushSeqTrackerPending()
+	})
+	c.seqTrackerPersistMu.Unlock()
+}
+
+func (d *messageDeliveryEngine) dropSeqTrackerPending(ns string) {
+	c := d.runtime.client
+	c.seqTrackerPersistMu.Lock()
+	delete(c.seqTrackerPendingPersist, ns)
+	if len(c.seqTrackerPendingPersist) == 0 {
+		c.seqTrackerPendingContext = ""
+		c.seqTrackerPendingAid = ""
+		c.seqTrackerPendingDevice = ""
+		c.seqTrackerPendingSlot = ""
+		if c.seqTrackerFlushTimer != nil {
+			c.seqTrackerFlushTimer.Stop()
+			c.seqTrackerFlushTimer = nil
+		}
+	}
+	c.seqTrackerPersistMu.Unlock()
+}
 
 // restoreSeqTrackerState 从 keystore seq_tracker 表恢复 SeqTracker 状态
 func (d *messageDeliveryEngine) restoreSeqTrackerState() {
@@ -2144,23 +2282,61 @@ func (d *messageDeliveryEngine) migrateSeqStateGroupIDs(aid, deviceID, slotID st
 // saveSeqTrackerState 将 SeqTracker 状态保存到 keystore seq_tracker 表（每 namespace 一行）
 func (d *messageDeliveryEngine) saveSeqTrackerState() {
 	c := d.runtime.client
-	c.mu.RLock()
-	aid := c.aid
-	deviceID := c.deviceID
-	slotID := c.slotID
-	c.mu.RUnlock()
-	if aid == "" {
+	context, _, _, _ := d.currentSeqTrackerIdentity()
+	if context == "" {
+		d.flushSeqTrackerPending()
 		return
 	}
 	state := c.seqTracker.ExportState()
-	if len(state) == 0 {
-		return
-	}
-	if store, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
-		for ns, seq := range state {
-			_ = store.SaveSeq(aid, deviceID, slotID, ns, seq)
+	c.seqTrackerPersistMu.Lock()
+	if len(c.seqTrackerPendingPersist) > 0 && c.seqTrackerPendingContext == context {
+		for ns := range c.seqTrackerPendingPersist {
+			if _, ok := state[ns]; !ok {
+				delete(c.seqTrackerPendingPersist, ns)
+			}
 		}
+		if len(c.seqTrackerPendingPersist) == 0 {
+			c.seqTrackerPendingContext = ""
+		}
+	}
+	c.seqTrackerPersistMu.Unlock()
+	if len(state) > 0 {
+		d.mergeSeqTrackerPending(context, state)
+	}
+	d.flushSeqTrackerPending()
+}
+
+func (d *messageDeliveryEngine) persistSeq(ns string) {
+	c := d.runtime.client
+	context, _, _, _ := d.currentSeqTrackerIdentity()
+	if context == "" {
+		d.flushSeqTrackerPending()
 		return
 	}
-	c.log.Warn("keystore does not support SeqTrackerStore, seq_tracker_state not persisted")
+	seq := c.seqTracker.GetContiguousSeq(ns)
+	if ns == "" || seq <= 0 {
+		return
+	}
+	d.mergeSeqTrackerPending(context, map[string]int{ns: seq})
+	d.scheduleSeqTrackerFlush()
+}
+
+func (d *messageDeliveryEngine) persistRepairedSeq(ns string) {
+	c := d.runtime.client
+	if ns == "" {
+		return
+	}
+	d.dropSeqTrackerPending(ns)
+	seq := c.seqTracker.GetContiguousSeq(ns)
+	context, aid, deviceID, slotID := d.currentSeqTrackerIdentity()
+	if context == "" {
+		return
+	}
+	if seq > 0 {
+		d.writeSeqTrackerValues(aid, deviceID, slotID, map[string]int{ns: seq})
+		return
+	}
+	if deleter, ok := c.tokenStore.(keystore.SeqTrackerDeleter); ok {
+		_ = deleter.DeleteSeq(aid, deviceID, slotID, ns)
+	}
 }

@@ -4,7 +4,7 @@
 >
 > **服务端编排**：collab 编排已并入 storage 服务进程，`collab.*` RPC handler 与 `storage.*` 并列注册。collab handler 以调用者身份（Gateway 注入的 `_auth.aid`）直调 storage 原语，无特权通道。
 >
-> **授权 = 存储 ACL**：谁能 `commit` = 谁对 `collab_root` 有写权限（`storage.set_acl`）。无独立发起人特权。
+> **授权 = 协作根写 ACL**：谁能 `commit` = 谁对 `collab_root` 有写权限。普通 AID storage 可继续用 `storage.set_acl/remove_acl` 管理写授权；群 `memberdata` 协作根必须用 `collab.set_acl/remove_acl` 按 `collab_root` 授权，SDK/CLI 不得拼接真实 `group_data` 路径。
 >
 > SDK 侧通过 `client.collab` 访问（`CollabClient`），每个命令 1:1 映射一条 `collab.*` RPC。
 
@@ -50,6 +50,8 @@
 |------|------|
 | [collab.ls-remote](#collabls-remote) | 列出群内已登记的协作根 |
 | [collab.unregister](#collabunregister) | 注销注册表中的协作根条目 |
+| [collab.set_acl](#collabset_acl) | owner 授予具体 AID 对协作根的写权限 |
+| [collab.remove_acl](#collabremove_acl) | owner 撤销具体 AID 对协作根的写权限 |
 
 ---
 
@@ -536,6 +538,35 @@ if not res["ok"]:
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `ok` | boolean | `true` |
+
+---
+
+## collab.set_acl
+
+授予具体 AID 对协作根的写权限。调用者必须是协作根真实 storage owner。对 `group_aid:/memberdata/{aid}/...` 根，服务端内部映射到成员 storage 的 `group_data/{group_aid}`，但调用参数仍只使用 `collab_root`。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `collab_root` | string | 是 | 协作根 `<aid>:<path>` |
+| `grantee_aid` | string | 是 | 被授权 AID；不支持 `role:*` |
+| `perms` | string | 否 | 权限位，默认 `w` |
+| `expires_at` | integer | 否 | 过期时间戳 |
+| `max_uses` | integer | 否 | 最大使用次数 |
+
+---
+
+## collab.remove_acl
+
+撤销具体 AID 对协作根的写权限。调用者必须是协作根真实 storage owner。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `collab_root` | string | 是 | 协作根 `<aid>:<path>` |
+| `grantee_aid` | string | 是 | 被撤销 AID |
 
 ---
 

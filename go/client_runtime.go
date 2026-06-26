@@ -247,6 +247,7 @@ func (s *runtimeDeliveryState) seqTracker() *SeqTracker {
 
 func (s *runtimeDeliveryState) resetSeqTrackingStateLocked() {
 	c := s.runtime.client
+	c.delivery().flushSeqTrackerPending()
 	c.seqTracker = NewSeqTracker()
 	c.seqTrackerContext = ""
 	c.gapFillDoneMu.Lock()
@@ -277,6 +278,7 @@ func (s *runtimeDeliveryState) refreshSeqTrackerContextLocked() {
 	if nextContext == c.seqTrackerContext {
 		return
 	}
+	c.delivery().flushSeqTrackerPending()
 	c.seqTracker = NewSeqTracker()
 	c.seqTrackerContext = nextContext
 	c.gapFillDoneMu.Lock()

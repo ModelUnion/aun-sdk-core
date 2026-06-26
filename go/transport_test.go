@@ -165,6 +165,52 @@ func TestCallOnClosedTransportIncludesLastCloseCode(t *testing.T) {
 	}
 }
 
+func TestSendFailureErrorUsesCloseCodeFromWriteError(t *testing.T) {
+	tr := NewRPCTransport(NewEventDispatcher(), 5*time.Second, nil, false)
+
+	err := tr.sendFailureError("rpc meta.ping", websocket.CloseError{
+		Code:   4013,
+		Reason: "short_connection_capacity_exceeded",
+	})
+
+	if err == nil {
+		t.Fatal("写失败应返回错误")
+	}
+	if !strings.Contains(err.Error(), "4013") {
+		t.Fatalf("写失败错误应包含 close code，实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short_connection_capacity_exceeded") {
+		t.Fatalf("写失败错误应包含 close reason，实际: %v", err)
+	}
+}
+
+func TestSendFailureErrorWaitsForReaderCloseCode(t *testing.T) {
+	tr := NewRPCTransport(NewEventDispatcher(), 5*time.Second, nil, false)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- tr.sendFailureError("rpc meta.ping", errors.New("use of closed network connection"))
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	tr.closedMu.Lock()
+	tr.lastCloseCode = 4013
+	tr.lastCloseErr = websocket.CloseError{Code: 4013, Reason: "short_connection_capacity_exceeded"}
+	tr.closedMu.Unlock()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("写失败应返回错误")
+		}
+		if !strings.Contains(err.Error(), "4013") {
+			t.Fatalf("写失败错误应等待并包含 close code，实际: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("等待 close code 的写失败错误构造不应阻塞")
+	}
+}
+
 func TestSetTimeoutConcurrentSafety(t *testing.T) {
 	dispatcher := NewEventDispatcher()
 	tr := NewRPCTransport(dispatcher, 10*time.Second, nil, false)

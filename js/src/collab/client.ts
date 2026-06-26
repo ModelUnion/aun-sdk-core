@@ -159,4 +159,22 @@ export class CollabClient {
   unregister(groupAid: string, collabRoot: string): Promise<CollabRaw> {
     return this._call('collab.unregister', { group_aid: groupAid, collab_root: collabRoot });
   }
+
+  setAcl(
+    collabRoot: string,
+    granteeAid: string,
+    options: { perms?: string; expires_at?: number; expiresAt?: number; max_uses?: number; maxUses?: number } = {},
+  ): Promise<CollabRaw> {
+    return this._call('collab.set_acl', stripNil({
+      collab_root: collabRoot,
+      grantee_aid: granteeAid,
+      perms: options.perms ?? 'w',
+      expires_at: options.expires_at ?? options.expiresAt,
+      max_uses: options.max_uses ?? options.maxUses,
+    }));
+  }
+
+  removeAcl(collabRoot: string, granteeAid: string): Promise<CollabRaw> {
+    return this._call('collab.remove_acl', { collab_root: collabRoot, grantee_aid: granteeAid });
+  }
 }

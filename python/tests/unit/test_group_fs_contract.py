@@ -87,7 +87,7 @@ async def test_group_fs_posix_methods_call_group_fs_rpc():
 
 
 @pytest.mark.asyncio
-async def test_group_fs_does_not_map_memberdata_to_groupdata_in_sdk():
+async def test_group_fs_does_not_map_memberdata_to_storage_root_in_sdk():
     client = _FakeClient()
     fs = GroupFacade(client).fs
 
@@ -96,4 +96,4 @@ async def test_group_fs_does_not_map_memberdata_to_groupdata_in_sdk():
     assert client.calls == [
         ("group.fs.stat", {"path": "g-team.agentid.pub:/memberdata/me/logs/a.md"})
     ]
-    assert "groupdata" not in json.dumps(client.calls, ensure_ascii=False)
+    assert "group_data" not in json.dumps(client.calls, ensure_ascii=False)

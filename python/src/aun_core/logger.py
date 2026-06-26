@@ -154,6 +154,8 @@ class AUNLogger:
 class NullLogger:
     """静默 logger，用于不需要日志输出的场景。"""
 
+    is_null_logger = True
+
     def bind_device_id(self, device_id: str | None) -> None:
         pass
 

@@ -79,6 +79,8 @@ const GROUP_FS_CONTROL_METHODS = [
   'group.fs.rm',
   'group.fs.cp',
   'group.fs.mv',
+  'group.fs.set_acl',
+  'group.fs.remove_acl',
   'group.fs.mount',
   'group.fs.umount',
   'group.fs.check_upload',

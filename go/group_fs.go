@@ -121,6 +121,14 @@ type GroupFSMkdirOptions struct {
 	Extra    map[string]any
 }
 
+type GroupFSAclOptions struct {
+	GranteeAID string
+	Perms      string
+	SignAs     string
+	AidStore   *AIDStore
+	Extra      map[string]any
+}
+
 type GroupFSRmOptions struct {
 	Recursive bool
 	Force     bool
@@ -340,6 +348,33 @@ func (v *GroupFSVFS) Mkdir(ctx context.Context, p string, opts *GroupFSMkdirOpti
 		return GroupFSNodeView{}, err
 	}
 	return GroupFSNodeViewFromAny(raw), nil
+}
+
+func (v *GroupFSVFS) SetACL(ctx context.Context, p string, opts *GroupFSAclOptions) (map[string]any, error) {
+	params := map[string]any{"path": p, "grantee_aid": "role:admin", "perms": "rwx"}
+	if opts != nil {
+		if opts.GranteeAID != "" {
+			params["grantee_aid"] = opts.GranteeAID
+		}
+		if opts.Perms != "" {
+			params["perms"] = opts.Perms
+		}
+		params = groupFSParams(params, opts.Extra)
+		groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
+	}
+	return v.call(ctx, "group.fs.set_acl", params, p)
+}
+
+func (v *GroupFSVFS) RemoveACL(ctx context.Context, p string, opts *GroupFSAclOptions) (map[string]any, error) {
+	params := map[string]any{"path": p, "grantee_aid": "role:admin"}
+	if opts != nil {
+		if opts.GranteeAID != "" {
+			params["grantee_aid"] = opts.GranteeAID
+		}
+		params = groupFSParams(params, opts.Extra)
+		groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
+	}
+	return v.call(ctx, "group.fs.remove_acl", params, p)
 }
 
 func (v *GroupFSVFS) Rm(ctx context.Context, p string, opts *GroupFSRmOptions) (GroupFSRemoveResult, error) {

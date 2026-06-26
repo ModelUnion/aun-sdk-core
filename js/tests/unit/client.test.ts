@@ -138,7 +138,7 @@ describe('AUNClient.notify', () => {
     await client.notify(
       'event/app.typing',
       { thread_id: 't1' },
-      { to: 'bob.agentid.pub', device_id: 'dev-1', slot_id: 'slot-1', ttl_ms: 5000 },
+      { to: 'bob1.agentid.pub', device_id: 'dev-1', slot_id: 'slot-1', ttl_ms: 5000 },
     );
 
     expect((client as any)._transport.notify).toHaveBeenCalledWith(
@@ -146,7 +146,7 @@ describe('AUNClient.notify', () => {
       {
         target: {
           type: 'aid',
-          aid: 'bob.agentid.pub',
+          aid: 'bob1.agentid.pub',
           device_id: 'dev-1',
           slot_id: 'slot-1',
         },
@@ -463,7 +463,7 @@ describe('AUNClient message.send 接收者校验', () => {
     (client as any)._state = 'connected';
 
     await expect(client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       persist: true,
@@ -475,7 +475,7 @@ describe('AUNClient message.send 接收者校验', () => {
     (client as any)._state = 'connected';
 
     await expect(client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       delivery_mode: { mode: 'queue' },
@@ -494,7 +494,7 @@ describe('AUNClient message.send 接收者校验', () => {
     const protectedHeaders = new ProtectedHeaders({ Device_ID: 'dev-a', slot_id: 'slot-a' });
 
     await client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       protected_headers: protectedHeaders as unknown as import('../../src/types.js').JsonValue,

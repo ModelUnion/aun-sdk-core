@@ -58,6 +58,8 @@ async def test_collab_methods_match_server_rpc_contract():
     await collab.revert("alice.aid.com:/proj", "d.md", 1, message="revert")
     await collab.ls_remote("g-team.aid.com")
     await collab.unregister("g-team.aid.com", "g-team.aid.com:/proj")
+    await collab.set_acl("alice.aid.com:/proj", grantee_aid="bob.aid.com", perms="w", expires_at=123, max_uses=2)
+    await collab.remove_acl("alice.aid.com:/proj", grantee_aid="bob.aid.com")
     await collab.tag.create("alice.aid.com:/proj", message="m", major=True)
     await collab.tag.list("alice.aid.com:/proj")
     await collab.tag.show("alice.aid.com:/proj", "1.0.0")
@@ -83,6 +85,8 @@ async def test_collab_methods_match_server_rpc_contract():
         "collab.revert",
         "collab.ls-remote",
         "collab.unregister",
+        "collab.set_acl",
+        "collab.remove_acl",
         "collab.tag.create",
         "collab.tag.list",
         "collab.tag.show",
@@ -105,6 +109,17 @@ async def test_collab_methods_match_server_rpc_contract():
         "src": "alice.aid.com:/proj",
         "dest": "alice.aid.com:/new",
         "reroot": True,
+    }
+    assert client.calls[16][1] == {
+        "collab_root": "alice.aid.com:/proj",
+        "grantee_aid": "bob.aid.com",
+        "perms": "w",
+        "expires_at": 123,
+        "max_uses": 2,
+    }
+    assert client.calls[17][1] == {
+        "collab_root": "alice.aid.com:/proj",
+        "grantee_aid": "bob.aid.com",
     }
 
 

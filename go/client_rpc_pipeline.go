@@ -43,6 +43,7 @@ var signedMethods = map[string]bool{
 	"group.set_role":                   true,
 	"group.transfer_owner":             true,
 	"group.bind_group_aid":             true,
+	"group.renew_group_aid":            true,
 	"group.complete_transfer":          true,
 	"group.review_join_request":        true,
 	"group.batch_review_join_request":  true,
@@ -55,6 +56,8 @@ var signedMethods = map[string]bool{
 	"group.fs.rm":                      true,
 	"group.fs.cp":                      true,
 	"group.fs.mv":                      true,
+	"group.fs.set_acl":                 true,
+	"group.fs.remove_acl":              true,
 	"group.fs.mount":                   true,
 	"group.fs.umount":                  true,
 	"group.fs.check_upload":            true,
@@ -361,6 +364,10 @@ func (p *rpcPipeline) validateOutboundCall(method string, params map[string]any)
 		if err := validateMessageRecipient(params["to"]); err != nil {
 			return err
 		}
+		// 校验目标 AID 格式（拒绝 __system__ 等非法格式）
+		if _, err := ValidateAIDFormat(params["to"], "message.send.to"); err != nil {
+			return err
+		}
 		if _, ok := params["persist"]; ok {
 			return NewValidationError("message.send no longer accepts 'persist'; configure delivery_mode during connect")
 		}
@@ -376,6 +383,10 @@ func (p *rpcPipeline) validateOutboundCall(method string, params map[string]any)
 		return nil
 	}
 	if method == "group.send" {
+		// 校验目标 Group ID 格式
+		if _, err := ValidateGroupIDFormat(params["group_id"], "group.send.group_id"); err != nil {
+			return err
+		}
 		if _, ok := params["persist"]; ok {
 			return NewValidationError("group.send does not accept 'persist'; group messages are always fanout")
 		}
@@ -397,10 +408,24 @@ func (p *rpcPipeline) validateOutboundCall(method string, params map[string]any)
 			return NewValidationError(method + " requires context.type + context.id")
 		}
 	}
+	if method == "group.thought.put" {
+		// 校验目标 Group ID 格式
+		if _, err := ValidateGroupIDFormat(params["group_id"], "group.thought.put.group_id"); err != nil {
+			return err
+		}
+	}
 	if method == "group.thought.get" {
 		senderAID, _ := params["sender_aid"].(string)
 		if strings.TrimSpace(senderAID) == "" {
 			return NewValidationError("group.thought.get requires sender_aid")
+		}
+		// 校验 sender_aid 格式
+		if _, err := ValidateAIDFormat(params["sender_aid"], "group.thought.get.sender_aid"); err != nil {
+			return err
+		}
+		// 校验目标 Group ID 格式
+		if _, err := ValidateGroupIDFormat(params["group_id"], "group.thought.get.group_id"); err != nil {
+			return err
 		}
 	}
 	if method == "message.thought.put" {
@@ -410,11 +435,19 @@ func (p *rpcPipeline) validateOutboundCall(method string, params map[string]any)
 		if strings.TrimSpace(fmt.Sprint(params["to"])) == "" {
 			return NewValidationError("message.thought.put requires to")
 		}
+		// 校验目标 AID 格式
+		if _, err := ValidateAIDFormat(params["to"], "message.thought.put.to"); err != nil {
+			return err
+		}
 	}
 	if method == "message.thought.get" {
 		senderAID, _ := params["sender_aid"].(string)
 		if strings.TrimSpace(senderAID) == "" {
 			return NewValidationError("message.thought.get requires sender_aid")
+		}
+		// 校验 sender_aid 格式
+		if _, err := ValidateAIDFormat(params["sender_aid"], "message.thought.get.sender_aid"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -834,7 +867,7 @@ func (p *rpcPipeline) postprocessMessagePull(method string, params map[string]an
 		}
 	}
 	if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
-		c.saveSeqTrackerState()
+		c.persistSeq(ns)
 	}
 	resultMap["_contig_before"] = contigBefore
 }
@@ -880,7 +913,7 @@ func (p *rpcPipeline) postprocessGroupPull(method string, params map[string]any,
 		}
 	}
 	if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
-		c.saveSeqTrackerState()
+		c.persistSeq(ns)
 	}
 	resultMap["_contig_before"] = contigBefore
 }

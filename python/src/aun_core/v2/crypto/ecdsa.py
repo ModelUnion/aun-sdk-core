@@ -8,11 +8,36 @@ AUN E2EE V2: ECDSA-SHA256 RAW (RFC 6979 deterministic)
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+from threading import RLock
+
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
+
+
+_PUBLIC_KEY_CACHE_MAX = 512
+_PUBLIC_KEY_CACHE: OrderedDict[bytes, ec.EllipticCurvePublicKey] = OrderedDict()
+_PUBLIC_KEY_CACHE_LOCK = RLock()
+
+
+def _public_key_from_der(public_key_der: bytes) -> ec.EllipticCurvePublicKey | None:
+    with _PUBLIC_KEY_CACHE_LOCK:
+        cached = _PUBLIC_KEY_CACHE.get(public_key_der)
+        if cached is not None:
+            _PUBLIC_KEY_CACHE.move_to_end(public_key_der)
+            return cached
+    public_key = serialization.load_der_public_key(public_key_der, default_backend())
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        return None
+    with _PUBLIC_KEY_CACHE_LOCK:
+        _PUBLIC_KEY_CACHE[public_key_der] = public_key
+        _PUBLIC_KEY_CACHE.move_to_end(public_key_der)
+        while len(_PUBLIC_KEY_CACHE) > _PUBLIC_KEY_CACHE_MAX:
+            _PUBLIC_KEY_CACHE.popitem(last=False)
+    return public_key
 
 
 def ecdsa_sign_raw(private_key_scalar: bytes, message: bytes) -> bytes:
@@ -58,8 +83,8 @@ def ecdsa_verify_raw(public_key_der: bytes, signature_raw: bytes, message: bytes
         return False
 
     try:
-        public_key = serialization.load_der_public_key(public_key_der, default_backend())
-        if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        public_key = _public_key_from_der(public_key_der)
+        if public_key is None:
             return False
 
         # RAW → DER

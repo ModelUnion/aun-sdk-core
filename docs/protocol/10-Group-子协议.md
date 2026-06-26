@@ -44,25 +44,31 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ### Group ID 格式与规范化
 
-`group_id` 是群组的全网唯一标识，前缀 `g-` 为 Group 保留前缀。普通 AID 的本地名称不得以 `g-` 开头，避免与群 ID 混淆。短形式必须以 `g-` 开头，总长度 6 到 16 字符；`g-` 后面的 slug 为 4 到 14 位，只能使用小写字母和数字。
+`group_id` 是群组的全网唯一标识，前缀 `g-` 为 Group 保留前缀（legacy 格式）。普通 AID 的本地名称不得以 `g-` 开头，避免与群 ID 混淆。
 
-服务端必须接受以下三种输入形式，并在内部统一为 canonical group_id：
+**支持的 base 格式**（不含域名部分）：
+- **Legacy 格式**: `g-[a-z0-9]{4,32}` — 以 `g-` 开头，后接 4 到 32 位小写字母或数字
+- **新格式**: `[a-z0-9]{5,}` — 5 位或更多小写字母或数字，无上限
+- **Group name 格式**: `[a-z0-9][a-z0-9_-]{3,63}` — 4 到 64 个字符，可包含下划线和短横线
+
+服务端必须接受以下输入形式，并在内部统一为 canonical group_id：
 
 | 输入形式 | 用途 | canonical 结果 |
 |----------|------|----------------|
-| `g-{slug}` | 本地域内简写别名 | 若本域 issuer 为 `issuer-domain`，规范化为 `g-{slug}.issuer-domain` |
-| `g-{slug}@issuer-domain` | 跨域传播兼容形式 | 规范化为 `g-{slug}.issuer-domain` |
-| `g-{slug}.issuer-domain` | canonical 形式 | 保持为 `g-{slug}.issuer-domain` |
+| `{base}` | 本地域内简写（base 为上述任一格式） | 若本域 issuer 为 `issuer-domain`，规范化为 `group.issuer-domain/{base}` |
+| `{base}@issuer-domain` | 跨域传播兼容形式 | 规范化为 `group.issuer-domain/{base}` |
+| `{base}.issuer-domain` | 旧 canonical 形式 | 规范化为 `group.issuer-domain/{base}` |
+| `group.issuer-domain/{base}` | 新 canonical 形式 | 保持为 `group.issuer-domain/{base}` |
 
 规范化规则：
 
-- `group_id` 比较、数据库存储、成员归属、权限校验、E2EE AAD / 签名输入均必须使用 canonical group_id。
-- 输入必须先 trim 并转换为小写；`@issuer-domain` 形式仅作为兼容输入，进入内部前必须转换为 `.issuer-domain`。
-- 本域内客户端可以提交 `g-{slug}` 简写；服务端按本域 `AUN_ISSUER_DOMAIN` 解析为 canonical group_id。没有本域 issuer 配置时，简写保持为 `g-{slug}`。
+- `group_id` 比较、数据库存储、成员归属、权限校验、E2EE AAD / 签名输入均必须使用 canonical group_id（`group.{issuer}/{base}` 格式）。
+- 输入必须先 trim 并转换为小写；`@issuer-domain` 和 `.issuer-domain` 形式仅作为兼容输入，进入内部前必须转换为 `group.{issuer}/{base}`。
+- 本域内客户端可以提交 `{base}` 简写；服务端按本域 `AUN_ISSUER_DOMAIN` 解析为 canonical group_id。没有本域 issuer 配置时，简写保持为 `{base}`。
 - 跨域消息、邀请传播、日志和协议响应应使用 canonical group_id，避免远端误把短 ID 当成本域群。
 - `group.create` 可以指定 `group_id`；指定时必须满足上述格式且未被占用，被占用时返回错误。未指定时由服务端自动分配。
-- 自动生成的群 ID 使用 `g-` 加随机小写十六进制短 slug，服务端必须通过唯一约束或等效机制保证 canonical group_id 唯一；发现碰撞时重新生成。
-- 在 `group.{issuer-domain}` 这类已携带 issuer 的公开 HTTP 主机下，生成的群链接 path 应使用本域简写，例如 `https://group.issuer-domain/g-abc123` 或 `https://group.issuer-domain/g-abc123/invite/ic-xxx`。
+- 自动生成的群 ID 使用随机小写十六进制短字符串（长度 14），服务端必须通过唯一约束或等效机制保证 canonical group_id 唯一；发现碰撞时重新生成。
+- 在 `group.{issuer-domain}` 这类已携带 issuer 的公开 HTTP 主机下，生成的群链接 path 应使用本域简写，例如 `https://group.issuer-domain/{base}` 或 `https://group.issuer-domain/{base}/invite/ic-xxx`。
 
 ### 10.2.3 群分发模式（dispatch_mode）
 
@@ -147,7 +153,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
 | `name` | string | ✅ | 群组名称 |
-| `group_id` | string | ❌ | 自定义群 ID，短形式必须以 `g-` 开头且总长度 6 到 16 字符；不提供则服务端自动生成；已被占用时返回错误 |
+| `group_id` | string | ❌ | 自定义群 ID，支持 legacy 格式 `g-[a-z0-9]{4,32}` 或新格式 `[a-z0-9]{5,}` 或 group name 格式 `[a-z0-9][a-z0-9_-]{3,63}`；不提供则服务端自动生成；已被占用时返回错误 |
 | `visibility` | string | ❌ | `"public"` / `"private"`，默认由服务配置决定 |
 | `description` | string | ❌ | 群组描述 |
 | `metadata` | object | ❌ | 自定义元数据 |
@@ -572,9 +578,11 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ## 10.9 群文件系统
 
-群文件系统统一使用 `group.fs.*`。群路径采用 `group_aid:/path` 或 `https://{group_aid}/path`，也可在 RPC 参数中同时传 `group_id` 与裸路径。群自有区包括 `announce`、`public`、`archive`；成员数据区为 `memberdata/{member_ref}`，服务端映射到成员自己的 `groupdata/{group_id}` 存储根。
+群文件系统统一使用 `group.fs.*`。群路径采用 `group_aid:/path` 或 `https://{group_aid}/path`，也可在 RPC 参数中同时传 `group_id` 与裸路径。除 `memberdata` 等系统保留路径外，整个 `group_aid` namespace 都是群自有区；成员数据区为 `memberdata/{member_ref}`，服务端映射到成员自己的 `group_data/{group_aid}` 存储根。
 
-群自有区写入必须满足双身份规则：连接身份 `_auth.aid` 是群 owner，签名身份 `_auth.client_signature_aid` 是当前 `group_aid`。`group_aid` 私钥由群主持有，gateway 仅允许 `group.fs.*` 出现签名身份与连接身份不一致。成员数据区写入只允许对应成员本人。
+`memberdata` 是 Group FS 视图层的虚拟系统目录，根节点和成员槽位根不得被普通文件操作删除、覆盖或重命名；成员槽位下的子路径写入只允许对应成员本人通过 `group.fs.*` 完成。完整保护规则见 [16-系统目录保护方案.md](16-系统目录保护方案.md)。
+
+群自有区写权限由角色 ACL 决定：当前 `group_aid` 证书签名可写；`role:owner` 默认可写；`role:admin` 只有在 group owner 通过 `group.fs.set_acl` 显式授权后才可写。授权和撤销的是 `role:admin` 角色策略，不与某个 admin 成员绑定；成员升降级、退群、踢出不会联动 ACL。成员数据区写入只允许对应成员本人。
 
 | 方法 | 说明 |
 |------|------|
@@ -584,6 +592,8 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `group.fs.lstat` | 查看链接本身 |
 | `group.fs.df` | 查看群文件系统用量 |
 | `group.fs.create_download_ticket` | 创建下载票据，SDK 使用票据执行数据面下载 |
+| `group.fs.set_acl` | owner 授予群自有区 `role:admin` 写 ACL |
+| `group.fs.remove_acl` | owner 撤销群自有区 `role:admin` 写 ACL |
 | `group.fs.mkdir` | 创建目录 |
 | `group.fs.rm` | 删除节点 |
 | `group.fs.cp` | group→group 远程复制；本地上传/下载由 SDK 数据面编排 |
@@ -594,7 +604,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `group.fs.mount` | 挂载成员数据区 |
 | `group.fs.umount` | 卸载成员数据区 |
 
-逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准，详细设计见 `docs/aun-fs/group-fs/`。
+`group.fs.set_acl/remove_acl` 只允许当前 group owner 调用，`grantee_aid` 当前只允许 `role:admin`；底层由 group 服务以内部门面调用 storage ACL，不允许客户端直接对 `group_aid` 空间设置 `role:*`。逐方法 SDK 参数以 `docs/sdk/09-group-rpc-manual.md` 为准，详细设计见 `docs/aun-fs/group-fs/`。
 
 ---
 
@@ -741,7 +751,7 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 - **消息 seq 单调递增**：per-group 粒度，确保顺序一致性，`ack_seq` 仅增不减。
 - **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立；消息增量拉取使用 `group.pull`，事件增量拉取使用 `group.pull_events`。
 - **duty 模式**：`duty_mode` 非 `"none"` 且 `duty_human_message_policy = "dispatch"` 时，消息先推送给当班成员处理，回复后再广播；`group.pull` 始终可拉取全量消息。
-- **群文件系统写边界**：群自有区仅 owner 可写且必须使用 `group_aid` 签名；成员数据区仅对应成员可写。
+- **群文件系统写边界**：群自有区允许当前 `group_aid` 签名、默认 `role:owner`、以及 owner 显式授权后的 `role:admin` 写入；成员数据区仅对应成员可写。
 - **在线状态**：通过 `group.get_online_members` 查询当前在线成员列表。
 
 

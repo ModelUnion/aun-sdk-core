@@ -1,4 +1,4 @@
-"""群协作根的 storage ACL 读权限集成测试。"""
+"""群协作根的 group 控制面授权集成测试。"""
 from __future__ import annotations
 
 import base64
@@ -55,18 +55,12 @@ async def _cleanup_root(client: AUNClient, owner: str, collab_root: str) -> None
         print(f"[collab-acl] cleanup root skipped: {exc}")
 
 
-async def _grant_root_acl(client: AUNClient, owner: str, collab_root: str, grantee_aid: str, perms: str) -> None:
-    _, root_path = collab_root.split(":", 1)
-    await client.storage.set_acl(root_path, owner=owner, grantee_aid=grantee_aid, perms=perms)
-    print(f"[collab-acl] acl owner={owner} root={root_path} grantee={grantee_aid} perms={perms}")
-
-
 def _is_permission_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(token in text for token in ("permission", "forbidden", "denied", "无权", "权限", "不存在"))
+    return any(token in text for token in ("permission", "forbidden", "denied", "无权", "权限", "不存在", "acl 管理"))
 
 
-async def _setup_group_case(*, grant_charlie: bool) -> tuple[AUNClient, AUNClient, AUNClient, AIDStore, str, str, str]:
+async def _setup_group_case() -> tuple[AUNClient, AUNClient, AUNClient, AUNClient, AIDStore, str, str, str]:
     rid = uuid.uuid4().hex[:10]
     owner_aid = f"collab-acl-owner-{rid}.{_ISSUER}"
     member_aid = f"collab-acl-member-{rid}.{_ISSUER}"
@@ -74,6 +68,7 @@ async def _setup_group_case(*, grant_charlie: bool) -> tuple[AUNClient, AUNClien
     owner = _make_client()
     member = _make_client()
     charlie = _make_client()
+    group_identity = _make_client()
     store = _make_store()
 
     await ensure_connected_identity(owner, owner_aid)
@@ -94,56 +89,78 @@ async def _setup_group_case(*, grant_charlie: bool) -> tuple[AUNClient, AUNClien
     if not group_id or not group_aid:
         raise AssertionError(f"create_group 未返回 group_id/group_aid: {created}")
     await _rpc(owner, "group.add_member", {"group_id": group_id, "aid": member_aid, "role": "member"})
+    namespace = await _rpc(owner, "group.fs.namespace_ready", {"group_id": group_id})
+    if namespace.get("namespace_ready") is not True or "public" not in namespace.get("baseline_paths", []):
+        raise AssertionError(f"group.fs namespace 初始化异常: {namespace}")
+    role_updated = await _rpc(owner, "group.set_role", {
+        "group_id": group_id,
+        "aid": member_aid,
+        "role": "admin",
+        "perms": "rwd",
+    })
+    if role_updated.get("new_role") != "admin":
+        raise AssertionError(f"group.set_role 未返回 admin: {role_updated}")
 
-    collab_root = f"{group_aid}:/collab-acl/{rid}/proj"
-    await _grant_root_acl(owner, group_aid, collab_root, owner_aid, "rwd")
-    await _grant_root_acl(owner, group_aid, collab_root, member_aid, "r")
-    if grant_charlie:
-        await _grant_root_acl(owner, group_aid, collab_root, charlie_aid, "r")
-
-    await owner.collab.create(collab_root, "doc1.md", _b64("group acl\n"))
-    return owner, member, charlie, store, group_id, group_aid, collab_root
+    collab_root = f"{group_aid}:/public/collab-acl/{rid}/proj"
+    await ensure_connected_identity(group_identity, group_aid)
+    await group_identity.collab.create(collab_root, "doc1.md", _b64("group acl\n"))
+    return owner, member, charlie, group_identity, store, group_id, group_aid, collab_root
 
 
 async def _close_case(
     owner: AUNClient,
     member: AUNClient,
     charlie: AUNClient,
+    group_identity: AUNClient,
     store: AIDStore,
     group_id: str,
     group_aid: str,
     collab_root: str,
 ) -> None:
-    await _cleanup_root(owner, group_aid, collab_root)
+    await _cleanup_root(group_identity, group_aid, collab_root)
     try:
         await _rpc(owner, "group.dissolve", {"group_id": group_id})
     except Exception as exc:
         print(f"[collab-acl] dissolve skipped: {exc}")
     store.close()
+    await group_identity.close()
     await charlie.close()
     await member.close()
     await owner.close()
 
 
 @pytest.mark.asyncio
-async def test_collab_read_non_member_with_acl() -> None:
-    owner, member, charlie, store, group_id, group_aid, collab_root = await _setup_group_case(grant_charlie=True)
+async def test_collab_member_with_group_role_acl_can_read() -> None:
+    owner, member, charlie, group_identity, store, group_id, group_aid, collab_root = await _setup_group_case()
     try:
-        result = await charlie.collab.show(collab_root, "doc1.md")
+        result = await member.collab.show(collab_root, "doc1.md")
         content = base64.b64decode(str(result.get("content") or "")).decode("utf-8")
-        assert content == "group acl\n", f"Charlie 读取内容异常: {result}"
-        print(f"[collab-acl] non-member read with ACL ok root={collab_root}")
+        assert content == "group acl\n", f"成员读取内容异常: {result}"
+        print(f"[collab-acl] member read with group role ACL ok root={collab_root}")
     finally:
-        await _close_case(owner, member, charlie, store, group_id, group_aid, collab_root)
+        await _close_case(owner, member, charlie, group_identity, store, group_id, group_aid, collab_root)
 
 
 @pytest.mark.asyncio
-async def test_collab_read_non_member_without_acl() -> None:
-    owner, member, charlie, store, group_id, group_aid, collab_root = await _setup_group_case(grant_charlie=False)
+async def test_collab_non_member_without_group_membership_is_denied() -> None:
+    owner, member, charlie, group_identity, store, group_id, group_aid, collab_root = await _setup_group_case()
     try:
         with pytest.raises(Exception) as exc_info:
             await charlie.collab.show(collab_root, "doc1.md")
         assert _is_permission_error(exc_info.value), f"无 ACL 读取应被权限拒绝，实际: {exc_info.value}"
-        print(f"[collab-acl] non-member read without ACL denied: {exc_info.value}")
+        print(f"[collab-acl] non-member read without group membership denied: {exc_info.value}")
     finally:
-        await _close_case(owner, member, charlie, store, group_id, group_aid, collab_root)
+        await _close_case(owner, member, charlie, group_identity, store, group_id, group_aid, collab_root)
+
+
+@pytest.mark.asyncio
+async def test_direct_storage_acl_on_group_space_is_rejected() -> None:
+    owner, member, charlie, group_identity, store, group_id, group_aid, collab_root = await _setup_group_case()
+    try:
+        _, root_path = collab_root.split(":", 1)
+        with pytest.raises(Exception) as exc_info:
+            await owner.storage.set_acl(root_path, owner=group_aid, grantee_aid=charlie.aid, perms="r")
+        assert _is_permission_error(exc_info.value), f"group_aid 直接 storage ACL 应被拒绝，实际: {exc_info.value}"
+        print(f"[collab-acl] direct storage ACL on group space denied: {exc_info.value}")
+    finally:
+        await _close_case(owner, member, charlie, group_identity, store, group_id, group_aid, collab_root)

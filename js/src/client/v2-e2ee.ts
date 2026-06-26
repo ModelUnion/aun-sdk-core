@@ -22,6 +22,7 @@ interface V2WrapPolicy {
 
 const V2_BOOTSTRAP_TTL_MS = 60 * 60 * 1000;
 const V2_RETRYABLE_CODES = new Set([-33011, -33012, -33050, -33052, -33054]);
+const V2_GROUP_STALE_BOOTSTRAP_CODE = -33054;
 
 const MEMBERSHIP_ACTIONS = new Set([
   'member_added',
@@ -696,7 +697,7 @@ export class V2E2EECoordinator {
         const contigAdvanced = ackSeq !== pageContigBefore;
         if (contigAdvanced) {
           await client._drainOrderedMessages(ns);
-          client._saveSeqTrackerState();
+          client._persistSeq(ns);
         }
         const ackNeeded = messages.length > 0
           && ackSeq > 0
@@ -786,7 +787,7 @@ export class V2E2EECoordinator {
           const ns = `group:${gid}`;
           client._seqTracker.onMessageSeq(ns, seq);
           client._markPublishedSeq(ns, seq);
-          client._saveSeqTrackerState();
+          await client._saveSeqTrackerState();
         }
       }
       return client._delivery.attachSendResultEnvelope('group.send', {
@@ -809,7 +810,7 @@ export class V2E2EECoordinator {
             const ns = `group:${gid}`;
             client._seqTracker.onMessageSeq(ns, seq);
             client._markPublishedSeq(ns, seq);
-            client._saveSeqTrackerState();
+            await client._saveSeqTrackerState();
           }
         }
         return client._delivery.attachSendResultEnvelope('group.send', {
@@ -944,7 +945,7 @@ export class V2E2EECoordinator {
       const contigAdvanced = ackSeq !== pageContigBefore;
       if (contigAdvanced) {
         await client._drainOrderedMessages(ns);
-        client._saveSeqTrackerState();
+        client._persistSeq(ns);
       }
       const hasServerCursor = cursor !== null && Object.prototype.hasOwnProperty.call(cursor, 'current_seq');
       const ackNeeded = messages.length > 0
@@ -1610,6 +1611,7 @@ export class V2E2EECoordinator {
     let stateCommitment: Partial<StateCommitmentAAD> = { state_version: 0, state_hash: '', state_chain: '' };
     let auditRecipientsRaw: Array<Record<string, unknown>> = [];
     let wrapPolicy: V2WrapPolicy | undefined;
+    let usedCachedBootstrap = false;
 
     const cached = useCache ? this.getBootstrapCacheEntry(cacheKey) : undefined;
     if (cached && (Date.now() - Number(cached.cachedAt ?? 0)) < V2_BOOTSTRAP_TTL_MS) {
@@ -1618,6 +1620,7 @@ export class V2E2EECoordinator {
       stateCommitment = cached.stateCommitment ?? { state_version: 0, state_hash: '', state_chain: '' };
       auditRecipientsRaw = (cached.auditRecipients ?? []) as Array<Record<string, unknown>>;
       wrapPolicy = cached.wrapPolicy;
+      usedCachedBootstrap = true;
     } else {
       const bs = await client.call('group.v2.bootstrap', {
         group_id: groupId,
@@ -1672,6 +1675,12 @@ export class V2E2EECoordinator {
     }
 
     if (targets.length === 0) {
+      if (usedCachedBootstrap) {
+        throw new E2EEError(`V2 group: no target devices for group ${groupId}; bootstrap may be stale`, {
+          code: V2_GROUP_STALE_BOOTSTRAP_CODE,
+          data: { expected_peer_aids: [] },
+        });
+      }
       throw new E2EEError(`V2 group: no target devices for group ${groupId}`);
     }
     for (const dev of auditRecipientsRaw) {

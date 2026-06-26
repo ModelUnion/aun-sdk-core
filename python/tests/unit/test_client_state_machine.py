@@ -166,7 +166,7 @@ def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkey
     peer_name = "peer.agentid.pub"
     store._keystore.save_cert(peer_name, _identity(peer_name)["cert"])
     peer = store.load(peer_name).data["aid"]
-    bob_name = "bob.agentid.pub"
+    bob_name = "bob1.agentid.pub"
     store._keystore.save_cert(bob_name, _identity(bob_name)["cert"])
     client = AUNClient(aid)
 
@@ -204,7 +204,7 @@ def test_client_instance_protected_headers_merge_only_for_message_methods():
     client._transport = _Transport()
 
     asyncio.run(client.call("message.send", {
-        "to": "bob.agentid.pub",
+        "to": "bob1.agentid.pub",
         "payload": {"type": "text", "text": "hello"},
         "encrypt": False,
         "protected_headers": {"trace": "call"},

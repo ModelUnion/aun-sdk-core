@@ -510,6 +510,94 @@ export class LocalIdentityStore implements KeyStore {
     return join(this._aidsRoot, '_pending');
   }
 
+  // ── Pending Group Bind（幂等暂存槽位）────────────────────
+
+  private _pendingBindsRoot(): string {
+    return join(this._aidsRoot, '_pending_binds');
+  }
+
+  private _pendingBindPath(groupId: string): string {
+    return join(this._pendingBindsRoot(), `${safeAid(groupId.trim())}.json`);
+  }
+
+  savePendingGroupBind(groupId: string, keyPair: KeyPairRecord): void {
+    const gid = groupId.trim();
+    if (!gid) throw new Error('savePendingGroupBind requires non-empty group_id');
+
+    const privateKeyPem = String(keyPair.private_key_pem || '').trim();
+    const publicKeyDerB64 = String(keyPair.public_key_der_b64 || '').trim();
+    if (!privateKeyPem || !publicKeyDerB64) {
+      throw new Error('savePendingGroupBind requires private_key_pem and public_key_der_b64');
+    }
+    const curve = String(keyPair.curve || 'P-256').trim() || 'P-256';
+
+    const protectedKey = this._secretStore.protect(
+      safeAid(gid),
+      'pending_bind/private_key',
+      Buffer.from(privateKeyPem, 'utf-8'),
+    );
+
+    const record: JsonObject = {
+      public_key_der_b64: publicKeyDerB64,
+      curve,
+      private_key_protection: protectedKey,
+    };
+
+    const path = this._pendingBindPath(gid);
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+    const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+    writeFileSync(tmpPath, JSON.stringify(record, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    replaceFileSync(tmpPath, path);
+  }
+
+  loadPendingGroupBind(groupId: string): KeyPairRecord | null {
+    const gid = groupId.trim();
+    if (!gid) return null;
+
+    const path = this._pendingBindPath(gid);
+    if (!existsSync(path)) return null;
+
+    try {
+      const data = JSON.parse(readFileSync(path, 'utf-8')) as JsonObject;
+      const protection = data.private_key_protection;
+      if (!isJsonObject(protection)) {
+        this._logger.warn(`loadPendingGroupBind: invalid private_key_protection for ${gid}`);
+        return null;
+      }
+
+      const privateKeyBytes = this._secretStore.reveal(
+        safeAid(gid),
+        'pending_bind/private_key',
+        protection,
+      );
+      if (!privateKeyBytes) return null;
+
+      return {
+        public_key_der_b64: String(data.public_key_der_b64 || ''),
+        private_key_pem: privateKeyBytes.toString('utf-8'),
+        curve: String(data.curve || 'P-256'),
+      };
+    } catch (e) {
+      this._logger.warn(`loadPendingGroupBind failed for ${gid}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+
+  clearPendingGroupBind(groupId: string): void {
+    const gid = groupId.trim();
+    if (!gid) return;
+    const path = this._pendingBindPath(gid);
+    try {
+      unlinkSync(path);
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'ENOENT') {
+        this._logger.warn(`clearPendingGroupBind failed for ${gid}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
   // ── 路径辅助 ─────────────────────────────────────────────
 
   private _keyPairPath(aid: string): string {

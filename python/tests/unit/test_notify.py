@@ -1,9 +1,12 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
 import pytest
+import websockets
 
 from aun_core import AUNClient
+from aun_core.errors import ConnectionError
 from aun_core.events import EventDispatcher
 from aun_core.transport import RPCTransport
 
@@ -33,6 +36,40 @@ async def test_transport_notify_sends_json_rpc_notification_without_id():
 
 
 @pytest.mark.asyncio
+async def test_transport_send_failure_uses_close_code_from_error():
+    transport = RPCTransport(event_dispatcher=EventDispatcher(), connection_factory=AsyncMock())
+
+    exc = websockets.ConnectionClosedError(
+        rcvd=websockets.frames.Close(4013, "short_connection_capacity_exceeded"),
+        sent=None,
+    )
+    err = await transport._send_failure_error("rpc meta.ping", exc)
+
+    assert isinstance(err, ConnectionError)
+    assert err.code == 4013
+    assert "4013" in str(err)
+    assert "short_connection_capacity_exceeded" in str(err)
+
+
+@pytest.mark.asyncio
+async def test_transport_send_failure_waits_for_reader_close_code():
+    transport = RPCTransport(event_dispatcher=EventDispatcher(), connection_factory=AsyncMock())
+
+    async def set_close_code():
+        await asyncio.sleep(0.01)
+        transport._last_close_code = 4013
+        transport._last_close_reason = "short_connection_capacity_exceeded"
+
+    setter = asyncio.create_task(set_close_code())
+    err = await transport._send_failure_error("rpc meta.ping", OSError("websocket is already closing"))
+    await setter
+
+    assert err.code == 4013
+    assert "4013" in str(err)
+    assert "short_connection_capacity_exceeded" in str(err)
+
+
+@pytest.mark.asyncio
 async def test_transport_event_app_is_published_directly():
     dispatcher = EventDispatcher()
     received = []
@@ -56,7 +93,7 @@ async def test_client_notify_to_aid_wraps_route_notification():
     await client.notify(
         "event/app.typing",
         {"thread_id": "t1"},
-        to="bob.agentid.pub",
+        to="bob1.agentid.pub",
         device_id="dev-1",
         slot_id="slot-1",
         ttl_ms=5000,
@@ -67,7 +104,7 @@ async def test_client_notify_to_aid_wraps_route_notification():
     assert method == "notification/route"
     assert params["target"] == {
         "type": "aid",
-        "aid": "bob.agentid.pub",
+        "aid": "bob1.agentid.pub",
         "device_id": "dev-1",
         "slot_id": "slot-1",
     }

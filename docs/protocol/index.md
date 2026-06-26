@@ -23,6 +23,7 @@
 | 11 | [11-Storage-子协议.md](11-Storage-子协议.md) | `storage.*` 对象存储、大文件上传下载、预签名 URL |
 | 12 | [12-Stream-子协议.md](12-Stream-子协议.md) | `stream.*` 实时流式传输、WebSocket 推流、HTTP SSE 拉流、跨域拉流 |
 | 15 | [15-离线推送通知协议.md](15-离线推送通知协议.md) | `push.*` 离线推送、push_notify_aid 代理、事件通知 + 背压 ack、白名单与去重 |
+| 16 | [16-系统目录保护方案.md](16-系统目录保护方案.md) | `memberdata` 与 `group_data` 的系统目录保护、目录树隐藏/读下载/写保护边界、配额归属和访问矩阵 |
 
 **附录**：A-术语表 | B-扩展性 | C-私钥管理 | D-Root CA 治理 | E-Root CA 准入 | F-Issuer CA 申请 | G-孤儿 AID | H-Auth 实现 | I-跨域消息路由 | J-客户端接入 | K-Agent Web | L-E2EE 实现 | M-JWT 实现
 
@@ -57,6 +58,7 @@
 | 群成员权限（owner/admin/member） | 10 §10.2 |
 | 邀请码（group.create_invite_code） | 10 §10.7 |
 | 群文件系统（group.fs.*） | 10 §10.9 |
+| 系统目录保护（memberdata / group_data） | 16 |
 | 对象存储（storage.*） | 11 |
 | 实时流传输（stream.*） | 12 |
 | 推流（WebSocket） | 12 §12.6 推流端点 |
@@ -122,5 +124,8 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 
 ### 15-离线推送通知协议
 目标 AID 全部设备离线时的推送机制。push_notify_aid 作为普通客户端 AID 连接 Gateway，通过 `event/push.offline_message` 事件接收推送摘要（仅元数据，不含正文），处理后回 `push.ack` RPC 释放 in-flight 槽位（默认 max_in_flight=1 串行确认，30s 超时不重试）。聚合机制：同一 target_aid 60s 冷却期内合并为一条推送（unread_count++、senders 去重追加）。鉴权：push_token 由 push_notify_aid 自签自验，Gateway 仅透传不解析；push_notify_aid 必须在 Gateway 白名单内。跨域：推送由目标 AID 所属域的 Gateway 触发，push_notify_aid 必须与目标 AID 同域。
+
+### 16-系统目录保护方案
+定义 `memberdata` 与 `group_data` 的分层保护。`memberdata` 不是隐藏目录，但根和成员槽位根不可被普通文件操作破坏，group AID 命名空间下的普通 Storage 写入必须拒绝；`group_data` 是成员个人 Storage 内部真实根，Storage 服务端必须在目录树浏览中隐藏它，读/下载按普通 read 权限处理，写入、删除、重命名、挂载、授权和状态变更必须拒绝。文档同时规定 `group_data` 空间计入真实 owner AID 配额，group.fs 是可信授权写入路径，并给出访问矩阵、生命周期、审计和测试验收要求。
 
 

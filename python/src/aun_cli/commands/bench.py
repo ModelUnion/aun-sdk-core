@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import Counter
+from contextlib import contextmanager
 from typing import Any, Callable
 
 import typer
@@ -121,6 +122,21 @@ def _print_summary(summary: dict[str, Any]) -> None:
             print(f"    {item['count']}x {item['message']}")
 
 
+@contextmanager
+def _bench_trace_off(ctx: typer.Context):
+    ctx.ensure_object(dict)
+    had_trace = "trace" in ctx.obj
+    previous = ctx.obj.get("trace")
+    ctx.obj["trace"] = "off"
+    try:
+        yield
+    finally:
+        if had_trace:
+            ctx.obj["trace"] = previous
+        else:
+            ctx.obj.pop("trace", None)
+
+
 async def _run_benchmark(
     *,
     ctx: typer.Context,
@@ -129,7 +145,9 @@ async def _run_benchmark(
     method: str,
     build_params: Callable[[int], dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    async with CLISession(ctx) as client:
+    with _bench_trace_off(ctx):
+        session = CLISession(ctx)
+    async with session as client:
         async def _run_one(index: int) -> dict[str, Any]:
             started = time.perf_counter()
             try:
@@ -171,6 +189,7 @@ def bench_send(
     concurrency: int = typer.Option(1, "--concurrency", "-c", help="单 WebSocket 最大 in-flight RPC 数"),
     size: int = typer.Option(64, "--size", help="payload.text 目标字符数"),
     no_encrypt: bool = typer.Option(False, "--no-encrypt", help="不加密"),
+    no_persist: bool = typer.Option(False, "--no-persist", help="不持久化（临时消息，不写数据库）"),
     prefix: str = typer.Option("bench", "--prefix", help="消息内容前缀"),
 ) -> None:
     """压测 P2P message.send"""
@@ -180,11 +199,14 @@ def bench_send(
     encrypt = not no_encrypt
 
     def _params(index: int) -> dict[str, Any]:
-        return {
+        params = {
             "to": target,
             "payload": {"text": _payload_text(prefix, index, size)},
             "encrypt": encrypt,
         }
+        if no_persist:
+            params["persist_required"] = False
+        return params
 
     started_at = time.perf_counter()
     try:
@@ -277,3 +299,8 @@ def bench_group_send(
 
 
 bench_app.add_typer(bench_group_app)
+
+from aun_cli.commands.bench_e2e import autoscale_app, e2e_app
+
+bench_app.add_typer(e2e_app)
+bench_app.add_typer(autoscale_app)

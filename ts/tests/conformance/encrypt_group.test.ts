@@ -3,8 +3,7 @@ import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group.js';
 import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
-
-const SDK_VERSION = '0.3.6';
+import { VERSION as SDK_VERSION } from '../../src/version.js';
 
 /**
  * Group 加密自加密自解密回环：

@@ -594,18 +594,59 @@ export class RPCTransport {
   }
 
   private _sendText(payload: string, context: string, beforeSend?: () => boolean): Promise<void> {
-    return this._enqueueSend(() => {
+    return this._enqueueSend(async () => {
       if (beforeSend && !beforeSend()) {
         throw new ConnectionError(`send cancelled before write: ${context}`);
       }
       if (this._closed || !this._ws) {
         throw this._notConnectedError();
       }
+      const ws = this._ws;
       try {
-        this._ws.send(payload);
+        ws.send(payload);
       } catch (err) {
-        throw new ConnectionError(`failed to send ${context}: ${err instanceof Error ? err.message : String(err)}`);
+        throw await this._sendFailureError(context, err, ws);
       }
+    });
+  }
+
+  private async _sendFailureError(context: string, err: unknown, ws: WebSocket | null): Promise<ConnectionError> {
+    const original = err instanceof Error ? err.message : String(err);
+    const closeCode = await this._waitForCloseCodeIfClosing(ws);
+    if (closeCode !== null) {
+      const reason = this._lastCloseReason ? ` reason=${this._lastCloseReason}` : '';
+      return new ConnectionError(`failed to send ${context}: websocket closed: code=${closeCode}${reason}; original=${original}`, {
+        code: closeCode,
+      });
+    }
+    return new ConnectionError(`failed to send ${context}: ${original}`);
+  }
+
+  private async _waitForCloseCodeIfClosing(ws: WebSocket | null): Promise<number | null> {
+    if (this._lastCloseCode !== null) return this._lastCloseCode;
+    if (!ws) return null;
+    const readyState = Number((ws as unknown as { readyState?: number }).readyState);
+    const closingState = typeof WebSocket !== 'undefined' ? WebSocket.CLOSING : 2;
+    const closedState = typeof WebSocket !== 'undefined' ? WebSocket.CLOSED : 3;
+    if (readyState !== closingState && readyState !== closedState) return null;
+
+    return await new Promise<number | null>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (code?: number): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        try { ws.removeEventListener('close', onClose); } catch { /* noop */ }
+        if (Number.isFinite(code)) {
+          resolve(Number(code));
+          return;
+        }
+        resolve(this._lastCloseCode);
+      };
+      const onClose = (event: CloseEvent): void => finish(event.code);
+      try { ws.addEventListener('close', onClose); } catch { resolve(this._lastCloseCode); return; }
+      timer = setTimeout(() => finish(), 100);
     });
   }
 

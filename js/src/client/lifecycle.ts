@@ -230,7 +230,7 @@ export class LifecycleController {
       return;
     }
 
-    client._saveSeqTrackerState();
+    await client._saveSeqTrackerState();
     client._stopBackgroundTasks();
 
     if (client._reconnectAbort) {
@@ -249,7 +249,7 @@ export class LifecycleController {
     const tStart = Date.now();
     client._clientLog.debug(`close enter: state=${client._state}`);
     this.runtime.lifecycle.setClosing(true);
-    client._saveSeqTrackerState();
+    await client._saveSeqTrackerState();
     client._stopBackgroundTasks();
 
     if (client._reconnectAbort) {

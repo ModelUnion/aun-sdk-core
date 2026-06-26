@@ -42,7 +42,7 @@ func TestPullV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 					"version":    "v1",
 					"seq":        1,
 					"message_id": "m-plain",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"t_server":   int64(100),
 					"legacy_v1": map[string]any{
 						"to":      "alice.example.com",
@@ -53,7 +53,7 @@ func TestPullV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 					"version":    "v1",
 					"seq":        2,
 					"message_id": "m-encrypted",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"legacy_v1": map[string]any{
 						"payload": map[string]any{"type": "e2ee.encrypted", "ciphertext": "x"},
 					},
@@ -62,7 +62,7 @@ func TestPullV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 					"version":    "v1",
 					"seq":        3,
 					"message_id": "m-empty",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"legacy_v1":  map[string]any{},
 				},
 			}}
@@ -113,7 +113,7 @@ func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 					"version":    "v1",
 					"seq":        1,
 					"message_id": "gm-plain",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"t_server":   int64(100),
 					"payload":    map[string]any{"type": "text", "text": "group-plain-v1"},
 				},
@@ -121,14 +121,14 @@ func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 					"version":    "v1",
 					"seq":        2,
 					"message_id": "gm-encrypted",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"payload":    map[string]any{"type": "e2ee.group_encrypted", "ciphertext": "x"},
 				},
 				map[string]any{
 					"version":    "v1",
 					"seq":        3,
 					"message_id": "gm-empty",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 				},
 			}}
 		default:
@@ -169,7 +169,7 @@ func TestGroupPullExternalCursorPreservesExplicitZeroAndDeviceSlot(t *testing.T)
 						"version":    "v1",
 						"seq":        1,
 						"message_id": "gm-sync-1",
-						"from_aid":   "bob.example.com",
+						"from_aid":   "bob1.example.com",
 						"payload":    map[string]any{"type": "text", "text": "sync-1"},
 					},
 				},

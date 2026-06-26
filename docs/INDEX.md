@@ -27,8 +27,10 @@
 | [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>) | Python SDK StorageVFS / StorageLowLevel 接口契约、返回类型、错误映射和跨语言对齐要求 |
 | [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>) | `aun fs` 命令语义、寻址规则、输出格式、CLI 工程改造和端到端场景 |
 | [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>) | AUN Storage VFS + CLI 的 6 阶段 TDD 实施计划、P1-P6 实际执行记录和验收口径 |
-| [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>) | 统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs` 的 POSIX 风格群文件系统设计；包含群自有区写身份、`parents` 和 JS string 语义 |
+| [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>) | 统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs` 的 POSIX 风格群文件系统设计；包含群自有区写授权、`parents` 和 JS string 语义 |
+| [群自有区角色 ACL 写权限实施方案](<aun-fs/group-fs/群自有区角色ACL写权限实施方案.md>) | 群自有区 owner 默认写、admin 需 owner 显式 `role:admin` ACL 授权、group/storage 分工、Storage 写审计、显式撤销和 TDD 执行计划 |
 | [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md>) | group.fs 重构的 8 阶段实施计划，每阶段包含目标、IPO、Step-by-step、用例集、Checklist、验收与回滚，并记录 Phase 8 单域/双域 Docker 与四语言互操作验收 |
+| [系统目录保护方案](protocol/16-系统目录保护方案.md) | `memberdata` 与 `group_data` 的系统目录保护、`group_data` 目录树隐藏与读下载/写保护边界、Group FS 间接访问和真实 owner AID 配额归属 |
 | [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>) | collab 服务端编排、台账、diff3、snapshot、export/adopt、群协作注册表和四语言薄 SDK 设计 |
 | [collab 协作层 Plan 1 服务端基础](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>) | storage 进程内 collab 编排的 TDD 任务拆分、repository 事务原语、RPC 注册和群协作发现计划 |
 | [collab 协作层 Plan 2 Python SDK/CLI](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>) | Python SDK collab 薄封装、CLI 命令、单域 Docker E2E 和文档同步计划 |
@@ -62,7 +64,9 @@
 - StorageVFS / StorageLowLevel 接口契约、NodeView/ObjectView、错误映射和跨语言对齐 → [AUN Storage SDK 存储分层设计](<aun-fs/SDK存储分层设计.md>)
 - `aun fs` 命令语义、AID 路径解析、输出格式和 CLI 到 SDK 的调用边界 → [AUN Storage CLI-fs 命令设计](<aun-fs/CLI-fs命令设计.md>)
 - AUN Storage 6 阶段 TDD 计划、P1/P2/P3/P4/P5/P6 实际执行记录、阶段实施前详细计划和 Docker 验证纪律 → [AUN Storage 分阶段实施计划](<aun-fs/分阶段实施计划.md>)
-- `group.fs.*` POSIX 风格群文件系统、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载心智、群自有区 `group_aid` 写身份、`parents` 语义、JS string 差异、服务端 memberdata 映射和 SDK 数据面编排 → [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>)
+- `group.fs.*` POSIX 风格群文件系统、`client.group.fs.*`、`aun group fs`、`cp/mv` 上传下载心智、群自有区写授权与 `group_aid` 签名、`parents` 语义、JS string 差异、服务端 memberdata 映射和 SDK 数据面编排 → [群文件系统 group.fs POSIX 化详细设计](<aun-fs/group-fs/group.fs-POSIX化详细设计.md>)
+- 群自有区 owner 默认写、admin 需 owner 显式 `role:admin` ACL 授权与撤销、group 与 storage 鉴权分工、Storage 写审计 → [群自有区角色 ACL 写权限实施方案](<aun-fs/group-fs/群自有区角色ACL写权限实施方案.md>)
+- `memberdata` 和 `group_data` 系统目录保护、`group_data` 目录树隐藏但读/下载不刻意隐藏、普通写入口保护、group.fs 授权写入路径、真实 owner AID 配额计入 → [系统目录保护方案](protocol/16-系统目录保护方案.md)
 - group.fs 8 阶段重构步骤、每阶段 IPO、Step-by-step、用例集、Checklist、验收、回滚和 Phase 8 Docker 完成记录 → [群文件系统 group.fs POSIX 化分阶段实施计划](<aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md>)
 - collab 协作层服务端编排、`collab.*` RPC、版本台账、snapshot、群协作注册表和后续四语言 SDK/CLI/E2E 计划 → [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>)、[Plan 1](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>)、[Plan 2](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>)、[Plan 3](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>)
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
@@ -96,7 +100,7 @@
 
 ### aun测试运行指南
 
-记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 43 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三语言 agent 同群的明文/E2EE 矩阵，以及 `group_fs_matrix_python_ts_go_js` 四语言 group.fs 互操作，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口和数据保护规则。
+记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 83 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三/四成员同群矩阵、storage ticket/ACL、group.fs 与 group.fs POSIX、collab 与 collab ACL、连续消息、ack、预期失败和混合明文/E2EE 场景，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口、message/group WAL 回归检查和数据保护规则。
 
 ### AUN SDK 重构修改清单
 
@@ -176,7 +180,15 @@
 
 ### 群文件系统 group.fs POSIX 化详细设计
 
-定义群文件系统对外模型：统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs`。文档规定群自有区与成员 `memberdata` 由 `group_aid:/...` 路径表达，群自有区只有 owner 可写但实际调用身份必须是 `group_aid` 并通过当前 group_identity 签名；`group_aid:/memberdata/{member_ref}/...` 在服务端映射到 `member_aid:/groupdata/{group_id}/...`，跨域成员必须使用完整 AID；上传、下载和远程复制统一用 `cp`，不提供 `read/write/put/get` 主入口，数据面由 SDK 编排，group 服务只负责控制面。
+定义群文件系统对外模型：统一为 `group.fs.*`、`client.group.fs.*` 和 `aun group fs`。文档规定群自有区与成员 `memberdata` 由 `group_aid:/...` 路径表达；群自有区允许当前 `group_aid` 证书签名、默认 `role:owner`、以及 owner 通过 `group.fs.set_acl` 显式授权后的 `role:admin` 写入，撤销使用 `group.fs.remove_acl`；`group_aid:/memberdata/{member_ref}/...` 在服务端映射到 `member_aid:/group_data/{group_aid}/...`，跨域成员必须使用完整 AID；上传、下载和远程复制统一用 `cp`，不提供 `read/write/put/get` 主入口，数据面由 SDK 编排，group 服务只负责控制面。
+
+### 群自有区角色 ACL 写权限实施方案
+
+定义群自有区写权限调整方案。群自有区是 `owner_aid = group_aid` 下除系统保留根外的整个 namespace，不与群主或管理员个人 storage 混用；owner 默认可写，admin 只有在 owner 通过 `group.fs.set_acl` 显式授予 `role:admin` ACL 后可写，并通过 `group.fs.remove_acl` 撤销。方案还规定 `group.set_role` 只改变 membership、不联动 ACL，`memberdata` / `group_data` 规则不变，Storage 写权限与控制面写入口均记录 `storage.write_auth` 审计，并给出 storage、group.fs、collab 和 CLI 的 TDD 执行计划。
+
+### 系统目录保护方案
+
+定义 `memberdata` 与 `group_data` 的分层保护。`memberdata` 不是隐藏目录，但根和成员槽位根不可被普通文件操作破坏，group AID 命名空间下的普通 Storage 写入必须拒绝；`group_data` 是成员个人 Storage 内部真实根，Storage 服务端必须在目录树浏览中隐藏它，读/下载按普通 read 权限处理，写入、删除、重命名、挂载、授权和状态变更必须拒绝。文档同时规定 `group_data` 空间计入真实 owner AID 配额，group.fs 是可信授权写入路径，并给出访问矩阵、生命周期、审计和测试验收要求。
 
 ### 群文件系统 group.fs POSIX 化分阶段实施计划
 
@@ -189,4 +201,3 @@
 ### Notify 通知方案
 
 定义 `client.notify()` 的 JSON-RPC Notification 发送语义。方案规定 notify 只投递在线长连接设备，不做离线存储、不分配 seq、不进入 pull/ack；同时说明服务端通知、AID 在线转发、群在线转发、跨域 federation 转发的路由模型，以及和 `message.send` / `group.send` 可靠应用事件的分工。
-

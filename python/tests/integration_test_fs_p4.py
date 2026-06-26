@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 import uuid
@@ -103,12 +104,22 @@ async def test_acl_and_visibility(alice: AUNClient, bob: AUNClient, root: str) -
     try:
         await alice.storage.write_bytes(f"/{root}/docs/a.txt", b"P4-ACL", owner=_ALICE_AID, content_type="text/plain")
         await _expect_denied(bob.storage.read_bytes(f"/{root}/docs/a.txt", owner=_ALICE_AID))
-        await alice.storage.set_acl(f"/{root}/docs", owner=_ALICE_AID, grantee_aid=_BOB_AID, perms="r")
-        if await bob.storage.read_bytes(f"/{root}/docs/a.txt", owner=_ALICE_AID) != b"P4-ACL":
-            raise AssertionError("bob ACL read mismatch")
-        await _expect_denied(bob.storage.write_bytes(f"/{root}/docs/b.txt", b"no", owner=_ALICE_AID))
-        await alice.storage.remove_acl(f"/{root}/docs", owner=_ALICE_AID, grantee_aid=_BOB_AID)
+        await alice.storage.set_acl(f"/{root}/docs", owner=_ALICE_AID, grantee_aid=_BOB_AID, perms="w")
         await _expect_denied(bob.storage.read_bytes(f"/{root}/docs/a.txt", owner=_ALICE_AID))
+        await bob.storage.write_bytes(f"/{root}/docs/b.txt", b"P4-ACL-WRITE", owner=_ALICE_AID, content_type="text/plain")
+        share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID,
+            "object_key": f"{root}/docs/a.txt",
+            "allowed_aids": [_BOB_AID],
+            "expire_in_seconds": 300,
+        })
+        shared = await bob.call("storage.get_by_share", {"share_id": share["share_id"]})
+        if base64.b64decode(str(shared.get("content") or "")) != b"P4-ACL":
+            raise AssertionError("bob share-link read mismatch")
+        await alice.call("storage.revoke_share_link", {"share_id": share["share_id"]})
+        await _expect_denied(bob.call("storage.get_by_share", {"share_id": share["share_id"]}))
+        await alice.storage.remove_acl(f"/{root}/docs", owner=_ALICE_AID, grantee_aid=_BOB_AID)
+        await _expect_denied(bob.storage.write_bytes(f"/{root}/docs/c.txt", b"no", owner=_ALICE_AID))
         await alice.storage.set_visibility(f"/{root}/docs/a.txt", owner=_ALICE_AID, visibility="public")
         if await bob.storage.read_bytes(f"/{root}/docs/a.txt", owner=_ALICE_AID) != b"P4-ACL":
             raise AssertionError("public read mismatch")

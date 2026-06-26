@@ -67,6 +67,8 @@ func TestCollabFacadeRPCMappings(t *testing.T) {
 		{"prune", func() error { _, err := collab.Prune(ctx, "alice.aid.com:/proj", "d.md"); return err }, "collab.prune"},
 		{"ls_remote", func() error { _, err := collab.LsRemote(ctx, "g-team.aid.com"); return err }, "collab.ls-remote"},
 		{"unregister", func() error { _, err := collab.Unregister(ctx, "g-team.aid.com", "g-team.aid.com:/proj"); return err }, "collab.unregister"},
+		{"set_acl", func() error { _, err := collab.SetACL(ctx, "alice.aid.com:/proj", "bob.aid.com", "w"); return err }, "collab.set_acl"},
+		{"remove_acl", func() error { _, err := collab.RemoveACL(ctx, "alice.aid.com:/proj", "bob.aid.com"); return err }, "collab.remove_acl"},
 		{"tag_create", func() error { _, err := collab.Tag().Create(ctx, "alice.aid.com:/proj", "m", true); return err }, "collab.tag.create"},
 		{"tag_list", func() error { _, err := collab.Tag().List(ctx, "alice.aid.com:/proj"); return err }, "collab.tag.list"},
 		{"tag_show", func() error { _, err := collab.Tag().Show(ctx, "alice.aid.com:/proj", "1.0.0"); return err }, "collab.tag.show"},
@@ -121,12 +123,12 @@ func TestCollabFacadeRPCMappings(t *testing.T) {
 		t.Fatalf("diff 参数不正确: %#v", client.calls[7].params)
 	}
 	// tag.prune params (last)
-	if !reflect.DeepEqual(client.calls[19].params, map[string]any{
+	if !reflect.DeepEqual(client.calls[21].params, map[string]any{
 		"collab_root": "alice.aid.com:/proj",
 		"before":      123,
 		"keep_last":   2,
 	}) {
-		t.Fatalf("tag.prune 参数不正确: %#v", client.calls[19].params)
+		t.Fatalf("tag.prune 参数不正确: %#v", client.calls[21].params)
 	}
 	// clone reroot params (index 9)
 	if !reflect.DeepEqual(client.calls[9].params, map[string]any{
@@ -243,7 +245,7 @@ func TestCollabConflictErrorPreservesServerFields(t *testing.T) {
 				"提交失败",
 				WithCode(-32009),
 				WithData(map[string]any{
-					"current_version": 4,
+					"current_version": int64(4),
 					"current_target":  "alice.aid.com:/proj/v4",
 					"hint":            "merge first",
 				}),

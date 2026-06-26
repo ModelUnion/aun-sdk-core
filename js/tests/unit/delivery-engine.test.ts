@@ -404,8 +404,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       throw new Error('disk full');
     });
 
-    engine.saveSeqTrackerState();
-    await Promise.resolve();
+    await engine.saveSeqTrackerState();
 
     expect(client._tokenStore.saveSeq).toHaveBeenCalled();
     expect(persistErrors).toEqual([expect.objectContaining({

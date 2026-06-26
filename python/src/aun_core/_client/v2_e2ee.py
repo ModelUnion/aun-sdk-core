@@ -5,10 +5,77 @@ import base64
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from ..v2.session import V2Session
 from .runtime import ClientRuntime
+
+
+@dataclass(slots=True)
+class _DecryptJob:
+    seq: int
+    msg: dict[str, Any]
+    envelope: dict[str, Any]
+    spk_id: str
+    recipient_key_source: str
+    group_id: str
+    from_aid: str
+    sender_device_id: str
+    ik_priv: bytes
+    spk_priv: bytes | None
+    sender_pub_der: bytes
+
+
+@dataclass(slots=True)
+class _DecryptResult:
+    seq: int
+    msg: dict[str, Any]
+    envelope: dict[str, Any]
+    spk_id: str = ""
+    recipient_key_source: str = ""
+    group_id: str = ""
+    from_aid: str = ""
+    sender_device_id: str = ""
+    plaintext: dict[str, Any] | None = None
+    error: Exception | None = None
+
+
+def _decrypt_job_sync(job: _DecryptJob, *, aid: str, device_id: str) -> _DecryptResult:
+    from ..v2.e2ee.decrypt import decrypt_message as v2_decrypt_message
+
+    try:
+        plaintext = v2_decrypt_message(
+            envelope=job.envelope,
+            self_aid=aid,
+            self_device_id=device_id,
+            self_ik_priv=job.ik_priv,
+            self_spk_priv=job.spk_priv,
+            sender_pub_der=job.sender_pub_der,
+        )
+        return _DecryptResult(
+            seq=job.seq,
+            msg=job.msg,
+            envelope=job.envelope,
+            spk_id=job.spk_id,
+            recipient_key_source=job.recipient_key_source,
+            group_id=job.group_id,
+            from_aid=job.from_aid,
+            sender_device_id=job.sender_device_id,
+            plaintext=plaintext,
+        )
+    except Exception as exc:
+        return _DecryptResult(
+            seq=job.seq,
+            msg=job.msg,
+            envelope=job.envelope,
+            spk_id=job.spk_id,
+            recipient_key_source=job.recipient_key_source,
+            group_id=job.group_id,
+            from_aid=job.from_aid,
+            sender_device_id=job.sender_device_id,
+            error=exc,
+        )
 
 
 class V2E2EECoordinator:
@@ -145,6 +212,10 @@ class V2E2EECoordinator:
                             new_spk = session._store.load_current_group_spk(session._device_id, normalized_gid)
                             if new_spk and (not old_spk or new_spk[0] != old_spk[0]):
                                 session._store.delete_group_spk(session._device_id, normalized_gid, new_spk[0])
+                                try:
+                                    session._group_spk_cache.pop((normalized_gid, new_spk[0]), None)
+                                except Exception:
+                                    pass
                                 client._log.warn(
                                     "client",
                                     "group SPK rotation upload failed, rolled back local spk_id=%s: group=%s reason=%s err=%s",
@@ -644,59 +715,68 @@ class V2E2EECoordinator:
             else:
                 page_max_seq = next_after_seq
 
-            for msg in raw_messages:
-                if not isinstance(msg, dict):
-                    continue
-                seq = int(msg.get("seq", 0) or 0)
-                if seq <= 0:
-                    continue
-
-                if str(msg.get("version", "") or "") == "v1":
-                    legacy = msg.get("legacy_v1") or {}
-                    v1_payload = legacy.get("payload")
-                    v1_payload_type = ""
-                    if isinstance(v1_payload, dict):
-                        v1_payload_type = str(v1_payload.get("type") or "").strip()
-                    if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
-                        v1_msg = {
-                            "message_id": msg.get("message_id", ""),
-                            "from": msg.get("from_aid", ""),
-                            "to": legacy.get("to", client._aid),
-                            "seq": seq,
-                            "type": msg.get("type", ""),
-                            "timestamp": msg.get("t_server", 0),
-                            "payload": v1_payload,
-                            "encrypted": False,
-                        }
-                        self.attach_gateway_proximity(v1_msg, msg)
-                        event_name, event_payload = client._delivery().p2p_app_event_for_message(v1_msg)
-                        if ns:
-                            await client._publish_pulled_message(event_name, ns, seq, event_payload)
-                        else:
-                            await client._publish_app_event(event_name, event_payload, source="pull")
-                        decrypted.append(v1_msg)
-                        client._log.debug("client", "message.v2.pull plaintext legacy row delivered: ns=%s seq=%d", ns or "<none>", seq)
+            if ns and self._can_parallel_decrypt_v2_page(raw_messages, expected_group_id=""):
+                page_decrypted = await self._decrypt_p2p_page_parallel(raw_messages)
+                for item in page_decrypted:
+                    plaintext = await self._apply_p2p_decrypt_result(item, ns)
+                    if plaintext is not None:
+                        decrypted.append(plaintext)
                     else:
-                        client._log.debug("client", "v2.pull skipping legacy envelope seq=%d payload_type=%s (old E2EE removed)",
-                                          seq, v1_payload_type or "<none>")
-                    continue
+                        client._log.debug("client", "message.v2.pull decrypt returned None: ns=%s seq=%d", ns or "<none>", item.seq)
+            else:
+                for msg in raw_messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    seq = int(msg.get("seq", 0) or 0)
+                    if seq <= 0:
+                        continue
 
-                try:
-                    msg_spk_id = str(msg.get("spk_id", "") or "")
-                    if msg_spk_id and client._v2_session and msg_spk_id != client._v2_session._spk_id:
-                        client._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
-                except Exception:
-                    pass
-                plaintext = await client._decrypt_v2_message(msg)
-                if plaintext is None:
-                    client._log.debug("client", "message.v2.pull decrypt returned None: ns=%s seq=%d", ns or "<none>", seq)
-                    continue
-                if ns:
-                    await client._publish_pulled_message("message.received", ns, seq, plaintext)
-                else:
-                    await client._publish_app_event("message.received", plaintext, source="pull")
-                decrypted.append(plaintext)
-                client._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", plaintext)
+                    if str(msg.get("version", "") or "") == "v1":
+                        legacy = msg.get("legacy_v1") or {}
+                        v1_payload = legacy.get("payload")
+                        v1_payload_type = ""
+                        if isinstance(v1_payload, dict):
+                            v1_payload_type = str(v1_payload.get("type") or "").strip()
+                        if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
+                            v1_msg = {
+                                "message_id": msg.get("message_id", ""),
+                                "from": msg.get("from_aid", ""),
+                                "to": legacy.get("to", client._aid),
+                                "seq": seq,
+                                "type": msg.get("type", ""),
+                                "timestamp": msg.get("t_server", 0),
+                                "payload": v1_payload,
+                                "encrypted": False,
+                            }
+                            self.attach_gateway_proximity(v1_msg, msg)
+                            event_name, event_payload = client._delivery().p2p_app_event_for_message(v1_msg)
+                            if ns:
+                                await client._publish_pulled_message(event_name, ns, seq, event_payload)
+                            else:
+                                await client._publish_app_event(event_name, event_payload, source="pull")
+                            decrypted.append(v1_msg)
+                            client._log.debug("client", "message.v2.pull plaintext legacy row delivered: ns=%s seq=%d", ns or "<none>", seq)
+                        else:
+                            client._log.debug("client", "v2.pull skipping legacy envelope seq=%d payload_type=%s (old E2EE removed)",
+                                              seq, v1_payload_type or "<none>")
+                        continue
+
+                    try:
+                        msg_spk_id = str(msg.get("spk_id", "") or "")
+                        if msg_spk_id and client._v2_session and msg_spk_id != client._v2_session._spk_id:
+                            client._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
+                    except Exception:
+                        pass
+                    plaintext = await client._decrypt_v2_message(msg)
+                    if plaintext is None:
+                        client._log.debug("client", "message.v2.pull decrypt returned None: ns=%s seq=%d", ns or "<none>", seq)
+                        continue
+                    if ns:
+                        await client._publish_pulled_message("message.received", ns, seq, plaintext)
+                    else:
+                        await client._publish_app_event("message.received", plaintext, source="pull")
+                    decrypted.append(plaintext)
+                    client._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", plaintext)
 
             if ns:
                 has_page_server_ack = "server_ack_seq" in result
@@ -757,6 +837,299 @@ class V2E2EECoordinator:
             after_seq, page_count, total_raw_count, len(decrypted), ns or "<none>",
         )
         return response
+
+    def _can_parallel_decrypt_v2_page(self, raw_messages: list[Any], *, expected_group_id: str = "") -> bool:
+        if len(raw_messages) <= 1:
+            return False
+        for msg in raw_messages:
+            if not isinstance(msg, dict):
+                return False
+            try:
+                seq = int(msg.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            if seq <= 0:
+                return False
+            if str(msg.get("version", "") or "") == "v1":
+                return False
+            envelope_json = msg.get("envelope_json")
+            if not envelope_json:
+                return False
+            try:
+                envelope = json.loads(envelope_json)
+            except (json.JSONDecodeError, TypeError):
+                return False
+            aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+            group_id_for_keys = str(msg.get("group_id") or aad.get("group_id") or envelope.get("group_id") or "").strip()
+            if expected_group_id:
+                if group_id_for_keys != expected_group_id:
+                    return False
+            elif group_id_for_keys:
+                return False
+        return True
+
+    def _can_parallel_decrypt_p2p_page(self, raw_messages: list[Any]) -> bool:
+        return self._can_parallel_decrypt_v2_page(raw_messages, expected_group_id="")
+
+    async def _prepare_decrypt_job(self, msg: dict[str, Any], seq: int, *, expected_group_id: str = "") -> _DecryptJob | None:
+        client = self.client
+        envelope_json = msg.get("envelope_json", "")
+        try:
+            envelope = json.loads(envelope_json)
+        except (json.JSONDecodeError, TypeError):
+            client._log.warn("client", "V2 decrypt: invalid envelope_json for msg seq=%s", msg.get("seq"))
+            return None
+        client._agent_md_manager.observe_envelope(envelope)
+
+        spk_id = ""
+        recipient_key_source = ""
+        if "recipient" in envelope:
+            recipient = envelope["recipient"]
+            spk_id = str(recipient.get("spk_id", "") or "")
+            recipient_key_source = str(recipient.get("key_source") or "")
+        elif "recipients" in envelope:
+            spk_id = str(msg.get("spk_id", "") or "")
+            selected_row = None
+            recipients = envelope.get("recipients")
+            if isinstance(recipients, list):
+                for row in recipients:
+                    if (
+                        isinstance(row, list)
+                        and len(row) >= 6
+                        and row[0] == client._aid
+                        and (row[1] == client._device_id or row[1] == "")
+                    ):
+                        selected_row = row
+                        if not spk_id:
+                            spk_id = str(row[5] or "")
+                        break
+            if isinstance(selected_row, list) and len(selected_row) >= 4:
+                recipient_key_source = str(selected_row[3] or "")
+
+        aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+        group_id_for_keys = str(msg.get("group_id") or aad.get("group_id") or envelope.get("group_id") or "").strip()
+        if expected_group_id and group_id_for_keys != expected_group_id:
+            return None
+        if not expected_group_id and group_id_for_keys:
+            return None
+        try:
+            if group_id_for_keys:
+                ik_priv, spk_priv = client._v2_session.get_group_decrypt_keys(group_id_for_keys, spk_id)
+            else:
+                ik_priv, spk_priv = client._v2_session.get_decrypt_keys(spk_id)
+        except Exception as exc:
+            client._log.warn("client", "V2 decrypt: SPK lookup failed seq=%s spk_id=%s: %s", msg.get("seq"), spk_id, exc)
+            event_name = "group.message_undecryptable" if group_id_for_keys else "message.undecryptable"
+            event = {
+                "message_id": msg.get("message_id", ""),
+                "from": msg.get("from_aid", ""),
+                "to": msg.get("to", ""),
+                "seq": msg.get("seq"),
+                "timestamp": msg.get("t_server") or msg.get("timestamp"),
+                "device_id": msg.get("device_id", ""),
+                "slot_id": msg.get("slot_id", ""),
+                "_decrypt_error": str(exc),
+                "_decrypt_stage": "spk_lookup",
+                "_envelope_type": envelope.get("type", ""),
+                "_suite": envelope.get("suite", ""),
+                "_spk_id": spk_id,
+            }
+            client._attach_v2_envelope_metadata(event, client._v2_thought_e2ee_metadata(envelope))
+            await client._dispatcher.publish(event_name, event)
+            return None
+
+        from_aid = str(msg.get("from_aid") or "")
+        sender_device_id = str(aad.get("from_device") or "")
+        sender_cert_fingerprint = str(envelope.get("sender_cert_fingerprint") or "").strip().lower()
+        sender_pub_der = await client._v2_sender_pub_der_from_cache_or_cert(from_aid, sender_device_id, sender_cert_fingerprint)
+        if not sender_pub_der:
+            client._log.warn("client", "V2 decrypt: no sender IK for %s device=%s", from_aid, sender_device_id)
+            client._schedule_v2_sender_ik_pending(
+                msg=msg,
+                envelope=envelope,
+                from_aid=from_aid,
+                sender_device_id=sender_device_id,
+                group_id=group_id_for_keys,
+            )
+            return None
+        return _DecryptJob(
+            seq=seq,
+            msg=msg,
+            envelope=envelope,
+            spk_id=spk_id,
+            recipient_key_source=recipient_key_source,
+            group_id=group_id_for_keys,
+            from_aid=from_aid,
+            sender_device_id=sender_device_id,
+            ik_priv=ik_priv,
+            spk_priv=spk_priv,
+            sender_pub_der=sender_pub_der,
+        )
+
+    async def _prepare_p2p_decrypt_job(self, msg: dict[str, Any], seq: int) -> _DecryptJob | None:
+        return await self._prepare_decrypt_job(msg, seq)
+
+    async def _decrypt_page_parallel(self, raw_messages: list[Any], *, expected_group_id: str = "") -> list[_DecryptResult]:
+        client = self.client
+        jobs: list[_DecryptJob] = []
+        for msg in raw_messages:
+            seq = int(msg.get("seq", 0) or 0)
+            if not expected_group_id:
+                try:
+                    msg_spk_id = str(msg.get("spk_id", "") or "")
+                    if msg_spk_id and client._v2_session and msg_spk_id != client._v2_session._spk_id:
+                        client._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
+                except Exception:
+                    pass
+            job = await self._prepare_decrypt_job(msg, seq, expected_group_id=expected_group_id)
+            if job is None:
+                continue
+            jobs.append(job)
+        if not jobs:
+            return []
+        tasks = [
+            asyncio.to_thread(_decrypt_job_sync, job, aid=client._aid, device_id=client._device_id)
+            for job in jobs
+        ]
+        results = await asyncio.gather(*tasks)
+        results.sort(key=lambda item: item.seq)
+        return results
+
+    async def _decrypt_p2p_page_parallel(self, raw_messages: list[Any]) -> list[_DecryptResult]:
+        return await self._decrypt_page_parallel(raw_messages)
+
+    async def _apply_p2p_decrypt_result(self, item: _DecryptResult, ns: str) -> dict[str, Any] | None:
+        client = self.client
+        msg = item.msg
+        if item.error is not None:
+            client._log.warn("client", "V2 decrypt failed for msg seq=%s: %s", msg.get("seq"), item.error)
+            event = {
+                "message_id": msg.get("message_id", ""),
+                "from": item.from_aid,
+                "to": msg.get("to", ""),
+                "seq": msg.get("seq"),
+                "timestamp": msg.get("t_server") or msg.get("timestamp"),
+                "device_id": msg.get("device_id", ""),
+                "slot_id": msg.get("slot_id", ""),
+                "_decrypt_error": str(item.error),
+                "_decrypt_stage": "decrypt",
+                "_envelope_type": item.envelope.get("type", ""),
+                "_suite": item.envelope.get("suite", ""),
+            }
+            client._attach_v2_envelope_metadata(event, client._v2_thought_e2ee_metadata(item.envelope))
+            await client._dispatcher.publish("message.undecryptable", event)
+            return None
+        if item.plaintext is None:
+            return None
+
+        if not item.from_aid and isinstance(msg.get("from_aid"), str):
+            item.from_aid = str(msg.get("from_aid") or "")
+        is_last_uploaded_spk = getattr(client._v2_session, "is_last_uploaded_spk", None) if client._v2_session else None
+        if item.spk_id and callable(is_last_uploaded_spk) and is_last_uploaded_spk(item.spk_id):
+            client._log.debug(
+                "client",
+                "SPK rotation check: spk_id=%s last_uploaded=%s matched=%s",
+                item.spk_id,
+                client._v2_session._last_uploaded_spk_id,
+                True,
+            )
+
+            async def _do_rotate():
+                try:
+                    await client._v2_session.rotate_spk(client.call)
+                    client._log.debug("client", "V2 SPK rotated after consumption: aid=%s", client._aid)
+                except Exception as exc:
+                    client._log.warn("client", "V2 SPK rotation failed (non-fatal): %s", exc)
+
+            loop = client._loop or asyncio.get_running_loop()
+            loop.create_task(_do_rotate())
+
+        meta = client._v2_thought_e2ee_metadata(item.envelope)
+        result = {
+            "message_id": msg.get("message_id", ""),
+            "from": item.from_aid,
+            "to": client._aid,
+            "seq": msg.get("seq"),
+            "t_server": msg.get("t_server"),
+            "payload": item.plaintext,
+            "encrypted": True,
+            "e2ee": meta,
+        }
+        direction = str(msg.get("direction") or "").strip()
+        if not direction:
+            direction = "outbound_sync" if item.from_aid and item.from_aid == client._aid else "inbound"
+        if direction:
+            result["direction"] = direction
+        if "device_id" in msg:
+            result["device_id"] = msg.get("device_id")
+        if "slot_id" in msg:
+            result["slot_id"] = msg.get("slot_id")
+        self.attach_gateway_proximity(result, msg)
+        client._attach_v2_envelope_metadata(result, meta)
+        await client._publish_pulled_message("message.received", ns, item.seq, result)
+        client._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", result)
+        return result
+
+    async def _apply_group_decrypt_result(self, item: _DecryptResult, group_id: str, ns: str) -> dict[str, Any] | None:
+        client = self.client
+        msg = item.msg
+        if item.error is not None:
+            client._log.warn("client", "V2 decrypt failed for msg seq=%s: %s", msg.get("seq"), item.error)
+            event = {
+                "message_id": msg.get("message_id", ""),
+                "from": item.from_aid,
+                "to": msg.get("to", ""),
+                "seq": msg.get("seq"),
+                "timestamp": msg.get("t_server") or msg.get("timestamp"),
+                "device_id": msg.get("device_id", ""),
+                "slot_id": msg.get("slot_id", ""),
+                "_decrypt_error": str(item.error),
+                "_decrypt_stage": "decrypt",
+                "_envelope_type": item.envelope.get("type", ""),
+                "_suite": item.envelope.get("suite", ""),
+            }
+            client._attach_v2_envelope_metadata(event, client._v2_thought_e2ee_metadata(item.envelope))
+            await client._dispatcher.publish("group.message_undecryptable", event)
+            return None
+        if item.plaintext is None:
+            return None
+
+        if (
+            item.recipient_key_source == "group_device_prekey"
+            and client._v2_session
+            and callable(getattr(client._v2_session, "is_last_uploaded_group_spk", None))
+            and client._v2_session.is_last_uploaded_group_spk(group_id, item.spk_id)
+        ):
+            client._schedule_group_spk_rotation(group_id, reason="group_spk_consumed")
+        elif item.recipient_key_source == "peer_device_prekey":
+            client._schedule_group_spk_registration_after_peer_fallback(group_id)
+
+        meta = client._v2_thought_e2ee_metadata(item.envelope)
+        result = {
+            "message_id": msg.get("message_id", ""),
+            "from": item.from_aid,
+            "to": client._aid,
+            "seq": msg.get("seq"),
+            "t_server": msg.get("t_server"),
+            "payload": item.plaintext,
+            "encrypted": True,
+            "e2ee": meta,
+            "group_id": group_id,
+        }
+        direction = str(msg.get("direction") or "").strip()
+        if not direction:
+            direction = "outbound_sync" if item.from_aid and item.from_aid == client._aid else "inbound"
+        if direction:
+            result["direction"] = direction
+        if "device_id" in msg:
+            result["device_id"] = msg.get("device_id")
+        if "slot_id" in msg:
+            result["slot_id"] = msg.get("slot_id")
+        self.attach_gateway_proximity(result, msg)
+        client._attach_v2_envelope_metadata(result, meta)
+        await client._publish_pulled_message("group.message_created", ns, item.seq, result)
+        client._log_message_debug("decrypt-ok", "group.v2.pull", "group.message_created", result)
+        return result
 
     async def ack_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 确认消费 + 自检销毁旧 SPK。内部方法，由 call("message.ack") 路由调用。"""
@@ -980,12 +1353,14 @@ class V2E2EECoordinator:
             client._log.debug("client", "group.v2.send attempt: group=%s use_cache=%s", group_id, use_cache)
             cache_key = f"group:{group_id}"
             epoch = 0
+            used_cached_bootstrap = False
             if use_cache:
                 cached = client._v2_bootstrap_cache.get(cache_key)
                 if cached and (time.time() - cached[1]) < client._V2_GROUP_BOOTSTRAP_TTL:
                     all_devices = cached[0]
                     epoch = cached[2] if len(cached) > 2 else 0
                     wrap_policy = cached[7] if len(cached) > 7 else None
+                    used_cached_bootstrap = True
                 else:
                     all_devices = None
                     wrap_policy = None
@@ -1071,6 +1446,12 @@ class V2E2EECoordinator:
                         f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
                         code=-33054,
                         data={"expected_peer_aids": sorted(expected_peer_aids)},
+                    )
+                if used_cached_bootstrap:
+                    raise E2EEError(
+                        f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
+                        code=-33054,
+                        data={"expected_peer_aids": []},
                     )
                 raise E2EEError(f"V2 group: no target devices for group {group_id}")
 
@@ -1766,11 +2147,17 @@ class V2E2EECoordinator:
         group: bool,
     ) -> bool:
         client = self.client
+        scope = "group" if group else "p2p"
+        client._delivery().record_push_processing(scope, "decrypt_fail")
         safe_event = client._safe_undecryptable_push_event(msg, group=group)
         client._log_message_debug("decrypt-fail", "push.encrypted", event, safe_event)
         if ns:
-            return await client._publish_ordered_message(event, ns, seq, safe_event)
+            published = await client._publish_ordered_message(event, ns, seq, safe_event)
+            if published:
+                client._delivery().record_push_processing(scope, "undecryptable_published")
+            return published
         await client._publish_app_event(event, safe_event, source="push")
+        client._delivery().record_push_processing(scope, "undecryptable_published")
         return True
 
     async def publish_encrypted_push_message(
@@ -1784,11 +2171,17 @@ class V2E2EECoordinator:
         group: bool,
     ) -> bool:
         client = self.client
+        scope = "group" if group else "p2p"
         decrypted = await client._decrypt_encrypted_push_payload(msg, group=group)
         if decrypted is not None:
+            client._delivery().record_push_processing(scope, "decrypt_ok")
             if ns:
-                return await client._publish_ordered_message(normal_event, ns, seq, decrypted)
+                published = await client._publish_ordered_message(normal_event, ns, seq, decrypted)
+                if published:
+                    client._delivery().record_push_processing(scope, "app_published")
+                return published
             await client._publish_app_event(normal_event, decrypted, source="push")
+            client._delivery().record_push_processing(scope, "app_published")
             return True
         return await client._publish_encrypted_push_as_undecryptable(
             undecryptable_event, ns, seq, msg, group=group,
@@ -1978,48 +2371,57 @@ class V2E2EECoordinator:
             else:
                 page_max_seq = next_after_seq
 
-            for msg in raw_messages:
-                if not isinstance(msg, dict):
-                    continue
-                seq = int(msg.get("seq", 0) or 0)
-                if seq <= 0:
-                    continue
-
-                if str(msg.get("version", "") or "") == "v1":
-                    payload = msg.get("payload")
-                    if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
+            if self._can_parallel_decrypt_v2_page(raw_messages, expected_group_id=group_id):
+                page_decrypted = await self._decrypt_page_parallel(raw_messages, expected_group_id=group_id)
+                for item in page_decrypted:
+                    plaintext = await self._apply_group_decrypt_result(item, group_id, ns)
+                    if plaintext is not None:
+                        decrypted.append(plaintext)
+                    else:
+                        client._log.debug("client", "group.v2.pull decrypt returned None: group=%s seq=%d", group_id, item.seq)
+            else:
+                for msg in raw_messages:
+                    if not isinstance(msg, dict):
                         continue
-                    # 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled，
-                    # 不当作普通消息投递；仍占 seq，确保 contiguous / ack 正常推进。
-                    if client._delivery().recall_event_from_group_message(msg) is not None:
-                        await client._delivery().publish_group_recall_tombstone(group_id, seq, msg)
-                        client._mark_published_seq(ns, seq)
-                        client._log.debug("client", "group.v2.pull recall tombstone delivered: group=%s seq=%d", group_id, seq)
+                    seq = int(msg.get("seq", 0) or 0)
+                    if seq <= 0:
                         continue
-                    v1_msg = {
-                        "message_id": msg.get("message_id", ""),
-                        "from": msg.get("from_aid", ""),
-                        "group_id": group_id,
-                        "seq": seq,
-                        "type": msg.get("type", ""),
-                        "timestamp": msg.get("t_server", 0),
-                        "payload": payload,
-                        "encrypted": False,
-                    }
-                    self.attach_gateway_proximity(v1_msg, msg)
-                    await client._publish_pulled_message("group.message_created", ns, seq, v1_msg)
-                    decrypted.append(v1_msg)
-                    client._log.debug("client", "group.v2.pull plaintext legacy row delivered: group=%s seq=%d", group_id, seq)
-                    continue
 
-                plaintext = await client._decrypt_v2_message(msg)
-                if plaintext is None:
-                    client._log.debug("client", "group.v2.pull decrypt returned None: group=%s seq=%d", group_id, seq)
-                    continue
-                plaintext["group_id"] = group_id
-                await client._publish_pulled_message("group.message_created", ns, seq, plaintext)
-                decrypted.append(plaintext)
-                client._log_message_debug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext)
+                    if str(msg.get("version", "") or "") == "v1":
+                        payload = msg.get("payload")
+                        if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
+                            continue
+                        # 群撤回 tombstone（占位 / 通知）：归一化为 group.message_recalled，
+                        # 不当作普通消息投递；仍占 seq，确保 contiguous / ack 正常推进。
+                        if client._delivery().recall_event_from_group_message(msg) is not None:
+                            await client._delivery().publish_group_recall_tombstone(group_id, seq, msg)
+                            client._mark_published_seq(ns, seq)
+                            client._log.debug("client", "group.v2.pull recall tombstone delivered: group=%s seq=%d", group_id, seq)
+                            continue
+                        v1_msg = {
+                            "message_id": msg.get("message_id", ""),
+                            "from": msg.get("from_aid", ""),
+                            "group_id": group_id,
+                            "seq": seq,
+                            "type": msg.get("type", ""),
+                            "timestamp": msg.get("t_server", 0),
+                            "payload": payload,
+                            "encrypted": False,
+                        }
+                        self.attach_gateway_proximity(v1_msg, msg)
+                        await client._publish_pulled_message("group.message_created", ns, seq, v1_msg)
+                        decrypted.append(v1_msg)
+                        client._log.debug("client", "group.v2.pull plaintext legacy row delivered: group=%s seq=%d", group_id, seq)
+                        continue
+
+                    plaintext = await client._decrypt_v2_message(msg)
+                    if plaintext is None:
+                        client._log.debug("client", "group.v2.pull decrypt returned None: group=%s seq=%d", group_id, seq)
+                        continue
+                    plaintext["group_id"] = group_id
+                    await client._publish_pulled_message("group.message_created", ns, seq, plaintext)
+                    decrypted.append(plaintext)
+                    client._log_message_debug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext)
 
             cursor = result.get("cursor")
             has_server_cursor = isinstance(cursor, dict) and "current_seq" in cursor
@@ -2075,6 +2477,8 @@ class V2E2EECoordinator:
         response["messages"] = decrypted
         response["_contig_before"] = first_contig_before
         response["raw_count"] = total_raw_count
+        if page_count >= max_pages and total_raw_count >= limit and int(limit or 0) > 0:
+            response["has_more"] = True
         latest_available = max(
             int(response.get("latest_seq") or 0),
             int(response.get("latest_message_seq") or 0),

@@ -22,7 +22,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
+import { createAIDStoreForClient, createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -193,8 +193,9 @@ describe('Group: 角色与群主转让', () => {
       // ---- 创建群 ----
       let createResult: Record<string, unknown>;
       try {
-        createResult = await alice.call('group.create', {
+        createResult = await alice.createGroup({
           name: `roles-${rid}`,
+          group_name: `roles${rid}`,
           visibility: 'private',
         }) as Record<string, unknown>;
       } catch (e) {
@@ -253,19 +254,35 @@ describe('Group: 角色与群主转让', () => {
 
       // ---- 群主转让给 Bob ----
       let transferResult: Record<string, unknown>;
+      const aliceStore = createAIDStoreForClient(alice);
       try {
-        transferResult = await alice.call('group.transfer_owner', {
+        transferResult = await alice.startGroupTransfer({
           group_id: groupId,
           new_owner: bobAid,
-        }) as Record<string, unknown>;
+        }, { aidStore: aliceStore }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
           console.log('group.transfer_owner 未实现，跳过转让测试');
           return;
         }
         throw e;
+      } finally {
+        aliceStore.close();
       }
       expect(transferResult).toBeDefined();
+      expect(transferResult.status).toBe('pending_rekey');
+
+      const bobStore = createAIDStoreForClient(bob);
+      let completeResult: Record<string, unknown>;
+      try {
+        completeResult = await bob.completeGroupTransfer({
+          group_id: groupId,
+        }, { aidStore: bobStore }) as Record<string, unknown>;
+      } finally {
+        bobStore.close();
+      }
+      expect(completeResult).toBeDefined();
+      expect(completeResult.status).toBe('transferred');
       cleanupClient = bob; // 转让后 Bob 是 owner
 
       await sleep(500);

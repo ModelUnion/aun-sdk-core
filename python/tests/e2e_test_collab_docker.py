@@ -85,11 +85,6 @@ async def _cleanup_root(client: AUNClient, owner: str, root: str) -> None:
         pass
 
 
-async def _grant_collab_root_acl(client: AUNClient, owner: str, root: str, grantee_aid: str) -> None:
-    _, root_path = root.split(":", 1)
-    await client.storage.set_acl(root_path, owner=owner, grantee_aid=grantee_aid, perms="rwd")
-
-
 async def test_collab_create_show_commit_log_get_diff() -> None:
     name = "collab_create_show_commit_log_get_diff"
     rid = uuid.uuid4().hex[:10]
@@ -243,6 +238,7 @@ async def test_collab_group_discover_unregister_and_wrong_namespace() -> None:
     rid = uuid.uuid4().hex[:10]
     owner = _make_client()
     member = _make_client()
+    group_identity = _make_client()
     owner_store = _make_store()
     group_id = ""
     group_aid = ""
@@ -266,16 +262,27 @@ async def test_collab_group_discover_unregister_and_wrong_namespace() -> None:
         if not group_id or not group_aid:
             raise AssertionError(f"create_group 未返回 group_id/group_aid: {created}")
         await _rpc(owner, "group.add_member", {"group_id": group_id, "aid": member_aid, "role": "member"})
+        namespace = await _rpc(owner, "group.fs.namespace_ready", {"group_id": group_id})
+        if namespace.get("namespace_ready") is not True or "public" not in namespace.get("baseline_paths", []):
+            raise AssertionError(f"group.fs namespace 初始化异常: {namespace}")
+        role_updated = await _rpc(
+            owner,
+            "group.set_role",
+            {"group_id": group_id, "aid": member_aid, "role": "admin", "perms": "rwd"},
+        )
+        if role_updated.get("new_role") != "admin":
+            raise AssertionError(f"group.set_role 未返回 admin: {role_updated}")
 
-        collab_root = f"{group_aid}:/collab-e2e/{rid}/group-proj"
-        await _grant_collab_root_acl(owner, group_aid, collab_root, owner_aid)
-        await _grant_collab_root_acl(owner, group_aid, collab_root, member_aid)
-        await member.collab.create(collab_root, "g.md", _b64("group\n"))
+        collab_root = f"{group_aid}:/public/collab-e2e/{rid}/group-proj"
+        await ensure_connected_identity(group_identity, group_aid)
+        await group_identity.collab.create(collab_root, "g.md", _b64("group\n"))
+        if _text(await member.collab.show(collab_root, "g.md")) != "group\n":
+            raise AssertionError("成员未能读取 group_aid 创建的群协作文档")
         roots = await member.collab.ls_remote(group_aid)
         if {"collab_root": collab_root, "authority_aid": group_aid} not in roots:
             raise AssertionError(f"ls_remote 未返回群协作根: {roots}")
 
-        removed = await member.collab.unregister(group_aid, collab_root)
+        removed = await group_identity.collab.unregister(group_aid, collab_root)
         if removed.get("removed") != 1 or await member.collab.ls_remote(group_aid) != []:
             raise AssertionError(f"unregister/ls_remote 返回异常: {removed}")
 
@@ -293,13 +300,14 @@ async def test_collab_group_discover_unregister_and_wrong_namespace() -> None:
         _fail(name, str(exc))
     finally:
         if group_aid:
-            await _cleanup_root(member, group_aid, f"{group_aid}:/collab-e2e/{rid}/group-proj")
+            await _cleanup_root(group_identity, group_aid, f"{group_aid}:/public/collab-e2e/{rid}/group-proj")
         if group_id:
             try:
                 await _rpc(owner, "group.dissolve", {"group_id": group_id})
             except Exception:
                 pass
         owner_store.close()
+        await group_identity.close()
         await member.close()
         await owner.close()
 

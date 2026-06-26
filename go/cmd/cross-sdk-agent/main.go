@@ -604,17 +604,25 @@ func (a *CrossSdkGoAgent) handleGroupFSCall(res http.ResponseWriter, req *http.R
 	if params == nil {
 		params = map[string]any{}
 	}
+	asGroupAID := strings.TrimSpace(firstNonEmpty(
+		stringValue(body["as_group_aid"]),
+		stringValue(body["asGroupAid"]),
+		stringValue(params["as_group_aid"]),
+		stringValue(params["asGroupAid"]),
+	))
+	delete(params, "as_group_aid")
+	delete(params, "asGroupAid")
 	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
 	defer cancel()
-	result, err := a.callGroupFSAction(ctx, action, params)
+	result, err := a.callGroupFSAction(ctx, action, params, asGroupAID)
 	if err != nil {
 		out := map[string]any{"ok": false, "trace_id": traceID, "action": action, "error_code": errorCode(err), "error_message": err.Error()}
-		a.recordTrace(traceID, map[string]any{"stage": "group_fs_call_error", "action": action, "error": out})
+		a.recordTrace(traceID, map[string]any{"stage": "group_fs_call_error", "action": action, "as_group_aid": asGroupAID, "error": out})
 		writeJSON(res, http.StatusInternalServerError, out)
 		return
 	}
 	out := map[string]any{"ok": true, "trace_id": traceID, "action": action, "result": jsonSafe(result)}
-	a.recordTrace(traceID, map[string]any{"stage": "group_fs_call", "action": action, "result": out})
+	a.recordTrace(traceID, map[string]any{"stage": "group_fs_call", "action": action, "as_group_aid": asGroupAID, "result": out})
 	writeJSON(res, http.StatusOK, out)
 }
 
@@ -663,6 +671,10 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 		return collab.LsRemote(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])))
 	case "unregister":
 		return collab.Unregister(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])), root)
+	case "set_acl":
+		return collab.SetACL(ctx, root, firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"])), firstNonEmpty(stringValue(params["perms"]), "w"))
+	case "remove_acl":
+		return collab.RemoveACL(ctx, root, firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"])))
 	case "tag.create":
 		return collab.Tag().Create(ctx, root, stringValue(params["message"]), boolValue(params["major"], false))
 	case "snapshot.create":
@@ -723,9 +735,14 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 	}
 }
 
-func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, params map[string]any) (any, error) {
+func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, params map[string]any, asGroupAID string) (any, error) {
 	fs := a.client.Group().FS()
 	pathValue := strings.TrimSpace(stringValue(params["path"]))
+	var signingStore *aun.AIDStore
+	if strings.TrimSpace(asGroupAID) != "" {
+		signingStore = a.aidStore()
+		defer signingStore.Close()
+	}
 	switch action {
 	case "ls":
 		return fs.Ls(ctx, pathValue, &aun.GroupFSListOptions{
@@ -735,6 +752,8 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			Token:     stringValue(params["token"]),
 			Long:      boolValue(params["long"], false),
 			Recursive: boolValue(params["recursive"], false),
+			SignAs:    asGroupAID,
+			AidStore:  signingStore,
 			Extra:     params,
 		})
 	case "find":
@@ -747,18 +766,37 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			Page:     intValue(params["page"]),
 			PageSize: intValue(firstNonNil(params["page_size"], params["pageSize"])),
 			Token:    stringValue(params["token"]),
+			SignAs:   asGroupAID,
+			AidStore: signingStore,
 			Extra:    params,
 		})
 	case "stat":
-		return fs.Stat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), Extra: params})
+		return fs.Stat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), SignAs: asGroupAID, AidStore: signingStore, Extra: params})
 	case "lstat":
-		return fs.Lstat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), Extra: params})
+		return fs.Lstat(ctx, pathValue, &aun.GroupFSStatOptions{Token: stringValue(params["token"]), SignAs: asGroupAID, AidStore: signingStore, Extra: params})
 	case "mkdir":
-		return fs.Mkdir(ctx, pathValue, &aun.GroupFSMkdirOptions{Parents: boolValue(params["parents"], false), Extra: params})
+		return fs.Mkdir(ctx, pathValue, &aun.GroupFSMkdirOptions{Parents: boolValue(params["parents"], false), SignAs: asGroupAID, AidStore: signingStore, Extra: params})
+	case "set_acl":
+		return fs.SetACL(ctx, pathValue, &aun.GroupFSAclOptions{
+			GranteeAID: firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAid"]), "role:admin"),
+			Perms:      firstNonEmpty(stringValue(params["perms"]), "rwx"),
+			SignAs:     asGroupAID,
+			AidStore:   signingStore,
+			Extra:      params,
+		})
+	case "remove_acl":
+		return fs.RemoveACL(ctx, pathValue, &aun.GroupFSAclOptions{
+			GranteeAID: firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAid"]), "role:admin"),
+			SignAs:     asGroupAID,
+			AidStore:   signingStore,
+			Extra:      params,
+		})
 	case "rm":
 		return fs.Rm(ctx, pathValue, &aun.GroupFSRmOptions{
 			Recursive: boolValue(params["recursive"], false),
 			Force:     boolValue(params["force"], false),
+			SignAs:    asGroupAID,
+			AidStore:  signingStore,
 			Extra:     params,
 		})
 	case "cp":
@@ -783,6 +821,8 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			GroupID:    stringValue(params["group_id"]),
 			SrcGroupID: stringValue(params["src_group_id"]),
 			DstGroupID: stringValue(params["dst_group_id"]),
+			SignAs:     asGroupAID,
+			AidStore:   signingStore,
 			Extra:      cpExtra,
 		})
 		if err != nil {
@@ -798,13 +838,17 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			GroupID:    stringValue(params["group_id"]),
 			SrcGroupID: stringValue(params["src_group_id"]),
 			DstGroupID: stringValue(params["dst_group_id"]),
+			SignAs:     asGroupAID,
+			AidStore:   signingStore,
 			Extra:      mvExtra,
 		})
 	case "df":
 		return fs.Df(ctx, pathValue, &aun.GroupFSDfOptions{
-			GroupID: stringValue(params["group_id"]),
-			Bucket:  stringValue(params["bucket"]),
-			Extra:   params,
+			GroupID:  stringValue(params["group_id"]),
+			Bucket:   stringValue(params["bucket"]),
+			SignAs:   asGroupAID,
+			AidStore: signingStore,
+			Extra:    params,
 		})
 	case "mount":
 		readonly := optionalBool(params["readonly"])
@@ -814,17 +858,58 @@ func (a *CrossSdkGoAgent) callGroupFSAction(ctx context.Context, action string, 
 			SourceBucket:    stringValue(params["source_bucket"]),
 			ExpiresAt:       optionalInt64(params["expires_at"]),
 			VolumeID:        stringValue(params["volume_id"]),
+			SignAs:          asGroupAID,
+			AidStore:        signingStore,
 			Extra:           params,
 		})
 	case "umount":
-		return fs.Umount(ctx, pathValue, &aun.GroupFSUmountOptions{Extra: params})
+		return fs.Umount(ctx, pathValue, &aun.GroupFSUmountOptions{SignAs: asGroupAID, AidStore: signingStore, Extra: params})
+	case "raw":
+		rawParams := copyMap(params)
+		method := stringValue(rawParams["method"])
+		delete(rawParams, "method")
+		return a.rawGroupFSCall(ctx, method, rawParams, asGroupAID, signingStore)
+	case "check_upload":
+		return a.rawGroupFSCall(ctx, "group.fs.check_upload", params, asGroupAID, signingStore)
+	case "create_upload_session":
+		return a.rawGroupFSCall(ctx, "group.fs.create_upload_session", params, asGroupAID, signingStore)
+	case "complete_upload":
+		return a.rawGroupFSCall(ctx, "group.fs.complete_upload", params, asGroupAID, signingStore)
+	case "create_download_ticket":
+		return a.rawGroupFSCall(ctx, "group.fs.create_download_ticket", params, asGroupAID, signingStore)
 	default:
 		return nil, fmt.Errorf("unsupported group fs action: %s", action)
 	}
 }
 
+func (a *CrossSdkGoAgent) rawGroupFSCall(ctx context.Context, method string, params map[string]any, asGroupAID string, signingStore *aun.AIDStore) (any, error) {
+	if strings.TrimSpace(method) == "" {
+		return nil, fmt.Errorf("raw group fs action requires method")
+	}
+	payload := copyMap(params)
+	if strings.TrimSpace(asGroupAID) != "" {
+		if signingStore == nil {
+			return nil, fmt.Errorf("group fs signing store is not initialized")
+		}
+		loaded := signingStore.Load(asGroupAID)
+		if !loaded.Ok || loaded.Data.AID == nil {
+			message := fmt.Sprintf("signer identity not found: %s", asGroupAID)
+			if loaded.Error != nil && strings.TrimSpace(loaded.Error.Message) != "" {
+				message = loaded.Error.Message
+			}
+			return nil, fmt.Errorf("%s", message)
+		}
+		if !loaded.Data.AID.IsPrivateKeyValid() || strings.TrimSpace(loaded.Data.AID.PrivateKeyPem) == "" {
+			return nil, fmt.Errorf("signer identity missing private key: %s", asGroupAID)
+		}
+		payload["_client_signature_identity"] = loaded.Data.AID
+	}
+	return a.client.Call(ctx, method, payload)
+}
+
 func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, params map[string]any) (any, error) {
 	storage := a.client.Storage()
+	low := aun.NewStorageLowLevel(a.client)
 	path := strings.TrimSpace(stringValue(params["path"]))
 	owner := strings.TrimSpace(firstNonEmpty(stringValue(params["owner_aid"]), stringValue(params["ownerAID"])))
 	bucket := strings.TrimSpace(stringValue(params["bucket"]))
@@ -832,6 +917,9 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 		bucket = "default"
 	}
 	token := strings.TrimSpace(stringValue(params["token"]))
+	src := strings.TrimSpace(stringValue(params["src"]))
+	dst := strings.TrimSpace(stringValue(params["dst"]))
+	objectKey := strings.TrimLeft(firstNonEmpty(stringValue(params["object_key"]), stringValue(params["objectKey"]), path), "/")
 	switch action {
 	case "write_bytes":
 		contentText := stringValue(params["content"])
@@ -862,16 +950,7 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 			"size_bytes":     len(data),
 		}, nil
 	case "create_download_ticket":
-		objectKey := strings.TrimLeft(firstNonEmpty(stringValue(params["object_key"]), stringValue(params["objectKey"]), path), "/")
-		callParams := map[string]any{
-			"owner_aid":  owner,
-			"bucket":     bucket,
-			"object_key": objectKey,
-		}
-		if token != "" {
-			callParams["token"] = token
-		}
-		return a.client.Call(ctx, "storage.create_download_ticket", callParams)
+		return low.CreateDownloadTicket(ctx, owner, bucket, objectKey, token)
 	case "download_text":
 		url := strings.TrimSpace(firstNonEmpty(stringValue(params["url"]), stringValue(params["download_url"]), stringValue(params["downloadUrl"])))
 		if url == "" {
@@ -897,6 +976,216 @@ func (a *CrossSdkGoAgent) callStorageAction(ctx context.Context, action string, 
 			Bucket:     bucket,
 			GranteeAID: strings.TrimSpace(firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"]))),
 		})
+	case "list":
+		return storage.List(ctx, path, &aun.ListOptions{
+			Owner:     owner,
+			Bucket:    bucket,
+			Page:      intValueDefault(params["page"], 1),
+			Size:      intValueDefault(params["size"], 100),
+			Marker:    stringValue(params["marker"]),
+			Long:      boolValue(params["long"], false),
+			Recursive: boolValue(params["recursive"], false),
+			Token:     token,
+		})
+	case "find":
+		return storage.Find(ctx, path, &aun.FindOptions{
+			Owner:    owner,
+			Bucket:   bucket,
+			Name:     stringValue(params["name"]),
+			NodeType: firstNonEmpty(stringValue(params["node_type"]), stringValue(params["nodeType"])),
+			Size:     firstNonEmpty(stringValue(params["size_expr"]), stringValue(params["sizeExpr"])),
+			MTime:    stringValue(params["mtime"]),
+			Page:     intValueDefault(params["page"], 1),
+			PageSize: intValueDefault(firstNonNil(params["page_size"], params["pageSize"]), 1000),
+			Token:    token,
+		})
+	case "stat":
+		return storage.Stat(ctx, path, &aun.StatOptions{Owner: owner, Bucket: bucket, Token: token})
+	case "lstat":
+		return storage.Lstat(ctx, path, &aun.StatOptions{Owner: owner, Bucket: bucket, Token: token})
+	case "mkdir":
+		return storage.Mkdir(ctx, path, &aun.MkdirOptions{Owner: owner, Bucket: bucket, Parents: boolValue(params["parents"], false)})
+	case "remove":
+		return storage.Remove(ctx, path, &aun.RemoveOptions{Owner: owner, Bucket: bucket, Recursive: boolValue(params["recursive"], false)})
+	case "rename":
+		return storage.Rename(ctx, src, dst, &aun.RenameOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			Overwrite:       boolValue(params["overwrite"], false),
+			ExpectedVersion: optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+		})
+	case "copy":
+		return storage.Copy(ctx, src, dst, &aun.CopyOptions{
+			Owner:          owner,
+			Bucket:         bucket,
+			DstOwner:       firstNonEmpty(stringValue(params["dst_owner_aid"]), stringValue(params["dstOwnerAID"]), stringValue(params["dstOwner"])),
+			DstBucket:      firstNonEmpty(stringValue(params["dst_bucket"]), stringValue(params["dstBucket"])),
+			Overwrite:      boolValue(params["overwrite"], false),
+			FollowSymlinks: boolValue(firstNonNil(params["follow_symlinks"], params["followSymlinks"]), false),
+			Recursive:      boolValue(params["recursive"], false),
+		})
+	case "df":
+		return storage.DF(ctx, &aun.UsageOptions{Owner: owner, Bucket: bucket})
+	case "symlink":
+		return storage.Symlink(ctx, stringValue(params["target"]), path, &aun.SymlinkOptions{
+			Owner:     owner,
+			Bucket:    bucket,
+			Overwrite: boolValue(params["overwrite"], false),
+		})
+	case "readlink":
+		return storage.Readlink(ctx, path, &aun.ReadlinkOptions{Owner: owner, Bucket: bucket})
+	case "repoint":
+		return storage.Repoint(ctx, path, firstNonEmpty(stringValue(params["new_target"]), stringValue(params["newTarget"])), &aun.RepointOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			ExpectedVersion: optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+		})
+	case "rename_symlink":
+		return storage.RenameSymlink(ctx, src, dst, &aun.RenameSymlinkOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			Overwrite:       boolValue(params["overwrite"], false),
+			ExpectedVersion: optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+		})
+	case "delete_symlink":
+		return low.DeleteSymlink(ctx, owner, bucket, objectKey)
+	case "list_acl":
+		return storage.ListACL(ctx, path, &aun.UsageOptions{Owner: owner, Bucket: bucket})
+	case "check_access":
+		follow := boolValue(firstNonNil(params["follow_symlinks"], params["followSymlinks"]), true)
+		return storage.CheckAccess(ctx, path, &aun.CheckAccessOptions{
+			Owner:          owner,
+			Bucket:         bucket,
+			Operation:      firstNonEmpty(stringValue(params["operation"]), "read"),
+			Token:          token,
+			FollowSymlinks: &follow,
+		})
+	case "issue_token":
+		return storage.IssueToken(ctx, path, aun.IssueTokenOptions{
+			Owner:     owner,
+			Bucket:    bucket,
+			ExpiresAt: optionalInt64(firstNonNil(params["expires_at"], params["expiresAt"])),
+			MaxReads:  optionalInt(firstNonNil(params["max_reads"], params["maxReads"])),
+		})
+	case "revoke_token":
+		return storage.RevokeToken(ctx, path, aun.RevokeTokenOptions{Owner: owner, Bucket: bucket, Token: token})
+	case "list_tokens":
+		return storage.ListTokens(ctx, path, &aun.UsageOptions{Owner: owner, Bucket: bucket})
+	case "set_visibility":
+		return storage.SetVisibility(ctx, path, aun.VisibilityOptions{
+			Owner:      owner,
+			Bucket:     bucket,
+			Visibility: firstNonEmpty(stringValue(params["visibility"]), "private"),
+			AllowRoles: stringList(firstNonNil(params["allow_roles"], params["allowRoles"])),
+		})
+	case "create_share_link":
+		return low.CreateShareLink(
+			ctx,
+			owner,
+			bucket,
+			objectKey,
+			stringList(firstNonNil(params["allowed_aids"], params["allowedAids"])),
+			optionalInt(firstNonNil(params["expire_in_seconds"], params["expireInSeconds"])),
+			optionalInt(firstNonNil(params["max_uses"], params["maxUses"])),
+		)
+	case "list_share_links":
+		return low.ListShareLinks(ctx, owner, bucket, objectKey)
+	case "revoke_share_link":
+		return low.RevokeShareLink(ctx, firstNonEmpty(stringValue(params["share_id"]), stringValue(params["shareId"])))
+	case "get_by_share":
+		result, err := low.GetByShare(ctx, firstNonEmpty(stringValue(params["share_id"]), stringValue(params["shareId"])))
+		if err != nil {
+			return nil, err
+		}
+		if content := stringValue(result["content"]); content != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(content); err == nil {
+				result["content_text"] = string(decoded)
+				result["content_base64"] = base64.StdEncoding.EncodeToString(decoded)
+			}
+		}
+		return result, nil
+	case "head_object":
+		return low.HeadObject(ctx, owner, bucket, objectKey, token)
+	case "list_objects":
+		return low.ListObjects(
+			ctx,
+			owner,
+			bucket,
+			stringValue(params["prefix"]),
+			intValueDefault(params["page"], 1),
+			intValueDefault(params["size"], 100),
+			stringValue(params["marker"]),
+		)
+	case "list_prefixes":
+		return low.ListPrefixes(ctx, owner, bucket, stringValue(params["prefix"]), intValueDefault(params["size"], 100))
+	case "delete_object":
+		return low.DeleteObject(ctx, owner, bucket, objectKey)
+	case "set_object_meta":
+		return low.SetObjectMeta(
+			ctx,
+			owner,
+			bucket,
+			objectKey,
+			asMapOrEmpty(params["metadata"]),
+			firstNonEmpty(stringValue(params["content_type"]), stringValue(params["contentType"])),
+			boolValue(params["merge"], true),
+			optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+		)
+	case "append_object":
+		contentText := stringValue(params["content"])
+		data := []byte(contentText)
+		if boolValue(firstNonNil(params["content_base64"], params["contentBase64"]), false) {
+			decoded, err := base64.StdEncoding.DecodeString(contentText)
+			if err != nil {
+				return nil, err
+			}
+			data = decoded
+		}
+		return low.AppendObject(ctx, aun.AppendObjectOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			ObjectKey:       objectKey,
+			Content:         data,
+			ContentType:     firstNonEmpty(stringValue(params["content_type"]), stringValue(params["contentType"])),
+			Metadata:        asMapOrEmpty(params["metadata"]),
+			ExpectedVersion: optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+			IsPublic:        boolValue(firstNonNil(params["public"], params["isPublic"]), false),
+		})
+	case "create_folder":
+		return low.CreateFolder(ctx, owner, bucket, objectKey, boolValue(firstNonNil(params["parents"], params["mkdirs"]), false))
+	case "list_children":
+		return low.ListChildren(ctx, aun.ListChildrenOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			Path:            objectKey,
+			NodeType:        firstNonEmpty(stringValue(params["node_type"]), stringValue(params["nodeType"]), stringValue(params["type"])),
+			Page:            intValueDefault(params["page"], 1),
+			Size:            intValueDefault(params["size"], 50),
+			OrderBy:         firstNonEmpty(stringValue(params["order_by"]), stringValue(params["orderBy"])),
+			Order:           stringValue(params["order"]),
+			IncludeMetadata: optionalBool(firstNonNil(params["include_metadata"], params["includeMetadata"])),
+			IncludeURLs:     optionalBool(firstNonNil(params["include_urls"], params["includeUrls"])),
+		})
+	case "copy_object":
+		return low.CopyObject(ctx, aun.CopyObjectOptions{
+			Owner:     owner,
+			Bucket:    bucket,
+			SrcPath:   strings.TrimLeft(firstNonEmpty(stringValue(params["src_path"]), stringValue(params["srcPath"]), src), "/"),
+			DstPath:   strings.TrimLeft(firstNonEmpty(stringValue(params["dst_path"]), stringValue(params["dstPath"]), dst), "/"),
+			Overwrite: boolValue(params["overwrite"], false),
+		})
+	case "move_object":
+		return low.MoveObject(ctx, aun.MoveObjectOptions{
+			Owner:           owner,
+			Bucket:          bucket,
+			Path:            strings.TrimLeft(firstNonEmpty(stringValue(params["src_path"]), stringValue(params["srcPath"]), src, objectKey), "/"),
+			DstParentPath:   strings.Trim(strings.TrimLeft(firstNonEmpty(stringValue(params["dst_parent_path"]), stringValue(params["dstParentPath"])), "/"), "/"),
+			NewName:         firstNonEmpty(stringValue(params["new_name"]), stringValue(params["newName"])),
+			Overwrite:       boolValue(params["overwrite"], false),
+			ExpectedVersion: optionalInt(firstNonNil(params["expected_version"], params["expectedVersion"])),
+		})
+	case "batch_delete":
+		return low.BatchDelete(ctx, owner, bucket, mapItems(params["items"]), boolValue(params["recursive"], false))
 	default:
 		return nil, fmt.Errorf("unsupported storage action: %s", action)
 	}
@@ -1352,6 +1641,9 @@ func compactUUID() string {
 func stringList(value any) []string {
 	items, ok := value.([]any)
 	if !ok {
+		if strings.TrimSpace(stringValue(value)) != "" {
+			return []string{strings.TrimSpace(stringValue(value))}
+		}
 		return []string{}
 	}
 	out := make([]string, 0, len(items))
@@ -1361,6 +1653,27 @@ func stringList(value any) []string {
 		}
 	}
 	return out
+}
+
+func mapItems(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return []map[string]any{}
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if m := asMap(item); m != nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func asMapOrEmpty(value any) map[string]any {
+	if m := asMap(value); m != nil {
+		return m
+	}
+	return map[string]any{}
 }
 
 func splitCSV(value string) []string {

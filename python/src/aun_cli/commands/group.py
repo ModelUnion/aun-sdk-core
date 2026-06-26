@@ -1001,6 +1001,47 @@ def group_add_member(
         output_success(f"Added {member_aid} to {resolved_group_id}")
 
 
+@group_app.command("set-role")
+@group_app.command("set_role")
+def group_set_role(
+    ctx: typer.Context,
+    group_id_or_aid: str = typer.Argument(..., help="群组 ID 或要设置角色的 AID"),
+    aid: str | None = typer.Argument(None, help="要设置角色的 AID；省略群组 ID 时使用当前 active group"),
+    role: str = typer.Option(..., "--role", help="目标角色：admin / member"),
+) -> None:
+    """设置成员角色（需要 owner 权限）"""
+    set_json_mode(ctx.obj.get("json", False))
+    normalized_role = role.strip().lower()
+    if normalized_role not in {"admin", "member"}:
+        handle_error(ValueError("role must be admin or member"))
+        return
+    if aid is None:
+        resolved_group_id = _resolve_group_id(ctx, None)
+        member_aid = group_id_or_aid
+    else:
+        resolved_group_id = _resolve_group_id(ctx, group_id_or_aid)
+        member_aid = aid
+
+    async def _run():
+        async with CLISession(ctx) as client:
+            return await client.call("group.set_role", {
+                "group_id": resolved_group_id,
+                "aid": member_aid,
+                "role": normalized_role,
+            })
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    if is_json_mode():
+        output_json(result)
+    else:
+        output_success(f"Set {member_aid} role to {normalized_role} in {resolved_group_id}")
+
+
 @group_app.command("kick")
 def group_kick(
     ctx: typer.Context,

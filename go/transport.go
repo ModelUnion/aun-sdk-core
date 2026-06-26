@@ -7,7 +7,9 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -605,7 +607,7 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
 		pkgLogTransport().Error("failed to send RPC request: method=%s id=%s err=%v", method, rpcID, writeErr)
-		return nil, NewConnectionError(fmt.Sprintf("failed to send RPC %s: %v", method, writeErr))
+		return nil, t.sendFailureError(fmt.Sprintf("rpc %s", method), writeErr)
 	}
 
 	// 等待响应（带超时）
@@ -705,10 +707,56 @@ func (t *RPCTransport) Notify(ctx context.Context, method string, params map[str
 	t.writeMu.Unlock()
 	if writeErr != nil {
 		pkgLogTransport().Error("failed to send notification: method=%s err=%v", method, writeErr)
-		return NewConnectionError(fmt.Sprintf("failed to send notification %s: %v", method, writeErr))
+		return t.sendFailureError(fmt.Sprintf("notification %s", method), writeErr)
 	}
 	pkgLogTransport().Debug("notification sent: method=%s size=%d", method, len(data))
 	return nil
+}
+
+func (t *RPCTransport) sendFailureError(context string, err error) *ConnectionError {
+	status := int(websocket.CloseStatus(err))
+	if status > 0 {
+		return NewConnectionError(fmt.Sprintf("failed to send %s: websocket closed: code=%d; original=%v", context, status, err), WithCode(status))
+	}
+
+	if shouldWaitForCloseCode(err) {
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for {
+			t.closedMu.RLock()
+			lastCode := t.lastCloseCode
+			lastErr := t.lastCloseErr
+			t.closedMu.RUnlock()
+			if lastCode > 0 {
+				if lastErr != nil {
+					return NewConnectionError(
+						fmt.Sprintf("failed to send %s: websocket closed: code=%d: %v; original=%v", context, lastCode, lastErr, err),
+						WithCode(lastCode),
+					)
+				}
+				return NewConnectionError(
+					fmt.Sprintf("failed to send %s: websocket closed: code=%d; original=%v", context, lastCode, err),
+					WithCode(lastCode),
+				)
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	return NewConnectionError(fmt.Sprintf("failed to send %s: %v", context, err))
+}
+
+func shouldWaitForCloseCode(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "closed") || strings.Contains(msg, "closing")
 }
 
 // recvInitialMessage 接收初始消息（通常为 challenge）

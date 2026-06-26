@@ -333,6 +333,18 @@ export class GroupFSVFS {
     return this.call('group.fs.mkdir', { ...options, path, parents: options.parents ?? false }, path);
   }
 
+  setAcl(path: string, options: GroupFSParams & { granteeAid?: string; grantee_aid?: string; perms?: string } = {}): Promise<RpcResult> {
+    const grantee = options.grantee_aid ?? options.granteeAid ?? 'role:admin';
+    const { granteeAid: _granteeAid, ...rest } = options;
+    return this.call('group.fs.set_acl', { ...rest, path, grantee_aid: grantee, perms: options.perms ?? 'rwx' }, path);
+  }
+
+  removeAcl(path: string, options: GroupFSParams & { granteeAid?: string; grantee_aid?: string } = {}): Promise<RpcResult> {
+    const grantee = options.grantee_aid ?? options.granteeAid ?? 'role:admin';
+    const { granteeAid: _granteeAid, ...rest } = options;
+    return this.call('group.fs.remove_acl', { ...rest, path, grantee_aid: grantee }, path);
+  }
+
   rm(path: string, options: GroupFSParams & { recursive?: boolean; force?: boolean } = {}): Promise<RpcResult> {
     return this.call('group.fs.rm', {
       ...options,
@@ -580,6 +592,11 @@ export class GroupFSVFS {
       const tempPath = join(dirname(targetPath), `.${basename(targetPath)}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
       try {
         await writeFile(tempPath, data);
+        try {
+          await unlink(targetPath);
+        } catch (exc) {
+          if ((exc as NodeJS.ErrnoException)?.code !== 'ENOENT') throw exc;
+        }
         await rename(tempPath, targetPath);
       } finally {
         try {

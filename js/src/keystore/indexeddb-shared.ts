@@ -30,11 +30,12 @@ export const STORE_SESSIONS = 'e2ee_sessions';
 export const STORE_GROUP_STATE = 'group_state';
 export const STORE_AGENT_MD_CACHE = 'agent_md_cache';
 export const STORE_PENDING_IDENTITIES = 'pending_identities';
+export const STORE_PENDING_BINDS = 'pending_binds';
 
 export const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 
 // ── 工具函数 ──────────────────────────────────────────────────────
 
@@ -294,7 +295,7 @@ export function openDB(): Promise<IDBDatabase> {
       for (const name of [
         STORE_KEY_PAIRS, STORE_CERTS, STORE_METADATA, STORE_INSTANCE_STATE,
         STORE_PREKEYS, STORE_GROUP_CURRENT, STORE_GROUP_OLD_EPOCHS, STORE_SESSIONS,
-        STORE_GROUP_STATE, STORE_AGENT_MD_CACHE, STORE_PENDING_IDENTITIES,
+        STORE_GROUP_STATE, STORE_AGENT_MD_CACHE, STORE_PENDING_IDENTITIES, STORE_PENDING_BINDS,
       ]) {
         if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
       }

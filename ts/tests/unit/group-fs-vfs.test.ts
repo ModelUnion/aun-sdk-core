@@ -15,6 +15,8 @@ const GROUP_FS_POSIX_METHODS = [
   'stat',
   'lstat',
   'mkdir',
+  'setAcl',
+  'removeAcl',
   'rm',
   'cp',
   'mv',
@@ -85,6 +87,8 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
     await fs.stat('g-team.agentid.pub:/docs/a.md');
     await fs.lstat('g-team.agentid.pub:/docs/link');
     await fs.mkdir('g-team.agentid.pub:/docs/new', { parents: true });
+    await fs.setAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin', perms: 'rwx' });
+    await fs.removeAcl('g-team.agentid.pub:/archive', { granteeAid: 'role:admin' });
     await fs.rm('g-team.agentid.pub:/docs/old.md', { recursive: false, force: true });
     await fs.cp('g-team.agentid.pub:/docs/a.md', 'g-team.agentid.pub:/docs/b.md', { force: true });
     await fs.mv('g-team.agentid.pub:/docs/b.md', 'g-team.agentid.pub:/docs/c.md');
@@ -98,6 +102,8 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
       'group.fs.stat',
       'group.fs.lstat',
       'group.fs.mkdir',
+      'group.fs.set_acl',
+      'group.fs.remove_acl',
       'group.fs.rm',
       'group.fs.cp',
       'group.fs.mv',
@@ -105,9 +111,17 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
       'group.fs.mount',
       'group.fs.umount',
     ]);
+    expect(client.calls[5]).toEqual({
+      method: 'group.fs.set_acl',
+      params: { path: 'g-team.agentid.pub:/archive', grantee_aid: 'role:admin', perms: 'rwx' },
+    });
+    expect(client.calls[6]).toEqual({
+      method: 'group.fs.remove_acl',
+      params: { path: 'g-team.agentid.pub:/archive', grantee_aid: 'role:admin' },
+    });
     expect(client.calls[0].params).toEqual({ path: 'g-team.agentid.pub:/docs', page: 1, size: 20 });
     expect(client.calls[4].params).toEqual({ path: 'g-team.agentid.pub:/docs/new', parents: true });
-    expect(client.calls[6].params).toEqual({
+    expect(client.calls[8].params).toEqual({
       src: 'g-team.agentid.pub:/docs/a.md',
       dst: 'g-team.agentid.pub:/docs/b.md',
       force: true,

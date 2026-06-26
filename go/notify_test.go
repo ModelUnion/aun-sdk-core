@@ -96,7 +96,7 @@ func TestClientNotifyToAIDWrapsRouteNotification(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := client.Notify(ctx, "event/app.typing", map[string]any{"thread_id": "t1"}, NotifyOptions{
-		To:       "bob.agentid.pub",
+		To:       "bob1.agentid.pub",
 		DeviceID: "dev-1",
 		SlotID:   "slot-1",
 		TTLMS:    5000,
@@ -112,7 +112,7 @@ func TestClientNotifyToAIDWrapsRouteNotification(t *testing.T) {
 		}
 		params, _ := msg["params"].(map[string]any)
 		target, _ := params["target"].(map[string]any)
-		if target["aid"] != "bob.agentid.pub" || target["device_id"] != "dev-1" || target["slot_id"] != "slot-1" {
+		if target["aid"] != "bob1.agentid.pub" || target["device_id"] != "dev-1" || target["slot_id"] != "slot-1" {
 			t.Fatalf("target 错误: %v", target)
 		}
 		deliver, _ := params["deliver"].(map[string]any)

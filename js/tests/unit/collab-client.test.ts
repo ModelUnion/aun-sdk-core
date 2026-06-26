@@ -59,6 +59,8 @@ describe('CollabClient Browser SDK 契约', () => {
     await collab.revert('alice.aid.com:/proj', 'd.md', 1, 'reset');
     await collab.lsRemote('g-team.aid.com');
     await collab.unregister('g-team.aid.com', 'g-team.aid.com:/proj');
+    await collab.setAcl('alice.aid.com:/proj', 'bob.aid.com', { perms: 'w', expiresAt: 123, maxUses: 2 });
+    await collab.removeAcl('alice.aid.com:/proj', 'bob.aid.com');
     await collab.tag.create('alice.aid.com:/proj', { message: 'm', major: true });
     await collab.tag.list('alice.aid.com:/proj');
     await collab.tag.show('alice.aid.com:/proj', '1.0.0');
@@ -84,6 +86,8 @@ describe('CollabClient Browser SDK 契约', () => {
       'collab.revert',
       'collab.ls-remote',
       'collab.unregister',
+      'collab.set_acl',
+      'collab.remove_acl',
       'collab.tag.create',
       'collab.tag.list',
       'collab.tag.show',
@@ -113,6 +117,17 @@ describe('CollabClient Browser SDK 契约', () => {
       doc: 'd.md',
       rev: 1,
       message: 'reset',
+    });
+    expect(client.calls[16].params).toEqual({
+      collab_root: 'alice.aid.com:/proj',
+      grantee_aid: 'bob.aid.com',
+      perms: 'w',
+      expires_at: 123,
+      max_uses: 2,
+    });
+    expect(client.calls[17].params).toEqual({
+      collab_root: 'alice.aid.com:/proj',
+      grantee_aid: 'bob.aid.com',
     });
   });
 

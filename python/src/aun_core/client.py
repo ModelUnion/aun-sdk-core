@@ -50,6 +50,7 @@ from .errors import (
 )
 from .events import EventDispatcher, Subscription
 from .group_id import normalize_group_id as _normalize_group_id
+from .validators import validate_aid_format as _validate_aid_format, validate_group_id_format as _validate_group_id_format
 from .keystore.local_token_store import LocalTokenStore
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
@@ -224,8 +225,9 @@ _NON_IDEMPOTENT_METHODS = frozenset({
     "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
     "auth.create_aid", "auth.renew_cert", "auth.rekey",
     "message.thought.put", "group.thought.put",
-    "group.add_member", "group.bind_group_aid", "group.complete_transfer",
+    "group.add_member", "group.bind_group_aid", "group.renew_group_aid", "group.complete_transfer",
     "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+    "group.fs.set_acl", "group.fs.remove_acl",
     "group.fs.mount", "group.fs.umount",
     "group.fs.check_upload", "group.fs.create_upload_session",
     "group.fs.complete_upload", "group.fs.create_download_ticket",
@@ -604,6 +606,9 @@ class AUNClient:
         # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
         self._seq_tracker = SeqTracker()
         self._seq_tracker_context: tuple[str, str, str] | None = None
+        self._seq_tracker_pending_persist: dict[str, int] = {}
+        self._seq_tracker_pending_persist_context: tuple[str, str, str] | None = None
+        self._seq_tracker_flush_handle: asyncio.Handle | None = None
         self._gap_fill_done: dict[str, float] = {}  # 补洞去重：进行中的 key -> 开始时间戳
         self._gap_fill_active: bool = False  # 当前是否在补洞中（用于标记 pull 来源）
         self._background_rpc_depth: int = 0  # SDK 内部后台任务 depth，不进入业务 RPC 参数
@@ -612,6 +617,12 @@ class AUNClient:
         self._pushed_seqs: dict[str, set[int]] = {}
         # 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq）
         self._pending_ordered_msgs: dict[str, dict[int, tuple[str, Any]]] = {}
+        # 诊断：应用层有序发布被 seq 空洞门控拦截的次数（按 namespace）。
+        self._ordered_gap_block_stats: dict[str, dict[str, Any]] = {}
+        # 诊断：push 从 raw 到应用层发布的关键分支计数。
+        self._push_processing_stats: dict[str, dict[str, int]] = {}
+        # 诊断：SDK auto-ack 后台任务计数。
+        self._auto_ack_stats: dict[str, int] = {}
         # P2P pull 进行中到达的纯通知 push 上界。当前 pull 结束后需要再补拉一次。
         self._pending_p2p_pull_upper: dict[str, int] = {}
         # 群惰性同步标志：只有收到推送或主动 pull 后才标记为已同步
@@ -1002,7 +1013,7 @@ class AUNClient:
         "group.leave", "group.remove_member", "group.update_rules",
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
-        "group.transfer_owner", "group.bind_group_aid", "group.complete_transfer",
+        "group.transfer_owner", "group.bind_group_aid", "group.renew_group_aid", "group.complete_transfer",
         "group.review_join_request",
         "group.batch_review_join_request",
         "group.request_join", "group.use_invite_code",
@@ -1030,6 +1041,7 @@ class AUNClient:
         "storage.fs.invalidate_membership",
         "storage.volume.create", "storage.volume.renew", "storage.volume.expire_due",
         "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+        "group.fs.set_acl", "group.fs.remove_acl",
         "group.fs.mount", "group.fs.umount",
         "group.fs.check_upload", "group.fs.create_upload_session",
         "group.fs.complete_upload", "group.fs.create_download_ticket",
@@ -1115,7 +1127,15 @@ class AUNClient:
         aid_store: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """为匿名群补齐 group_aid 身份材料并落盘本地 AIDs。"""
+        """为匿名群补齐 group_aid 身份材料并落盘本地 AIDs。
+
+        完整幂等保障（对齐普通 AID register_aid）：
+        1. 优先从 pending 目录恢复未完成的注册（崩溃恢复）
+        2. 未命中则创建 pending 目录并生成新密钥
+        3. RPC 成功后将 cert 写入 pending，原子 promote 到正式目录
+        4. 证书公钥校验：确保服务端返回的证书公钥 == 本地公钥
+        5. promote 成功后清理 pending 目录
+        """
         merged: dict[str, Any] = {}
         if params is not None:
             if not isinstance(params, dict):
@@ -1127,16 +1147,61 @@ class AUNClient:
         if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity"):
             raise ValueError("bind_group_aid requires aid_store with import_group_identity")
 
-        identity = store._register_flow.generate_identity()
-        public_key = str(identity.get("public_key_der_b64") or "").strip()
-        private_key = str(identity.get("private_key_pem") or "").strip()
-        curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+        group_id = str(merged.get("group_id") or "").strip()
+        if not group_id:
+            raise ValueError("bind_group_aid requires group_id")
+
+        keystore = getattr(store, "_keystore", None)
+        pseudo_aid = f"group:{group_id}"
+
+        # Step 1: 检查旧 pending 槽位（向后兼容）
+        pending_kp = None
+        if keystore is not None and hasattr(keystore, "load_pending_group_bind"):
+            pending_kp = keystore.load_pending_group_bind(group_id)
+
+        # Step 2: 检查 pending 目录（崩溃恢复）
+        pending_dir = None
+        if pending_kp is None and keystore is not None and hasattr(keystore, "list_pending_identity_dirs"):
+            for pd in keystore.list_pending_identity_dirs(pseudo_aid):
+                kp = keystore.load_pending_key_pair(pd, pseudo_aid)
+                if kp and kp.get("public_key_der_b64") and kp.get("private_key_pem"):
+                    pending_kp = kp
+                    pending_dir = pd
+                    break
+
+        # Step 3: 未命中 pending，创建 pending 目录并生成新密钥
+        if pending_kp is None:
+            identity = store._register_flow.generate_identity()
+            public_key = str(identity.get("public_key_der_b64") or "").strip()
+            private_key = str(identity.get("private_key_pem") or "").strip()
+            curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+            if not public_key or not private_key:
+                raise ValueError("bind_group_aid generated incomplete group identity")
+            if keystore is not None and hasattr(keystore, "pending_identity_dir") and hasattr(keystore, "save_pending_key_pair"):
+                pending_dir = keystore.pending_identity_dir(pseudo_aid)
+                keystore.save_pending_key_pair(pending_dir, pseudo_aid, {
+                    "public_key_der_b64": public_key,
+                    "private_key_pem": private_key,
+                    "curve": curve,
+                })
+            pending_kp = {"public_key_der_b64": public_key, "private_key_pem": private_key, "curve": curve}
+
+        public_key = str(pending_kp.get("public_key_der_b64") or "").strip()
+        private_key = str(pending_kp.get("private_key_pem") or "").strip()
+        curve = str(pending_kp.get("curve") or "P-256").strip() or "P-256"
         if not public_key or not private_key:
-            raise ValueError("bind_group_aid generated incomplete group identity")
+            raise ValueError("bind_group_aid: incomplete key pair")
+
         merged["public_key"] = public_key
         merged["curve"] = curve
 
-        result = await self.call("group.bind_group_aid", merged)
+        # Step 4: RPC 调用
+        try:
+            result = await self.call("group.bind_group_aid", merged)
+        except Exception:
+            # RPC 失败，保留 pending 用于恢复
+            raise
+
         group = result.get("group") if isinstance(result, dict) else None
         aid_cert = result.get("aid_cert") if isinstance(result, dict) else None
         group_aid = str((group or {}).get("group_aid") or "").strip()
@@ -1144,6 +1209,20 @@ class AUNClient:
         if not group_aid or not cert_pem:
             raise ValueError("bind_group_aid response missing group.group_aid or aid_cert.cert")
 
+        # Step 5: 证书公钥校验：确保服务端返回的证书公钥 == 本地公钥
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(public_key)
+        if cert_pub_der != local_pub_der:
+            raise AuthError(f"bind_group_aid: server returned certificate with mismatched public key for group {group_id}")
+
+        # Step 6: 落盘 group_aid 身份（import_group_identity 会覆盖写）
+        #        如果有 pending_dir，先不 promote，等 import 成功后再 promote
         imported = store.import_group_identity(
             group_aid,
             private_key_pem=private_key,
@@ -1153,7 +1232,149 @@ class AUNClient:
         )
         if not imported.ok:
             message = imported.error.message if imported.error else "unknown error"
+            # import 失败，保留 pending 用于重试
             raise ValueError(f"bind_group_aid failed to persist group identity: {message}")
+
+        # Step 7: import 成功后，使用 pending 原子 promote（如果有 pending_dir）
+        if pending_dir is not None and keystore is not None and hasattr(keystore, "save_pending_cert") and hasattr(keystore, "promote_pending_identity"):
+            # 将 cert 写入 pending
+            keystore.save_pending_cert(pending_dir, cert_pem)
+            try:
+                keystore.promote_pending_identity(pending_dir, group_aid)
+            except FileExistsError:
+                # 并发冲突或 import 已写入：清理本进程的 pending
+                if hasattr(keystore, "discard_pending_identity"):
+                    keystore.discard_pending_identity(pending_dir)
+                pending_dir = None  # 标记已清理
+
+        # Step 8: 清理旧 pending 槽位（向后兼容）
+        if keystore is not None and hasattr(keystore, "clear_pending_group_bind"):
+            keystore.clear_pending_group_bind(group_id)
+
+        # Step 9: 清理 pending 目录（promote 成功后）
+        if pending_dir is not None and keystore is not None and hasattr(keystore, "discard_pending_identity"):
+            keystore.discard_pending_identity(pending_dir)
+
+        return result
+
+    async def renew_group_aid(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        aid_store: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """显式轮换 group_aid 密钥：用本地旧 group_aid 私钥签名授权，生成新密钥替换。
+
+        与 bind 的区别：bind 只首次补齐证书（幂等复用密钥），renew 才更换密钥。
+        本地必须已持有旧 group_aid 私钥，否则无法签名授权。
+        """
+        merged: dict[str, Any] = {}
+        if params is not None:
+            if not isinstance(params, dict):
+                raise TypeError("params must be a dict")
+            merged.update(params)
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+
+        store = aid_store or getattr(self, "_aid_store", None)
+        if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity") or not hasattr(store, "load"):
+            raise ValueError("renew_group_aid requires aid_store with load/import_group_identity")
+
+        group_id = str(merged.get("group_id") or "").strip()
+        if not group_id:
+            raise ValueError("renew_group_aid requires group_id")
+        group_aid = str(merged.get("group_aid") or "").strip()
+        if not group_aid:
+            info = await self.call("group.get", {"group_id": group_id})
+            group_info = info.get("group") if isinstance(info, dict) else {}
+            group_aid = str(group_info.get("group_aid") or "").strip() if isinstance(group_info, dict) else ""
+        if not group_aid:
+            raise ValueError("renew_group_aid: unable to determine group_aid")
+
+        # 加载旧 group_aid 私钥（用于签名授权轮换）
+        loaded = store.load(group_aid)
+        if not getattr(loaded, "ok", False) or not getattr(loaded, "data", None):
+            raise ValueError(f"renew_group_aid: group_aid identity not found: {group_aid}")
+        old_aid_obj = loaded.data.get("aid") if isinstance(loaded.data, dict) else None
+        if old_aid_obj is None or not getattr(old_aid_obj, "private_key_pem", None):
+            raise ValueError(f"renew_group_aid: group_aid has no private key: {group_aid}")
+        try:
+            old_public_key = str(old_aid_obj.public_key or "").strip()
+        except Exception as exc:
+            raise ValueError(f"renew_group_aid: cannot read old public key for {group_aid}: {exc}") from exc
+        if not old_public_key:
+            raise ValueError(f"renew_group_aid: cannot determine old public key for {group_aid}")
+
+        # 生成新密钥
+        identity = store._register_flow.generate_identity()
+        new_public_key = str(identity.get("public_key_der_b64") or "").strip()
+        new_private_key = str(identity.get("private_key_pem") or "").strip()
+        curve = str(identity.get("curve") or "P-256").strip() or "P-256"
+        if not new_public_key or not new_private_key:
+            raise ValueError("renew_group_aid generated incomplete group identity")
+
+        # 用旧私钥对 canonical payload 签名
+        nonce = uuid.uuid4().hex
+        issued_ms = int(time.time() * 1000)
+        old_hash = hashlib.sha256(old_public_key.encode("utf-8")).hexdigest()
+        new_hash = hashlib.sha256(new_public_key.encode("utf-8")).hexdigest()
+        canonical = "|".join([
+            "aun-group-aid-renew-v1",
+            group_id.strip().lower(),
+            group_aid.strip().lower(),
+            old_hash,
+            new_hash,
+            nonce,
+            str(issued_ms),
+        ])
+        signed = old_aid_obj.sign(canonical)
+        if not signed.ok:
+            raise ValueError(f"renew_group_aid: sign failed: {signed.error}")
+
+        merged["group_aid"] = group_aid
+        merged["old_public_key"] = old_public_key
+        merged["new_public_key"] = new_public_key
+        merged["curve"] = curve
+        merged["renew_proof"] = {"nonce": nonce, "issued_ms": issued_ms, "signature": signed.data["signature"]}
+
+        result = await self.call("group.renew_group_aid", merged)
+        result_map = result if isinstance(result, dict) else {}
+        group = result_map.get("group") if isinstance(result_map.get("group"), dict) else {}
+        aid_cert = result_map.get("aid_cert") if isinstance(result_map.get("aid_cert"), dict) else {}
+        returned_group_aid = str(group.get("group_aid") or result_map.get("group_aid") or group_aid).strip()
+        cert_pem = str(
+            aid_cert.get("cert")
+            or aid_cert.get("cert_pem")
+            or result_map.get("cert")
+            or result_map.get("cert_pem")
+            or ""
+        ).strip()
+        if not returned_group_aid or not cert_pem:
+            raise ValueError("renew_group_aid response missing group.group_aid or aid_cert.cert")
+
+        # 证书公钥校验：确保服务端返回的新证书公钥 == 本地新公钥
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(new_public_key)
+        if cert_pub_der != local_pub_der:
+            raise AuthError(f"renew_group_aid: server returned certificate with mismatched public key for group {group_id}")
+
+        # 用新密钥覆盖本地身份（合法轮换）
+        imported = store.import_group_identity(
+            returned_group_aid,
+            private_key_pem=new_private_key,
+            public_key_der_b64=new_public_key,
+            curve=curve,
+            cert_pem=cert_pem,
+        )
+        if not imported.ok:
+            message = imported.error.message if imported.error else "unknown error"
+            raise ValueError(f"renew_group_aid failed to persist group identity: {message}")
         return result
 
     async def start_group_transfer(
@@ -1295,6 +1516,18 @@ class AUNClient:
         if not group_aid or not cert_pem:
             raise ValueError("complete_group_transfer response missing group.group_aid or aid_cert.cert")
 
+        # 证书公钥校验：确保服务端返回的证书公钥 == 本地公钥
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(public_key)
+        if cert_pub_der != local_pub_der:
+            raise AuthError(f"complete_group_transfer: server returned certificate with mismatched public key for group {group_id}")
+
         imported = store.import_group_identity(
             group_aid,
             private_key_pem=private_key,
@@ -1362,6 +1595,8 @@ class AUNClient:
 
         if target_aid:
             event_method = self._validate_notify_event_method(method)
+            # 校验目标 AID 格式（拒绝 __system__ 等非法格式）
+            _validate_aid_format(target_aid, param_name="notify.to")
             target: dict[str, Any] = {"type": "aid", "aid": target_aid}
             if target_device_id:
                 target["device_id"] = target_device_id
@@ -1378,6 +1613,8 @@ class AUNClient:
 
         if target_group_id:
             event_method = self._validate_notify_event_method(method)
+            # 校验目标 Group ID 格式
+            _validate_group_id_format(target_group_id, param_name="notify.group_id")
             normalized_group_id = _normalize_group_id(target_group_id)
             if not normalized_group_id:
                 raise ValidationError("group_id is required for group notify")
@@ -1532,18 +1769,22 @@ class AUNClient:
             return
         self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
         self._v2_group_security_levels.pop(group_id, None)
-        self._seq_tracker.remove_namespace(f"group:{group_id}")
-        self._seq_tracker.remove_namespace(f"group_event:{group_id}")
+        group_ns = f"group:{group_id}"
+        group_event_ns = f"group_event:{group_id}"
+        self._seq_tracker.remove_namespace(group_ns)
+        self._seq_tracker.remove_namespace(group_event_ns)
+        self._persist_repaired_seq(group_ns)
+        self._persist_repaired_seq(group_event_ns)
         self._delivery().save_seq_tracker_state()
 
         for key in list(self._gap_fill_done):
             if group_id in key:
                 self._gap_fill_done.pop(key, None)
 
-        self._pushed_seqs.pop(f"group:{group_id}", None)
-        self._pushed_seqs.pop(f"group_event:{group_id}", None)
-        self._pending_ordered().pop(f"group:{group_id}", None)
-        self._pending_ordered().pop(f"group_event:{group_id}", None)
+        self._pushed_seqs.pop(group_ns, None)
+        self._pushed_seqs.pop(group_event_ns, None)
+        self._pending_ordered().pop(group_ns, None)
+        self._pending_ordered().pop(group_event_ns, None)
         self._log.info("client", "cleaned up dissolved group local state: group=%s", group_id)
 
     async def _on_v2_epoch_rotated(self, data: Any) -> None:

@@ -7,6 +7,9 @@ AUN E2EE V2: ECDH P-256
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+from threading import RLock
+
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
@@ -14,6 +17,51 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 from cryptography.hazmat.backends import default_backend
+
+
+_KEY_CACHE_MAX = 512
+_PRIVATE_KEY_CACHE: OrderedDict[bytes, ec.EllipticCurvePrivateKey] = OrderedDict()
+_PUBLIC_KEY_CACHE: OrderedDict[bytes, ec.EllipticCurvePublicKey] = OrderedDict()
+_KEY_CACHE_LOCK = RLock()
+
+
+def _cache_get(cache: OrderedDict[bytes, object], key: bytes) -> object | None:
+    with _KEY_CACHE_LOCK:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+
+def _cache_put(cache: OrderedDict[bytes, object], key: bytes, value: object) -> object:
+    with _KEY_CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > _KEY_CACHE_MAX:
+            cache.popitem(last=False)
+        return value
+
+
+def _private_key_from_scalar(private_key_scalar: bytes) -> ec.EllipticCurvePrivateKey:
+    cached = _cache_get(_PRIVATE_KEY_CACHE, private_key_scalar)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    key = ec.derive_private_key(
+        int.from_bytes(private_key_scalar, "big"),
+        ec.SECP256R1(),
+        default_backend(),
+    )
+    return _cache_put(_PRIVATE_KEY_CACHE, private_key_scalar, key)  # type: ignore[return-value]
+
+
+def _public_key_from_der(peer_public_key_der: bytes) -> ec.EllipticCurvePublicKey:
+    cached = _cache_get(_PUBLIC_KEY_CACHE, peer_public_key_der)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    key = load_der_public_key(peer_public_key_der, default_backend())
+    if not isinstance(key, ec.EllipticCurvePublicKey):
+        raise ValueError("peer_public_key_der is not an EC public key")
+    return _cache_put(_PUBLIC_KEY_CACHE, peer_public_key_der, key)  # type: ignore[return-value]
 
 
 def ecdh_compute_shared(private_key_scalar: bytes, peer_public_key_der: bytes) -> bytes:
@@ -26,17 +74,8 @@ def ecdh_compute_shared(private_key_scalar: bytes, peer_public_key_der: bytes) -
     Returns:
         32 字节共享秘密（椭圆曲线点 X 坐标）
     """
-    # 从 scalar 构造私钥对象
-    private_key = ec.derive_private_key(
-        int.from_bytes(private_key_scalar, "big"),
-        ec.SECP256R1(),
-        default_backend(),
-    )
-
-    # 解析对端公钥
-    peer_key = load_der_public_key(peer_public_key_der, default_backend())
-    if not isinstance(peer_key, ec.EllipticCurvePublicKey):
-        raise ValueError("peer_public_key_der is not an EC public key")
+    private_key = _private_key_from_scalar(private_key_scalar)
+    peer_key = _public_key_from_der(peer_public_key_der)
 
     # ECDH
     shared_key = private_key.exchange(ec.ECDH(), peer_key)

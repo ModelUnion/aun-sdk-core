@@ -11,6 +11,7 @@ import {
   type RpcParams,
   type RpcResult,
 } from '../types.js';
+import { validateAIDFormat, validateGroupIDFormat } from '../validators.js';
 import type { ClientRuntime } from './runtime.js';
 
 const INTERNAL_ONLY_METHODS = new Set([
@@ -74,6 +75,7 @@ const SIGNED_METHODS = new Set([
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
   'group.fs.check_upload', 'group.fs.create_upload_session',
   'group.fs.complete_upload', 'group.fs.create_download_ticket',
@@ -109,12 +111,13 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'storage.fs.invalidate_membership',
   'storage.volume.create', 'storage.volume.renew', 'storage.volume.expire_due',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
   'group.fs.check_upload', 'group.fs.create_upload_session',
   'group.fs.complete_upload', 'group.fs.create_download_ticket',
   'auth.create_aid', 'auth.renew_cert', 'auth.rekey',
   'message.thought.put', 'group.thought.put',
-  'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
+  'group.add_member', 'group.bind_group_aid', 'group.renew_group_aid', 'group.complete_transfer',
   'collab.create', 'collab.commit', 'collab.clone',
   'collab.prune', 'collab.unregister',
   'collab.tag.create', 'collab.tag.restore',
@@ -368,6 +371,8 @@ export class RpcPipeline {
   validateOutboundCall(method: string, params: RpcParams): void {
     if (method === 'message.send') {
       this.validateMessageRecipient(params.to);
+      // 校验目标 AID 格式（拒绝 __system__ 等非法格式）
+      validateAIDFormat(params.to, 'message.send.to');
       if ('persist' in params) {
         throw new ValidationError("message.send no longer accepts 'persist'; configure delivery_mode during connect");
       }
@@ -376,6 +381,10 @@ export class RpcPipeline {
       }
     }
     if (method === 'group.send') {
+      // 校验目标 Group ID 格式（空值交由下游抛规范错误）
+      if (String(params.group_id ?? '').trim()) {
+        validateGroupIDFormat(params.group_id, 'group.send.group_id');
+      }
       if ('persist' in params) {
         throw new ValidationError("group.send does not accept 'persist'; group messages are always fanout");
       }
@@ -395,17 +404,32 @@ export class RpcPipeline {
         throw new ValidationError(`${method} requires context.type + context.id`);
       }
     }
-    if (method === 'group.thought.get' && !String(params.sender_aid ?? '').trim()) {
-      throw new ValidationError('group.thought.get requires sender_aid');
+    if (method === 'group.thought.put') {
+      // 校验目标 Group ID 格式
+      validateGroupIDFormat(params.group_id, 'group.thought.put.group_id');
+    }
+    if (method === 'group.thought.get') {
+      if (!String(params.sender_aid ?? '').trim()) {
+        throw new ValidationError('group.thought.get requires sender_aid');
+      }
+      // 校验 sender_aid 和 group_id 格式
+      validateAIDFormat(params.sender_aid, 'group.thought.get.sender_aid');
+      validateGroupIDFormat(params.group_id, 'group.thought.get.group_id');
     }
     if (method === 'message.thought.put') {
       this.validateMessageRecipient(params.to);
       if (!String(params.to ?? '').trim()) {
         throw new ValidationError('message.thought.put requires to');
       }
+      // 校验目标 AID 格式
+      validateAIDFormat(params.to, 'message.thought.put.to');
     }
-    if (method === 'message.thought.get' && !String(params.sender_aid ?? '').trim()) {
-      throw new ValidationError('message.thought.get requires sender_aid');
+    if (method === 'message.thought.get') {
+      if (!String(params.sender_aid ?? '').trim()) {
+        throw new ValidationError('message.thought.get requires sender_aid');
+      }
+      // 校验 sender_aid 格式
+      validateAIDFormat(params.sender_aid, 'message.thought.get.sender_aid');
     }
   }
 
@@ -638,7 +662,7 @@ export class RpcPipeline {
       }
     }
     if (client._seqTracker.getContiguousSeq(ns) !== contigBefore) {
-      client._saveSeqTrackerState?.();
+      client._persistSeq?.(ns);
     }
     result._contig_before = contigBefore;
   }
@@ -666,7 +690,7 @@ export class RpcPipeline {
       }
     }
     if (client._seqTracker.getContiguousSeq(ns) !== contigBefore) {
-      client._saveSeqTrackerState?.();
+      client._persistSeq?.(ns);
     }
     result._contig_before = contigBefore;
   }
@@ -714,6 +738,9 @@ export class RpcPipeline {
   }
 
   validateMessageRecipient(toAid: JsonValue | object | undefined): void {
+    if (!String(toAid ?? '').trim()) {
+      throw new ValidationError("message.send requires 'to' (recipient AID)");
+    }
     if (isGroupServiceAid(toAid)) {
       throw new ValidationError('message.send receiver cannot be group.{issuer}; use group.send instead');
     }

@@ -47,16 +47,20 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 	if _, err := alice.Storage().SetACL(ctx, sourceDir, SetACLOptions{
 		Owner:      aliceAID,
 		GranteeAID: groupAID,
-		Perms:      "rwd",
+		Perms:      "w",
 	}); err != nil {
 		t.Fatalf("source ACL 授权失败: %v", err)
 	}
+	if _, err := groupOwner.Storage().ReadBytes(ctx, sourceDir+"/a.txt", &ReadOptions{Owner: aliceAID}); err == nil {
+		t.Fatalf("source 写 ACL 不应授予直接读取")
+	}
 
 	mounted, err := groupOwner.Storage().Mount(ctx, mountDir, &MountOptions{
-		Owner:      groupAID,
-		SourceAID:  aliceAID,
-		SourcePath: sourceDir,
-		Readonly:   false,
+		Owner:           groupAID,
+		SourceAID:       aliceAID,
+		SourcePath:      sourceDir,
+		Readonly:        false,
+		RequireApproval: true,
 	})
 	if err != nil {
 		t.Fatalf("Mount 失败: %v", err)
@@ -66,6 +70,16 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 	}
 	if !strings.Contains(mounted.MountSource, aliceAID) || !strings.Contains(mounted.MountSource, strings.TrimPrefix(sourceDir, "/")) {
 		t.Fatalf("MountSource 异常: %#v", mounted)
+	}
+	if _, err := groupOwner.Storage().Stat(ctx, mountDir, &StatOptions{Owner: groupAID}); err == nil {
+		t.Fatalf("pending mount 审批前不应可读")
+	}
+	approved, err := alice.Storage().ApproveMount(ctx, mountDir, &MountReviewOptions{Owner: groupAID})
+	if err != nil {
+		t.Fatalf("ApproveMount 失败: %v", err)
+	}
+	if storageBool(approved["approved"], false) != true || storageString(approved["status"], "") != "active" {
+		t.Fatalf("ApproveMount 返回异常: %#v", approved)
 	}
 
 	lstat, err := groupOwner.Storage().Lstat(ctx, mountDir, &StatOptions{Owner: groupAID})
@@ -109,6 +123,15 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("通过挂载点 Copy 失败: %v", err)
 	}
+	if copied.Owner != aliceAID || copied.Path != sourceDir+"/copied.txt" {
+		t.Fatalf("通过挂载点 Copy 返回异常: copied=%#v", copied)
+	}
+	if _, err := alice.Storage().Stat(ctx, sourceDir+"/copied.txt", &StatOptions{Owner: aliceAID}); err != nil {
+		t.Fatalf("source stat 挂载 Copy 目标失败: %v; copied=%#v", err, copied)
+	}
+	if _, err := groupOwner.Storage().Stat(ctx, mountDir+"/copied.txt", &StatOptions{Owner: groupAID}); err != nil {
+		t.Fatalf("通过挂载点 stat Copy 目标失败: %v; copied=%#v", err, copied)
+	}
 	renamed, err := groupOwner.Storage().Rename(ctx, mountDir+"/copied.txt", mountDir+"/renamed.txt", &RenameOptions{Owner: groupAID})
 	if err != nil {
 		t.Fatalf("通过挂载点 Rename 失败: %v", err)
@@ -117,7 +140,7 @@ func TestIntegration_StorageVFSP6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("通过挂载点 Remove 失败: %v", err)
 	}
-	if copied.Owner != aliceAID || renamed.Path != sourceDir+"/renamed.txt" || removed.RemovedCount != 1 {
+	if renamed.Path != sourceDir+"/renamed.txt" || removed.RemovedCount != 1 {
 		t.Fatalf("挂载点写操作返回异常: copied=%#v renamed=%#v removed=%#v", copied, renamed, removed)
 	}
 	if _, err := alice.Storage().Stat(ctx, sourceDir+"/renamed.txt", &StatOptions{Owner: aliceAID}); err == nil {

@@ -1,5 +1,6 @@
 import { GroupFSVFS } from './group-fs.js';
 import type { RpcParams, RpcResult } from './types.js';
+import { validateAIDFormat, validateGroupIDFormat } from './validators.js';
 
 export interface FacadeRpcClient {
   call(method: string, params?: RpcParams): Promise<RpcResult>;
@@ -29,10 +30,16 @@ abstract class RpcFacade {
 
 export class MessageThoughtFacade extends RpcFacade {
   put(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.to) {
+      validateAIDFormat(params.to, 'to');
+    }
     return this.call('message.thought.put', params);
   }
 
   get(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.sender_aid) {
+      validateAIDFormat(params.sender_aid, 'sender_aid');
+    }
     return this.call('message.thought.get', params);
   }
 }
@@ -46,6 +53,9 @@ export class MessageFacade extends RpcFacade {
   }
 
   send(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.to) {
+      validateAIDFormat(params.to, 'to');
+    }
     return this.call('message.send', params);
   }
 
@@ -69,10 +79,19 @@ export class MessageFacade extends RpcFacade {
 
 export class GroupThoughtFacade extends RpcFacade {
   put(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.group_id) {
+      validateGroupIDFormat(params.group_id, 'group_id');
+    }
     return this.call('group.thought.put', params);
   }
 
   get(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.sender_aid) {
+      validateAIDFormat(params.sender_aid, 'sender_aid');
+    }
+    if (params?.group_id) {
+      validateGroupIDFormat(params.group_id, 'group_id');
+    }
     return this.call('group.thought.get', params);
   }
 }
@@ -122,7 +141,12 @@ export class GroupFacade extends RpcFacade {
   getBanlist(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_banlist', params); }
   ban(params?: FacadeParams): Promise<RpcResult> { return this.call('group.ban', params); }
   unban(params?: FacadeParams): Promise<RpcResult> { return this.call('group.unban', params); }
-  send(params?: FacadeParams): Promise<RpcResult> { return this.call('group.send', params); }
+  send(params?: FacadeParams): Promise<RpcResult> {
+    if (params?.group_id) {
+      validateGroupIDFormat(params.group_id, 'group_id');
+    }
+    return this.call('group.send', params);
+  }
   pull(params?: FacadeParams): Promise<RpcResult> { return this.call('group.pull', params); }
   recall(params?: FacadeParams): Promise<RpcResult> { return this.call('group.recall', params); }
   pullEvents(params?: FacadeParams): Promise<RpcResult> { return this.call('group.pull_events', params); }

@@ -794,6 +794,136 @@ func (f *LocalIdentityStore) SaveTrustRoots(trustList map[string]any, imported [
 	return bundlePath, nil
 }
 
+// ── Pending Group Bind (幂等暂存槽位) ────────────────────────
+
+func (f *LocalIdentityStore) pendingBindsRoot() string {
+	return filepath.Join(f.aidsRoot, "_pending_binds")
+}
+
+func (f *LocalIdentityStore) pendingBindPath(groupID string) string {
+	return filepath.Join(f.pendingBindsRoot(), safeAID(strings.TrimSpace(groupID))+".json")
+}
+
+// SavePendingGroupBind 暂存待绑定 group_aid 密钥（私钥加密）。
+func (f *LocalIdentityStore) SavePendingGroupBind(groupID string, keyPair map[string]any) error {
+	gid := strings.TrimSpace(groupID)
+	if gid == "" {
+		return fmt.Errorf("SavePendingGroupBind requires non-empty group_id")
+	}
+	l := f.getLock("_pending_bind:" + gid)
+	l.Lock()
+	defer l.Unlock()
+
+	privateKeyPEM, _ := keyPair["private_key_pem"].(string)
+	if privateKeyPEM == "" {
+		return fmt.Errorf("SavePendingGroupBind requires private_key_pem")
+	}
+	publicKeyDerB64, _ := keyPair["public_key_der_b64"].(string)
+	if publicKeyDerB64 == "" {
+		return fmt.Errorf("SavePendingGroupBind requires public_key_der_b64")
+	}
+	curve, _ := keyPair["curve"].(string)
+	if curve == "" {
+		curve = "P-256"
+	}
+
+	protected, err := f.secretStore.Protect(safeAID(gid), "pending_bind/private_key", []byte(privateKeyPEM))
+	if err != nil {
+		return fmt.Errorf("SavePendingGroupBind: 加密私钥失败: %w", err)
+	}
+
+	record := map[string]any{
+		"public_key_der_b64":     publicKeyDerB64,
+		"curve":                  curve,
+		"private_key_protection": protected,
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return fmt.Errorf("SavePendingGroupBind: 序列化失败: %w", err)
+	}
+
+	path := f.pendingBindPath(gid)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("SavePendingGroupBind: 创建目录失败: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return fmt.Errorf("SavePendingGroupBind: 写入临时文件失败: %w", err)
+	}
+	if err := safeRename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("SavePendingGroupBind: 重命名失败: %w", err)
+	}
+	return nil
+}
+
+// LoadPendingGroupBind 读取待绑定 group_aid 密钥（解密私钥）。无则返回 nil。
+func (f *LocalIdentityStore) LoadPendingGroupBind(groupID string) (map[string]any, error) {
+	gid := strings.TrimSpace(groupID)
+	if gid == "" {
+		return nil, nil
+	}
+	l := f.getLock("_pending_bind:" + gid)
+	l.Lock()
+	defer l.Unlock()
+
+	path := f.pendingBindPath(gid)
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("LoadPendingGroupBind: 读取文件失败: %w", err)
+	}
+
+	var record map[string]any
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, fmt.Errorf("LoadPendingGroupBind: 解析 JSON 失败: %w", err)
+	}
+
+	protectionMap, ok := record["private_key_protection"].(map[string]any)
+	if !ok || protectionMap == nil {
+		return nil, fmt.Errorf("LoadPendingGroupBind: missing or invalid private_key_protection")
+	}
+
+	privateKeyBytes, err := f.secretStore.Reveal(safeAID(gid), "pending_bind/private_key", protectionMap)
+	if err != nil {
+		return nil, fmt.Errorf("LoadPendingGroupBind: 解密私钥失败: %w", err)
+	}
+
+	publicKeyDerB64, _ := record["public_key_der_b64"].(string)
+	curve, _ := record["curve"].(string)
+	if curve == "" {
+		curve = "P-256"
+	}
+
+	return map[string]any{
+		"public_key_der_b64": publicKeyDerB64,
+		"private_key_pem":    string(privateKeyBytes),
+		"curve":              curve,
+	}, nil
+}
+
+// ClearPendingGroupBind 清除待绑定槽位。
+func (f *LocalIdentityStore) ClearPendingGroupBind(groupID string) error {
+	gid := strings.TrimSpace(groupID)
+	if gid == "" {
+		return nil
+	}
+	l := f.getLock("_pending_bind:" + gid)
+	l.Lock()
+	defer l.Unlock()
+
+	path := f.pendingBindPath(gid)
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// ── Issuer Root Cert ─────────────────────────────────────────
+
 func (f *LocalIdentityStore) SaveIssuerRootCert(issuer, certPEM, fingerprint string) (string, string, error) {
 	dir := filepath.Join(f.TrustRootDir(), "issuers")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

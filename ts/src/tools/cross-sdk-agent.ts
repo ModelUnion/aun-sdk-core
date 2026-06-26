@@ -68,6 +68,12 @@ function jsonObjectOf(value: unknown): JsonObject | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : null;
 }
 
+function withoutKeys(source: JsonObject, keys: string[]): JsonObject {
+  const next = { ...source } as JsonObject;
+  for (const key of keys) delete next[key];
+  return next;
+}
+
 function accessTokenFromClient(client: AUNClient): string {
   const internals = client as unknown as ClientInternals & { accessToken?: unknown; access_token?: unknown };
   const direct = textOf(internals.accessToken ?? internals.access_token).trim();
@@ -584,10 +590,13 @@ class CrossSdkTsAgent {
     const traceId = textOf(body.trace_id || crypto.randomUUID().replace(/-/g, ''));
     const action = textOf(body.action).trim();
     const params = jsonObjectOf(body.params) ?? {};
+    const asGroupAid = textOf(body.as_group_aid || body.asGroupAid || params.as_group_aid || params.asGroupAid).trim();
+    delete params.as_group_aid;
+    delete params.asGroupAid;
     try {
-      const result = await this.callGroupFsAction(action, params);
+      const result = await this.callGroupFsAction(action, params, asGroupAid);
       const response: JsonObject = { ok: true, trace_id: traceId, action, result: jsonSafe(result) as any };
-      this.recordTrace(traceId, { stage: 'group_fs_call', action, result: response });
+      this.recordTrace(traceId, { stage: 'group_fs_call', action, as_group_aid: asGroupAid, result: response });
       sendJson(res, 200, response);
     } catch (err) {
       const error: JsonObject = {
@@ -597,7 +606,7 @@ class CrossSdkTsAgent {
         error_code: err instanceof Error ? err.name : 'Error',
         error_message: err instanceof Error ? err.message : String(err),
       };
-      this.recordTrace(traceId, { stage: 'group_fs_call_error', action, error });
+      this.recordTrace(traceId, { stage: 'group_fs_call_error', action, as_group_aid: asGroupAid, error });
       sendJson(res, 500, error);
     }
   }
@@ -713,6 +722,18 @@ class CrossSdkTsAgent {
         return await this.client.collab.lsRemote(textOf(params.group_aid ?? params.groupAid));
       case 'unregister':
         return await this.client.collab.unregister(textOf(params.group_aid ?? params.groupAid), collabRoot);
+      case 'set_acl':
+        return await this.client.collab.setAcl(
+          collabRoot,
+          textOf(params.grantee_aid ?? params.granteeAID),
+          {
+            perms: textOf(params.perms || 'w'),
+            expires_at: params.expires_at == null && params.expiresAt == null ? undefined : Number(params.expires_at ?? params.expiresAt),
+            max_uses: params.max_uses == null && params.maxUses == null ? undefined : Number(params.max_uses ?? params.maxUses),
+          },
+        );
+      case 'remove_acl':
+        return await this.client.collab.removeAcl(collabRoot, textOf(params.grantee_aid ?? params.granteeAID));
       case 'snapshot.create':
       case 'tag.create':
         return await this.client.collab.tag.create(collabRoot, {
@@ -745,56 +766,108 @@ class CrossSdkTsAgent {
     }
   }
 
-  async callGroupFsAction(action: string, params: JsonObject): Promise<unknown> {
+  async callGroupFsAction(action: string, params: JsonObject, asGroupAid = ''): Promise<unknown> {
     const groupFs = this.client.group.fs;
-    const path = textOf(params.path).trim();
-    const options = { ...params } as JsonObject;
-    delete options.path;
-    switch (action) {
-      case 'ls':
-        return await groupFs.ls(path, options as any);
-      case 'find':
-        return await groupFs.find(path, options as any);
-      case 'stat':
-        return await groupFs.stat(path, options as any);
-      case 'lstat':
-        return await groupFs.lstat(path, options as any);
-      case 'mkdir':
-        return await groupFs.mkdir(path, { ...options, parents: Boolean(params.parents) } as any);
-      case 'rm':
-        return await groupFs.rm(path, {
-          ...options,
-          recursive: Boolean(params.recursive),
-          force: Boolean(params.force),
-        } as any);
-      case 'cp': {
-        let src = textOf(params.src);
-        const dst = textOf(params.dst);
-        const cpOptions = { ...params } as JsonObject;
-        delete cpOptions.src;
-        delete cpOptions.dst;
-        delete cpOptions.src_text;
-        if (params.src_text != null) {
-          src = this.writeTempText(textOf(params.src_text), '.txt');
-        }
-        const result = await groupFs.cp(src, dst, cpOptions as any);
-        return this.groupFsCpResponse(result, dst);
+    let signingStore: AIDStore | null = null;
+    const withSigning = (source: JsonObject): JsonObject => {
+      const next = { ...source } as JsonObject;
+      if (asGroupAid) {
+        signingStore ??= this.aidStore();
+        next.signAs = asGroupAid;
+        (next as Record<string, unknown>).aidStore = signingStore;
       }
-      case 'mv':
-        {
-          const mvOptions = { ...params } as JsonObject;
-          delete mvOptions.src;
-          delete mvOptions.dst;
-          return await groupFs.mv(textOf(params.src), textOf(params.dst), mvOptions as any);
+      return next;
+    };
+    const rawCall = async (method: string, source: JsonObject): Promise<unknown> => {
+      const payload = { ...source } as RpcParams;
+      if (asGroupAid) {
+        signingStore ??= this.aidStore();
+        const loaded = await signingStore.load(asGroupAid) as unknown as {
+          ok?: boolean;
+          data?: { aid?: unknown };
+          error?: { message?: string };
+        };
+        if (!loaded.ok || !loaded.data?.aid) {
+          throw new Error(loaded.error?.message || `signer identity not found: ${asGroupAid}`);
         }
-      case 'df':
-        return await groupFs.df(path || textOf(params.group_id), options as any);
-      case 'mount':
-        return await groupFs.mount(path, options as any);
-      case 'umount':
-        return await groupFs.umount(path, options as any);
-      default:
-        throw new Error(`unsupported group fs action: ${action}`);
+        (payload as Record<string, unknown>)._client_signature_identity = loaded.data.aid;
+      }
+      return await this.client.call(method, payload);
+    };
+    const path = textOf(params.path).trim();
+    const options = withSigning(params);
+    delete options.path;
+    try {
+      switch (action) {
+        case 'ls':
+          return await groupFs.ls(path, options as any);
+        case 'find':
+          return await groupFs.find(path, options as any);
+        case 'stat':
+          return await groupFs.stat(path, options as any);
+        case 'lstat':
+          return await groupFs.lstat(path, options as any);
+        case 'mkdir':
+          return await groupFs.mkdir(path, { ...options, parents: Boolean(params.parents) } as any);
+        case 'set_acl':
+          return await groupFs.setAcl(path, {
+            ...options,
+            grantee_aid: textOf(params.grantee_aid ?? params.granteeAid).trim() || 'role:admin',
+            perms: textOf(params.perms).trim() || 'rwx',
+          } as any);
+        case 'remove_acl':
+          return await groupFs.removeAcl(path, {
+            ...options,
+            grantee_aid: textOf(params.grantee_aid ?? params.granteeAid).trim() || 'role:admin',
+          } as any);
+        case 'rm':
+          return await groupFs.rm(path, {
+            ...options,
+            recursive: Boolean(params.recursive),
+            force: Boolean(params.force),
+          } as any);
+        case 'cp': {
+          let src = textOf(params.src);
+          const dst = textOf(params.dst);
+          const cpOptions = withSigning(params);
+          delete cpOptions.src;
+          delete cpOptions.dst;
+          delete cpOptions.src_text;
+          if (params.src_text != null) {
+            src = this.writeTempText(textOf(params.src_text), '.txt');
+          }
+          const result = await groupFs.cp(src, dst, cpOptions as any);
+          return this.groupFsCpResponse(result, dst);
+        }
+        case 'mv':
+          {
+            const mvOptions = withSigning(params);
+            delete mvOptions.src;
+            delete mvOptions.dst;
+            return await groupFs.mv(textOf(params.src), textOf(params.dst), mvOptions as any);
+          }
+        case 'df':
+          return await groupFs.df(path || textOf(params.group_id), options as any);
+        case 'mount':
+          return await groupFs.mount(path, options as any);
+        case 'umount':
+          return await groupFs.umount(path, options as any);
+        case 'raw':
+          return await rawCall(textOf(params.method), withoutKeys(params, ['method']));
+        case 'check_upload':
+          return await rawCall('group.fs.check_upload', params);
+        case 'create_upload_session':
+          return await rawCall('group.fs.create_upload_session', params);
+        case 'complete_upload':
+          return await rawCall('group.fs.complete_upload', params);
+        case 'create_download_ticket':
+          return await rawCall('group.fs.create_download_ticket', params);
+        default:
+          throw new Error(`unsupported group fs action: ${action}`);
+      }
+    } finally {
+      const storeToClose = signingStore as AIDStore | null;
+      if (storeToClose) storeToClose.close();
     }
   }
 
@@ -839,6 +912,9 @@ class CrossSdkTsAgent {
     const owner = textOf(params.owner_aid ?? params.ownerAID).trim() || undefined;
     const bucket = textOf(params.bucket).trim() || 'default';
     const token = textOf(params.token).trim() || undefined;
+    const src = textOf(params.src).trim();
+    const dst = textOf(params.dst).trim();
+    const objectKey = textOf(params.object_key ?? params.objectKey ?? path).replace(/^\/+/, '');
     switch (action) {
       case 'write_bytes':
         return await storage.writeBytes(
@@ -863,7 +939,6 @@ class CrossSdkTsAgent {
         };
       }
       case 'create_download_ticket': {
-        const objectKey = textOf(params.object_key ?? params.objectKey ?? path).replace(/^\/+/, '');
         return await storage.lowlevel.createDownloadTicket({ owner, bucket, objectKey, token });
       }
       case 'download_text': {
@@ -886,6 +961,202 @@ class CrossSdkTsAgent {
           bucket,
           granteeAid: textOf(params.grantee_aid ?? params.granteeAID).trim(),
         });
+      case 'list':
+        return await storage.list(path, {
+          owner,
+          bucket,
+          page: Number(params.page ?? 1) || 1,
+          size: Number(params.size ?? 100) || 100,
+          marker: textOf(params.marker).trim() || undefined,
+          long: Boolean(params.long),
+          recursive: Boolean(params.recursive),
+          token,
+        });
+      case 'find':
+        return await storage.find(path, {
+          owner,
+          bucket,
+          name: textOf(params.name).trim() || undefined,
+          nodeType: textOf(params.node_type ?? params.nodeType).trim() || undefined,
+          size: textOf(params.size_expr ?? params.sizeExpr).trim() || undefined,
+          mtime: textOf(params.mtime).trim() || undefined,
+          page: Number(params.page ?? 1) || 1,
+          pageSize: Number(params.page_size ?? params.pageSize ?? 1000) || 1000,
+          token,
+        });
+      case 'stat':
+        return await storage.stat(path, { owner, bucket, token });
+      case 'lstat':
+        return await storage.lstat(path, { owner, bucket, token });
+      case 'mkdir':
+        return await storage.mkdir(path, { owner, bucket, parents: Boolean(params.parents) });
+      case 'remove':
+        return await storage.remove(path, { owner, bucket, recursive: Boolean(params.recursive) });
+      case 'rename':
+        return await storage.rename(src, dst, {
+          owner,
+          bucket,
+          overwrite: Boolean(params.overwrite),
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+        });
+      case 'copy':
+        return await storage.copy(src, dst, {
+          owner,
+          bucket,
+          dstOwner: textOf(params.dst_owner_aid ?? params.dstOwnerAID ?? params.dstOwner).trim() || undefined,
+          dstBucket: textOf(params.dst_bucket ?? params.dstBucket).trim() || undefined,
+          overwrite: Boolean(params.overwrite),
+          followSymlinks: Boolean(params.follow_symlinks ?? params.followSymlinks),
+          recursive: Boolean(params.recursive),
+        });
+      case 'df':
+        return await storage.df({ owner, bucket });
+      case 'symlink':
+        return await storage.symlink(textOf(params.target), path, { owner, bucket, overwrite: Boolean(params.overwrite) });
+      case 'readlink':
+        return await storage.readlink(path, { owner, bucket });
+      case 'repoint':
+        return await storage.repoint(path, textOf(params.new_target ?? params.newTarget), {
+          owner,
+          bucket,
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+        });
+      case 'rename_symlink':
+        return await storage.renameSymlink(src, dst, {
+          owner,
+          bucket,
+          overwrite: Boolean(params.overwrite),
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+        });
+      case 'delete_symlink':
+        return await storage.lowlevel.deleteSymlink({ owner, bucket, path: objectKey });
+      case 'list_acl':
+        return await storage.listAcl(path, { owner, bucket });
+      case 'check_access':
+        return await storage.checkAccess(path, {
+          owner,
+          bucket,
+          operation: textOf(params.operation).trim() || 'read',
+          token,
+          followSymlinks: params.follow_symlinks == null && params.followSymlinks == null ? true : Boolean(params.follow_symlinks ?? params.followSymlinks),
+        });
+      case 'issue_token':
+        return await storage.issueToken(path, {
+          owner,
+          bucket,
+          expiresAt: params.expires_at == null && params.expiresAt == null ? undefined : Number(params.expires_at ?? params.expiresAt),
+          maxReads: params.max_reads == null && params.maxReads == null ? undefined : Number(params.max_reads ?? params.maxReads),
+        });
+      case 'revoke_token':
+        return await storage.revokeToken(path, { owner, bucket, token: textOf(params.token) });
+      case 'list_tokens':
+        return await storage.listTokens(path, { owner, bucket });
+      case 'set_visibility': {
+        const allowRoles = Array.isArray(params.allow_roles) ? params.allow_roles.map((item) => textOf(item)) : (Array.isArray(params.allowRoles) ? params.allowRoles.map((item) => textOf(item)) : undefined);
+        return await storage.setVisibility(path, { owner, bucket, visibility: textOf(params.visibility).trim() || 'private', allowRoles });
+      }
+      case 'create_share_link': {
+        const allowedAids = Array.isArray(params.allowed_aids) ? params.allowed_aids.map((item) => textOf(item)) : (Array.isArray(params.allowedAids) ? params.allowedAids.map((item) => textOf(item)) : undefined);
+        return await storage.lowlevel.createShareLink({
+          owner,
+          bucket,
+          objectKey,
+          allowedAids,
+          expireInSeconds: params.expire_in_seconds == null && params.expireInSeconds == null ? undefined : Number(params.expire_in_seconds ?? params.expireInSeconds),
+          maxUses: params.max_uses == null && params.maxUses == null ? undefined : Number(params.max_uses ?? params.maxUses),
+        });
+      }
+      case 'list_share_links':
+        return await storage.lowlevel.listShareLinks({ owner, bucket, objectKey: objectKey || undefined });
+      case 'revoke_share_link':
+        return await storage.lowlevel.revokeShareLink({ shareId: textOf(params.share_id ?? params.shareId).trim() });
+      case 'get_by_share': {
+        const result = await storage.lowlevel.getByShare({ shareId: textOf(params.share_id ?? params.shareId).trim() });
+        const resultObj = jsonObjectOf(result);
+        const content = textOf(resultObj?.content);
+        if (content) {
+          try {
+            const buffer = Buffer.from(content, 'base64');
+            return { ...(resultObj ?? {}), content_text: buffer.toString('utf-8'), content_base64: buffer.toString('base64') };
+          } catch {
+            return result;
+          }
+        }
+        return result;
+      }
+      case 'head_object':
+        return await storage.lowlevel.headObject({ owner, bucket, objectKey, token });
+      case 'list_objects':
+        return await storage.lowlevel.listObjects({
+          owner,
+          bucket,
+          prefix: textOf(params.prefix),
+          page: Number(params.page ?? 1) || 1,
+          size: Number(params.size ?? 100) || 100,
+          marker: textOf(params.marker).trim() || undefined,
+        });
+      case 'list_prefixes':
+        return await storage.lowlevel.listPrefixes({ owner, bucket, prefix: textOf(params.prefix), size: Number(params.size ?? 100) || 100 });
+      case 'delete_object':
+        return await storage.lowlevel.deleteObject({ owner, bucket, objectKey });
+      case 'set_object_meta':
+        return await storage.lowlevel.setObjectMeta({
+          owner,
+          bucket,
+          objectKey,
+          metadata: jsonObjectOf(params.metadata) ?? {},
+          contentType: textOf(params.content_type ?? params.contentType).trim() || undefined,
+          merge: params.merge == null ? true : Boolean(params.merge),
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+        });
+      case 'append_object':
+        return await storage.lowlevel.appendObject({
+          owner,
+          bucket,
+          objectKey,
+          content: params.content_base64 || params.contentBase64 ? Buffer.from(textOf(params.content), 'base64') : Buffer.from(textOf(params.content), 'utf-8'),
+          contentType: textOf(params.content_type ?? params.contentType).trim() || undefined,
+          metadata: jsonObjectOf(params.metadata) ?? undefined,
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+          isPublic: Boolean(params.public ?? params.isPublic),
+        });
+      case 'create_folder':
+        return await storage.lowlevel.createFolder({ owner, bucket, path: objectKey, parents: Boolean(params.parents ?? params.mkdirs) });
+      case 'list_children':
+        return await storage.lowlevel.listChildren({
+          owner,
+          bucket,
+          path: objectKey,
+          nodeType: textOf(params.node_type ?? params.nodeType ?? params.type).trim() || 'all',
+          page: Number(params.page ?? 1) || 1,
+          size: Number(params.size ?? 50) || 50,
+          orderBy: textOf(params.order_by ?? params.orderBy).trim() || undefined,
+          order: textOf(params.order).trim() || undefined,
+          includeMetadata: params.include_metadata == null && params.includeMetadata == null ? undefined : Boolean(params.include_metadata ?? params.includeMetadata),
+          includeUrls: params.include_urls == null && params.includeUrls == null ? undefined : Boolean(params.include_urls ?? params.includeUrls),
+        });
+      case 'copy_object':
+        return await storage.lowlevel.copyObject({
+          owner,
+          bucket,
+          srcPath: textOf(params.src_path ?? params.srcPath ?? src).replace(/^\/+/, ''),
+          dstPath: textOf(params.dst_path ?? params.dstPath ?? dst).replace(/^\/+/, ''),
+          overwrite: Boolean(params.overwrite),
+        });
+      case 'move_object':
+        return await storage.lowlevel.moveObject({
+          owner,
+          bucket,
+          path: textOf(params.src_path ?? params.srcPath ?? src ?? objectKey).replace(/^\/+/, ''),
+          dstParentPath: textOf(params.dst_parent_path ?? params.dstParentPath).replace(/^\/+/, '').replace(/\/+$/g, ''),
+          newName: textOf(params.new_name ?? params.newName),
+          overwrite: Boolean(params.overwrite),
+          expectedVersion: params.expected_version == null && params.expectedVersion == null ? undefined : Number(params.expected_version ?? params.expectedVersion),
+        });
+      case 'batch_delete': {
+        const items = Array.isArray(params.items) ? params.items.filter((item) => item && typeof item === 'object' && !Array.isArray(item)) as JsonObject[] : [];
+        return await storage.lowlevel.batchDelete({ owner, bucket, items, recursive: Boolean(params.recursive) });
+      }
       default:
         throw new Error(`unsupported storage action: ${action}`);
     }

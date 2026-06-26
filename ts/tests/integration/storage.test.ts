@@ -548,3 +548,143 @@ describe('Storage: 配额', () => {
     }
   }, 60_000);
 });
+
+// ── 5. Storage low-level: 目录树与对象管理 facade ────────────────
+
+describe('Storage low-level: 目录树与对象管理 facade', () => {
+  it('create/get/list/resolve + append/meta/copy/move/batch/delete', async () => {
+    const rid = runId();
+    const aliceAid = `stotree${rid}.${ISSUER}`;
+    const bobAid = `stotreeb${rid}.${ISSUER}`;
+    const bucket = `tree-${rid}`;
+    const alice = makeClient();
+    const bob = makeClient();
+
+    try {
+      await ensureConnected(alice, aliceAid);
+      await ensureConnected(bob, bobAid);
+
+      await expect(bob.storage.lowlevel.createFolder({
+        owner: aliceAid,
+        bucket,
+        path: 'docs',
+        parents: true,
+      })).rejects.toThrow();
+
+      let folder: Record<string, unknown>;
+      try {
+        folder = await alice.storage.lowlevel.createFolder({
+          owner: aliceAid,
+          bucket,
+          path: 'docs/sub',
+          parents: true,
+        });
+      } catch (e) {
+        if (isNotImplemented(e)) {
+          console.log('storage.create_folder 未实现，跳过 low-level object tree 测试');
+          return;
+        }
+        throw e;
+      }
+      expect(String(folder.folder_id ?? '')).toBeTruthy();
+
+      const gotFolder = await alice.storage.lowlevel.getFolder({ owner: aliceAid, bucket, path: 'docs/sub' });
+      expect(String(gotFolder.folder_id ?? '')).toBeTruthy();
+
+      const created = await alice.storage.lowlevel.appendObject({
+        owner: aliceAid,
+        bucket,
+        objectKey: 'docs/sub/a.txt',
+        content: Buffer.from('hello'),
+        contentType: 'text/plain',
+        metadata: { stage: 'created' },
+      });
+      const firstVersion = Number(created.version ?? 0);
+      expect(String(created.object_id ?? '')).toBeTruthy();
+      expect(created.path).toBe('docs/sub/a.txt');
+
+      const appended = await alice.storage.lowlevel.appendObject({
+        owner: aliceAid,
+        bucket,
+        objectKey: 'docs/sub/a.txt',
+        content: Buffer.from(' world'),
+        contentType: 'text/plain',
+        expectedVersion: firstVersion,
+      });
+      expect(Number(appended.version ?? 0)).toBe(firstVersion + 1);
+
+      const read = await alice.storage.lowlevel.getObject({ owner: aliceAid, bucket, objectKey: 'docs/sub/a.txt' });
+      expect(Buffer.from(String(read.content ?? ''), 'base64').toString('utf-8')).toBe('hello world');
+
+      const meta = await alice.storage.lowlevel.setObjectMeta({
+        owner: aliceAid,
+        bucket,
+        objectKey: 'docs/sub/a.txt',
+        metadata: { stage: 'final' },
+        contentType: 'text/markdown',
+      });
+      expect(meta.content_type).toBe('text/markdown');
+
+      const listed = await alice.storage.lowlevel.listChildren({
+        owner: aliceAid,
+        bucket,
+        path: 'docs/sub',
+        includeMetadata: true,
+      });
+      const children = Array.isArray(listed.items) ? listed.items as Record<string, unknown>[] : [];
+      expect(children.some((item) => item.node_type === 'object' && item.name === 'a.txt')).toBe(true);
+
+      const resolved = await alice.storage.lowlevel.resolvePath({
+        owner: aliceAid,
+        bucket,
+        path: 'docs/sub/a.txt',
+        expectedType: 'object',
+      });
+      const objectId = String(resolved.object_id ?? '');
+      expect(objectId).toBeTruthy();
+
+      await alice.storage.lowlevel.createFolder({ owner: aliceAid, bucket, path: 'archive', parents: true });
+      const copied = await alice.storage.lowlevel.copyObject({
+        owner: aliceAid,
+        bucket,
+        srcPath: 'docs/sub/a.txt',
+        dstPath: 'archive/copy.txt',
+        overwrite: true,
+      });
+      expect(String(copied.object_id ?? '')).toBeTruthy();
+      expect(copied.object_id).not.toBe(objectId);
+
+      const moved = await alice.storage.lowlevel.moveObject({
+        owner: aliceAid,
+        bucket,
+        path: 'docs/sub/a.txt',
+        dstParentPath: 'archive',
+        newName: 'moved.txt',
+      });
+      expect(moved.object_id).toBe(objectId);
+      expect(moved.path).toBe('archive/moved.txt');
+      await expect(alice.storage.lowlevel.resolvePath({
+        owner: aliceAid,
+        bucket,
+        path: 'docs/sub/a.txt',
+        expectedType: 'object',
+      })).rejects.toThrow();
+
+      const deleted = await alice.storage.lowlevel.batchDelete({
+        owner: aliceAid,
+        bucket,
+        items: [
+          { type: 'object', path: 'archive/copy.txt' },
+          { type: 'object', path: 'archive/moved.txt' },
+        ],
+      });
+      expect(Number(deleted.deleted_count ?? deleted.deleted ?? 0)).toBeGreaterThanOrEqual(2);
+
+      await alice.storage.lowlevel.deleteFolder({ owner: aliceAid, bucket, path: 'docs', recursive: true });
+      await alice.storage.lowlevel.deleteFolder({ owner: aliceAid, bucket, path: 'archive', recursive: true });
+    } finally {
+      await alice.close();
+      await bob.close();
+    }
+  }, 90_000);
+});

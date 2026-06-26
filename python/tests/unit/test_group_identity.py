@@ -118,6 +118,18 @@ class _CreateGroupClient(AUNClient):
                 "group": {"group_id": payload.get("group_id", "123456"), "group_aid": self.group_aid},
                 "aid_cert": {"cert": cert_pem, "curve": payload["curve"], "key_purpose": "group_identity"},
             }
+        if method == "group.transfer_owner":
+            return {
+                "status": "pending_rekey",
+                "group_id": payload.get("group_id", "123456"),
+                "group_aid": payload.get("group_aid", self.group_aid),
+                "old_owner": "old-owner.agentid.pub",
+                "new_owner": payload.get("new_owner"),
+                "pending_owner_transfer": {
+                    "status": "pending_rekey",
+                    "transfer_auth": payload.get("transfer_auth") or {},
+                },
+            }
         if "group_name" not in payload:
             return {"group": {"group_id": "123456", "group_aid": "123456.agentid.pub"}}
         cert_pem = _cert_for_public_key(self.group_aid, payload["public_key"])
@@ -236,6 +248,72 @@ async def test_bind_group_aid_requires_aid_store():
 
     with pytest.raises(ValueError, match="aid_store"):
         await client.bind_group_aid({"group_id": "group.agentid.pub/123456"})
+
+
+@pytest.mark.asyncio
+async def test_start_group_transfer_signs_with_group_aid_identity(tmp_path):
+    store = AIDStore(tmp_path / "aun", encryption_seed="test-seed")
+    material = store._register_flow.generate_identity()
+    group_aid = "g-transfer.agentid.pub"
+    cert_pem = _cert_for_public_key(group_aid, material["public_key_der_b64"])
+    imported = store.import_group_identity(
+        group_aid,
+        private_key_pem=material["private_key_pem"],
+        public_key_der_b64=material["public_key_der_b64"],
+        curve=material["curve"],
+        cert_pem=cert_pem,
+    )
+    assert imported.ok, imported.error
+    client = _CreateGroupClient(group_aid)
+
+    result = await client.start_group_transfer(
+        {
+            "group_id": "group.agentid.pub/transfer-demo",
+            "new_owner": "new-owner.agentid.pub",
+            "group_aid": group_aid,
+        },
+        aid_store=store,
+    )
+
+    assert result["status"] == "pending_rekey"
+    assert [item[0] for item in client.calls] == ["group.transfer_owner"]
+    payload = client.calls[0][1]
+    assert payload["group_aid"] == group_aid
+    auth = payload["transfer_auth"]
+    assert auth["nonce"]
+    assert isinstance(auth["issued_ms"], int)
+    assert auth["signature"]
+    canonical = "|".join([
+        "aun-group-owner-transfer-v1",
+        "group.agentid.pub/transfer-demo",
+        group_aid,
+        "new-owner.agentid.pub",
+        auth["nonce"],
+        str(auth["issued_ms"]),
+    ])
+    loaded = store.load(group_aid)
+    assert loaded.ok, loaded.error
+    verified = loaded.data["aid"].verify(canonical, auth["signature"])
+    assert verified.ok, verified.error
+    assert verified.data["valid"] is True
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_group_transfer_requires_group_identity(tmp_path):
+    store = AIDStore(tmp_path / "aun", encryption_seed="test-seed")
+    client = _CreateGroupClient("missing.agentid.pub")
+
+    with pytest.raises(ValueError, match="group_aid identity not found"):
+        await client.start_group_transfer(
+            {
+                "group_id": "group.agentid.pub/missing",
+                "new_owner": "new-owner.agentid.pub",
+                "group_aid": "missing.agentid.pub",
+            },
+            aid_store=store,
+        )
+    store.close()
 
 
 @pytest.mark.asyncio

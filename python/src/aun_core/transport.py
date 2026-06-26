@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 import time
+import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
@@ -88,6 +89,21 @@ def _summarize_dict(payload: Any, fields: tuple[str, ...]) -> str:
 
 def _debug_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _should_wait_for_close_code(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "closed" in text or "closing" in text
+
+
+def _connection_closed_code_reason(exc: websockets.ConnectionClosed) -> tuple[int | None, str]:
+    close = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    if close is not None:
+        return getattr(close, "code", None), getattr(close, "reason", "") or ""
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return getattr(exc, "code", None), getattr(exc, "reason", "") or ""
 
 
 def _sort_trace_spans_for_display(spans: list) -> list:
@@ -296,6 +312,8 @@ class RPCTransport:
         self._send_lock = asyncio.Lock()
         self._last_reader_closed_at: float = 0.0
         self._last_reader_error: str = ""
+        self._last_close_code: int | None = None
+        self._last_close_reason: str = ""
         self._foreground_waiters = 0
         self._admission_cond = asyncio.Condition()
         # Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
@@ -339,6 +357,8 @@ class RPCTransport:
         try:
             self._ws = await self._connection_factory(url)
             self._closed = False
+            self._last_close_code = None
+            self._last_close_reason = ""
             challenge = await self._recv_initial_message()
             self._challenge = challenge
             self._reader_task = asyncio.create_task(self._reader_loop())
@@ -448,7 +468,7 @@ class RPCTransport:
     async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, trace: str | None = None, background: bool = False) -> Any:
         if self._closed or self._ws is None:
             self._log.warn("transport", "RPC call failed (not connected): method=%s", method)
-            raise ConnectionError("transport not connected")
+            raise self._not_connected_error()
 
         effective_timeout = timeout or self._timeout
         import time as _diag_time
@@ -492,7 +512,7 @@ class RPCTransport:
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         if self._closed or self._ws is None:
             self._log.warn("transport", "notification send failed (not connected): method=%s", method)
-            raise ConnectionError("transport not connected")
+            raise self._not_connected_error()
         method = str(method or "").strip()
         if not method.startswith(("notification/", "event/")):
             raise ValidationError("notify method must start with notification/ or event/")
@@ -513,7 +533,7 @@ class RPCTransport:
                 await self._ws.send(payload)
         except Exception as exc:
             self._log.warn("transport", "notification send failed: method=%s err=%s", method, exc)
-            raise ConnectionError(f"failed to send notification {method}: {exc}") from exc
+            raise await self._send_failure_error(f"notification {method}", exc) from exc
         self._log.debug("transport", "notification sent: method=%s size=%d", method, len(payload_bytes))
 
     async def _call_inner(self, method: str, params: dict[str, Any] | None = None, *, effective_timeout: float, trace: str | None = None, t0: float) -> Any:
@@ -562,7 +582,7 @@ class RPCTransport:
             self._pending.pop(rpc_id, None)
             self._pending_meta.pop(rpc_id, None)
             self._log.warn("transport", "RPC send failed: method=%s rpc_id=%s err=%s", method, rpc_id, exc)
-            raise ConnectionError(f"failed to send rpc {method}: {exc}") from exc
+            raise await self._send_failure_error(f"rpc {method}", exc) from exc
 
         _t_sent = _diag_time.time()
         try:
@@ -705,6 +725,8 @@ class RPCTransport:
             self._closed = True
             self._last_reader_closed_at = _diag_time.time()
             self._last_reader_error = f"{type(disconnect_error).__name__}: {disconnect_error}" if disconnect_error else ""
+            if isinstance(disconnect_error, websockets.ConnectionClosed):
+                self._last_close_code, self._last_close_reason = _connection_closed_code_reason(disconnect_error)
             if self._pending:
                 if disconnect_error is not None:
                     pending_error = ConnectionError(f"transport closed: {disconnect_error}")
@@ -716,9 +738,39 @@ class RPCTransport:
                     # 从 websockets.ConnectionClosed 中提取 close code
                     close_code: int | None = None
                     if isinstance(disconnect_error, websockets.ConnectionClosed):
-                        close_code = disconnect_error.code
+                        close_code, _ = _connection_closed_code_reason(disconnect_error)
                     self._log.debug("transport", "triggering on_disconnect callback: close_code=%s", close_code)
                     await self._on_disconnect(disconnect_error, close_code)
+
+    def _not_connected_error(self) -> ConnectionError:
+        if self._last_close_code is not None:
+            reason = f" reason={self._last_close_reason}" if self._last_close_reason else ""
+            return ConnectionError(f"transport not connected: last websocket close code={self._last_close_code}{reason}", code=self._last_close_code)
+        return ConnectionError("transport not connected")
+
+    async def _send_failure_error(self, context: str, exc: Exception) -> ConnectionError:
+        if isinstance(exc, websockets.ConnectionClosed):
+            code, reason = _connection_closed_code_reason(exc)
+            self._last_close_code = code
+            self._last_close_reason = reason
+            reason_part = f" reason={reason}" if reason else ""
+            return ConnectionError(
+                f"failed to send {context}: websocket closed: code={code}{reason_part}; original={exc}",
+                code=code,
+            )
+
+        if _should_wait_for_close_code(exc):
+            deadline = time.time() + 0.1
+            while time.time() < deadline:
+                if self._last_close_code is not None:
+                    reason = f" reason={self._last_close_reason}" if self._last_close_reason else ""
+                    return ConnectionError(
+                        f"failed to send {context}: websocket closed: code={self._last_close_code}{reason}; original={exc}",
+                        code=self._last_close_code,
+                    )
+                await asyncio.sleep(0.005)
+
+        return ConnectionError(f"failed to send {context}: {exc}")
 
     async def _route_message(self, message: dict[str, Any]) -> None:
         if "id" in message:

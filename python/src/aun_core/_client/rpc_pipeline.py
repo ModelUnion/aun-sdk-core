@@ -17,6 +17,7 @@ from ..errors import (
 )
 from ..group_id import normalize_group_id as _normalize_group_id
 from ..types import ConnectionState
+from ..validators import validate_aid_format, validate_group_id_format
 from .runtime import ClientRuntime
 
 
@@ -285,11 +286,15 @@ class RpcPipeline:
         client = self.client
         if method == "message.send":
             client._validate_message_recipient(params.get("to"))
+            # 校验目标 AID 格式（拒绝 __system__ 等非法格式）
+            validate_aid_format(params.get("to"), param_name="message.send.to")
             if "persist" in params:
                 raise ValidationError("message.send no longer accepts 'persist'; configure delivery_mode during connect")
             if "delivery_mode" in params or "queue_routing" in params or "affinity_ttl_ms" in params:
                 raise ValidationError("message.send does not accept delivery_mode; configure delivery_mode during connect")
         if method == "group.send":
+            # 校验目标 Group ID 格式
+            validate_group_id_format(params.get("group_id"), param_name="group.send.group_id")
             if "persist" in params:
                 raise ValidationError("group.send does not accept 'persist'; group messages are always fanout")
             if "delivery_mode" in params or "queue_routing" in params or "affinity_ttl_ms" in params:
@@ -303,15 +308,27 @@ class RpcPipeline:
             )
             if not has_context:
                 raise ValidationError(f"{method} requires context.type + context.id")
-        if method == "group.thought.get" and not str(params.get("sender_aid") or "").strip():
-            raise ValidationError("group.thought.get requires sender_aid")
+        if method == "group.thought.put":
+            # 校验目标 Group ID 格式
+            validate_group_id_format(params.get("group_id"), param_name="group.thought.put.group_id")
+        if method == "group.thought.get":
+            if not str(params.get("sender_aid") or "").strip():
+                raise ValidationError("group.thought.get requires sender_aid")
+            # 校验 sender_aid 格式
+            validate_aid_format(params.get("sender_aid"), param_name="group.thought.get.sender_aid")
+            # 校验目标 Group ID 格式
+            validate_group_id_format(params.get("group_id"), param_name="group.thought.get.group_id")
         if method == "message.thought.put":
             client._validate_message_recipient(params.get("to"))
             if not str(params.get("to") or "").strip():
                 raise ValidationError("message.thought.put requires to")
+            # 校验目标 AID 格式
+            validate_aid_format(params.get("to"), param_name="message.thought.put.to")
         if method == "message.thought.get":
             if not str(params.get("sender_aid") or "").strip():
                 raise ValidationError("message.thought.get requires sender_aid")
+            # 校验 sender_aid 格式
+            validate_aid_format(params.get("sender_aid"), param_name="message.thought.get.sender_aid")
 
     def inject_message_cursor_context(self, method: str, params: dict[str, Any]) -> None:
         client = self.client

@@ -330,6 +330,20 @@ export class GroupFSVFS {
     return this.call('group.fs.mkdir', { path, parents: options.parents ?? false, ...options }, path);
   }
 
+  setAcl(path: string, options: GroupFSParams & { granteeAid?: string; grantee_aid?: string; perms?: string } = {}): Promise<unknown> {
+    const grantee = options.grantee_aid ?? options.granteeAid ?? 'role:admin';
+    const params: GroupFSParams = { ...options, path, grantee_aid: grantee, perms: options.perms ?? 'rwx' };
+    delete params.granteeAid;
+    return this.call('group.fs.set_acl', params, path);
+  }
+
+  removeAcl(path: string, options: GroupFSParams & { granteeAid?: string; grantee_aid?: string } = {}): Promise<unknown> {
+    const grantee = options.grantee_aid ?? options.granteeAid ?? 'role:admin';
+    const params: GroupFSParams = { ...options, path, grantee_aid: grantee };
+    delete params.granteeAid;
+    return this.call('group.fs.remove_acl', params, path);
+  }
+
   rm(path: string, options: GroupFSParams & { recursive?: boolean; force?: boolean } = {}): Promise<unknown> {
     return this.call('group.fs.rm', {
       path,

@@ -150,7 +150,7 @@ func TestAgentMDDownloadHTTPUsesUnconditionalGET(t *testing.T) {
 	}))
 	defer server.Close()
 
-	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob.agentid.pub")
+	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob1.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestAgentMDDownloadHTTPRetriesUnconditionalGETOn304WithoutCache(t *testing.
 	}))
 	defer server.Close()
 
-	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob.agentid.pub")
+	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob1.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestAgentMDDownloadHTTPUsesCachedContentOn304(t *testing.T) {
 		context.Background(),
 		server.Client(),
 		server.URL+"/agent.md",
-		"bob.agentid.pub",
+		"bob1.agentid.pub",
 		agentMDDownloadCache{Content: "# Bob cached\n", Etag: "\"cached\""},
 	)
 	if err != nil {
@@ -337,7 +337,7 @@ func TestDownloadAgentMDSelfAidUpdatesEtagAndSavesFile(t *testing.T) {
 func TestDownloadAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	c.agentMD().localAgentMDEtag = "\"unchanged\""
-	body := "---\naid: bob.agentid.pub\n---\n# Bob\n"
+	body := "---\naid: bob1.agentid.pub\n---\n# Bob\n"
 	c.agentMD().agentMDOps = &fakeAgentMDOps{
 		downloadFn: func(_ context.Context, aid string) (agentMDDownloadResult, error) {
 			return agentMDDownloadResult{AID: aid, Content: body}, nil
@@ -347,24 +347,24 @@ func TestDownloadAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
 		},
 	}
 
-	info, err := c.agentMD().Download(context.Background(), "bob.agentid.pub")
+	info, err := c.agentMD().Download(context.Background(), "bob1.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.InSync != nil || c.agentMD().localAgentMDEtag != "\"unchanged\"" {
 		t.Fatalf("unexpected local state info=%#v local=%s", info, c.agentMD().localAgentMDEtag)
 	}
-	if rec := readAgentMDListRecords(t, c)["bob.agentid.pub"]; rec["local_etag"] != agentMDContentEtag(body) || rec["verify_status"] != "verified" {
+	if rec := readAgentMDListRecords(t, c)["bob1.agentid.pub"]; rec["local_etag"] != agentMDContentEtag(body) || rec["verify_status"] != "verified" {
 		t.Fatalf("bad bob record: %#v", rec)
 	}
 }
 
 func TestObserveRPCMetaAgentMDEtagsPersistToList(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob.agentid.pub", "carol.agentid.pub", "dave.agentid.pub")
-	c.observeRPCMeta(map[string]any{"agent_md_etag": "\"self-cloud\"", "agent_md_etags": map[string]any{"to": map[string]any{"aid": "bob.agentid.pub", "etag": "\"bob-cloud\""}, "target": map[string]any{"aid": "carol.agentid.pub", "etag": "\"carol-cloud\""}, "sender": map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""}}})
+	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob1.agentid.pub", "carol.agentid.pub", "dave.agentid.pub")
+	c.observeRPCMeta(map[string]any{"agent_md_etag": "\"self-cloud\"", "agent_md_etags": map[string]any{"to": map[string]any{"aid": "bob1.agentid.pub", "etag": "\"bob-cloud\""}, "target": map[string]any{"aid": "carol.agentid.pub", "etag": "\"carol-cloud\""}, "sender": map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""}}})
 	records := readAgentMDListRecords(t, c)
-	if records["alice.agentid.pub"]["remote_etag"] != "\"self-cloud\"" || records["bob.agentid.pub"]["remote_etag"] != "\"bob-cloud\"" || records["carol.agentid.pub"]["remote_etag"] != "\"carol-cloud\"" || records["dave.agentid.pub"]["remote_etag"] != "\"dave-cloud\"" {
+	if records["alice.agentid.pub"]["remote_etag"] != "\"self-cloud\"" || records["bob1.agentid.pub"]["remote_etag"] != "\"bob-cloud\"" || records["carol.agentid.pub"]["remote_etag"] != "\"carol-cloud\"" || records["dave.agentid.pub"]["remote_etag"] != "\"dave-cloud\"" {
 		t.Fatalf("bad records: %#v", records)
 	}
 }
@@ -386,7 +386,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 		"agent_md_etag": "\"alice-cloud\"",
 		"agent_md_etags": map[string]any{
 			"requester": map[string]any{"aid": "alice.agentid.pub", "etag": "\"alice-cloud-2\"", "last_modified": "Sun, 24 May 2026 00:00:00 GMT"},
-			"receiver":  map[string]any{"aid": "bob.agentid.pub", "etag": "\"bob-cloud\"", "last_modified": "Sun, 24 May 2026 00:00:01 GMT"},
+			"receiver":  map[string]any{"aid": "bob1.agentid.pub", "etag": "\"bob-cloud\"", "last_modified": "Sun, 24 May 2026 00:00:01 GMT"},
 			"sender":    map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""},
 		},
 	})
@@ -401,7 +401,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 			t.Fatalf("timed out waiting for auto download, got=%v", got)
 		}
 	}
-	for _, aid := range []string{"alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"} {
+	for _, aid := range []string{"alice.agentid.pub", "bob1.agentid.pub", "dave.agentid.pub"} {
 		if !got[aid] {
 			t.Fatalf("missing downloaded aid %s, got=%v", aid, got)
 		}
@@ -411,10 +411,10 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	for deadline := time.Now().Add(2 * time.Second); ; {
 		records = readAgentMDListRecords(t, c)
 		if records["alice.agentid.pub"]["remote_etag"] == "\"alice-cloud-2\"" &&
-			records["bob.agentid.pub"]["remote_etag"] == "\"bob-cloud\"" &&
+			records["bob1.agentid.pub"]["remote_etag"] == "\"bob-cloud\"" &&
 			records["dave.agentid.pub"]["remote_etag"] == "\"dave-cloud\"" &&
 			records["alice.agentid.pub"]["local_etag"] != "" &&
-			records["bob.agentid.pub"]["local_etag"] != "" &&
+			records["bob1.agentid.pub"]["local_etag"] != "" &&
 			records["dave.agentid.pub"]["local_etag"] != "" {
 			break
 		}
@@ -425,7 +425,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	}
 	waitAgentMDFetchesIdle(t, c)
 	if records["alice.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:00 GMT" ||
-		records["bob.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:01 GMT" {
+		records["bob1.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:01 GMT" {
 		t.Fatalf("last_modified not persisted: %#v", records)
 	}
 	for aid, rec := range records {
@@ -433,18 +433,18 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 			t.Fatalf("content leaked into list for %s: %#v", aid, rec)
 		}
 	}
-	p, err := c.agentMD().agentMDFilePath("bob.agentid.pub")
+	p, err := c.agentMD().agentMDFilePath("bob1.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(p); err != nil || string(data) != "# bob.agentid.pub\n" {
+	if data, err := os.ReadFile(p); err != nil || string(data) != "# bob1.agentid.pub\n" {
 		t.Fatalf("bob content not saved: data=%q err=%v", string(data), err)
 	}
 }
 
 func TestTransportEventAndNotificationMetaAgentMDEtagsPersistToList(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob.agentid.pub", "carol.agentid.pub", "dave.agentid.pub")
+	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob1.agentid.pub", "carol.agentid.pub", "dave.agentid.pub")
 	c.transport.routeMessage(map[string]any{"method": "event/custom.notice", "params": map[string]any{}, "_meta": map[string]any{"agent_md_etags": map[string]any{"target": map[string]any{"aid": "carol.agentid.pub", "etag": "\"carol-cloud\""}}}})
 	c.transport.routeMessage(map[string]any{"method": "custom.notice", "params": map[string]any{}, "_meta": map[string]any{"agent_md_etags": map[string]any{"sender": map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""}}}})
 	records := readAgentMDListRecords(t, c)
@@ -476,9 +476,9 @@ func TestCheckAgentMDComparesHeadAndPersistsToList(t *testing.T) {
 
 func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	content := "---\naid: bob.agentid.pub\n---\n# Bob\n"
+	content := "---\naid: bob1.agentid.pub\n---\n# Bob\n"
 	etag := agentMDContentEtag(content)
-	c.agentMD().saveAgentMDRecord("bob.agentid.pub", keystore.AgentMDCacheUpsert{
+	c.agentMD().saveAgentMDRecord("bob1.agentid.pub", keystore.AgentMDCacheUpsert{
 		Content:      agentMDStringPtr(content),
 		LocalEtag:    agentMDStringPtr(etag),
 		RemoteEtag:   agentMDStringPtr(etag),
@@ -491,7 +491,7 @@ func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 		return nil, nil
 	}}
 
-	checked, err := c.agentMD().Check(context.Background(), "bob.agentid.pub", 7)
+	checked, err := c.agentMD().Check(context.Background(), "bob1.agentid.pub", 7)
 	if err != nil {
 		t.Fatal(err)
 	}

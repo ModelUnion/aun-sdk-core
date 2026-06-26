@@ -331,6 +331,17 @@ describe('RPCTransport 后台 RPC 调度', () => {
 
     await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
   });
+
+  it('send 与 close 竞态时应等待并保留 close code', async () => {
+    const { transport, ws } = createReadyTransportWithListeners();
+    ws.readyState = 2; // WebSocket 正在关闭
+    ws.send = (_data: string, cb?: (err?: Error) => void): void => {
+      cb?.(new Error('WebSocket is not open: readyState 2 (CLOSING)'));
+      process.nextTick(() => ws.emit('close', 4013));
+    };
+
+    await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
+  });
 });
 
 describe('RPCTransport notify', () => {

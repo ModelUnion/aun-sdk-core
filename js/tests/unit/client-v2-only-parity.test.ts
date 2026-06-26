@@ -74,11 +74,11 @@ describe('AUNClient V2-only parity', () => {
   it('legacy E2EE RPC 不应透传到底层 transport', async () => {
     const client = connectedClient();
 
-    await expect(client.call('message.e2ee.get_prekey', { aid: 'bob.aid.com' }))
+    await expect(client.call('message.e2ee.get_prekey', { aid: 'bob1.aid.com' }))
       .rejects.toThrow(PermissionError);
-    await expect(client.call('group.e2ee.get_epoch', { group_id: 'g1' }))
+    await expect(client.call('group.e2ee.get_epoch', { group_id: 'grp01' }))
       .rejects.toThrow(PermissionError);
-    await expect(client.call('group.rotate_epoch', { group_id: 'g1' }))
+    await expect(client.call('group.rotate_epoch', { group_id: 'grp01' }))
       .rejects.toThrow(PermissionError);
 
     expect((client as any)._transport.call).not.toHaveBeenCalled();
@@ -134,11 +134,11 @@ describe('AUNClient V2-only parity', () => {
 
     await expect(client.call('message.pull', { after_seq: 3, limit: 10 }))
       .resolves.toEqual({ messages: p2pMessages });
-    await expect(client.call('group.pull', { group_id: 'g1', after_message_seq: 7, limit: 11 }))
+    await expect(client.call('group.pull', { group_id: 'grp01', after_message_seq: 7, limit: 11 }))
       .resolves.toEqual({ messages: groupMessages });
 
     expect(pullV2).toHaveBeenCalledWith(3, 10, { force: false });
-    expect(pullGroupV2).toHaveBeenCalledWith('g1', 7, 11, expect.objectContaining({
+    expect(pullGroupV2).toHaveBeenCalledWith('grp01', 7, 11, expect.objectContaining({
       explicitAfterSeq: true,
     }));
   });
@@ -151,11 +151,11 @@ describe('AUNClient V2-only parity', () => {
 
     await expect(client.call('message.ack', { up_to_seq: 9 }))
       .resolves.toEqual({ acked: 9 });
-    await expect(client.call('group.ack_messages', { group_id: 'g1', msg_seq: 12 }))
+    await expect(client.call('group.ack_messages', { group_id: 'grp01', msg_seq: 12 }))
       .resolves.toEqual({ acked: 12 });
 
     expect(ackV2).toHaveBeenCalledWith(9);
-    expect(ackGroupV2).toHaveBeenCalledWith('g1', 12);
+    expect(ackGroupV2).toHaveBeenCalledWith('grp01', 12);
   });
 
   it('group.create 成功时应同步触发 V2 state propose', async () => {
@@ -229,7 +229,7 @@ describe('AUNClient V2-only parity', () => {
     (client as any).call = vi.fn().mockImplementation(async (method: string) => {
       calls.push(method);
       if (method === 'group.get_members') {
-        return { members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'member' }] };
+        return { members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob1.aid.com', role: 'member' }] };
       }
       if (method === 'group.v2.bootstrap') {
         return { devices: [], audit_recipients: [] };
@@ -276,7 +276,7 @@ describe('AUNClient V2-only parity', () => {
       ...basePayload,
       members: [
         { aid: 'alice.aid.com', devices: [] },
-        { aid: 'bob.aid.com', devices: [] },
+        { aid: 'bob1.aid.com', devices: [] },
       ],
     };
     const baseHash = await computeStateCommitment(groupId, 1, basePayload);
@@ -326,7 +326,7 @@ describe('AUNClient V2-only parity', () => {
     const fetchCertSpy = vi.spyOn(client as any, '_fetchPeerCert')
       .mockRejectedValue(new Error('cert unavailable'));
 
-    await expect((client as any)._v2VerifyStateSignature('g1', {
+    await expect((client as any)._v2VerifyStateSignature('grp01', {
       state_version: 2,
       state_signature: btoa('not-a-real-signature'),
       state_actor_aid: 'owner.aid.com',
@@ -366,7 +366,7 @@ describe('AUNClient V2-only parity', () => {
       state_actor_aid: actorAid,
       state_hash_signed: stateHash,
       state_membership_snapshot: membershipSnapshot,
-      member_aids: ['alice.aid.com', 'bob.aid.com'],
+      member_aids: ['alice.aid.com', 'bob1.aid.com'],
     };
 
     await (client as any)._v2VerifyStateSignature(groupId, bootstrap);
@@ -376,14 +376,14 @@ describe('AUNClient V2-only parity', () => {
     expect(callSpy).toHaveBeenCalledWith('group.get_join_requirements', { group_id: groupId });
     expect(publishSpy).toHaveBeenCalledWith('group.v2.state_tampered', {
       group_id: groupId,
-      pending_extra: ['bob.aid.com'],
+      pending_extra: ['bob1.aid.com'],
       mode: 'closed',
     });
   });
 
   it('V2 auto propose 非 leader 延迟应使用 Python SHA-256 算法', async () => {
     const client = connectedV2Client();
-    const input = 'group.agentid.pub/12345\x00bob.aid.com\x1fdev-bob';
+    const input = 'group.agentid.pub/12345\x00bob1.aid.com\x1fdev-bob';
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(input)));
     const expected = 2000 + (new DataView(digest.buffer).getUint32(0, false) % 4000);
 
@@ -409,12 +409,12 @@ describe('AUNClient V2-only parity', () => {
       .mockResolvedValueOnce(rawGroupResult);
 
     await expect(client.call('message.thought.get', {
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
       context: { type: 'run', id: 'r1' },
     })).resolves.toMatchObject({ thoughts: [{ payload: { text: 'ok' } }] });
     await expect(client.call('group.thought.get', {
-      group_id: 'g1',
-      sender_aid: 'bob.aid.com',
+      group_id: 'grp01',
+      sender_aid: 'bob1.aid.com',
       context: { type: 'run', id: 'r1' },
     })).resolves.toMatchObject({ thoughts: [{ payload: { text: 'group-ok' } }] });
 
@@ -432,7 +432,7 @@ describe('AUNClient V2-only parity', () => {
             {
               version: 'v1',
               message_id: 'm-plain',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               type: 'message',
               t_server: 123,
@@ -444,7 +444,7 @@ describe('AUNClient V2-only parity', () => {
             {
               version: 'v1',
               message_id: 'm-e2ee',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 2,
               legacy_v1: {
                 payload: { type: 'e2ee.encrypted', ciphertext: 'x' },
@@ -458,7 +458,7 @@ describe('AUNClient V2-only parity', () => {
 
     await expect((client as any)._pullV2(0, 10)).resolves.toEqual([expect.objectContaining({
       message_id: 'm-plain',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'legacy plain' },
@@ -478,7 +478,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq,
             message_id: `m-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -510,7 +510,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq,
             message_id: `gm-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             type: 'message',
             payload: { type: 'text', text: `gm-${seq}` },
@@ -521,12 +521,12 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'dev-alice', slot_id: 'slot-a' }]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'dev-alice', slot_id: 'slot-a' }]]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -542,7 +542,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq,
             message_id: `m-page-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -584,7 +584,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq,
             message_id: `gm-page-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             type: 'message',
             payload: { type: 'text', text: `gm-page-${seq}` },
@@ -595,19 +595,19 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 2);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
-      ['group.v2.pull', expect.objectContaining({ group_id: 'g1', after_seq: 0, limit: 2 })],
-      ['group.v2.pull', expect.objectContaining({ group_id: 'g1', after_seq: 2, limit: 2 })],
+      ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 0, limit: 2 })],
+      ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 2, limit: 2 })],
     ]);
     expect(ackCalls).toEqual([
-      ['group.v2.ack', expect.objectContaining({ group_id: 'g1', up_to_seq: 2 })],
-      ['group.v2.ack', expect.objectContaining({ group_id: 'g1', up_to_seq: 3 })],
+      ['group.v2.ack', expect.objectContaining({ group_id: 'grp01', up_to_seq: 2 })],
+      ['group.v2.ack', expect.objectContaining({ group_id: 'grp01', up_to_seq: 3 })],
     ]);
   });
 
@@ -640,7 +640,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq: 5,
             message_id: 'm-stale-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             legacy_v1: {
               to: 'alice.aid.com',
               payload: { type: 'text', text: 'old' },
@@ -675,7 +675,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v2',
             seq: 5,
             message_id: 'm-lag-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             envelope_json: '{}',
           }],
         };
@@ -709,7 +709,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq: 1,
             message_id: 'm-pull-1',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             legacy_v1: {
               to: 'alice.aid.com',
               payload: { type: 'text', text: 'pulled' },
@@ -728,7 +728,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('group.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
     const client = connectedV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') return { has_more: false, messages: [] };
@@ -736,7 +736,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -745,7 +745,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('group.v2.pull 陈旧 raw 未推进 contiguous_seq 时不应 ack', async () => {
     const client = connectedV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') {
@@ -755,7 +755,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq: 5,
             message_id: 'gm-stale-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             payload: { type: 'text', text: 'old' },
           }],
         };
@@ -764,7 +764,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
@@ -775,7 +775,7 @@ describe('AUNClient V2-only parity', () => {
   it('group.v2.pull 服务端 cursor 落后于本地 contiguous_seq 时应补 ack', async () => {
     const client = connectedV2Client();
     (client as any)._safeAsync = (promise: Promise<unknown>) => { promise.catch(() => {}); };
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
     const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
@@ -787,7 +787,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v2',
             seq: 5,
             message_id: 'gm-lag-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             envelope_json: '{}',
           }],
         };
@@ -796,19 +796,19 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 5, device_id: 'dev-alice', slot_id: 'slot-a' }],
+      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 5, device_id: 'dev-alice', slot_id: 'slot-a' }],
     ]);
   });
 
   it('group.v2.pull 发布消息前应先推进 contiguous_seq，避免事件处理器 ack 拉到旧边界', async () => {
     const client = connectedV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     const observedContig: number[] = [];
     client.on('group.message_created', () => {
       observedContig.push((client as any)._seqTracker.getContiguousSeq(ns));
@@ -821,7 +821,7 @@ describe('AUNClient V2-only parity', () => {
             version: 'v1',
             seq: 1,
             message_id: 'gm-pull-1',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             type: 'message',
             payload: { type: 'text', text: 'group pulled' },
           }],
@@ -830,7 +830,7 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await (client as any)._pullGroupV2('g1', 0, 10);
+    await (client as any)._pullGroupV2('grp01', 0, 10);
 
     expect(observedContig).toEqual([1]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(1);
@@ -849,7 +849,7 @@ describe('AUNClient V2-only parity', () => {
           messages: [{
             version: 'v1',
             message_id: 'm-v2-pure-push',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             seq: 1,
             t_server: 123,
             legacy_v1: {
@@ -865,7 +865,7 @@ describe('AUNClient V2-only parity', () => {
     await (client as any)._onV2PushNotification({
       seq: 1,
       message_id: 'm-v2-pure-push',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._transport.call).toHaveBeenCalledWith(
@@ -878,7 +878,7 @@ describe('AUNClient V2-only parity', () => {
     expect(published).toHaveLength(1);
     expect(published[0]).toMatchObject({
       message_id: 'm-v2-pure-push',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'pulled by v2 pure push' },
@@ -891,7 +891,7 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._seqTracker.onMessageSeq(ns, 1);
     vi.spyOn(client as any, '_decryptV2Message').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -906,7 +906,7 @@ describe('AUNClient V2-only parity', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -930,7 +930,7 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._seqTracker.forceContiguousSeq(ns, 99999);
     vi.spyOn(client as any, '_decryptV2Message').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -942,7 +942,7 @@ describe('AUNClient V2-only parity', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -958,7 +958,7 @@ describe('AUNClient V2-only parity', () => {
     const repairSpy = vi.spyOn((client as any)._seqTracker, 'repairContiguousSeq');
     const decryptSpy = vi.spyOn(client as any, '_decryptV2Message').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -970,7 +970,7 @@ describe('AUNClient V2-only parity', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -993,7 +993,7 @@ describe('AUNClient V2-only parity', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
@@ -1002,7 +1002,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('V2 group 纯通知 push 应修复过大的 contiguous_seq 后再 pull', async () => {
     const client = connectedV2Client();
-    const groupId = 'g1';
+    const groupId = 'grp01';
     const ns = `group:${groupId}`;
     (client as any)._seqTracker.forceContiguousSeq(ns, 99999);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
@@ -1015,7 +1015,7 @@ describe('AUNClient V2-only parity', () => {
       group_id: groupId,
       seq: 3,
       message_id: 'gm-push-3',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(2);
@@ -1039,10 +1039,10 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._transport.call = transportCall;
 
     await (client as any)._onRawGroupV2MessageCreated({
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
       kind: 'group.online_unread_hint',
     });
 
@@ -1052,7 +1052,7 @@ describe('AUNClient V2-only parity', () => {
     }
     expect(transportCall).toHaveBeenCalledWith(
       'group.v2.pull',
-      expect.objectContaining({ group_id: 'g1', after_seq: 0 }),
+      expect.objectContaining({ group_id: 'grp01', after_seq: 0 }),
       undefined,
       undefined,
       true,
@@ -1067,10 +1067,10 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._transport.call = transportCall;
 
     await (client as any)._onRawGroupV2MessageCreated({
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
       kind: 'group.online_unread_hint',
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1080,7 +1080,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等不 pull 但补 ack', async () => {
     const client = connectedV2Client();
-    const groupId = 'g1';
+    const groupId = 'grp01';
     const ns = `group:${groupId}`;
     (client as any)._seqTracker.forceContiguousSeq(ns, 3);
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
@@ -1090,7 +1090,7 @@ describe('AUNClient V2-only parity', () => {
       group_id: groupId,
       seq: 3,
       message_id: 'gm-push-3',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
@@ -1111,7 +1111,7 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._pushedSeqs.set(ns, new Set([1]));
     const decrypted = {
       message_id: 'm-v2',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'already pushed' },
@@ -1126,7 +1126,7 @@ describe('AUNClient V2-only parity', () => {
           messages: [{
             version: 'v2',
             message_id: 'm-v2',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             seq: 1,
             envelope_json: '{}',
           }],
@@ -1152,11 +1152,11 @@ describe('AUNClient V2-only parity', () => {
 
   it('group.v2.pull 应透传 V1 明文行、跳过 V1 E2EE envelope，且返回值不受已发布 seq 去重影响', async () => {
     const client = connectedV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._pushedSeqs.set(ns, new Set([3]));
     const decrypted = {
       message_id: 'gm-v2',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'already pushed group' },
       encrypted: true,
@@ -1171,7 +1171,7 @@ describe('AUNClient V2-only parity', () => {
             {
               version: 'v1',
               message_id: 'gm-plain',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               type: 'group.message',
               t_server: 456,
@@ -1180,14 +1180,14 @@ describe('AUNClient V2-only parity', () => {
             {
               version: 'v1',
               message_id: 'gm-e2ee',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 2,
               payload: { type: 'e2ee.group_encrypted', ciphertext: 'x' },
             },
             {
               version: 'v2',
               message_id: 'gm-v2',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 3,
               envelope_json: '{}',
             },
@@ -1197,16 +1197,16 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await expect((client as any)._pullGroupV2('g1', 0, 10)).resolves.toEqual([
+    await expect((client as any)._pullGroupV2('grp01', 0, 10)).resolves.toEqual([
       expect.objectContaining({
         message_id: 'gm-plain',
-        from: 'bob.aid.com',
-        group_id: 'g1',
+        from: 'bob1.aid.com',
+        group_id: 'grp01',
         seq: 1,
         payload: { type: 'text', text: 'group legacy plain' },
         encrypted: false,
       }),
-      { ...decrypted, group_id: 'g1' },
+      { ...decrypted, group_id: 'grp01' },
     ]);
   });
 
@@ -1215,18 +1215,18 @@ describe('AUNClient V2-only parity', () => {
     const sendSpy = vi.spyOn(encrypted as any, '_sendV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       content: { text: 'hello' },
     } as any);
 
-    expect(sendSpy).toHaveBeenCalledWith('bob.aid.com', { type: 'text', text: 'hello' }, expect.any(Object));
+    expect(sendSpy).toHaveBeenCalledWith('bob1.aid.com', { type: 'text', text: 'hello' }, expect.any(Object));
 
     const plaintext = connectedV2Client();
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (plaintext as any)._transport.call = transportCall;
 
     await plaintext.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       content: { text: 'plain' },
       encrypt: false,
     } as any);
@@ -1241,18 +1241,18 @@ describe('AUNClient V2-only parity', () => {
     const sendSpy = vi.spyOn(encrypted as any, '_sendGroupV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       content: { text: '群密文' },
     } as any);
 
-    expect(sendSpy).toHaveBeenCalledWith('g1', { type: 'text', text: '群密文' }, expect.any(Object));
+    expect(sendSpy).toHaveBeenCalledWith('grp01', { type: 'text', text: '群密文' }, expect.any(Object));
 
     const plaintext = connectedV2Client();
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (plaintext as any)._transport.call = transportCall;
 
     await plaintext.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: { text: '群明文' },
       encrypt: false,
     } as any);
@@ -1261,17 +1261,38 @@ describe('AUNClient V2-only parity', () => {
     expect(sentParams.content).toBeUndefined();
     expect(sentParams.payload).toEqual({ type: 'text', text: '群明文' });
   });
+
+  it('V2 group 发送遇到旧 self-only bootstrap 缓存时应触发刷新重试错误', async () => {
+    const client = connectedV2Client();
+    const groupId = 'group.aid.com/invite';
+    (client as any)._v2BootstrapCache.set(`group:${groupId}`, {
+      devices: [{ aid: 'alice.aid.com', device_id: 'dev-alice' }],
+      auditRecipients: [],
+      cachedAt: Date.now(),
+      epoch: 1,
+      stateCommitment: { state_version: 1, state_hash: 'h1', state_chain: 'c1' },
+    });
+    vi.spyOn(client as any, '_v2BuildTargetFromDevice').mockResolvedValue(null);
+
+    await expect((client as any)._buildV2GroupEnvelope({
+      groupId,
+      payload: { type: 'text', text: 'hello' },
+    })).rejects.toMatchObject({
+      code: -33054,
+    });
+  });
+
   it('message.send/group.send 的 V2 加密 payload 必须是对象且错误不落到底层 transport', async () => {
     const client = connectedV2Client();
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (client as any)._transport.call = transportCall;
 
     await expect(client.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       payload: 'bad-payload' as any,
     })).rejects.toThrow(ValidationError);
     await expect(client.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: 'bad-payload' as any,
     })).rejects.toThrow(ValidationError);
 
@@ -1291,25 +1312,25 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._transport.call = transportCall;
 
     await client.call('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: 'p2p-thought' },
     });
     await client.call('group.thought.put', {
-      group_id: 'g1',
+      group_id: 'grp01',
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: 'group-thought' },
     });
 
     expect(transportCall).toHaveBeenNthCalledWith(1, 'message.thought.put', expect.objectContaining({
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       encrypted: true,
       payload: p2pEnvelope,
       thought_id: expect.stringMatching(/^mt-/),
       client_signature: { aid: 'alice.aid.com' },
     }));
     expect(transportCall).toHaveBeenNthCalledWith(2, 'group.thought.put', expect.objectContaining({
-      group_id: 'g1',
+      group_id: 'grp01',
       encrypted: true,
       payload: groupEnvelope,
       thought_id: expect.stringMatching(/^gt-/),

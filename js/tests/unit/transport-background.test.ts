@@ -8,6 +8,28 @@ class MockWebSocket {
   send(data: string): void { this.sent.push(data); }
 }
 
+class ClosingMockWebSocket {
+  readyState = 2;
+  onclose: ((event: { code: number; reason: string }) => void) | null = null;
+  private closeListeners: Array<(event: { code: number; reason: string }) => void> = [];
+
+  close(): void { /* noop */ }
+  send(_data: string): void {
+    throw new Error('WebSocket is already in CLOSING or CLOSED state');
+  }
+  addEventListener(type: string, handler: (event: { code: number; reason: string }) => void): void {
+    if (type === 'close') this.closeListeners.push(handler);
+  }
+  removeEventListener(type: string, handler: (event: { code: number; reason: string }) => void): void {
+    if (type === 'close') this.closeListeners = this.closeListeners.filter((item) => item !== handler);
+  }
+  emitClose(code: number, reason: string): void {
+    const event = { code, reason };
+    this.onclose?.(event);
+    for (const listener of [...this.closeListeners]) listener(event);
+  }
+}
+
 function createReadyTransport(timeout = 10) {
   const dispatcher = new EventDispatcher();
   const transport = new RPCTransport({
@@ -44,6 +66,24 @@ describe('RPCTransport 后台 RPC 调度', () => {
 
     await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
     await expect(transport.call('auth.connect', {})).rejects.toThrow(/short_connection_capacity_exceeded/);
+  });
+
+  it('send 与 close 竞态时应等待并保留 close code', async () => {
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({
+      eventDispatcher: dispatcher,
+      timeout: 1,
+    });
+    const ws = new ClosingMockWebSocket();
+    (transport as any)._ws = ws;
+    (transport as any)._closed = false;
+    ws.onclose = (event) => (transport as any)._handleClose(event);
+
+    const call = transport.call('meta.ping', {});
+    setTimeout(() => ws.emitClose(4013, 'short_connection_capacity_exceeded'), 0);
+
+    await expect(call).rejects.toThrow(/4013/);
+    await expect(call).rejects.toThrow(/short_connection_capacity_exceeded|websocket closed/);
   });
 
   it('后台 RPC 不能占满全部 in-flight，普通 RPC 应优先发送', async () => {

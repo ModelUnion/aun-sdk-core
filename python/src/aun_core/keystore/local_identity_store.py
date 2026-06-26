@@ -334,6 +334,82 @@ class LocalIdentityStore:
                 self._log.warn("keystore", "cleanup pending dir failed (path=%s): %s", path, exc)
         return removed
 
+    # ── Pending group bind 槽位 ──────────────────────────────
+    # bind_group_aid 首次生成的 group_aid 密钥在 import 落盘前先暂存到此，
+    # 以 group_id 为键。崩溃/重试时复用同一密钥，保证 bind 幂等（私钥加密落盘）。
+
+    def _pending_binds_root(self) -> Path:
+        return self._aids_root / "_pending_binds"
+
+    def _pending_bind_path(self, group_id: str) -> Path:
+        return self._pending_binds_root() / f"{safe_aid(str(group_id or '').strip())}.json"
+
+    def save_pending_group_bind(self, group_id: str, key_pair: dict) -> None:
+        """暂存待绑定 group_aid 密钥（私钥字段加密）。"""
+        gid = str(group_id or "").strip()
+        if not gid:
+            raise ValueError("save_pending_group_bind requires non-empty group_id")
+        lock = self._get_metadata_lock(f"_pending_bind:{gid}")
+        with lock:
+            self._pending_binds_root().mkdir(parents=True, exist_ok=True)
+            record = {
+                "group_id": gid,
+                "public_key_der_b64": str(key_pair.get("public_key_der_b64") or ""),
+                "curve": str(key_pair.get("curve") or "P-256"),
+            }
+            private_key_pem = str(key_pair.get("private_key_pem") or "")
+            if not record["public_key_der_b64"] or not private_key_pem:
+                raise ValueError("save_pending_group_bind requires public_key_der_b64 and private_key_pem")
+            record["private_key_protection"] = protect_field(
+                self._seed_bytes, safe_aid(gid), "pending_bind/private_key", private_key_pem.encode("utf-8")
+            )
+            write_key_json_atomic(self._pending_bind_path(gid), record, self._log)
+
+    def load_pending_group_bind(self, group_id: str) -> dict | None:
+        """读取待绑定 group_aid 密钥（解密私钥）。无则返回 None。"""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return None
+        lock = self._get_metadata_lock(f"_pending_bind:{gid}")
+        with lock:
+            path = self._pending_bind_path(gid)
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                self._log.warn("keystore", "load_pending_group_bind read failed (group_id=%s): %s", gid, exc)
+                return None
+            if not isinstance(data, dict):
+                return None
+            protection = data.get("private_key_protection")
+            private_key_pem = None
+            if isinstance(protection, dict):
+                revealed = reveal_field(
+                    self._seed_bytes, safe_aid(gid), "pending_bind/private_key", protection, self._log
+                )
+                if revealed is not None:
+                    private_key_pem = revealed.decode("utf-8")
+            if not private_key_pem or not data.get("public_key_der_b64"):
+                return None
+            return {
+                "group_id": gid,
+                "public_key_der_b64": str(data.get("public_key_der_b64") or ""),
+                "private_key_pem": private_key_pem,
+                "curve": str(data.get("curve") or "P-256"),
+            }
+
+    def clear_pending_group_bind(self, group_id: str) -> None:
+        gid = str(group_id or "").strip()
+        if not gid:
+            return
+        lock = self._get_metadata_lock(f"_pending_bind:{gid}")
+        with lock:
+            try:
+                self._pending_bind_path(gid).unlink(missing_ok=True)
+            except OSError as exc:
+                self._log.warn("keystore", "clear_pending_group_bind failed (group_id=%s): %s", gid, exc)
+
     # ── Seed 迁移 ────────────────────────────────────────────
 
     def change_seed(self, old_seed: str, new_seed: str) -> Any:

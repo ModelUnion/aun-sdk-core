@@ -164,7 +164,7 @@ describe('AUNClient.call 状态检查', () => {
     ];
 
     for (const method of removedMethods) {
-      await expect(client.call(method, { group_id: 'group.agentid.pub/g1' })).rejects.toThrow(PermissionError);
+      await expect(client.call(method, { group_id: 'group.agentid.pub/grp01' })).rejects.toThrow(PermissionError);
     }
     expect((client as any)._transport.call).not.toHaveBeenCalled();
   });
@@ -193,7 +193,7 @@ describe('AUNClient.call 状态检查', () => {
     (client as any)._slotId = 'slot-empty-device';
     (client as any)._transport.call = vi.fn().mockResolvedValue({ members: [] });
 
-    await client.call('group.get_members', { group_id: 'group.agentid.pub/g1' });
+    await client.call('group.get_members', { group_id: 'group.agentid.pub/grp01' });
 
     const [, sentParams] = (client as any)._transport.call.mock.calls[0];
     expect(sentParams).toHaveProperty('device_id', '');
@@ -1338,7 +1338,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.pull 使用外部 cursor 时应保留 after_message_seq=0、透传设备槽位且不自动 ack', async () => {
     const client = makeV2Client();
-    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    (client as any)._seqTracker.forceContiguousSeq('group:grp01', 3);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') {
         return {
@@ -1359,7 +1359,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     const result = await client.call('group.pull', {
-      group_id: 'g1',
+      group_id: 'grp01',
       after_message_seq: 0,
       limit: 2,
       device_id: 'sync-dev-a',
@@ -1372,7 +1372,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect((result.messages as Array<Record<string, unknown>>).map((msg) => msg.seq)).toEqual([1]);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
       ['group.v2.pull', {
-        group_id: 'g1',
+        group_id: 'grp01',
         after_seq: 0,
         limit: 2,
         device_id: 'sync-dev-a',
@@ -1386,12 +1386,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.ack_messages 使用外部 cursor 时应走原始 RPC 而不是 group.v2.ack', async () => {
     const client = makeV2Client();
-    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    (client as any)._seqTracker.forceContiguousSeq('group:grp01', 3);
     const transportCall = vi.fn().mockResolvedValue({ ok: true, acked: 1 });
     (client as any)._transport.call = transportCall;
 
     await client.call('group.ack_messages', {
-      group_id: 'g1',
+      group_id: 'grp01',
       msg_seq: 1,
       device_id: 'sync-dev-a',
       slot_id: 'sync-slot-a',
@@ -1401,7 +1401,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(transportCall.mock.calls).toContainEqual([
       'group.ack_messages',
       expect.objectContaining({
-        group_id: 'g1',
+        group_id: 'grp01',
         msg_seq: 1,
         device_id: 'sync-dev-a',
         slot_id: 'sync-slot-a',
@@ -1522,7 +1522,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       keySource: 'aid_master',
       ikPkDer: recipientIkPubDer,
     };
-    const envelope = encryptGroupMessage(sender, 'g1', 0, [target], { type: 'group-text', text: 'decrypted' });
+    const envelope = encryptGroupMessage(sender, 'grp01', 0, [target], { type: 'group-text', text: 'decrypted' });
     (client as any)._v2Session = {
       getGroupDecryptKeys: vi.fn(() => ({ ikPriv: recipientIkPriv, spkPriv: undefined })),
       isLastUploadedGroupSPK: vi.fn(() => false),
@@ -1533,7 +1533,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       seq: 1,
       message_id: 'gm1',
       from_aid: 'bob.aid.com',
-      group_id: 'g1',
+      group_id: 'grp01',
       envelope_json: JSON.stringify(envelope),
       t_server: 123,
       device_id: 'device-001',
@@ -1709,12 +1709,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -1781,19 +1781,19 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 2);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
-      ['group.v2.pull', { group_id: 'g1', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.pull', { group_id: 'g1', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
     expect(ackCalls).toEqual([
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
   });
 
@@ -1919,7 +1919,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
     const client = makeV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') {
@@ -1929,7 +1929,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -1938,7 +1938,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.v2.pull 陈旧 raw 未推进 contiguous_seq 时不应 ack', async () => {
     const client = makeV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
       if (method === 'group.v2.pull') {
@@ -1957,7 +1957,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => msg.seq)).toEqual([5]);
@@ -1967,7 +1967,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.v2.pull 服务端 cursor 落后于本地 contiguous_seq 时应补 ack', async () => {
     const client = makeV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._seqTracker.forceContiguousSeq(ns, 5);
     (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
     const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
@@ -1988,19 +1988,19 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 5, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 5, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
   });
 
   it('group.v2.pull 发布事件时应已推进 contiguous_seq，且本页只 ack 一次', async () => {
     const client = makeV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     const observedContig: number[] = [];
     client.on('group.message_created', () => {
       observedContig.push((client as any)._seqTracker.getContiguousSeq(ns));
@@ -2024,12 +2024,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    await (client as any)._pullGroupV2('g1', 0, 10);
+    await (client as any)._pullGroupV2('grp01', 0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
   });
 
   it('V2 target 构建应接受显式空 device_id', async () => {
@@ -2515,7 +2515,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('V2 group 纯通知 push 应修复过大的 contiguous_seq 后再 pull', async () => {
     const client = makeV2Client();
-    const groupId = 'g1';
+    const groupId = 'grp01';
     const ns = `group:${groupId}`;
     (client as any)._seqTracker.forceContiguousSeq(ns, 99999);
     const transportCall = vi.fn().mockImplementation(async (method: string) => {
@@ -2554,7 +2554,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await (client as any)._onRawGroupV2MessageCreated({
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
       sender_aid: 'bob.aid.com',
@@ -2567,7 +2567,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     }
     expect(transportCall).toHaveBeenCalledWith(
       'group.v2.pull',
-      expect.objectContaining({ group_id: 'g1', after_seq: 0 }),
+      expect.objectContaining({ group_id: 'grp01', after_seq: 0 }),
       undefined,
       undefined,
       true,
@@ -2582,7 +2582,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await (client as any)._onRawGroupV2MessageCreated({
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
       sender_aid: 'bob.aid.com',
@@ -2595,7 +2595,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
     const client = makeV2Client();
-    const groupId = 'g1';
+    const groupId = 'grp01';
     const ns = `group:${groupId}`;
     (client as any)._seqTracker.forceContiguousSeq(ns, 3);
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
@@ -2691,18 +2691,18 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const sendSpy = vi.spyOn(encrypted as any, '_sendGroupV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       content: { text: '群密文' },
     } as any);
 
-    expect(sendSpy).toHaveBeenCalledWith('g1', { type: 'text', text: '群密文' }, expect.any(Object));
+    expect(sendSpy).toHaveBeenCalledWith('grp01', { type: 'text', text: '群密文' }, expect.any(Object));
 
     const plaintext = makeV2Client();
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (plaintext as any)._transport.call = transportCall;
 
     await plaintext.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: { text: '群明文' },
       encrypt: false,
     } as any);
@@ -2744,7 +2744,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
 
     expect(result).toEqual([]);
   });
@@ -2778,12 +2778,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
 
     expect(result).toEqual([expect.objectContaining({
       message_id: 'gm-plain',
       from: 'bob.aid.com',
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 1,
       payload: { type: 'text', text: 'group legacy plain' },
       encrypted: false,
@@ -2796,7 +2796,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await expect(client.call('group.send', {
-      group_id: 'g1',
+      group_id: 'grp01',
       payload: 'bad-payload' as any,
     })).rejects.toThrow(ValidationError);
 
@@ -2805,7 +2805,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.v2.pull 返回值不应因 seq 已投递而去重', async () => {
     const client = makeV2Client();
-    const ns = 'group:g1';
+    const ns = 'group:grp01';
     (client as any)._pushedSeqs.set(ns, new Set([1]));
     const decrypted = {
       message_id: 'gm-v2',
@@ -2835,9 +2835,9 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
 
-    expect(result).toEqual([{ ...decrypted, group_id: 'g1' }]);
+    expect(result).toEqual([{ ...decrypted, group_id: 'grp01' }]);
   });
 
   it('message.v2.pull 发现空洞时应推进 seq tracker，且不触发后台补洞', async () => {
@@ -2881,7 +2881,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
               version: 'legacy',
               message_id: 'gm-gap',
               from_aid: 'bob.aid.com',
-              group_id: 'g1',
+              group_id: 'grp01',
               seq: 3,
               payload: { type: 'text', text: 'gap trigger group' },
             },
@@ -2891,11 +2891,11 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await (client as any)._pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('grp01', 0, 10);
 
     expect(result).toEqual([]);
     expect(fillSpy).not.toHaveBeenCalled();
-    expect((client as any)._seqTracker.getContiguousSeq('group:g1')).toBe(3);
+    expect((client as any)._seqTracker.getContiguousSeq('group:grp01')).toBe(3);
   });
 
   it('group.thought.put 自动使用 V2 群 envelope 并附带签名', async () => {
@@ -2909,19 +2909,39 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await client.call('group.thought.put', {
-      group_id: 'g1',
+      group_id: 'grp01',
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: '推理片段' },
     });
 
     expect(transportCall).toHaveBeenCalledWith('group.thought.put', expect.objectContaining({
-      group_id: 'g1',
+      group_id: 'grp01',
       context: { type: 'run', id: 'run-root' },
       encrypted: true,
       payload: envelope,
       thought_id: expect.stringMatching(/^gt-/),
       client_signature: { aid: 'alice.aid.com' },
     }));
+  });
+
+  it('V2 group 发送遇到旧 self-only bootstrap 缓存时应触发刷新重试错误', async () => {
+    const client = makeV2Client();
+    const groupId = 'group.aid.com/invite';
+    (client as any)._v2BootstrapCache.set(`group:${groupId}`, {
+      devices: [{ aid: 'alice.aid.com', device_id: 'device-001' }],
+      auditRecipients: [],
+      cachedAt: Date.now(),
+      epoch: 1,
+      stateCommitment: { state_version: 1, state_hash: 'h1', state_chain: 'c1' },
+    });
+    vi.spyOn(client as any, '_v2BuildTargetFromDevice').mockResolvedValue(null);
+
+    await expect((client as any)._buildV2GroupEnvelope({
+      groupId,
+      payload: { type: 'text', text: 'hello' },
+    })).rejects.toMatchObject({
+      code: -33054,
+    });
   });
 
   it('message.thought.put 自动使用 V2 P2P envelope 并附带签名', async () => {
@@ -2972,7 +2992,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     }));
 
     await client.call('group.thought.put', {
-      group_id: 'g1',
+      group_id: 'grp01',
       context: { type: 'run', id: 'run-root' },
       protected_headers: { device_id: 'dev-a', slot_id: 'slot-a' },
       payload: { type: 'thought', text: 'group-thought' },
@@ -3009,7 +3029,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       found: true,
-      group_id: 'g1',
+      group_id: 'grp01',
       sender_aid: 'alice.aid.com',
       thoughts: [
         {
@@ -3022,7 +3042,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
 
     const result = await client.call('group.thought.get', {
-      group_id: 'g1',
+      group_id: 'grp01',
       sender_aid: 'alice.aid.com',
       context: { type: 'run', id: 'run-root' },
     }) as any;
@@ -3194,7 +3214,7 @@ describe('有序消息发布', () => {
     (client as any)._deviceId = 'dev-1';
     (client as any)._slotId = 'slot-a';
     const p2pNs = 'p2p:alice.aid.com';
-    const groupNs = 'group:g1';
+    const groupNs = 'group:grp01';
     const p2pEvents: any[] = [];
     const groupEvents: any[] = [];
     client.on('message.received', (payload: any) => p2pEvents.push(payload));
@@ -3202,7 +3222,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._publishOrderedMessage('message.received', p2pNs, 1, { seq: 1, payload: { type: 'text' } });
     await (client as any)._publishOrderedMessage('group.message_created', groupNs, 1, {
-      group_id: 'g1',
+      group_id: 'grp01',
       seq: 1,
       payload: { type: 'text' },
     });
@@ -3400,7 +3420,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted-ok',
-      group_id: 'g1',
+      group_id: 'grp01',
       from: 'bob.aid.com',
       seq: 1,
       timestamp: 123,
@@ -3410,7 +3430,7 @@ describe('有序消息发布', () => {
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'group-text',
         protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1', _auth: 'secret' },
-        aad: { from: 'bob.aid.com', from_device: 'bob-dev', group_id: 'g1' },
+        aad: { from: 'bob.aid.com', from_device: 'bob-dev', group_id: 'grp01' },
         recipients: [['alice.aid.com', 'dev-1', 'peer', 'group_device_prekey', 'fp', 'spk-1']],
         ciphertext: 'ciphertext',
       },
@@ -3439,7 +3459,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted-self',
-      group_id: 'g1',
+      group_id: 'grp01',
       from: 'alice.aid.com',
       seq: 1,
       timestamp: 123,
@@ -3448,7 +3468,7 @@ describe('有序消息发布', () => {
         version: 'v2',
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'group-text',
-        aad: { from: 'alice.aid.com', from_device: 'alice-main', group_id: 'g1' },
+        aad: { from: 'alice.aid.com', from_device: 'alice-main', group_id: 'grp01' },
         recipients: [['alice.aid.com', 'dev-1', 'self_sync', 'group_device_prekey', 'fp', 'spk-1']],
         ciphertext: 'ciphertext',
       },
@@ -3470,7 +3490,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-other-slot',
-      group_id: 'g1',
+      group_id: 'grp01',
       from: 'bob.aid.com',
       device_id: 'dev-2',
       slot_id: 'slot-b',
@@ -3495,7 +3515,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted',
-      group_id: 'g1',
+      group_id: 'grp01',
       from: 'bob.aid.com',
       seq: 1,
       timestamp: 123,
@@ -3514,7 +3534,7 @@ describe('有序消息发布', () => {
     expect(undecryptable[0]).not.toHaveProperty('payload');
     expect(undecryptable[0]).toEqual(expect.objectContaining({
       message_id: 'gm-raw-encrypted',
-      group_id: 'g1',
+      group_id: 'grp01',
       from: 'bob.aid.com',
       seq: 1,
       payload_type: 'group-text',

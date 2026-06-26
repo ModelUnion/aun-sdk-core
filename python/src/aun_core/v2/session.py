@@ -66,6 +66,8 @@ class V2Session:
         self._verified_spks: set[tuple[str, str, str]] = set()
         # 旧 SPK 私钥内存缓存：{spk_id: priv}
         self._spk_cache: dict[str, bytes] = {}
+        # 群 SPK 私钥内存缓存：{(group_id, spk_id): priv}
+        self._group_spk_cache: dict[tuple[str, str], bytes] = {}
         # ensure_group_registered 并发保护锁
         self._group_register_lock = asyncio.Lock()
 
@@ -184,10 +186,12 @@ class V2Session:
         group_id = self._group_key(group_id)
         result = self._store.load_current_group_spk(self._device_id, group_id)
         if result:
+            self._group_spk_cache[(group_id, result[0])] = result[1]
             return result
         spk_priv, spk_pub_der = generate_p256_keypair()
         spk_id = "sha256:" + hashlib.sha256(spk_pub_der).hexdigest()[:16]
         self._store.save_group_spk(self._device_id, group_id, spk_id, spk_priv, spk_pub_der)
+        self._group_spk_cache[(group_id, spk_id)] = spk_priv
         return (spk_id, spk_priv, spk_pub_der)
 
     def get_group_decrypt_keys(self, group_id: str, spk_id: str | None) -> tuple[bytes, bytes | None]:
@@ -197,8 +201,12 @@ class V2Session:
         if not spk_id:
             return (self._ik_priv, None)
         lookup_group_id, lookup_spk_id = self._normalize_group_spk_lookup(group_id, str(spk_id))
+        cached_group_spk = self._group_spk_cache.get((lookup_group_id, lookup_spk_id))
+        if cached_group_spk is not None:
+            return (self._ik_priv, cached_group_spk)
         group_spk = self._store.load_group_spk(self._device_id, lookup_group_id, lookup_spk_id)
         if group_spk is not None:
+            self._group_spk_cache[(lookup_group_id, lookup_spk_id)] = group_spk
             return (self._ik_priv, group_spk)
         return self.get_decrypt_keys(lookup_spk_id)
 
@@ -221,6 +229,7 @@ class V2Session:
         spk_priv, spk_pub_der = generate_p256_keypair()
         spk_id = "sha256:" + hashlib.sha256(spk_pub_der).hexdigest()[:16]
         self._store.save_group_spk(self._device_id, group_id, spk_id, spk_priv, spk_pub_der)
+        self._group_spk_cache[(group_id, spk_id)] = spk_priv
         await self._publish_group_spk(group_id, spk_id, spk_pub_der, call_fn)
         return (spk_id, spk_priv, spk_pub_der)
 

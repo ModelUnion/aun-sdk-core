@@ -171,11 +171,32 @@ async def main() -> None:
             mount_dir = f"{_GROUP_AID}:/{root}/memberdata/alice"
             _cmd(env, "fs", "mkdir", "-p", source_dir)
             _cmd(env, "fs", "cp", str(source_file), f"{source_dir}/a.txt")
-            _cmd(env, "fs", "setfacl", "-m", f"aid:{_GROUP_AID}:rwd", source_dir)
+            _cmd(env, "fs", "setfacl", "-m", f"aid:{_GROUP_AID}:w", source_dir)
+            direct_read = _text_cmd(env, "fs", "cat", "--as", _GROUP_AID, f"{source_dir}/a.txt", expect_ok=False)
+            if "rc=0" in direct_read:
+                raise AssertionError("写 ACL 不应授予 group_aid 直接读取 source 文件")
 
-            mounted = _cmd(env, "fs", "mount", "--as", _GROUP_AID, "--readwrite", mount_dir, "--source", source_dir)
-            if mounted.get("type") != "mount" or mounted.get("mount_source") != f"{_ALICE_AID}:{root}/source":
+            mounted = _cmd(
+                env,
+                "fs",
+                "mount",
+                "--as",
+                _GROUP_AID,
+                "--readwrite",
+                "--require-approval",
+                mount_dir,
+                "--source",
+                source_dir,
+            )
+            mount_source = str(mounted.get("mount_source") or "")
+            if mounted.get("type") != "mount" or _ALICE_AID not in mount_source or f"{root}/source" not in mount_source:
                 raise AssertionError(f"mount 返回异常: {mounted}")
+            pending = _cmd(env, "fs", "stat", "--as", _GROUP_AID, mount_dir, expect_ok=False)
+            if pending["returncode"] == 0:
+                raise AssertionError("pending mount 审批前不应可 stat")
+            approved = _cmd(env, "fs", "approve", mount_dir)
+            if approved.get("status") != "active" or approved.get("approved") is not True:
+                raise AssertionError(f"approve 返回异常: {approved}")
             listing = _cmd(env, "fs", "ls", "--as", _GROUP_AID, mount_dir)
             if not any(item.get("name") == "a.txt" for item in listing):
                 raise AssertionError(f"ls 未看到 source 文件: {listing}")

@@ -125,3 +125,29 @@ class CollabClient:
 
     async def unregister(self, group_aid: str, collab_root: str) -> dict[str, Any]:
         return await self._call("collab.unregister", {"group_aid": group_aid, "collab_root": collab_root})
+
+    async def set_acl(
+        self,
+        collab_root: str,
+        *,
+        grantee_aid: str,
+        perms: str = "w",
+        expires_at: int | None = None,
+        max_uses: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "collab_root": collab_root,
+            "grantee_aid": grantee_aid,
+            "perms": perms,
+        }
+        if expires_at is not None:
+            params["expires_at"] = expires_at
+        if max_uses is not None:
+            params["max_uses"] = max_uses
+        return await self._call("collab.set_acl", params)
+
+    async def remove_acl(self, collab_root: str, *, grantee_aid: str) -> dict[str, Any]:
+        return await self._call(
+            "collab.remove_acl",
+            {"collab_root": collab_root, "grantee_aid": grantee_aid},
+        )

@@ -32,6 +32,8 @@ class _FakeClient:
         self.calls = []
         self.responses = {}
         self.access_token = None
+        self._identity = {}
+        self._session_params = {}
 
     async def call(self, method, params=None):
         merged = params or {}
@@ -54,6 +56,33 @@ def test_group_remote_path_detection_keeps_windows_paths_local():
     assert not is_group_remote_path("local:/tmp/a.md")
     assert not is_group_remote_path("relative/a.md")
     assert not is_group_remote_path("/tmp/a.md")
+
+
+@pytest.mark.asyncio
+async def test_group_fs_role_acl_facade_maps_to_control_rpcs():
+    client = _FakeClient()
+    fs = GroupFSVFS(client)
+
+    await fs.set_acl("g-team.agentid.pub:/archive", grantee_aid="role:admin", perms="rwx")
+    await fs.remove_acl("g-team.agentid.pub:/archive", grantee_aid="role:admin")
+
+    assert client.calls == [
+        (
+            "group.fs.set_acl",
+            {
+                "path": "g-team.agentid.pub:/archive",
+                "grantee_aid": "role:admin",
+                "perms": "rwx",
+            },
+        ),
+        (
+            "group.fs.remove_acl",
+            {
+                "path": "g-team.agentid.pub:/archive",
+                "grantee_aid": "role:admin",
+            },
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -101,7 +130,7 @@ async def test_cp_local_to_group_uses_upload_control_plane(tmp_path):
     assert lowlevel.puts == [
         ("https://upload.example.test/session-1", b"hello group", {"Content-Type": "text/markdown"})
     ]
-    assert "groupdata" not in json.dumps(client.calls, ensure_ascii=False)
+    assert "group_data" not in json.dumps(client.calls, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -254,6 +283,64 @@ async def test_cp_group_to_local_sends_bearer_for_scoped_download_ticket(tmp_pat
         (
             "https://storage.example.test/g-team/docs/a.md?t=share",
             {"Authorization": "Bearer access-token-1"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cp_memberdata_shared_file_sends_bearer(tmp_path):
+    data = b"shared by another member"
+    target = tmp_path / "shared.txt"
+    client = _FakeClient()
+    client.access_token = "viewer-access-token"
+    client.responses = {
+        "group.fs.create_download_ticket": {
+            "download_url": "https://storage.example.test/member-source/group_data/g-team/shared.txt?t=share",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "file_name": "shared.txt",
+        }
+    }
+    lowlevel = _FakeLowLevel(download_data=data)
+    fs = GroupFSVFS(client, lowlevel=lowlevel)
+
+    await fs.cp("g-team.agentid.pub:/memberdata/alice.agentid.pub/shared.txt", str(target))
+
+    assert client.calls == [
+        (
+            "group.fs.create_download_ticket",
+            {"path": "g-team.agentid.pub:/memberdata/alice.agentid.pub/shared.txt"},
+        )
+    ]
+    assert lowlevel.gets == [
+        (
+            "https://storage.example.test/member-source/group_data/g-team/shared.txt?t=share",
+            {"Authorization": "Bearer viewer-access-token"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cp_group_to_local_uses_identity_access_token_fallback(tmp_path):
+    data = b"identity token"
+    target = tmp_path / "out.md"
+    client = _FakeClient()
+    client._identity = {"access_token": "identity-token-1"}
+    client.responses = {
+        "group.fs.create_download_ticket": {
+            "download_url": "https://download.example.test/identity-token",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "file_name": "a.md",
+        }
+    }
+    lowlevel = _FakeLowLevel(download_data=data)
+    fs = GroupFSVFS(client, lowlevel=lowlevel)
+
+    await fs.cp("g-team.agentid.pub:/docs/a.md", str(target))
+
+    assert lowlevel.gets == [
+        (
+            "https://download.example.test/identity-token",
+            {"Authorization": "Bearer identity-token-1"},
         )
     ]
 

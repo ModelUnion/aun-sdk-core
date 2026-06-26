@@ -56,20 +56,31 @@ def _compute_fingerprints(cert_pem: bytes) -> tuple[str, str]:
     return cert_der_hex, pubkey_spki_hex
 
 
-async def _fetch_cert_by_fingerprint(session: aiohttp.ClientSession, aid: str, fingerprint: str) -> str | None:
-    """通过 Gateway PKI 端点下载证书"""
+async def _fetch_cert_by_fingerprint_response(
+    session: aiohttp.ClientSession,
+    aid: str,
+    fingerprint: str,
+) -> tuple[int | None, str | None]:
+    """通过 Gateway PKI 端点下载证书，返回 HTTP 状态和证书正文。"""
     url = f"https://{_GATEWAY_HOST}:20001/pki/cert/{quote(aid, safe='')}?{urlencode({'cert_fingerprint': fingerprint})}"
     try:
         async with session.get(url, ssl=False) as resp:
+            body = await resp.text()
             if resp.status == 200:
-                return await resp.text()
-            else:
-                body = await resp.text()
-                print(f"    HTTP {resp.status}: {body[:200]}")
-                return None
+                return resp.status, body
+            print(f"    HTTP {resp.status}: {body[:200]}")
+            return resp.status, None
     except Exception as e:
         print(f"    请求失败: {e}")
-        return None
+        return None, None
+
+
+async def _fetch_cert_by_fingerprint(session: aiohttp.ClientSession, aid: str, fingerprint: str) -> str | None:
+    """通过 Gateway PKI 端点下载证书"""
+    status, cert_pem = await _fetch_cert_by_fingerprint_response(session, aid, fingerprint)
+    if status == 200:
+        return cert_pem
+    return None
 
 
 async def _fetch_cert_no_fingerprint(session: aiohttp.ClientSession, aid: str) -> str | None:
@@ -171,16 +182,15 @@ async def main():
             print(f"  [SKIP] 前置测试未通过")
             failed += 1
 
-        # ── 测试 4: 不存在的指纹 → fallback 到 active_signing ──
-        print("[TEST 4] 不存在的指纹查询 → 预期 fallback 到 active_signing ...")
+        # ── 测试 4: 不存在的指纹 → 明确拒绝 ──
+        print("[TEST 4] 不存在的指纹查询 → 预期返回 404 ...")
         fake_fp = "sha256:" + "0" * 64
-        cert4 = await _fetch_cert_by_fingerprint(session, _ALICE_AID, fake_fp)
-        if cert4 and "BEGIN CERTIFICATE" in cert4:
-            # CA 设计：fingerprint 不匹配时 fallback 到 active_signing（兼容旧客户端）
-            print(f"  [PASS] 不存在的指纹 fallback 到 active_signing 证书（设计如此）")
+        status4, cert4 = await _fetch_cert_by_fingerprint_response(session, _ALICE_AID, fake_fp)
+        if status4 == 404 and not cert4:
+            print(f"  [PASS] 不存在的指纹不会 fallback 到 active_signing")
             passed += 1
         else:
-            print(f"  [FAIL] 应返回 fallback 证书")
+            print(f"  [FAIL] 应返回 404 且不返回证书，实际 status={status4}")
             failed += 1
 
     # ── 汇总 ──

@@ -16,7 +16,7 @@ func TestStorageLowLevelConvenienceRPCMappings(t *testing.T) {
 	expectedVersion := 7
 	metadata := map[string]any{"k": "v"}
 
-	if _, err := low.CreateShareLink(ctx, "alice.agentid.pub", "team", "docs/a.txt", []string{"bob.agentid.pub"}, &expireInSeconds, &maxUses); err != nil {
+	if _, err := low.CreateShareLink(ctx, "alice.agentid.pub", "team", "docs/a.txt", []string{"bob1.agentid.pub"}, &expireInSeconds, &maxUses); err != nil {
 		t.Fatalf("CreateShareLink 失败: %v", err)
 	}
 	if _, err := low.ListShareLinks(ctx, "alice.agentid.pub", "team", "docs/a.txt"); err != nil {
@@ -101,7 +101,7 @@ func TestStorageLowLevelConvenienceRPCMappings(t *testing.T) {
 	if createParams["expire_in_seconds"] != 3600 || createParams["max_uses"] != 3 {
 		t.Fatalf("create_share_link 限制参数不正确: %#v", createParams)
 	}
-	if aids, ok := createParams["allowed_aids"].([]string); !ok || len(aids) != 1 || aids[0] != "bob.agentid.pub" {
+	if aids, ok := createParams["allowed_aids"].([]string); !ok || len(aids) != 1 || aids[0] != "bob1.agentid.pub" {
 		t.Fatalf("create_share_link allowed_aids 不正确: %#v", createParams)
 	}
 

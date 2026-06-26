@@ -71,7 +71,7 @@ describe('AUNClient V2 thought', () => {
 
   it('message.thought.put 在 V2 session 就绪时构造 V2 envelope，type=e2ee.p2p_encrypted 含 recipients[]', async () => {
     const client = await newClientWithV2('alice.aid.com', 'dev-alice');
-    const bobAid = 'bob.aid.com';
+    const bobAid = 'bob1.aid.com';
 
     // bootstrap → 一个 bob 设备 + 一个 self（alice 自身设备数：仅当前一台，self_sync 跳过）
     const callMock = vi.spyOn(client as any, 'call').mockImplementation(async (method: any, params: any): Promise<any> => {
@@ -171,7 +171,7 @@ describe('AUNClient V2 thought', () => {
       if (method === 'group.v2.bootstrap') {
         return {
           devices: [{
-            aid: 'bob.aid.com',
+            aid: 'bob1.aid.com',
             device_id: 'dev-bob-1',
             ik_pk: bobIkB64,
             spk_pk: bobSpkB64,
@@ -231,7 +231,7 @@ describe('AUNClient V2 thought', () => {
     const v2Spy = vi.spyOn(client as any, '_putMessageThoughtEncryptedV2').mockResolvedValue({ stored_count: 1 });
 
     await client.call('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       thought_id: 'mt-1',
       context: { type: 'run', id: 'r1' },
       payload: { type: 'thought', text: 'x' },
@@ -245,7 +245,7 @@ describe('AUNClient V2 thought', () => {
     const v2Spy = vi.spyOn(client as any, '_putGroupThoughtEncryptedV2').mockResolvedValue({ ok: true });
 
     await client.call('group.thought.put', {
-      group_id: 'g1',
+      group_id: 'grp01',
       thought_id: 'gt-1',
       context: { type: 'run', id: 'r1' },
       payload: { type: 'thought', text: 'x' },
@@ -260,7 +260,7 @@ describe('AUNClient V2 thought', () => {
     (client as any)._aid = 'alice.aid.com';
 
     await expect(client.call('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       thought_id: 'mt-1',
       context: { type: 'run', id: 'r1' },
       payload: { type: 'thought', text: 'x' },

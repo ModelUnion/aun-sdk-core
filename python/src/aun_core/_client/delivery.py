@@ -19,6 +19,7 @@ _PENDING_ORDERED_LIMIT = 50000
 _GROUP_RECALL_SEEN_LIMIT = 10000
 _ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
 _ONLINE_UNREAD_HINT_INTERVAL = 0.05
+_SEQ_TRACKER_PERSIST_FLUSH_DELAY = 0.2
 
 
 _APP_MESSAGE_ENVELOPE_KEYS = (
@@ -648,6 +649,8 @@ class MessageDeliveryEngine:
         payload_override: Any = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        if getattr(self.client._log, "is_null_logger", False):
+            return
         record: dict[str, Any] = {
             "stage": stage,
             "source": source,
@@ -658,6 +661,21 @@ class MessageDeliveryEngine:
         if extra:
             record["extra"] = extra
         self.client._log.debug("client", "message.debug %s", self.client._debug_json(record))
+
+    def record_push_processing(self, scope: str, key: str, amount: int = 1) -> None:
+        stats = getattr(self.client, "_push_processing_stats", None)
+        if stats is None:
+            stats = {}
+            self.client._push_processing_stats = stats
+        section = stats.setdefault(scope, {})
+        section[key] = int(section.get(key) or 0) + amount
+
+    def record_auto_ack(self, key: str, amount: int = 1) -> None:
+        stats = getattr(self.client, "_auto_ack_stats", None)
+        if stats is None:
+            stats = {}
+            self.client._auto_ack_stats = stats
+        stats[key] = int(stats.get(key) or 0) + amount
 
     def log_app_message_publish(self, event: str, payload: Any, source: str) -> None:
         if event not in ("message.received", "group.message_created"):
@@ -706,6 +724,7 @@ class MessageDeliveryEngine:
             seq for seq in pending
             if seq <= contig and (before_seq is None or seq < before_seq)
         )
+        delivered = False
         for seq in ready:
             event, payload = pending.pop(seq)
             if client._is_published_seq(ns, seq):
@@ -713,9 +732,12 @@ class MessageDeliveryEngine:
                 continue
             await self.publish_ordered_queue_item(ns, event, seq, payload, source="ordered-drain")
             client._mark_published_seq(ns, seq)
+            delivered = True
             client._log.debug("client", "publish ordered drain delivered: ns=%s seq=%d event=%s", ns, seq, event)
         if not pending:
             client._pending_ordered().pop(ns, None)
+            if delivered:
+                client._save_seq_tracker_state()
 
     async def publish_ordered_message(self, event: str, ns: str, seq: Any, payload: Any) -> bool:
         """按 contiguous_seq 对应用层事件做有序放行。"""
@@ -746,12 +768,33 @@ class MessageDeliveryEngine:
 
         contig = client._seq_tracker.get_contiguous_seq(ns)
         if seq_i > contig:
+            pending = client._pending_ordered().get(ns)
+            pending_count_before = len(pending) if pending else 0
+            stats_map = getattr(client, "_ordered_gap_block_stats", None)
+            if stats_map is None:
+                stats_map = {}
+                client._ordered_gap_block_stats = stats_map
+            stats = stats_map.setdefault(ns, {"count": 0})
+            stats["count"] = int(stats.get("count") or 0) + 1
+            stats["last_event"] = event
+            stats["last_seq"] = seq_i
+            stats["last_contiguous_seq"] = contig
+            stats["last_pending_count"] = pending_count_before + 1
+            stats["last_blocked_at"] = time.time()
+            count = int(stats["count"])
             client._log.debug(
                 "client",
                 "publish ordered enqueue gap: ns=%s seq=%d contig=%d",
                 ns, seq_i, contig,
             )
             client._enqueue_ordered_message(ns, event, seq_i, payload)
+            if count == 1 or count % 10 == 0 or count % 100 == 0:
+                client._log.warn(
+                    "client",
+                    "ordered publish blocked by seq gap: ns=%s event=%s seq=%d contiguous_seq=%d "
+                    "pending_ordered=%d blocked_count=%d",
+                    ns, event, seq_i, contig, pending_count_before + 1, count,
+                )
             return False
 
         await client._drain_ordered_messages(ns, before_seq=seq_i)
@@ -766,6 +809,8 @@ class MessageDeliveryEngine:
         client._mark_published_seq(ns, seq_i)
         client._log.debug("client", "publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
         await client._drain_ordered_messages(ns)
+        if not client._pending_ordered().get(ns):
+            client._save_seq_tracker_state()
         return True
 
     async def publish_pulled_message(self, event: str, ns: str, seq: Any, payload: Any) -> bool:
@@ -821,6 +866,7 @@ class MessageDeliveryEngine:
         """将 ack RPC 以 fire-and-forget 方式发送，不阻塞消息事件分发。"""
         client = self.client
         params = client._clamp_ack_params(method, params) if isinstance(params, dict) else params
+        self.record_auto_ack("scheduled")
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
         task = loop.create_task(client._safe_ack(method, params, label))
         tasks = getattr(client, "_background_ack_tasks", None)
@@ -900,8 +946,10 @@ class MessageDeliveryEngine:
                 client._sign_client_operation(method, params)
             client._log.debug("client", "%s auto-ack send: method=%s params=%s", label or method, method, params)
             result = await self.transport_call_background(method, params)
+            self.record_auto_ack("ok")
             client._log.debug("client", "%s auto-ack ok: method=%s result=%s", label or method, method, result)
         except Exception as exc:
+            self.record_auto_ack("failed")
             client._log.debug("client", "%s auto-ack failed: %s", label or method, exc)
 
     async def transport_call_background(self, method: str, params: dict[str, Any]) -> Any:
@@ -956,9 +1004,11 @@ class MessageDeliveryEngine:
     async def process_and_publish_message_inner(self, data: Any) -> None:
         """P2P push 处理内部实现（在 ns lock 保护下调用）。"""
         client = self.client
+        self.record_push_processing("p2p", "started")
         try:
             if not isinstance(data, dict):
                 await client._publish_app_event("message.received", data)
+                self.record_push_processing("p2p", "app_published")
                 return
             msg = dict(data)
             client._log.debug(
@@ -968,6 +1018,7 @@ class MessageDeliveryEngine:
                 msg.get("device_id"), msg.get("slot_id"),
             )
             if not client._message_targets_current_instance(msg):
+                self.record_push_processing("p2p", "instance_filtered")
                 client._log.debug(
                     "client",
                     "_process_and_publish_message filtered (instance mismatch): "
@@ -1004,14 +1055,16 @@ class MessageDeliveryEngine:
                     ns, seq, msg.get("message_id", "?"),
                 )
                 if encrypted_push:
-                    await client._publish_encrypted_push_message(
+                    published = await client._publish_encrypted_push_message(
                         "message.received", "message.undecryptable", ns, seq, msg, group=False,
                     )
                 else:
-                    await client._publish_ordered_message("message.received", ns, seq, msg)
+                    published = await client._publish_ordered_message("message.received", ns, seq, msg)
+                    if published:
+                        self.record_push_processing("p2p", "app_published")
             else:
                 if encrypted_push:
-                    await client._publish_encrypted_push_message(
+                    published = await client._publish_encrypted_push_message(
                         "message.received", "message.undecryptable", "", seq, msg, group=False,
                     )
                     return
@@ -1021,6 +1074,7 @@ class MessageDeliveryEngine:
                     msg.get("message_id", "?"),
                 )
                 await client._publish_app_event("message.received", msg, source="push")
+                self.record_push_processing("p2p", "app_published")
 
             # auto-ack push 消息：ack contiguous_seq（连续确认到的最高位置，避免空洞时跳跃推进）
             if seq is not None and client._aid:
@@ -1030,6 +1084,7 @@ class MessageDeliveryEngine:
                         "seq": contig, "device_id": client._device_id, "slot_id": client._slot_id,
                     }, "P2P auto-ack")
         except Exception as exc:
+            self.record_push_processing("p2p", "exception")
             client._log.warn("client", "P2P push processing failed: %s", exc)
             if isinstance(data, dict) and data.get("seq") is not None and client._aid:
                 exc_ns = f"p2p:{client._aid}"
@@ -1719,13 +1774,141 @@ class MessageDeliveryEngine:
 
     def current_seq_tracker_context(self) -> tuple[str, str, str] | None:
         client = self.client
-        aid = str(client._aid or "").strip()
+        aid = str(getattr(client, "_aid", "") or "").strip()
         if not aid:
             return None
-        return (aid, client._device_id, client._slot_id)
+        return (
+            aid,
+            str(getattr(client, "_device_id", "") or ""),
+            str(getattr(client, "_slot_id", "") or ""),
+        )
+
+    def _seq_tracker_flush_loop(self) -> asyncio.AbstractEventLoop | None:
+        client = self.client
+        loop = getattr(client, "_loop", None)
+        if loop is not None and not loop.is_closed():
+            return loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        return None if loop.is_closed() else loop
+
+    def _cancel_seq_tracker_flush_handle(self) -> None:
+        client = self.client
+        handle = getattr(client, "_seq_tracker_flush_handle", None)
+        if handle is not None and not handle.cancelled():
+            handle.cancel()
+        client._seq_tracker_flush_handle = None
+
+    def _write_seq_tracker_values(self, context: tuple[str, str, str], values: dict[str, int]) -> None:
+        client = self.client
+        aid, device_id, slot_id = context
+        clean: dict[str, int] = {}
+        for ns, seq in values.items():
+            try:
+                seq_int = int(seq)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(ns, str) and ns and seq_int > 0:
+                clean[ns] = seq_int
+        if not clean:
+            return
+        batch_saver = getattr(client._token_store, "save_seqs", None)
+        if callable(batch_saver):
+            batch_saver(aid, device_id, slot_id, clean)
+            return
+        saver = getattr(client._token_store, "save_seq", None)
+        if callable(saver):
+            for ns, seq in clean.items():
+                saver(aid, device_id, slot_id, ns, seq)
+            return
+        updater = getattr(client._token_store, "update_instance_state", None)
+        if callable(updater):
+            def _merge_seq(m: dict) -> dict:
+                state = dict(m.get("seq_tracker_state") or {})
+                state.update(clean)
+                m["seq_tracker_state"] = state
+                return m
+            updater(aid, device_id, slot_id, _merge_seq)
+
+    def _flush_seq_tracker_pending(self) -> None:
+        client = self.client
+        self._cancel_seq_tracker_flush_handle()
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        if not pending:
+            client._seq_tracker_pending_persist_context = None
+            return
+        context = (
+            getattr(client, "_seq_tracker_pending_persist_context", None)
+            or client._current_seq_tracker_context()
+        )
+        values = dict(pending)
+        pending.clear()
+        client._seq_tracker_pending_persist_context = None
+        if context is None:
+            return
+        try:
+            self._write_seq_tracker_values(context, values)
+            client._log.debug("client", "seq_tracker flush: namespaces=%d context=%s", len(values), context)
+        except Exception as exc:
+            client._log.debug("client", "save seq batch failed: %s", exc)
+
+    def _merge_seq_tracker_pending(self, context: tuple[str, str, str], values: dict[str, int]) -> None:
+        client = self.client
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        if pending is None:
+            pending = {}
+            client._seq_tracker_pending_persist = pending
+        pending_context = getattr(client, "_seq_tracker_pending_persist_context", None)
+        if pending and pending_context is not None and pending_context != context:
+            self._flush_seq_tracker_pending()
+            pending = client._seq_tracker_pending_persist
+        client._seq_tracker_pending_persist_context = context
+        for ns, seq in values.items():
+            if isinstance(ns, str) and ns:
+                try:
+                    seq_int = int(seq)
+                except (TypeError, ValueError):
+                    continue
+                if seq_int > 0:
+                    pending[ns] = seq_int
+
+    def _drop_seq_tracker_pending(self, ns: str) -> None:
+        client = self.client
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        if pending and ns in pending:
+            pending.pop(ns, None)
+        if not pending:
+            client._seq_tracker_pending_persist_context = None
+            self._cancel_seq_tracker_flush_handle()
+
+    def _schedule_seq_tracker_flush(self) -> None:
+        client = self.client
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        if not pending:
+            return
+        handle = getattr(client, "_seq_tracker_flush_handle", None)
+        if handle is not None and not handle.cancelled():
+            return
+        loop = self._seq_tracker_flush_loop()
+        if loop is None:
+            self._flush_seq_tracker_pending()
+            return
+
+        def _flush() -> None:
+            client._seq_tracker_flush_handle = None
+            self._flush_seq_tracker_pending()
+
+        client._seq_tracker_flush_handle = loop.call_later(_SEQ_TRACKER_PERSIST_FLUSH_DELAY, _flush)
 
     def reset_seq_tracking_state(self) -> None:
         client = self.client
+        context = client._seq_tracker_context or client._current_seq_tracker_context()
+        state = client._seq_tracker.export_state() if context else {}
+        if context and state:
+            self._merge_seq_tracker_pending(context, state)
+        self._flush_seq_tracker_pending()
         self.runtime.delivery.reset_seq_tracking_state(reset_context=True)
 
     def refresh_seq_tracking_context(self) -> None:
@@ -1739,35 +1922,53 @@ class MessageDeliveryEngine:
             "SeqTracker 上下文切换 %s -> %s, 旧 state=%s",
             prev, next_context, old_state,
         )
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        pending_context = getattr(client, "_seq_tracker_pending_persist_context", None)
+        if prev and pending and pending_context == prev:
+            live_namespaces = set(old_state.keys())
+            for ns in list(pending):
+                if ns not in live_namespaces:
+                    pending.pop(ns, None)
+            if not pending:
+                client._seq_tracker_pending_persist_context = None
+                self._cancel_seq_tracker_flush_handle()
+        if prev and old_state:
+            self._merge_seq_tracker_pending(prev, old_state)
+        self._flush_seq_tracker_pending()
         self.runtime.delivery.reset_seq_tracking_state(next_context=next_context)
 
     def persist_seq(self, ns: str, *, force_seq: int | None = None) -> None:
-        """即时持久化单个 namespace 的 seq（行级写入）。"""
+        """延迟持久化单个 namespace 的最后 seq，窗口内多次推进只写最终值。"""
         client = self.client
-        if not client._aid:
+        context = client._current_seq_tracker_context()
+        if context is None:
+            self._flush_seq_tracker_pending()
             return
         seq = force_seq if force_seq is not None else client._seq_tracker.get_contiguous_seq(ns)
         if seq <= 0:
             return
-        client._log.debug("client", "persist_seq: ns=%s seq=%d (force=%s)", ns, seq, force_seq is not None)
+        client._log.debug("client", "persist_seq queued: ns=%s seq=%d (force=%s)", ns, seq, force_seq is not None)
         if force_seq is not None:
             # 同时更新内存中的 SeqTracker
             client._seq_tracker.restore_state({ns: seq})
-        try:
-            saver = getattr(client._token_store, "save_seq", None)
-            if callable(saver):
-                saver(client._aid, client._device_id, client._slot_id, ns, seq)
-        except Exception as seq_exc:
-            client._log.debug("client", "save seq failed: %s", seq_exc)
+        self._merge_seq_tracker_pending(context, {ns: seq})
+        self._schedule_seq_tracker_flush()
 
     def persist_repaired_seq(self, ns: str) -> None:
         """持久化倒退修复后的 seq；修复到 0 时删除旧落盘游标。"""
         client = self.client
         if not client._aid:
             return
+        self._drop_seq_tracker_pending(ns)
         seq = client._seq_tracker.get_contiguous_seq(ns)
+        context = client._current_seq_tracker_context()
+        if context is None:
+            return
         if seq > 0:
-            client._persist_seq(ns)
+            try:
+                self._write_seq_tracker_values(context, {ns: seq})
+            except Exception as exc:
+                client._log.debug("client", "persist repaired seq failed: ns=%s err=%s", ns, exc)
             return
         deleter = getattr(client._token_store, "delete_seq", None)
         if callable(deleter):
@@ -1797,35 +1998,33 @@ class MessageDeliveryEngine:
         return repaired
 
     def save_seq_tracker_state(self) -> None:
-        """将 SeqTracker 状态按行保存到 keystore seq_tracker 表。"""
+        """将 SeqTracker 当前状态强制保存到 keystore seq_tracker 表。"""
         client = self.client
-        if not client._aid:
+        context = client._current_seq_tracker_context()
+        if context is None:
             return
         state = client._seq_tracker.export_state()
-        if not state:
-            return
-        try:
-            saver = getattr(client._token_store, "save_seq", None)
-            if callable(saver):
-                for ns, seq in state.items():
-                    if isinstance(seq, int) and seq > 0:
-                        saver(client._aid, client._device_id, client._slot_id, ns, seq)
-            else:
-                # 旧版 fallback
-                updater = getattr(client._token_store, "update_instance_state", None)
-                if callable(updater):
-                    def _merge_seq(m: dict) -> dict:
-                        m["seq_tracker_state"] = state
-                        return m
-                    updater(client._aid, client._device_id, client._slot_id, _merge_seq)
-        except Exception as exc:
-            client._log.warn("client", "failed to save SeqTracker state: %s", exc)
+        pending = getattr(client, "_seq_tracker_pending_persist", None)
+        pending_context = getattr(client, "_seq_tracker_pending_persist_context", None)
+        if pending and pending_context == context:
+            live_namespaces = set(state.keys())
+            for ns in list(pending):
+                if ns not in live_namespaces:
+                    pending.pop(ns, None)
+            if not pending:
+                client._seq_tracker_pending_persist_context = None
+                self._cancel_seq_tracker_flush_handle()
+        if state:
+            self._merge_seq_tracker_pending(context, state)
+        self._flush_seq_tracker_pending()
 
     async def on_v2_push_notification(self, data: Any) -> None:
         """处理 V2 P2P push 通知：自动 pull + decrypt + emit。"""
         client = self.client
+        self.record_push_processing("p2p", "started")
         client._log_message_debug("server-push", "_raw.peer.v2.message_received", "message.received", data)
         if not client._v2_session:
+            self.record_push_processing("p2p", "no_v2_session")
             client._log.debug("client", "_on_v2_push_notification skipped: no v2_session")
             return
 
@@ -1852,6 +2051,7 @@ class MessageDeliveryEngine:
         if push_seq_int > 0 and ns:
             client._seq_tracker.update_max_seen(ns, push_seq_int)
             if contig_before == push_seq_int:
+                self.record_push_processing("p2p", "already_covered")
                 client._log.debug(
                     "client",
                     "_on_v2_push_notification: push seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
@@ -1867,9 +2067,12 @@ class MessageDeliveryEngine:
             try:
                 decrypted = await client._decrypt_v2_message(data)
                 if decrypted is not None:
+                    self.record_push_processing("p2p", "decrypt_ok")
                     # 解密成功：把 push_seq 加入 received_seqs，让 _try_advance 自然推进。
                     need_pull = client._seq_tracker.on_message_seq(ns, push_seq_int)
                     published = await client._publish_ordered_message("message.received", ns, push_seq_int, decrypted)
+                    if published:
+                        self.record_push_processing("p2p", "app_published")
                     new_contig = client._seq_tracker.get_contiguous_seq(ns)
                     if new_contig != contig_before:
                         client._persist_seq(ns)
@@ -1898,7 +2101,10 @@ class MessageDeliveryEngine:
                             push_seq_int,
                         )
                         return
+                else:
+                    self.record_push_processing("p2p", "decrypt_fail")
             except Exception as exc:
+                self.record_push_processing("p2p", "decrypt_exception")
                 client._log.debug("client", "_on_v2_push_notification: push payload 解密失败, fallback to pull: %s", exc)
 
         # 不带 payload 或解密失败：触发 pull。

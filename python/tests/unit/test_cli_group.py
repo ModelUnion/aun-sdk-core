@@ -193,6 +193,91 @@ def test_group_kick_uses_active_group_when_group_id_omitted(monkeypatch, tmp_pat
     ]
 
 
+def test_group_set_role_command_calls_existing_rpc(monkeypatch):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import group as group_commands
+    from aun_cli.main import app
+
+    calls = []
+
+    class FakeClient:
+        async def call(self, method, params):
+            calls.append((method, params))
+            return {"ok": True, "new_role": params["role"]}
+
+    class FakeSession:
+        def __init__(self, ctx, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return FakeClient()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(group_commands, "CLISession", FakeSession)
+
+    result = CliRunner().invoke(
+        app,
+        ["--json", "group", "set-role", "g-test.agentid.pub", "bob.agentid.pub", "--role", "admin"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"ok": True, "new_role": "admin"}
+    assert calls == [
+        (
+            "group.set_role",
+            {
+                "group_id": "g-test.agentid.pub",
+                "aid": "bob.agentid.pub",
+                "role": "admin",
+            },
+        )
+    ]
+
+
+def test_group_set_role_uses_active_group_when_group_id_omitted(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import group as group_commands
+    from aun_cli.main import app
+
+    _write_profile_config(tmp_path, monkeypatch, active_group="g-team.agentid.pub")
+    calls = []
+
+    class FakeClient:
+        async def call(self, method, params):
+            calls.append((method, params))
+            return {"ok": True}
+
+    class FakeSession:
+        def __init__(self, ctx, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return FakeClient()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(group_commands, "CLISession", FakeSession)
+
+    result = CliRunner().invoke(app, ["--json", "group", "set-role", "bob.agentid.pub", "--role", "member"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (
+            "group.set_role",
+            {
+                "group_id": "g-team.agentid.pub",
+                "aid": "bob.agentid.pub",
+                "role": "member",
+            },
+        )
+    ]
+
+
 def test_group_create_sets_active_group_from_nested_response(monkeypatch, tmp_path):
     from typer.testing import CliRunner
 
@@ -449,3 +534,62 @@ def test_group_add_member_underscore_alias_calls_rpc(monkeypatch):
             },
         )
     ]
+
+
+def test_group_fs_write_commands_use_as_aid_for_session_and_signature(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import group as group_commands
+    from aun_cli.main import app
+
+    _write_profile_config(tmp_path, monkeypatch, active_group="g-active.agentid.pub")
+    sessions = []
+    calls = []
+
+    class FakeGroupFS:
+        async def mkdir(self, path, **kwargs):
+            calls.append(("mkdir", path, kwargs))
+            return {"ok": True}
+
+        async def rm(self, path, **kwargs):
+            calls.append(("rm", path, kwargs))
+            return {"ok": True}
+
+        async def cp(self, src, dst, **kwargs):
+            calls.append(("cp", src, dst, kwargs))
+            return {"ok": True}
+
+        async def mv(self, src, dst, **kwargs):
+            calls.append(("mv", src, dst, kwargs))
+            return {"ok": True}
+
+    class FakeClient:
+        def __init__(self):
+            self.group = SimpleNamespace(fs=FakeGroupFS())
+
+    class FakeSession:
+        def __init__(self, ctx, **kwargs):
+            sessions.append(kwargs)
+
+        async def __aenter__(self):
+            return FakeClient()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(group_commands, "CLISession", FakeSession)
+
+    runner = CliRunner()
+    command_specs = [
+        ["--json", "group", "fs", "mkdir", "--parents", "g-group.agentid.pub:/cli-dir", "--as", "g-group.agentid.pub"],
+        ["--json", "group", "fs", "rm", "--recursive", "g-group.agentid.pub:/cli-dir", "--as", "g-group.agentid.pub"],
+        ["--json", "group", "fs", "cp", "g-group.agentid.pub:/src.txt", "g-group.agentid.pub:/dst.txt", "--as", "g-group.agentid.pub"],
+        ["--json", "group", "fs", "mv", "g-group.agentid.pub:/old.txt", "g-group.agentid.pub:/new.txt", "--as", "g-group.agentid.pub"],
+    ]
+
+    for args in command_specs:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+
+    assert [session.get("aid") for session in sessions] == [None] * 4
+    assert [call[-1].get("sign_as") for call in calls] == ["g-group.agentid.pub"] * 4

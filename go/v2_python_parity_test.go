@@ -41,7 +41,7 @@ func TestV2BuildTargetAllowsExplicitEmptyDeviceID(t *testing.T) {
 		context.Background(),
 		state,
 		map[string]any{"device_id": "", "ik_pk": base64.StdEncoding.EncodeToString(ikDER)},
-		"bob.example.com",
+		"bob1.example.com",
 		"",
 		"peer",
 		"peer_device_prekey",
@@ -52,12 +52,53 @@ func TestV2BuildTargetAllowsExplicitEmptyDeviceID(t *testing.T) {
 	if !ok {
 		t.Fatal("显式空 device_id 应被当作有效设备值")
 	}
-	if target.DeviceID != "" || target.AID != "bob.example.com" || target.Role != "peer" {
+	if target.DeviceID != "" || target.AID != "bob1.example.com" || target.Role != "peer" {
 		t.Fatalf("target 不正确: %#v", target)
 	}
-	cached := state.session.GetPeerIK("bob.example.com", "")
+	cached := state.session.GetPeerIK("bob1.example.com", "")
 	if string(cached) != string(ikDER) {
 		t.Fatalf("显式空 device_id 的 IK 未缓存: %#v", cached)
+	}
+}
+
+func TestV2GroupSendCachedSelfOnlyBootstrapIsRetryable(t *testing.T) {
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	groupID := "group.example.com/invite"
+	state := &v2P2PState{
+		session:             v2session.NewV2Session(nil, "dev-alice", "alice.example.com", nil, nil),
+		bootstrapCache:      make(map[string]v2BootstrapEntry),
+		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
+	}
+	state.groupBootstrapCache[groupID] = &v2GroupBootstrapEntry{
+		Devices: []map[string]any{{
+			"aid":       "alice.example.com",
+			"device_id": "dev-alice",
+		}},
+		Epoch:    1,
+		CachedAt: time.Now(),
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.deviceID = "dev-alice"
+	c.v2State = state
+	c.mu.Unlock()
+
+	_, err := c.getV2E2EECoordinator().v2GroupSendOnce(
+		context.Background(),
+		state,
+		groupID,
+		map[string]any{"type": "text", "text": "hello"},
+		true,
+		v2e2ee.EncryptOptions{},
+	)
+	if err == nil {
+		t.Fatal("旧缓存仅包含当前设备时应返回可刷新错误")
+	}
+	ae, ok := err.(*AUNError)
+	if !ok || ae.Code != -33054 || !isV2RetryableError(err) {
+		t.Fatalf("旧 group bootstrap 缓存应映射为 -33054 可重试错误，实际: %#v", err)
 	}
 }
 
@@ -73,9 +114,9 @@ func TestCacheV2PeerIKFromDeviceAllowsExplicitEmptyDeviceID(t *testing.T) {
 	c.cacheV2PeerIKFromDevice(state, map[string]any{
 		"device_id": "",
 		"ik_pk":     base64.StdEncoding.EncodeToString(ikDER),
-	}, "bob.example.com")
+	}, "bob1.example.com")
 
-	cached := state.session.GetPeerIK("bob.example.com", "")
+	cached := state.session.GetPeerIK("bob1.example.com", "")
 	if !bytes.Equal(cached, ikDER) {
 		t.Fatalf("显式空 device_id 的 bootstrap IK 未缓存: %#v", cached)
 	}
@@ -92,15 +133,15 @@ func TestV2BuildTargetAllowsIKInSPKFields(t *testing.T) {
 	ikSum := sha256.Sum256(ikDER)
 	ikID := "sha256:" + hex.EncodeToString(ikSum[:])[:16]
 	c.mu.Lock()
-	c.aid = "bob.example.com"
+	c.aid = "bob1.example.com"
 	c.mu.Unlock()
-	ks, err := openV2Keystore(t.TempDir(), "bob.example.com")
+	ks, err := openV2Keystore(t.TempDir(), "bob1.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ks.Close()
 	state := &v2P2PState{
-		session: v2session.NewV2Session(ks.store, "", "bob.example.com", ikPriv, ikDER),
+		session: v2session.NewV2Session(ks.store, "", "bob1.example.com", ikPriv, ikDER),
 	}
 
 	target, ok, err := c.v2BuildTargetFromDevice(
@@ -113,7 +154,7 @@ func TestV2BuildTargetAllowsIKInSPKFields(t *testing.T) {
 			"spk_id":     ikID,
 			"key_source": "peer_device_prekey",
 		},
-		"bob.example.com",
+		"bob1.example.com",
 		"",
 		"peer",
 		"peer_device_prekey",
@@ -362,7 +403,7 @@ func TestV2P2PPurePushNotificationPullsFromCurrentContiguousSeq(t *testing.T) {
 					"version":    "v1",
 					"seq":        1,
 					"message_id": "m-v2-pure-push",
-					"from_aid":   "bob.example.com",
+					"from_aid":   "bob1.example.com",
 					"t_server":   int64(123),
 					"legacy_v1": map[string]any{
 						"to":      "alice.example.com",
@@ -389,7 +430,7 @@ func TestV2P2PPurePushNotificationPullsFromCurrentContiguousSeq(t *testing.T) {
 	c.events.Publish("_raw.peer.v2.message_received", map[string]any{
 		"seq":        1,
 		"message_id": "m-v2-pure-push",
-		"from_aid":   "bob.example.com",
+		"from_aid":   "bob1.example.com",
 	})
 
 	select {
@@ -430,7 +471,7 @@ func TestV2P2PPayloadPushWithGapPullsFromCurrentContiguousSeq(t *testing.T) {
 	c.events.Publish("_raw.peer.v2.message_received", map[string]any{
 		"seq":           int64(3),
 		"message_id":    "m-push-3",
-		"from_aid":      "bob.example.com",
+		"from_aid":      "bob1.example.com",
 		"envelope_json": "{}",
 	})
 
@@ -469,7 +510,7 @@ func TestV2P2PPurePushEqualContiguousIsIdempotent(t *testing.T) {
 	c.events.Publish("_raw.peer.v2.message_received", map[string]any{
 		"seq":        int64(3),
 		"message_id": "m-pure-duplicate",
-		"from_aid":   "bob.example.com",
+		"from_aid":   "bob1.example.com",
 	})
 
 	time.Sleep(150 * time.Millisecond)
@@ -505,7 +546,7 @@ func TestV2GroupPurePushEqualContiguousIsIdempotent(t *testing.T) {
 		"group_id":   groupID,
 		"seq":        int64(3),
 		"message_id": "gm-pure-duplicate",
-		"sender_aid": "bob.example.com",
+		"sender_aid": "bob1.example.com",
 	})
 
 	time.Sleep(150 * time.Millisecond)
@@ -526,7 +567,7 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 	aliceKey, _, alicePubB64 := testGenerateECKeypair(t)
 	bobKey, _, bobPubB64 := testGenerateECKeypair(t)
 	aliceAID := "alice.example.com"
-	bobAID := "bob.example.com"
+	bobAID := "bob1.example.com"
 	aliceCert := testMakeSelfSignedCert(t, aliceKey, aliceAID)
 
 	alicePriv := aliceKey.D.FillBytes(make([]byte, 32))
@@ -641,7 +682,7 @@ func TestDecryptGroupV2MessageExposesDirectionAndInstanceMetadata(t *testing.T) 
 		t.Fatalf("生成 Bob IK 失败: %v", err)
 	}
 	aliceAID := "alice.example.com"
-	bobAID := "bob.example.com"
+	bobAID := "bob1.example.com"
 	groupID := "group.example.com/g1"
 
 	envelope, err := v2e2ee.EncryptGroupMessage(
@@ -724,7 +765,7 @@ func TestDecryptEncryptedPushPayloadExposesDirection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("生成 Alice IK 失败: %v", err)
 	}
-	bobAID := "bob.example.com"
+	bobAID := "bob1.example.com"
 	aliceAID := "alice.example.com"
 	groupID := "group.example.com/g1"
 
@@ -869,7 +910,7 @@ func TestDecryptEncryptedPushPayloadExposesDirection(t *testing.T) {
 }
 
 func TestDecryptV2MessageUndecryptableEventPreservesMetadata(t *testing.T) {
-	bobAID := "bob.example.com"
+	bobAID := "bob1.example.com"
 	bobPriv, bobPubDER, err := v2crypto.GenerateP256Keypair()
 	if err != nil {
 		t.Fatalf("生成 IK 失败: %v", err)
@@ -960,7 +1001,7 @@ func TestV2P2PPullPublishesUndecryptableBeforeContiguousAdvance(t *testing.T) {
 		"version":      "v2",
 		"suite":        "P256_HKDF_SHA256_AES_256_GCM",
 		"payload_type": "text",
-		"aad":          map[string]any{"from": "bob.example.com", "from_device": "dev-bob"},
+		"aad":          map[string]any{"from": "bob1.example.com", "from_device": "dev-bob"},
 		"recipients": []any{[]any{
 			aliceAID, "dev-alice", "peer", "peer_device_prekey", "fp", "missing-spk", "n", "w",
 		}},
@@ -978,7 +1019,7 @@ func TestV2P2PPullPublishesUndecryptableBeforeContiguousAdvance(t *testing.T) {
 					"version":       "v2",
 					"seq":           int64(1),
 					"message_id":    "m-missing-spk",
-					"from_aid":      "bob.example.com",
+					"from_aid":      "bob1.example.com",
 					"to":            aliceAID,
 					"spk_id":        "missing-spk",
 					"envelope_json": string(envJSON),
@@ -1035,9 +1076,9 @@ func TestV2P2PPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 		switch method {
 		case "message.v2.pull":
 			return map[string]any{"messages": []any{
-				map[string]any{"version": "v1", "seq": 1, "message_id": "m-1", "from_aid": "bob.example.com", "t_server": int64(1), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-1"}}},
-				map[string]any{"version": "v1", "seq": 2, "message_id": "m-2", "from_aid": "bob.example.com", "t_server": int64(2), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-2"}}},
-				map[string]any{"version": "v1", "seq": 3, "message_id": "m-3", "from_aid": "bob.example.com", "t_server": int64(3), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-3"}}},
+				map[string]any{"version": "v1", "seq": 1, "message_id": "m-1", "from_aid": "bob1.example.com", "t_server": int64(1), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-1"}}},
+				map[string]any{"version": "v1", "seq": 2, "message_id": "m-2", "from_aid": "bob1.example.com", "t_server": int64(2), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-2"}}},
+				map[string]any{"version": "v1", "seq": 3, "message_id": "m-3", "from_aid": "bob1.example.com", "t_server": int64(3), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-3"}}},
 			}}
 		default:
 			return map[string]any{"ok": true}
@@ -1137,7 +1178,7 @@ func TestV2P2PPublicPullGateSerializesFullPipeline(t *testing.T) {
 						"version":    "v1",
 						"seq":        1,
 						"message_id": "m-1",
-						"from_aid":   "bob.example.com",
+						"from_aid":   "bob1.example.com",
 						"t_server":   int64(1),
 						"legacy_v1": map[string]any{
 							"to":      "alice.example.com",
@@ -1190,9 +1231,9 @@ func TestV2P2PPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 		switch method {
 		case "message.v2.pull":
 			return map[string]any{"messages": []any{
-				map[string]any{"version": "v1", "seq": 1, "message_id": "m-event-1", "from_aid": "bob.example.com", "t_server": int64(1), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-1"}}},
-				map[string]any{"version": "v1", "seq": 2, "message_id": "m-event-2", "from_aid": "bob.example.com", "t_server": int64(2), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-2"}}},
-				map[string]any{"version": "v1", "seq": 3, "message_id": "m-event-3", "from_aid": "bob.example.com", "t_server": int64(3), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-3"}}},
+				map[string]any{"version": "v1", "seq": 1, "message_id": "m-event-1", "from_aid": "bob1.example.com", "t_server": int64(1), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-1"}}},
+				map[string]any{"version": "v1", "seq": 2, "message_id": "m-event-2", "from_aid": "bob1.example.com", "t_server": int64(2), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-2"}}},
+				map[string]any{"version": "v1", "seq": 3, "message_id": "m-event-3", "from_aid": "bob1.example.com", "t_server": int64(3), "legacy_v1": map[string]any{"to": "alice.example.com", "payload": map[string]any{"type": "text", "text": "m-event-3"}}},
 			}}
 		default:
 			return map[string]any{"ok": true}
@@ -1261,7 +1302,7 @@ func TestV2P2PPullReacksWhenServerAckLagsExistingContiguousSeq(t *testing.T) {
 						"version":    "v1",
 						"seq":        int64(5),
 						"message_id": "m-lag-5",
-						"from_aid":   "bob.example.com",
+						"from_aid":   "bob1.example.com",
 						"legacy_v1": map[string]any{
 							"payload": map[string]any{"type": "e2ee.encrypted", "ciphertext": "bad"},
 						},
@@ -1340,9 +1381,9 @@ func TestV2GroupPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 		switch method {
 		case "group.v2.pull":
 			return map[string]any{"messages": []any{
-				map[string]any{"version": "v1", "seq": 1, "message_id": "gm-1", "from_aid": "bob.example.com", "t_server": int64(1), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-1"}},
-				map[string]any{"version": "v1", "seq": 2, "message_id": "gm-2", "from_aid": "bob.example.com", "t_server": int64(2), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-2"}},
-				map[string]any{"version": "v1", "seq": 3, "message_id": "gm-3", "from_aid": "bob.example.com", "t_server": int64(3), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-3"}},
+				map[string]any{"version": "v1", "seq": 1, "message_id": "gm-1", "from_aid": "bob1.example.com", "t_server": int64(1), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-1"}},
+				map[string]any{"version": "v1", "seq": 2, "message_id": "gm-2", "from_aid": "bob1.example.com", "t_server": int64(2), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-2"}},
+				map[string]any{"version": "v1", "seq": 3, "message_id": "gm-3", "from_aid": "bob1.example.com", "t_server": int64(3), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-3"}},
 			}}
 		default:
 			return map[string]any{"ok": true}
@@ -1393,9 +1434,9 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 		switch method {
 		case "group.v2.pull":
 			return map[string]any{"messages": []any{
-				map[string]any{"version": "v1", "seq": 1, "message_id": "gm-event-1", "from_aid": "bob.example.com", "t_server": int64(1), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-1"}},
-				map[string]any{"version": "v1", "seq": 2, "message_id": "gm-event-2", "from_aid": "bob.example.com", "t_server": int64(2), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-2"}},
-				map[string]any{"version": "v1", "seq": 3, "message_id": "gm-event-3", "from_aid": "bob.example.com", "t_server": int64(3), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-3"}},
+				map[string]any{"version": "v1", "seq": 1, "message_id": "gm-event-1", "from_aid": "bob1.example.com", "t_server": int64(1), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-1"}},
+				map[string]any{"version": "v1", "seq": 2, "message_id": "gm-event-2", "from_aid": "bob1.example.com", "t_server": int64(2), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-2"}},
+				map[string]any{"version": "v1", "seq": 3, "message_id": "gm-event-3", "from_aid": "bob1.example.com", "t_server": int64(3), "type": "message", "payload": map[string]any{"type": "text", "text": "gm-event-3"}},
 			}}
 		default:
 			return map[string]any{"ok": true}
@@ -1465,7 +1506,7 @@ func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T
 						"version":    "v1",
 						"seq":        int64(5),
 						"message_id": "gm-lag-5",
-						"from_aid":   "bob.example.com",
+						"from_aid":   "bob1.example.com",
 						"payload":    map[string]any{"type": "e2ee.group_encrypted", "ciphertext": "bad"},
 					},
 				},
@@ -1546,7 +1587,7 @@ func TestV2GroupBootstrapStateSignatureFailureIsFatal(t *testing.T) {
 		if method == "group.v2.bootstrap" {
 			return map[string]any{
 				"devices": []any{map[string]any{
-					"aid":       "bob.example.com",
+					"aid":       "bob1.example.com",
 					"device_id": "dev-bob",
 					"ik_pk":     "AA==",
 				}},
@@ -1600,7 +1641,7 @@ func TestV2AutoProposeStateConfirmsReturnedProposal(t *testing.T) {
 		case "group.get_members":
 			return map[string]any{"members": []any{
 				map[string]any{"aid": "alice.example.com", "role": "owner"},
-				map[string]any{"aid": "bob.example.com", "role": "member"},
+				map[string]any{"aid": "bob1.example.com", "role": "member"},
 			}}
 		case "group.v2.bootstrap":
 			return map[string]any{"devices": []any{}, "audit_recipients": []any{}}
@@ -1706,7 +1747,7 @@ func TestV2AutoProposeStateVerifiesCommittedBaseBeforePropose(t *testing.T) {
 		case "group.get_members":
 			return map[string]any{"members": []any{
 				map[string]any{"aid": "alice.example.com", "role": "owner"},
-				map[string]any{"aid": "bob.example.com", "role": "member"},
+				map[string]any{"aid": "bob1.example.com", "role": "member"},
 			}}
 		case "group.v2.bootstrap":
 			return map[string]any{"devices": []any{}, "audit_recipients": []any{}}
@@ -1753,7 +1794,7 @@ func TestV2ConfirmPendingProposalVerifiesCommittedBaseAndHash(t *testing.T) {
 	nextPayload := map[string]any{
 		"members": []any{
 			map[string]any{"aid": "alice.example.com", "devices": []any{}},
-			map[string]any{"aid": "bob.example.com", "devices": []any{}},
+			map[string]any{"aid": "bob1.example.com", "devices": []any{}},
 		},
 		"audit_aids":       []any{},
 		"admin_set":        map[string]any{"admin_aids": []any{"alice.example.com"}, "threshold": 1},

@@ -7,6 +7,7 @@ import type { ClientRuntime } from './runtime.js';
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
 const GROUP_RECALL_SEEN_LIMIT = 10_000;
+const SEQ_TRACKER_PERSIST_FLUSH_DELAY_MS = 200;
 const APP_MESSAGE_ENVELOPE_KEYS = [
   'module_id', 'message_type', 'type', 'kind', 'version',
   'from', 'from_aid', 'sender_aid', 'to', 'to_aid', 'group_id',
@@ -474,7 +475,7 @@ export class MessageDeliveryEngine {
       client._withBackgroundRpc(() => client._ackGroupV2(groupId, ackSeq))
         .catch((e: unknown) => { client._clientLog.debug(`group recall auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`); });
     }
-    if (contig !== contigBefore) this.saveSeqTrackerState();
+    if (contig !== contigBefore) this.persistSeq(ns);
   }
 
   publishAppEvent(event: string, payload: EventPayload, source = 'direct'): void | Promise<void> {
@@ -647,7 +648,7 @@ export class MessageDeliveryEngine {
           .then(() => { client._clientLog.debug(`P2P push auto-ack ok: ns=${ns}, seq=${ackSeq}`); })
           .catch((e: unknown) => { client._clientLog.debug(`P2P auto-ack failed: ${formatDeliveryError(e)}`); });
       }
-      if (contigAfter !== contigBefore) this.saveSeqTrackerState();
+      if (contigAfter !== contigBefore) this.persistSeq(ns);
       if (encryptedPush) return;
     } else {
       if (encryptedPush) {
@@ -724,7 +725,7 @@ export class MessageDeliveryEngine {
           client._withBackgroundRpc(() => client._ackGroupV2(groupId, ackSeq))
             .catch((e: unknown) => { client._clientLog.debug(`group recall auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`); });
         }
-        if (contigAfter !== contigBefore) this.saveSeqTrackerState();
+        if (contigAfter !== contigBefore) this.persistSeq(ns);
         void published;
         return;
       }
@@ -746,7 +747,7 @@ export class MessageDeliveryEngine {
           .then(() => { client._clientLog.debug(`group push auto-ack ok: group=${groupId}, seq=${ackSeq}`); })
           .catch((e: unknown) => { client._clientLog.debug(`group message auto-ack failed: group=${groupId} ${formatDeliveryError(e)}`); });
       }
-      if (contigAfter !== contigBefore) this.saveSeqTrackerState();
+      if (contigAfter !== contigBefore) this.persistSeq(ns);
       if (encryptedPush) return;
     } else {
       if (encryptedPush) {
@@ -800,7 +801,7 @@ export class MessageDeliveryEngine {
       this.prunePushedSeqs(ns);
       if (client._seqTracker.getContiguousSeq(ns) !== afterSeq) {
         await this.drainOrderedMessages(ns, undefined, true);
-        this.saveSeqTrackerState();
+        this.persistSeq(ns);
       }
       const contig = client._seqTracker.getContiguousSeq(ns);
       if (contig > 0 && contig !== afterSeq) {
@@ -840,7 +841,7 @@ export class MessageDeliveryEngine {
       this.prunePushedSeqs(ns);
       if (client._seqTracker.getContiguousSeq(ns) !== afterSeq) {
         await this.drainOrderedMessages(ns, undefined, true);
-        this.saveSeqTrackerState();
+        this.persistSeq(ns);
       }
       client._clientLog.debug(`group message gap fill done: group=${groupId}, after_seq=${afterSeq}, filled=${filled}`);
     } catch (exc) {
@@ -933,7 +934,7 @@ export class MessageDeliveryEngine {
         const ackContig = client._seqTracker.getContiguousSeq(ns);
         await this.drainOrderedMessages(ns);
         if (ackContig !== pageContigBefore && !hasDissolvedEvent) {
-          this.saveSeqTrackerState();
+          this.persistSeq(ns);
         }
         if (eventObjects.length > 0 && ackContig > 0 && ackContig !== pageContigBefore) {
           const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
@@ -997,7 +998,7 @@ export class MessageDeliveryEngine {
     await this.drainOrderedMessages(ns);
 
     if (ackContig > 0 && ackContig !== contigBefore) {
-      if (data.action !== 'dissolved') this.saveSeqTrackerState();
+      if (data.action !== 'dissolved') this.persistSeq(ns);
       const ackSeq = this.clampAckSeq('group.ack_events', 'event_seq', ns, ackContig);
       client._transport.call('group.ack_events', {
         group_id: groupId,
@@ -1111,7 +1112,7 @@ export class MessageDeliveryEngine {
           const newContig = client._seqTracker.getContiguousSeq(ns);
           const needPull = pushSeq > newContig && !published;
           if (newContig !== contigBefore) {
-            client._saveSeqTrackerState();
+            this.persistSeq(ns);
           }
           if (newContig > 0 && newContig !== contigBefore) {
             const ackSeq = this.clampAckSeq('message.v2.ack', 'up_to_seq', ns, newContig);
@@ -1361,22 +1362,134 @@ export class MessageDeliveryEngine {
 
   saveSeqTrackerState(): void {
     const client = this.runtime.client;
-    if (!client._aid) return;
+    const context = this.currentSeqTrackerContext();
+    if (!context) {
+      this.flushSeqTrackerPending();
+      return;
+    }
     const state = client._seqTracker.exportState();
-    if (Object.keys(state).length === 0) return;
+    const pending = this.seqTrackerPending();
+    if (pending.size > 0 && client._seqTrackerPendingPersistContext === context) {
+      const liveNamespaces = new Set(Object.keys(state));
+      for (const ns of [...pending.keys()]) {
+        if (!liveNamespaces.has(ns)) pending.delete(ns);
+      }
+      if (pending.size === 0) client._seqTrackerPendingPersistContext = null;
+    }
+    if (Object.keys(state).length > 0) this.mergeSeqTrackerPending(context, state);
+    this.flushSeqTrackerPending();
+  }
+
+  persistSeq(ns: string, forceSeq?: number): void {
+    const client = this.runtime.client;
+    const context = this.currentSeqTrackerContext();
+    if (!context) {
+      this.flushSeqTrackerPending();
+      return;
+    }
+    const seq = forceSeq ?? client._seqTracker.getContiguousSeq(ns);
+    if (!ns || !Number.isFinite(seq) || seq <= 0) return;
+    if (forceSeq !== undefined) {
+      client._seqTracker.forceContiguousSeq(ns, seq);
+    }
+    this.mergeSeqTrackerPending(context, { [ns]: seq });
+    this.scheduleSeqTrackerFlush();
+  }
+
+  flushSeqTrackerPending(): void {
+    const client = this.runtime.client;
+    this.cancelSeqTrackerFlushTimer();
+    const context = client._seqTrackerPendingPersistContext as string | null | undefined;
+    const pending = this.seqTrackerPending();
+    if (!context || pending.size === 0) {
+      client._seqTrackerPendingPersistContext = null;
+      return;
+    }
+    const [aid, deviceId, slotId] = JSON.parse(context) as [string, string, string];
+    const state = Object.fromEntries(pending.entries());
+    pending.clear();
+    client._seqTrackerPendingPersistContext = null;
+    this.writeSeqTrackerState(aid, deviceId, slotId, state);
+  }
+
+  private dropSeqTrackerPending(ns: string): void {
+    const client = this.runtime.client;
+    const pending = this.seqTrackerPending();
+    pending.delete(ns);
+    if (pending.size === 0) {
+      client._seqTrackerPendingPersistContext = null;
+      this.cancelSeqTrackerFlushTimer();
+    }
+  }
+
+  private currentSeqTrackerContext(): string | null {
+    const client = this.runtime.client;
+    if (!client._aid) return null;
+    return JSON.stringify([client._aid, client._deviceId, client._slotId]);
+  }
+
+  private seqTrackerPending(): Map<string, number> {
+    const client = this.runtime.client;
+    if (!(client._seqTrackerPendingPersist instanceof Map)) {
+      client._seqTrackerPendingPersist = new Map<string, number>();
+    }
+    return client._seqTrackerPendingPersist as Map<string, number>;
+  }
+
+  private mergeSeqTrackerPending(context: string, state: Record<string, number>): void {
+    const client = this.runtime.client;
+    const pending = this.seqTrackerPending();
+    const pendingContext = client._seqTrackerPendingPersistContext as string | null | undefined;
+    if (pendingContext && pendingContext !== context && pending.size > 0) {
+      this.flushSeqTrackerPending();
+    }
+    client._seqTrackerPendingPersistContext = context;
+    for (const [ns, seq] of Object.entries(state)) {
+      const seqNum = Number(seq);
+      if (ns && Number.isFinite(seqNum) && seqNum > 0) {
+        pending.set(ns, seqNum);
+      }
+    }
+  }
+
+  private scheduleSeqTrackerFlush(): void {
+    const client = this.runtime.client;
+    const pending = this.seqTrackerPending();
+    if (pending.size === 0) return;
+    if (client._seqTrackerFlushTimer) return;
+    client._seqTrackerFlushTimer = setTimeout(() => {
+      client._seqTrackerFlushTimer = null;
+      this.flushSeqTrackerPending();
+    }, SEQ_TRACKER_PERSIST_FLUSH_DELAY_MS);
+  }
+
+  private cancelSeqTrackerFlushTimer(): void {
+    const client = this.runtime.client;
+    if (client._seqTrackerFlushTimer) {
+      clearTimeout(client._seqTrackerFlushTimer);
+      client._seqTrackerFlushTimer = null;
+    }
+  }
+
+  private writeSeqTrackerState(aid: string, deviceId: string, slotId: string, state: Record<string, number>): void {
+    const client = this.runtime.client;
+    if (!aid || Object.keys(state).length === 0) return;
     try {
       const saveFn = client._tokenStore.saveSeq;
       if (typeof saveFn === 'function') {
         for (const [ns, seq] of Object.entries(state)) {
-          saveFn.call(client._tokenStore, client._aid, client._deviceId, client._slotId, ns, seq);
+          saveFn.call(client._tokenStore, aid, deviceId, slotId, ns, seq);
         }
         return;
       }
 
       const updater = client._tokenStore.updateInstanceState;
       if (typeof updater === 'function') {
-        updater.call(client._tokenStore, client._aid, client._deviceId, client._slotId, (metadata: JsonObject) => {
-          metadata.seq_tracker_state = state as unknown as JsonValue;
+        updater.call(client._tokenStore, aid, deviceId, slotId, (metadata: JsonObject) => {
+          const existing = isJsonObject(metadata.seq_tracker_state as JsonValue | object | null | undefined)
+            ? { ...(metadata.seq_tracker_state as JsonObject) }
+            : {};
+          metadata.seq_tracker_state = { ...existing, ...state } as unknown as JsonValue;
           return metadata;
         });
       }
@@ -1385,9 +1498,9 @@ export class MessageDeliveryEngine {
       client._clientLog.warn(`save SeqTracker state failed: ${error}`);
       client._dispatcher.publish('seq_tracker.persist_error', {
         phase: 'save',
-        aid: client._aid,
-        device_id: client._deviceId,
-        slot_id: client._slotId,
+        aid,
+        device_id: deviceId,
+        slot_id: slotId,
         error: String(error),
       }).catch(() => {});
     }
@@ -1397,6 +1510,7 @@ export class MessageDeliveryEngine {
     const client = this.runtime.client;
     if (!client._aid || !ns) return;
     const seq = client._seqTracker.getContiguousSeq(ns);
+    this.dropSeqTrackerPending(ns);
     try {
       if (seq > 0 && typeof client._tokenStore.saveSeq === 'function') {
         client._tokenStore.saveSeq(client._aid, client._deviceId, client._slotId, ns, seq);
@@ -1405,6 +1519,18 @@ export class MessageDeliveryEngine {
       const deleteSeq = client._tokenStore.deleteSeq;
       if (seq <= 0 && typeof deleteSeq === 'function') {
         deleteSeq.call(client._tokenStore, client._aid, client._deviceId, client._slotId, ns);
+        return;
+      }
+      const updater = client._tokenStore.updateInstanceState;
+      if (seq <= 0 && typeof updater === 'function') {
+        updater.call(client._tokenStore, client._aid, client._deviceId, client._slotId, (metadata: JsonObject) => {
+          if (isJsonObject(metadata.seq_tracker_state as JsonValue | object | null | undefined)) {
+            const next = { ...(metadata.seq_tracker_state as JsonObject) };
+            delete next[ns];
+            metadata.seq_tracker_state = next as unknown as JsonValue;
+          }
+          return metadata;
+        });
         return;
       }
       if (seq > 0) {
@@ -1462,6 +1588,7 @@ export class MessageDeliveryEngine {
     const client = this.runtime.client;
     const queue = client._pendingOrderedMsgs.get(ns) as Map<number, { event: string; payload: EventPayload }> | undefined;
     if (!queue || queue.size === 0) return;
+    let delivered = false;
     while (true) {
       const contig = client._seqTracker.getContiguousSeq(ns);
       const ready = [...queue.keys()]
@@ -1486,9 +1613,13 @@ export class MessageDeliveryEngine {
       await this.publishOrderedQueueItem(ns, item.event, seq, item.payload, 'ordered-drain', pullResponse);
       this.markPublishedSeq(ns, seq);
       client._markOrderedSeqDelivered(ns, seq);
+      delivered = true;
       client._clientLog.debug(`publish ordered drain delivered: ns=${ns}, seq=${seq}, event=${item.event}`);
     }
-    if (queue.size === 0) client._pendingOrderedMsgs.delete(ns);
+    if (queue.size === 0) {
+      client._pendingOrderedMsgs.delete(ns);
+      if (delivered) this.saveSeqTrackerState();
+    }
   }
 
   async publishOrderedMessage(event: string, ns: string, seq: unknown, payload: EventPayload): Promise<boolean> {
@@ -1534,6 +1665,7 @@ export class MessageDeliveryEngine {
     client._markOrderedSeqDelivered(ns, seqNum);
     client._clientLog.debug(`publish ordered delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
     await this.drainOrderedMessages(ns);
+    if (!client._pendingOrderedMsgs.get(ns)) this.saveSeqTrackerState();
     return true;
   }
 
@@ -1554,6 +1686,7 @@ export class MessageDeliveryEngine {
     this.markPublishedSeq(ns, seqNum);
     client._markOrderedSeqDelivered?.(ns, seqNum);
     await this.drainOrderedMessages(ns);
+    if (!client._pendingOrderedMsgs.get(ns)) this.saveSeqTrackerState();
     return true;
   }
 

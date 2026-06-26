@@ -763,18 +763,56 @@ export class RPCTransport {
         });
       }
       await new Promise<void>((resolve, reject) => {
+        const ws = this._ws;
         try {
-          this._ws!.send(payload, (err) => {
+          ws!.send(payload, (err) => {
             if (err) {
-              reject(new ConnectionError(`failed to send ${context}: ${err.message}`));
+              this._sendFailureError(context, err, ws).then(reject, reject);
               return;
             }
             resolve();
           });
         } catch (err) {
-          reject(new ConnectionError(`failed to send ${context}: ${err instanceof Error ? err.message : String(err)}`));
+          this._sendFailureError(context, err, ws).then(reject, reject);
         }
       });
+    });
+  }
+
+  private async _sendFailureError(context: string, err: unknown, ws: WebSocket | null): Promise<ConnectionError> {
+    const original = err instanceof Error ? err.message : String(err);
+    const closeCode = await this._waitForCloseCodeIfClosing(ws);
+    if (closeCode !== null) {
+      return new ConnectionError(`failed to send ${context}: websocket closed: code=${closeCode}; original=${original}`, {
+        code: closeCode,
+      });
+    }
+    return new ConnectionError(`failed to send ${context}: ${original}`);
+  }
+
+  private async _waitForCloseCodeIfClosing(ws: WebSocket | null): Promise<number | null> {
+    if (this._lastCloseCode !== null) return this._lastCloseCode;
+    if (!ws) return null;
+    const readyState = Number((ws as unknown as { readyState?: number }).readyState);
+    if (readyState !== WebSocket.CLOSING && readyState !== WebSocket.CLOSED) return null;
+
+    return await new Promise<number | null>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (code?: number): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        try { ws.removeListener('close', onClose); } catch { /* noop */ }
+        if (Number.isFinite(code)) {
+          resolve(Number(code));
+          return;
+        }
+        resolve(this._lastCloseCode);
+      };
+      const onClose = (code: number): void => finish(code);
+      try { ws.once('close', onClose); } catch { resolve(this._lastCloseCode); return; }
+      timer = setTimeout(() => finish(), 100);
     });
   }
 

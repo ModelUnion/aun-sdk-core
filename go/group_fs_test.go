@@ -39,7 +39,7 @@ func TestGroupFSEntryIsCachedAndExposesOnlyPOSIXMainMethods(t *testing.T) {
 	}
 
 	fsType := reflect.TypeOf(client.Group().FS())
-	for _, method := range []string{"Ls", "Find", "Stat", "Lstat", "Mkdir", "Rm", "Cp", "Mv", "Df", "Mount", "Umount"} {
+	for _, method := range []string{"Ls", "Find", "Stat", "Lstat", "Mkdir", "SetACL", "RemoveACL", "Rm", "Cp", "Mv", "Df", "Mount", "Umount"} {
 		if _, ok := fsType.MethodByName(method); !ok {
 			t.Fatalf("GroupFS 缺少 POSIX 方法: %s", method)
 		}
@@ -71,6 +71,12 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 	if _, err := fs.Mkdir(ctx, "g-team.agentid.pub:/docs/new", &GroupFSMkdirOptions{Parents: true}); err != nil {
 		t.Fatalf("Mkdir 失败: %v", err)
 	}
+	if _, err := fs.SetACL(ctx, "g-team.agentid.pub:/archive", &GroupFSAclOptions{GranteeAID: "role:admin", Perms: "rwx"}); err != nil {
+		t.Fatalf("SetACL 失败: %v", err)
+	}
+	if _, err := fs.RemoveACL(ctx, "g-team.agentid.pub:/archive", &GroupFSAclOptions{GranteeAID: "role:admin"}); err != nil {
+		t.Fatalf("RemoveACL 失败: %v", err)
+	}
 	if _, err := fs.Rm(ctx, "g-team.agentid.pub:/docs/old.md", &GroupFSRmOptions{Force: true}); err != nil {
 		t.Fatalf("Rm 失败: %v", err)
 	}
@@ -96,6 +102,8 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 		"group.fs.stat",
 		"group.fs.lstat",
 		"group.fs.mkdir",
+		"group.fs.set_acl",
+		"group.fs.remove_acl",
 		"group.fs.rm",
 		"group.fs.cp",
 		"group.fs.mv",
@@ -117,8 +125,14 @@ func TestGroupFSPosixMethodsCallGroupFSRPC(t *testing.T) {
 	if client.calls[4].params["path"] != "g-team.agentid.pub:/docs/new" || client.calls[4].params["parents"] != true {
 		t.Fatalf("Mkdir 参数不正确: %#v", client.calls[4].params)
 	}
-	if client.calls[6].params["src"] != "g-team.agentid.pub:/docs/a.md" || client.calls[6].params["dst"] != "g-team.agentid.pub:/docs/b.md" || client.calls[6].params["force"] != true {
-		t.Fatalf("Cp 参数不正确: %#v", client.calls[6].params)
+	if client.calls[5].params["path"] != "g-team.agentid.pub:/archive" || client.calls[5].params["grantee_aid"] != "role:admin" || client.calls[5].params["perms"] != "rwx" {
+		t.Fatalf("SetACL 参数不正确: %#v", client.calls[5].params)
+	}
+	if client.calls[6].params["path"] != "g-team.agentid.pub:/archive" || client.calls[6].params["grantee_aid"] != "role:admin" {
+		t.Fatalf("RemoveACL 参数不正确: %#v", client.calls[6].params)
+	}
+	if client.calls[8].params["src"] != "g-team.agentid.pub:/docs/a.md" || client.calls[8].params["dst"] != "g-team.agentid.pub:/docs/b.md" || client.calls[8].params["force"] != true {
+		t.Fatalf("Cp 参数不正确: %#v", client.calls[8].params)
 	}
 }
 
@@ -137,8 +151,8 @@ func TestGroupFSDoesNotMapMemberdataToGroupdataInSDK(t *testing.T) {
 	if client.calls[0].params["path"] != "g-team.agentid.pub:/memberdata/me/logs/a.md" {
 		t.Fatalf("memberdata 路径未原样传递: %#v", client.calls[0].params)
 	}
-	if strings.Contains(fmt.Sprintf("%#v", client.calls), "groupdata") {
-		t.Fatalf("Go SDK 不应新增真实 groupdata 映射: %#v", client.calls)
+	if strings.Contains(fmt.Sprintf("%#v", client.calls), "group_data") {
+		t.Fatalf("Go SDK 不应新增真实 group_data 映射: %#v", client.calls)
 	}
 }
 
@@ -192,8 +206,8 @@ func TestGroupFSCpLocalToGroupUsesUploadControlPlane(t *testing.T) {
 	if client.calls[2].params["session_id"] != "s1" || client.calls[2].params["skip_blob"] != nil {
 		t.Fatalf("complete_upload 参数不正确: %#v", client.calls[2].params)
 	}
-	if strings.Contains(fmt.Sprintf("%#v", client.calls), "groupdata") {
-		t.Fatalf("Go SDK 不应新增真实 groupdata 映射: %#v", client.calls)
+	if strings.Contains(fmt.Sprintf("%#v", client.calls), "group_data") {
+		t.Fatalf("Go SDK 不应新增真实 group_data 映射: %#v", client.calls)
 	}
 }
 

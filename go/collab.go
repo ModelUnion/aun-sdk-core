@@ -117,23 +117,23 @@ type CollabGCResult struct {
 }
 
 type CollabReflogEntry struct {
-	Action        string `json:"action,omitempty"`
-	CollabRoot    string `json:"collab_root,omitempty"`
-	Doc           string `json:"doc,omitempty"`
-	Version       any    `json:"version,omitempty"`
-	BaseVersion   any    `json:"base_version,omitempty"`
-	Target        string `json:"target,omitempty"`
-	RequesterAID  string `json:"requester_aid,omitempty"`
-	Status        string `json:"status,omitempty"`
-	ErrorCode     any    `json:"error_code,omitempty"`
-	ErrorMsg      string `json:"error_msg,omitempty"`
-	CreatedAt     int64  `json:"created_at,omitempty"`
+	Action       string `json:"action,omitempty"`
+	CollabRoot   string `json:"collab_root,omitempty"`
+	Doc          string `json:"doc,omitempty"`
+	Version      any    `json:"version,omitempty"`
+	BaseVersion  any    `json:"base_version,omitempty"`
+	Target       string `json:"target,omitempty"`
+	RequesterAID string `json:"requester_aid,omitempty"`
+	Status       string `json:"status,omitempty"`
+	ErrorCode    any    `json:"error_code,omitempty"`
+	ErrorMsg     string `json:"error_msg,omitempty"`
+	CreatedAt    int64  `json:"created_at,omitempty"`
 }
 
 type CollabFacade struct {
-	client       StorageRPCClient
-	tagOnce      sync.Once
-	tagFacade    *CollabTagFacade
+	client    StorageRPCClient
+	tagOnce   sync.Once
+	tagFacade *CollabTagFacade
 }
 
 func newCollabFacade(client StorageRPCClient) *CollabFacade {
@@ -257,6 +257,40 @@ func (f *CollabFacade) Unregister(ctx context.Context, groupAID, collabRoot stri
 	return f.callAction(ctx, "collab.unregister", map[string]any{"group_aid": groupAID, "collab_root": collabRoot})
 }
 
+func (f *CollabFacade) SetACL(ctx context.Context, collabRoot, granteeAID, perms string) (map[string]any, error) {
+	if perms == "" {
+		perms = "w"
+	}
+	raw, err := f.call(ctx, "collab.set_acl", map[string]any{
+		"collab_root": collabRoot,
+		"grantee_aid": granteeAID,
+		"perms":       perms,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out, ok := raw.(map[string]any)
+	if !ok {
+		return map[string]any{}, nil
+	}
+	return out, nil
+}
+
+func (f *CollabFacade) RemoveACL(ctx context.Context, collabRoot, granteeAID string) (map[string]any, error) {
+	raw, err := f.call(ctx, "collab.remove_acl", map[string]any{
+		"collab_root": collabRoot,
+		"grantee_aid": granteeAID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out, ok := raw.(map[string]any)
+	if !ok {
+		return map[string]any{}, nil
+	}
+	return out, nil
+}
+
 func (f *CollabFacade) callDocument(ctx context.Context, name string, params map[string]any) (CollabDocumentResult, error) {
 	raw, err := f.call(ctx, name, params)
 	if err != nil {
@@ -368,18 +402,7 @@ func mapCollabError(err error) error {
 			return &CollabConflictError{AUNError: versionConflict.AUNError}
 		}
 		conflict := &CollabConflictError{AUNError: versionConflict.AUNError}
-		if cv, ok := data["current_version"]; ok {
-			if n, ok := cv.(int); ok {
-				conflict.CurrentVersion = &n
-			} else if n, ok := cv.(float64); ok {
-				v := int(n)
-				conflict.CurrentVersion = &v
-			} else if s, ok := cv.(string); ok {
-				if n, err := strconv.Atoi(s); err == nil {
-					conflict.CurrentVersion = &n
-				}
-			}
-		}
+		conflict.CurrentVersion = collabVersionPtr(data["current_version"])
 		if ct, ok := data["current_target"].(string); ok {
 			conflict.CurrentTarget = ct
 		}
@@ -402,18 +425,7 @@ func mapCollabError(err error) error {
 		return &CollabError{AUNError: *aunErr}
 	}
 	conflict := &CollabConflictError{AUNError: *aunErr}
-	if cv, ok := data["current_version"]; ok {
-		if n, ok := cv.(int); ok {
-			conflict.CurrentVersion = &n
-		} else if n, ok := cv.(float64); ok {
-			v := int(n)
-			conflict.CurrentVersion = &v
-		} else if s, ok := cv.(string); ok {
-			if n, err := strconv.Atoi(s); err == nil {
-				conflict.CurrentVersion = &n
-			}
-		}
-	}
+	conflict.CurrentVersion = collabVersionPtr(data["current_version"])
 	if ct, ok := data["current_target"].(string); ok {
 		conflict.CurrentTarget = ct
 	}
@@ -421,6 +433,29 @@ func mapCollabError(err error) error {
 		conflict.Hint = h
 	}
 	return conflict
+}
+
+func collabVersionPtr(value any) *int {
+	switch v := value.(type) {
+	case int:
+		return &v
+	case int64:
+		n := int(v)
+		return &n
+	case float64:
+		n := int(v)
+		return &n
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			n := int(i)
+			return &n
+		}
+	case string:
+		if n, err := strconv.Atoi(v); err == nil {
+			return &n
+		}
+	}
+	return nil
 }
 
 func toTyped[T any](raw any) (T, error) {

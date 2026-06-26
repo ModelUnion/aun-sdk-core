@@ -978,7 +978,7 @@ def test_call_rejects_message_send_persist_param():
 
     with pytest.raises(ValidationError, match="no longer accepts 'persist'"):
         asyncio.run(client.call("message.send", {
-            "to": "bob.remote.example",
+            "to": "bob1.remote.example",
             "payload": {"type": "text", "text": "hello"},
             "encrypt": False,
             "persist": True,
@@ -991,7 +991,7 @@ def test_call_rejects_message_send_delivery_mode_param():
 
     with pytest.raises(ValidationError, match="does not accept delivery_mode"):
         asyncio.run(client.call("message.send", {
-            "to": "bob.remote.example",
+            "to": "bob1.remote.example",
             "payload": {"type": "text", "text": "hello"},
             "encrypt": False,
             "delivery_mode": {"mode": "queue"},
@@ -1018,7 +1018,7 @@ def test_call_does_not_forward_message_send_delivery_mode():
     client._transport = _Transport()
 
     asyncio.run(client.call("message.send", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "payload": {"type": "text", "text": "hello"},
         "encrypt": False,
         "protected_headers": protected_headers,
@@ -1026,7 +1026,7 @@ def test_call_does_not_forward_message_send_delivery_mode():
     }))
 
     assert calls == [("message.send", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "payload": {"type": "text", "text": "hello"},
         "protected_headers": protected_headers,
         "headers": {"device_id": "dev-b"},
@@ -1046,13 +1046,13 @@ def test_message_send_content_alias_is_normalized_for_plaintext():
     client._transport = _Transport()
 
     asyncio.run(client.call("message.send", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "content": {"text": "hello"},
         "encrypt": False,
     }))
 
     assert calls == [("message.send", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "payload": {"type": "text", "text": "hello"},
     })]
 
@@ -1070,12 +1070,12 @@ def test_message_send_content_alias_reaches_encrypted_payload():
     client._send_encrypted_v2 = _fake_send
 
     asyncio.run(client.call("message.send", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "content": {"text": "hello"},
     }))
 
     assert captured == [{
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "payload": {"type": "text", "text": "hello"},
     }]
 
@@ -1093,12 +1093,12 @@ def test_group_send_text_payload_gets_default_payload_type():
     client._send_group_encrypted_v2 = _fake_send
 
     asyncio.run(client.call("group.send", {
-        "group_id": "g1.example.com",
+        "group_id": "group1.example.com",
         "payload": {"text": "hello group"},
     }))
 
     assert captured == [{
-        "group_id": "group.example.com/g1",
+        "group_id": "group.example.com/group1",
         "payload": {"type": "text", "text": "hello group"},
         "device_id": client._device_id,
         "slot_id": client._slot_id,
@@ -1119,7 +1119,7 @@ def test_message_thought_put_plaintext_passes_through():
     client._transport = _Transport()
 
     asyncio.run(client.call("message.thought.put", {
-        "to": "bob.remote.example",
+        "to": "bob1.remote.example",
         "payload": {"type": "thought", "text": "明文 thought"},
         "encrypt": False,
         "protected_headers": {"purpose": "trace"},
@@ -1159,7 +1159,7 @@ def test_group_thought_put_plaintext_passes_through():
         "payload": {"type": "thought", "text": "群明文 thought"},
         "encrypt": False,
         "protected_headers": {"trace": "t1"},
-        "context": {"type": "group", "id": "g-1"},
+        "context": {"type": "group", "id": "g-test1"},
     }))
 
     assert len(calls) == 1
@@ -1309,7 +1309,7 @@ async def test_group_thought_get_decrypts_v2_envelope_and_preserves_metadata():
         async def call(self, method, params, **kwargs):
             return {
                 "found": True,
-                "group_id": "group.agentid.pub/g-1",
+                "group_id": "group.agentid.pub/g-test1",
                 "sender_aid": "alice.agentid.pub",
                 "thoughts": [{
                     "thought_id": "gt-1",
@@ -1330,7 +1330,7 @@ async def test_group_thought_get_decrypts_v2_envelope_and_preserves_metadata():
     client._decrypt_v2_envelope_for_thought = _decrypt
 
     result = await client.call("group.thought.get", {
-        "group_id": "group.agentid.pub/g-1",
+        "group_id": "group.agentid.pub/g-test1",
         "sender_aid": "alice.agentid.pub",
         "context": {"type": "group", "id": "g-run"},
     })
@@ -1571,6 +1571,98 @@ async def test_v2_group_send_does_not_refresh_single_member_group(monkeypatch):
 
     assert [method for method, _ in calls].count("group.v2.bootstrap") == 1
     assert all(method != "group.v2.send" for method, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_v2_group_send_refreshes_cached_single_member_bootstrap_after_invite_join(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from aun_core.logger import NullLogger
+    from aun_core.seq_tracker import SeqTracker
+    import aun_core.v2.e2ee.encrypt_group as encrypt_group_module
+
+    class FakeV2Session:
+        def get_sender_identity(self):
+            return {"aid": "alice.aid.com", "device_id": "alice-dev"}
+
+    group_id = "group.aid.com/invite"
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.aid.com"
+    client._device_id = "alice-dev"
+    client._slot_id = "slot-a"
+    client._v2_session = FakeV2Session()
+    client._v2_bootstrap_cache = {
+        f"group:{group_id}": (
+            [{"aid": "alice.aid.com", "device_id": "alice-dev"}],
+            time.time(),
+            1,
+            set(),
+            {"alice.aid.com"},
+            {"state_version": 1, "state_hash": "h1", "state_chain": "c1"},
+            [],
+            None,
+            {"alice.aid.com"},
+        )
+    }
+    client._seq_tracker = SeqTracker()
+    client._log = NullLogger()
+    client._log_message_debug = lambda *args, **kwargs: None
+    client._v2_check_fork = AsyncMock()
+    client._v2_verify_state_signature = AsyncMock()
+    client._v2_maybe_trigger_auto_propose = lambda gid: None
+    client._persist_seq = lambda ns: None
+    client._mark_published_seq = lambda ns, seq: None
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(method, params, *, trace=None):
+        calls.append((method, dict(params)))
+        if method == "group.v2.bootstrap":
+            return {
+                "devices": [
+                    {"aid": "alice.aid.com", "device_id": "alice-dev"},
+                    {"aid": "bob.aid.net", "device_id": "bob-dev"},
+                ],
+                "epoch": 1,
+                "member_aids": ["alice.aid.com", "bob.aid.net"],
+                "committed_member_aids": ["alice.aid.com", "bob.aid.net"],
+                "pending_adds": [],
+            }
+        if method == "group.v2.send":
+            envelope = params["envelope"]
+            assert envelope["targets"][0]["aid"] == "bob.aid.net"
+            return {"seq": 8, "message_id": envelope["message_id"]}
+        raise AssertionError(f"unexpected method: {method}")
+
+    async def fake_build_target(dev, *, aid, device_id, role, default_key_source):
+        return {
+            "aid": aid,
+            "device_id": device_id,
+            "role": role,
+            "key_source": default_key_source,
+        }
+
+    def fake_encrypt_group_message(**kwargs):
+        return {
+            "type": "e2ee.group_encrypted",
+            "version": "v2",
+            "message_id": kwargs.get("message_id") or "m-test",
+            "targets": kwargs["targets"],
+        }
+
+    client.call = fake_call
+    client._v2_build_target_from_device = fake_build_target
+    monkeypatch.setattr(encrypt_group_module, "encrypt_group_message", fake_encrypt_group_message)
+
+    result = await client._send_group_encrypted_v2({
+        "group_id": group_id,
+        "payload": {"type": "text", "text": "hello"},
+    })
+
+    assert result["seq"] == 8
+    assert [method for method, _ in calls].count("group.v2.bootstrap") == 1
+    assert [method for method, _ in calls].count("group.v2.send") == 1
 
 
 def test_protected_headers_from_params_accepts_wrapper():
@@ -1883,6 +1975,116 @@ async def test_v2_p2p_pull_continues_pages_and_acks_each_page():
 
 
 @pytest.mark.asyncio
+async def test_v2_p2p_pull_parallel_decrypts_multi_message_page_only():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    envelope = json.dumps({"aad": {"from_device": "sender-device"}})
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"version": "v2", "seq": seq, "message_id": f"m-{seq}", "from_aid": "bob.agentid.pub", "envelope_json": envelope}
+                        for seq in (1, 2)
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    coordinator = client._v2_e2ee_coordinator()
+    parallel_called = False
+
+    async def fake_page(raw_messages):
+        nonlocal parallel_called
+        from aun_core._client.v2_e2ee import _DecryptResult
+
+        parallel_called = True
+        return [
+            _DecryptResult(
+                seq=int(msg["seq"]),
+                msg=msg,
+                envelope=json.loads(msg["envelope_json"]),
+                from_aid=str(msg["from_aid"]),
+                plaintext={"type": "text", "text": f"m-{msg['seq']}"},
+            )
+            for msg in raw_messages
+        ]
+
+    client._transport = _Transport()
+    coordinator._decrypt_p2p_page_parallel = fake_page
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
+
+    assert parallel_called is True
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2]
+    assert result["messages"][0]["payload"] == {"type": "text", "text": "m-1"}
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
+        ("message.v2.ack", {"up_to_seq": 2})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_keeps_single_message_on_serial_path():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    envelope = json.dumps({"aad": {"from_device": "sender-device"}})
+    parallel_called = False
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"version": "v2", "seq": 1, "message_id": "m-1", "from_aid": "bob.agentid.pub", "envelope_json": envelope}
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    async def fake_parallel(raw_messages):
+        nonlocal parallel_called
+        parallel_called = True
+        return []
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": client._aid,
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "m-1"},
+            "encrypted": True,
+        }
+
+    coordinator = client._v2_e2ee_coordinator()
+    client._transport = _Transport()
+    coordinator._decrypt_p2p_page_parallel = fake_parallel
+    client._decrypt_v2_message = fake_decrypt
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
+
+    assert parallel_called is False
+    assert [msg["seq"] for msg in result["messages"]] == [1]
+    assert result["messages"][0]["payload"] == {"type": "text", "text": "m-1"}
+
+
+@pytest.mark.asyncio
 async def test_v2_group_pull_continues_pages_and_acks_each_page():
     client = AUNClient()
     client._state = "connected"
@@ -1954,6 +2156,67 @@ async def test_v2_group_pull_continues_pages_and_acks_each_page():
     assert ack_calls == [
         ("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 2}),
         ("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 3}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_parallel_decrypts_multi_message_page():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+    group_id = "group.agentid.pub/g1"
+    envelope = json.dumps({"aad": {"from_device": "sender-device", "group_id": group_id}, "group_id": group_id})
+    parallel_called = False
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"version": "v2", "seq": seq, "message_id": f"gm-{seq}", "from_aid": "bob.agentid.pub", "group_id": group_id, "envelope_json": envelope}
+                        for seq in (1, 2)
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    async def fake_page(raw_messages, *, expected_group_id=""):
+        nonlocal parallel_called
+        from aun_core._client.v2_e2ee import _DecryptResult
+
+        parallel_called = True
+        assert expected_group_id == group_id
+        return [
+            _DecryptResult(
+                seq=int(msg["seq"]),
+                msg=msg,
+                envelope=json.loads(msg["envelope_json"]),
+                group_id=group_id,
+                from_aid=str(msg["from_aid"]),
+                plaintext={"type": "text", "text": f"gm-{msg['seq']}"},
+            )
+            for msg in raw_messages
+        ]
+
+    client._transport = _Transport()
+    client._v2_e2ee_coordinator()._decrypt_page_parallel = fake_page
+
+    result = await client.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 10})
+
+    assert parallel_called is True
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2]
+    assert result["messages"][0]["group_id"] == group_id
+    assert result["messages"][0]["payload"] == {"type": "text", "text": "gm-1"}
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == [
+        ("group.v2.ack", {"group_id": group_id, "up_to_seq": 2})
     ]
 
 
@@ -2038,6 +2301,58 @@ async def test_v2_group_pull_preserves_explicit_cursor_alias_and_device_slot():
             "slot_id": "sync-slot-a",
         })
     ]
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_max_pages_full_page_keeps_has_more_true():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"gm-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "type": "message",
+                            "payload": {"type": "text", "text": f"gm-{seq}"},
+                        }
+                        for seq in (1, 2)
+                    ],
+                    "latest_message_seq": 0,
+                    "cursor": {"current_seq": 0, "latest_seq": 0},
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("group.pull", {
+        "group_id": "group.agentid.pub/g1",
+        "after_message_seq": 0,
+        "limit": 2,
+        "max_pages": 1,
+        "device_id": "external-device",
+        "slot_id": "external-slot",
+    })
+
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2]
+    assert result["has_more"] is True
+    assert result["latest_seq"] == 2
     assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
 
 
@@ -3438,36 +3753,36 @@ def test_call_rejects_message_slot_context_override():
 def test_build_cert_url_with_cert_fingerprint():
     url = AUNClient._build_cert_url(
         "wss://gateway.example.com/aun",
-        "bob.example.com",
+        "bob1.example.com",
         "sha256:abc",
     )
-    assert url == "https://gateway.example.com/pki/cert/bob.example.com?cert_fingerprint=sha256%3Aabc"
+    assert url == "https://gateway.example.com/pki/cert/bob1.example.com?cert_fingerprint=sha256%3Aabc"
 
 
 def test_thought_selector_validation_requires_context():
     client = AUNClient()
     client._validate_outbound_call("message.thought.put", {
-        "to": "bob.example.com",
+        "to": "bob1.example.com",
         "context": {"type": "run", "id": "run-1"},
     })
 
     with pytest.raises(ValidationError, match="context.type"):
         client._validate_outbound_call("message.thought.put", {
-            "to": "bob.example.com",
+            "to": "bob1.example.com",
         })
 
 
 def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp_path):
-    cert_pem, cert_fp = _make_test_cert("bob.example.com")
+    cert_pem, cert_fp = _make_test_cert("bob1.example.com")
     client = _make_client_with_aid(tmp_path / "aun")
     now = time.time()
-    client._cert_cache[client._cert_cache_key("bob.example.com", cert_fp)] = _CachedPeerCert(
+    client._cert_cache[client._cert_cache_key("bob1.example.com", cert_fp)] = _CachedPeerCert(
         cert_bytes=cert_pem.encode("utf-8"),
         validated_at=now,
         refresh_after=now + _PEER_CERT_CACHE_TTL,
     )
 
-    assert client._get_verified_peer_cert("bob.example.com") == cert_pem
+    assert client._get_verified_peer_cert("bob1.example.com") == cert_pem
 
 
 def test_seq_tracker_state_isolated_between_slots(tmp_path):
@@ -4524,7 +4839,7 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
 
     # 发送 seq=1 的消息（contiguous 会从 0 推进到 1）
     msg = {
-        "message_id": "msg-1",
+        "message_id": "msg-test1",
         "from": "bob.aid.com",
         "to": "alice.aid.com",
         "seq": 1,
@@ -4645,6 +4960,56 @@ async def test_published_message_events_fallback_current_instance_context(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_publish_ordered_message_records_gap_block_counter(tmp_path):
+    client = _make_client_with_aid(tmp_path / "ordered_gap_block_counter")
+    ns = "p2p:alice.agentid.pub"
+
+    published = await client._publish_ordered_message(
+        "message.received",
+        ns,
+        5,
+        {
+            "message_id": "m-gap",
+            "seq": 5,
+            "from": "bob.agentid.pub",
+            "to": "alice.agentid.pub",
+            "payload": {"type": "text"},
+        },
+    )
+
+    assert published is False
+    stats = client._ordered_gap_block_stats[ns]
+    assert stats["count"] == 1
+    assert stats["last_seq"] == 5
+    assert stats["last_contiguous_seq"] == 0
+    assert stats["last_pending_count"] == 1
+
+
+def test_log_message_debug_short_circuits_for_null_logger(tmp_path, monkeypatch):
+    from aun_core.logger import NullLogger
+
+    client = _make_client_with_aid(tmp_path / "message_debug_null_logger")
+    client._log = NullLogger()
+
+    called = False
+
+    def fail_debug_json(value):
+        nonlocal called
+        called = True
+        raise AssertionError("debug json should not run for NullLogger")
+
+    monkeypatch.setattr(client, "_debug_json", fail_debug_json)
+    client._log_message_debug(
+        "server-push",
+        "_raw.message.received",
+        "message.received",
+        {"message_id": "m-1", "payload": {"text": "hello"}},
+    )
+
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_pulled_batch_publishes_internal_gap(tmp_path):
     client = _make_client_with_aid(tmp_path / "pulled_batch_gap")
     ns = "p2p:alice.aid.com"
@@ -4728,6 +5093,8 @@ async def test_p2p_push_ignores_other_slot_context(tmp_path):
 
     assert published == []
     assert not client._decrypt_single_message.called
+    assert client._push_processing_stats["p2p"]["started"] == 1
+    assert client._push_processing_stats["p2p"]["instance_filtered"] == 1
 
 
 @pytest.mark.asyncio
@@ -4775,6 +5142,9 @@ async def test_p2p_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
     assert received[0]["direction"] == "inbound"
     assert received[0]["payload_type"] == "text"
     assert received[0]["protected_headers"] == {"payload_type": "text", "trace_id": "trace-1"}
+    assert client._push_processing_stats["p2p"]["started"] == 1
+    assert client._push_processing_stats["p2p"]["decrypt_ok"] == 1
+    assert client._push_processing_stats["p2p"]["app_published"] == 1
 
 
 @pytest.mark.asyncio
@@ -4853,6 +5223,9 @@ async def test_p2p_raw_encrypted_push_publishes_header_only_undecryptable_when_i
 
     assert received == []
     assert len(undecryptable) == 1
+    assert client._push_processing_stats["p2p"]["started"] == 1
+    assert client._push_processing_stats["p2p"]["decrypt_fail"] == 1
+    assert client._push_processing_stats["p2p"]["undecryptable_published"] == 1
     event = undecryptable[0]
     assert "payload" not in event
     assert event["message_id"] == "m-raw-encrypted"
@@ -4862,6 +5235,44 @@ async def test_p2p_raw_encrypted_push_publishes_header_only_undecryptable_when_i
     assert event["payload_type"] == "text"
     assert event["protected_headers"] == {"payload_type": "text", "trace_id": "trace-1"}
     assert event["_decrypt_stage"] == "push_envelope"
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_push_notification_records_processing_stats(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = _make_client_with_aid(tmp_path / "v2_push_stats")
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._v2_session = object()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_message = AsyncMock(return_value={
+        "message_id": "m-v2",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "payload": {"type": "text", "text": "hello"},
+    })
+
+    received: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: received.append(data))
+
+    await client._on_v2_push_notification({
+        "message_id": "m-v2",
+        "from_aid": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "envelope_json": "{}",
+    })
+
+    assert len(received) == 1
+    assert client._push_processing_stats["p2p"]["started"] == 1
+    assert client._push_processing_stats["p2p"]["decrypt_ok"] == 1
+    assert client._push_processing_stats["p2p"]["app_published"] == 1
 
 
 @pytest.mark.asyncio
@@ -5436,4 +5847,3 @@ async def test_max_attempts_stops_reconnect_on_connect_fail():
 
 
 # ── R3: 批量路径解密失败不应出现在返回结果中 ──────────────────
-

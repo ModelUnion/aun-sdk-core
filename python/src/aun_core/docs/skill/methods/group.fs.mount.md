@@ -1,6 +1,6 @@
 # group.fs.mount
 
-挂载成员数据区。当前只允许挂载到 `/memberdata/{member_ref}`，服务端会把它映射为成员 storage 的 `groupdata/{group_id}`。
+挂载成员数据区。当前只允许挂载到 `/memberdata/{member_ref}`，服务端会把它映射为成员 storage 的 `group_data/{group_aid}`。
 
 ## 调用示例
 

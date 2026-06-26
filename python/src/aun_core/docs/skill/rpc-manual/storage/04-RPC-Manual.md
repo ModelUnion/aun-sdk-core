@@ -91,6 +91,8 @@
 ### ACL / 权限方法
 
 > 统一权限求值顺序（硬顺序）：公开位 → token → ACL（最近祖先前缀）→ 角色 → owner → 拒绝。
+>
+> AID storage 的 `storage.set_acl/remove_acl` 面向具体 AID，当前主要用于写/删除授权；直接读授权不通过 ACL 下发，读访问应使用 `storage.create_share_link` / `storage.get_by_share`，撤销分享使用 `storage.revoke_share_link`。`role:*` 伪主体只允许可信 group 内部门面管理，客户端不得直接对 `group_aid` 空间设置角色 ACL；群自有区 admin 写授权使用 `group.fs.set_acl/remove_acl`。
 
 | 方法 | 说明 |
 |------|------|
@@ -1280,14 +1282,16 @@ fs 目录节点视图。
 
 ## storage.set_acl
 
-授予路径前缀 ACL grant（群内部 admin 或群代理写授权）。支持 `role:<role>` 形式 grantee。ACL 对目录前缀授权，子路径默认继承（最近祖先覆盖）。
+授予路径前缀 ACL grant。普通 AID storage 的 `grantee_aid` 必须是具体 AID，主要用于授予写/删除权限；子路径默认继承（最近祖先覆盖）。读取不通过 AID ACL 直接授权，应用应改用 `storage.create_share_link` 并在需要时用 `storage.revoke_share_link` 撤销。
+
+`role:*` 伪主体只允许可信 group 内部门面写入。客户端不能直接对 `group_aid` 空间调用 `storage.set_acl` 设置 `role:admin`；群自有区角色写授权统一使用 `group.fs.set_acl`。
 
 ### 参数
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
 | `path` | string | 是 | — | 授权路径前缀 |
-| `grantee_aid` | string | 是 | — | 被授权 AID（或 `role:<role>`） |
+| `grantee_aid` | string | 是 | — | 被授权 AID；`role:*` 仅限 group 内部调用 |
 | `perms` | string | 是 | — | 权限位：`r`/`w`/`rw`/`rwx`（`rwx` 含删除） |
 | `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
 | `bucket` | string | 否 | `"default"` | 存储桶 |
@@ -1302,7 +1306,7 @@ ACL 视图。
 
 ## storage.remove_acl
 
-移除路径 ACL 授权。
+移除路径 ACL 授权。对 AID storage，这是撤销写/删除授权的入口；读分享的撤销入口是 `storage.revoke_share_link`。群自有区角色写授权撤销使用 `group.fs.remove_acl`，不要由客户端直接调用 `storage.remove_acl` 操作 `role:*`。
 
 ### 参数
 
@@ -1339,7 +1343,7 @@ ACL 视图。
 
 ## storage.set_visibility
 
-切换对象或目录的公开/私有（软链不支持）。`allow_roles` 替换 `role:` 类 ACL。
+切换对象或目录的公开/私有（软链不支持）。`allow_roles` 是低层兼容字段，不能作为群自有区 admin 写授权入口；群自有区角色写授权必须使用 `group.fs.set_acl/remove_acl`。
 
 ### 参数
 
@@ -1349,7 +1353,7 @@ ACL 视图。
 | `visibility` | string | 是 | — | `public` / `private` |
 | `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
 | `bucket` | string | 否 | `"default"` | 存储桶 |
-| `allow_roles` | array | 否 | — | 允许的角色列表（替换 role ACL） |
+| `allow_roles` | array | 否 | — | 低层兼容字段，仅表示可见性读角色；不能用于群自有区写授权 |
 
 ### 响应
 

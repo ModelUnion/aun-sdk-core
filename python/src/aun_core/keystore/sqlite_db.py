@@ -1300,17 +1300,28 @@ class AIDDatabase:
     # ── Seq Tracker ─────────────────────────────────────────
 
     def save_seq(self, device_id: str, slot_id: str, namespace: str, contiguous_seq: int) -> None:
+        self.save_seqs(device_id, slot_id, {namespace: contiguous_seq})
+
+    def save_seqs(self, device_id: str, slot_id: str, seqs: dict[str, int]) -> None:
+        if not seqs:
+            return
         from ..config import slot_isolation_key
         def _do():
             conn = self._get_conn()
             now = _now_ms()
             slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
             slot_full = slot_id or ""
-            conn.execute(
+            rows = [
+                (device_id, slot_key, slot_full, str(namespace), int(contiguous_seq), now)
+                for namespace, contiguous_seq in seqs.items()
+            ]
+            if not rows:
+                return
+            conn.executemany(
                 "INSERT INTO seq_tracker (device_id, slot_id, slot_id_full, namespace, contiguous_seq, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id, namespace) "
                 "DO UPDATE SET slot_id_full = excluded.slot_id_full, contiguous_seq = excluded.contiguous_seq, updated_at = excluded.updated_at",
-                (device_id, slot_key, slot_full, namespace, contiguous_seq, now),
+                rows,
             )
             conn.commit()
         self._retry_on_locked(_do)

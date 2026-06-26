@@ -395,17 +395,17 @@ func TestStorageVFSFSMutationsAndSymlinkContracts(t *testing.T) {
 
 func TestStorageVFSCopySupportsDstOwner(t *testing.T) {
 	ctx := context.Background()
-	client := &fakeStorageClient{aid: "bob.agentid.pub"}
+	client := &fakeStorageClient{aid: "bob1.agentid.pub"}
 	storage := NewStorageVFS(client)
 
-	copied, err := storage.Copy(ctx, "/docs/a.txt", "/inbox/a.txt", &CopyOptions{Owner: "alice.agentid.pub", DstOwner: "bob.agentid.pub"})
+	copied, err := storage.Copy(ctx, "/docs/a.txt", "/inbox/a.txt", &CopyOptions{Owner: "alice.agentid.pub", DstOwner: "bob1.agentid.pub"})
 	if err != nil {
 		t.Fatalf("Copy 失败: %v", err)
 	}
-	if copied.Owner != "bob.agentid.pub" {
+	if copied.Owner != "bob1.agentid.pub" {
 		t.Fatalf("目标 owner 不正确: %#v", copied)
 	}
-	if client.calls[0].params["owner_aid"] != "alice.agentid.pub" || client.calls[0].params["dst_owner_aid"] != "bob.agentid.pub" {
+	if client.calls[0].params["owner_aid"] != "alice.agentid.pub" || client.calls[0].params["dst_owner_aid"] != "bob1.agentid.pub" {
 		t.Fatalf("跨 owner copy 参数不正确: %#v", client.calls[0].params)
 	}
 }
@@ -451,7 +451,7 @@ func TestStorageVFSAclTokenAndUsage(t *testing.T) {
 	storage := NewStorageVFS(client)
 
 	maxUses := 2
-	if _, err := storage.SetACL(ctx, "/docs", SetACLOptions{GranteeAID: "bob.agentid.pub", Perms: "r", MaxUses: &maxUses}); err != nil {
+	if _, err := storage.SetACL(ctx, "/docs", SetACLOptions{GranteeAID: "bob1.agentid.pub", Perms: "r", MaxUses: &maxUses}); err != nil {
 		t.Fatalf("SetACL 失败: %v", err)
 	}
 	if _, err := storage.SetVisibility(ctx, "/docs/a.txt", VisibilityOptions{Visibility: "private", AllowRoles: []string{"admin"}}); err != nil {
@@ -475,7 +475,7 @@ func TestStorageVFSAclTokenAndUsage(t *testing.T) {
 	if usage.AvailBytes != 6 {
 		t.Fatalf("AvailBytes 不正确: %d", usage.AvailBytes)
 	}
-	if client.calls[0].params["grantee_aid"] != "bob.agentid.pub" || client.calls[0].params["max_uses"] != 2 {
+	if client.calls[0].params["grantee_aid"] != "bob1.agentid.pub" || client.calls[0].params["max_uses"] != 2 {
 		t.Fatalf("ACL 参数不正确: %#v", client.calls[0].params)
 	}
 	if client.calls[1].method != "storage.set_visibility" || client.calls[1].params["allow_roles"] == nil {

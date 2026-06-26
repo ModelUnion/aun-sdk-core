@@ -1,6 +1,6 @@
 # group.fs.mkdir
 
-创建群文件系统目录。群自有区写入使用 `group_aid` 身份；`memberdata/{member_ref}` 写入映射到对应成员的 `groupdata/{group_id}`，SDK 不拼接真实 storage 路径。
+创建群文件系统目录。群自有区写入使用 `group_aid` 身份；`memberdata/{member_ref}` 写入映射到对应成员的 `group_data/{group_aid}`，SDK 不拼接真实 storage 路径。
 
 ## 调用示例
 

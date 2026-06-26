@@ -29,7 +29,7 @@ function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: Rp
 describe('RpcPipeline 组件边界', () => {
   it('preflight 拒绝未连接和 internal-only 方法', () => {
     const disconnected = createPipeline({ _state: 'disconnected' }).pipeline;
-    expect(() => disconnected.preflight('message.send', { to: 'bob.agentid.pub' })).toThrow(ConnectionError);
+    expect(() => disconnected.preflight('message.send', { to: 'bob1.agentid.pub' })).toThrow(ConnectionError);
 
     const { pipeline } = createPipeline();
     expect(() => pipeline.preflight('auth.connect', {})).toThrow(PermissionError);
@@ -38,7 +38,7 @@ describe('RpcPipeline 组件边界', () => {
   it('preflight 合并 protected_headers 并规范化 outbound payload，且不修改调用方 params', () => {
     const { pipeline } = createPipeline();
     const original = {
-      to: 'bob.agentid.pub',
+      to: 'bob1.agentid.pub',
       content: { text: 'hello' },
       protected_headers: { priority: 'urgent' },
     };
@@ -84,6 +84,58 @@ describe('RpcPipeline 组件边界', () => {
       device_id: 'device-a',
       slot_id: 'slot-a',
     });
+  });
+
+  it('message.pull 后处理推进 seq 时应记 pending persist，而不是直接强刷', () => {
+    const contigByNs = new Map<string, number>([['p2p:alice.agentid.pub', 1]]);
+    const { client, pipeline } = createPipeline({
+      _persistSeq: vi.fn(),
+      _saveSeqTrackerState: vi.fn(),
+      _seqTracker: {
+        getContiguousSeq: vi.fn((ns: string) => contigByNs.get(ns) ?? 0),
+        onPullResult: vi.fn((ns: string) => {
+          contigByNs.set(ns, 4);
+        }),
+        forceContiguousSeq: vi.fn((ns: string, seq: number) => {
+          contigByNs.set(ns, seq);
+        }),
+      },
+    });
+
+    const result: Record<string, unknown> = {
+      messages: [{ seq: 2 }, { seq: 4 }],
+    };
+    (pipeline as any).postprocessMessagePull({ after_seq: 1 }, result);
+
+    expect(client._persistSeq).toHaveBeenCalledWith('p2p:alice.agentid.pub');
+    expect(client._saveSeqTrackerState).not.toHaveBeenCalled();
+    expect(result._contig_before).toBe(1);
+  });
+
+  it('group.pull 后处理用 retention floor 推进 seq 时应记 pending persist，而不是直接强刷', () => {
+    const groupNs = 'group:group.agentid.pub/g1';
+    const contigByNs = new Map<string, number>([[groupNs, 2]]);
+    const { client, pipeline } = createPipeline({
+      _persistSeq: vi.fn(),
+      _saveSeqTrackerState: vi.fn(),
+      _seqTracker: {
+        getContiguousSeq: vi.fn((ns: string) => contigByNs.get(ns) ?? 0),
+        onPullResult: vi.fn(),
+        forceContiguousSeq: vi.fn((ns: string, seq: number) => {
+          contigByNs.set(ns, seq);
+        }),
+      },
+    });
+
+    const result: Record<string, unknown> = {
+      messages: [],
+      cursor: { current_seq: 5 },
+    };
+    (pipeline as any).postprocessGroupPull({ group_id: 'group.agentid.pub/g1', after_message_seq: 2 }, result);
+
+    expect(client._persistSeq).toHaveBeenCalledWith(groupNs);
+    expect(client._saveSeqTrackerState).not.toHaveBeenCalled();
+    expect(result._contig_before).toBe(2);
   });
 
   it('applyClientSignature 对明文 echo send 跳过签名，对普通关键方法调用签名函数', async () => {

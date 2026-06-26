@@ -43,7 +43,7 @@ func TestMessageFacadeRPCMappingsAndNilFiltering(t *testing.T) {
 		method string
 	}{
 		{"send", func() error {
-			_, err := message.Send(ctx, map[string]any{"to": "bob.agentid.pub", "payload": map[string]any{"text": "hi"}, "drop": nil})
+			_, err := message.Send(ctx, map[string]any{"to": "bob1.agentid.pub", "payload": map[string]any{"text": "hi"}, "drop": nil})
 			return err
 		}, "message.send"},
 		{"pull", func() error {
@@ -59,15 +59,15 @@ func TestMessageFacadeRPCMappingsAndNilFiltering(t *testing.T) {
 			return err
 		}, "message.recall"},
 		{"query_online", func() error {
-			_, err := message.QueryOnline(ctx, map[string]any{"aid": "bob.agentid.pub"})
+			_, err := message.QueryOnline(ctx, map[string]any{"aid": "bob1.agentid.pub"})
 			return err
 		}, "message.query_online"},
 		{"thought_put", func() error {
-			_, err := message.Thought().Put(ctx, map[string]any{"to": "bob.agentid.pub", "context": map[string]any{"type": "chat", "id": "c1"}, "payload": map[string]any{"text": "t"}})
+			_, err := message.Thought().Put(ctx, map[string]any{"to": "bob1.agentid.pub", "context": map[string]any{"type": "chat", "id": "c1"}, "payload": map[string]any{"text": "t"}})
 			return err
 		}, "message.thought.put"},
 		{"thought_get", func() error {
-			_, err := message.Thought().Get(ctx, map[string]any{"sender_aid": "bob.agentid.pub", "context": map[string]any{"type": "chat", "id": "c1"}})
+			_, err := message.Thought().Get(ctx, map[string]any{"sender_aid": "bob1.agentid.pub", "context": map[string]any{"type": "chat", "id": "c1"}})
 			return err
 		}, "message.thought.get"},
 	}
@@ -121,22 +121,22 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 		{"get_stats", func() error { _, err := group.GetStats(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_stats"},
 		{"info", func() error { _, err := group.Info(ctx, map[string]any{"group_id": "g1"}); return err }, "group.info"},
 		{"add_member", func() error {
-			_, err := group.AddMember(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub"})
+			_, err := group.AddMember(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
 		}, "group.add_member"},
 		{"get_members", func() error { _, err := group.GetMembers(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_members"},
 		{"get_online_members", func() error { _, err := group.GetOnlineMembers(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_online_members"},
 		{"kick", func() error {
-			_, err := group.Kick(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub"})
+			_, err := group.Kick(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
 		}, "group.kick"},
 		{"leave", func() error { _, err := group.Leave(ctx, map[string]any{"group_id": "g1"}); return err }, "group.leave"},
 		{"set_role", func() error {
-			_, err := group.SetRole(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub", "role": "admin"})
+			_, err := group.SetRole(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub", "role": "admin"})
 			return err
 		}, "group.set_role"},
 		{"transfer_owner", func() error {
-			_, err := group.TransferOwner(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub"})
+			_, err := group.TransferOwner(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
 		}, "group.transfer_owner"},
 		{"complete_transfer", func() error {
@@ -144,11 +144,11 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			return err
 		}, "group.complete_transfer"},
 		{"ban", func() error {
-			_, err := group.Ban(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub"})
+			_, err := group.Ban(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
 		}, "group.ban"},
 		{"unban", func() error {
-			_, err := group.Unban(ctx, map[string]any{"group_id": "g1", "aid": "bob.agentid.pub"})
+			_, err := group.Unban(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
 		}, "group.unban"},
 		{"get_banlist", func() error { _, err := group.GetBanlist(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_banlist"},
@@ -335,7 +335,7 @@ func TestMessageFacadeSendUsesClientCallPipeline(t *testing.T) {
 	}
 
 	if _, err := client.Message().Send(ctx, map[string]any{
-		"to":      "bob.example.com",
+		"to":      "bob1.example.com",
 		"content": map[string]any{"text": "hello"},
 		"encrypt": false,
 		"drop":    nil,

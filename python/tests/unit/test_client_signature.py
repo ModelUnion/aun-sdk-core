@@ -110,6 +110,7 @@ class TestSignedMethodsCoverage:
 
     GROUP_FS_SIGNED_METHODS = [
         "group.fs.mkdir", "group.fs.rm", "group.fs.cp", "group.fs.mv",
+        "group.fs.set_acl", "group.fs.remove_acl",
         "group.fs.mount", "group.fs.umount",
         "group.fs.check_upload", "group.fs.create_upload_session",
         "group.fs.complete_upload", "group.fs.create_download_ticket",
@@ -141,6 +142,7 @@ class TestSignedMethodsCoverage:
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
         "group.transfer_owner", "group.complete_transfer", "group.bind_group_aid",
+        "group.renew_group_aid",
         "group.review_join_request",
         "group.batch_review_join_request",
         "group.request_join", "group.use_invite_code",

@@ -95,6 +95,17 @@ class GroupFSVFS:
 
     def _bearer_headers(self) -> dict[str, str]:
         token = str(getattr(self._client, "access_token", "") or "").strip()
+        if not token:
+            identity = getattr(self._client, "_identity", None)
+            if isinstance(identity, dict):
+                token = str(identity.get("access_token") or "").strip()
+        if not token:
+            for attr in ("_session_params", "_sessionParams"):
+                session_params = getattr(self._client, attr, None)
+                if isinstance(session_params, dict):
+                    token = str(session_params.get("access_token") or "").strip()
+                    if token:
+                        break
         return {"Authorization": f"Bearer {token}"} if token else {}
 
     async def ls(self, path: str, **options: Any) -> Any:
@@ -111,6 +122,33 @@ class GroupFSVFS:
 
     async def mkdir(self, path: str, *, parents: bool = False, **options: Any) -> Any:
         return await self._call("group.fs.mkdir", self._params(path=path, parents=parents, **options), path=path)
+
+    async def set_acl(
+        self,
+        path: str,
+        *,
+        grantee_aid: str = "role:admin",
+        perms: str = "rwx",
+        **options: Any,
+    ) -> Any:
+        return await self._call(
+            "group.fs.set_acl",
+            self._params(path=path, grantee_aid=grantee_aid, perms=perms, **options),
+            path=path,
+        )
+
+    async def remove_acl(
+        self,
+        path: str,
+        *,
+        grantee_aid: str = "role:admin",
+        **options: Any,
+    ) -> Any:
+        return await self._call(
+            "group.fs.remove_acl",
+            self._params(path=path, grantee_aid=grantee_aid, **options),
+            path=path,
+        )
 
     async def rm(self, path: str, *, recursive: bool = False, force: bool = False, **options: Any) -> Any:
         return await self._call(

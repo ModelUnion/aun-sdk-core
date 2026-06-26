@@ -318,6 +318,13 @@ class LocalTokenStore:
         with lock:
             self._get_db(aid).save_seq(device_id, slot_id, namespace, contiguous_seq)
 
+    def save_seqs(self, aid: str, device_id: str, slot_id: str, seqs: dict[str, int]) -> None:
+        if not seqs:
+            return
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            self._get_db(aid).save_seqs(device_id, slot_id, seqs)
+
     def load_seq(self, aid: str, device_id: str, slot_id: str, namespace: str) -> int:
         lock = self._get_metadata_lock(aid)
         with lock:

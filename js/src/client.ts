@@ -8,6 +8,7 @@
 import { createConfig, getDeviceId, normalizeSlotId, type AUNConfig } from './config.js';
 import { EventDispatcher, type EventPayload, type EventHandler, type Subscription } from './events.js';
 import { normalizeGroupId } from './group-id.js';
+import { validateAIDFormat, validateGroupIDFormat } from './validators.js';
 import { GatewayDiscovery } from './discovery.js';
 import { AIDStore } from './aid-store.js';
 import { RPCTransport } from './transport.js';
@@ -61,6 +62,7 @@ import {
   type IdentityRecord,
   type JsonObject,
   type JsonValue,
+  type KeyPairRecord,
   type RpcParams,
   type RpcResult,
 } from './types.js';
@@ -253,6 +255,7 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'message.thought.put', 'group.thought.put',
   'group.add_member', 'group.bind_group_aid', 'group.complete_transfer',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
   'group.fs.check_upload', 'group.fs.create_upload_session',
   'group.fs.complete_upload', 'group.fs.create_download_ticket',
@@ -285,6 +288,7 @@ const SIGNED_METHODS = new Set([
   'message.thought.put',
   'group.set_settings',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
+  'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
   'group.fs.check_upload', 'group.fs.create_upload_session',
   'group.fs.complete_upload', 'group.fs.create_download_ticket',
@@ -1337,7 +1341,33 @@ export class AUNClient {
       throw new ValidationError('bindGroupAid requires aidStore');
     }
 
-    const keyPair = await new CryptoProvider().generateIdentity();
+    const groupId = String(params.group_id ?? '').trim();
+    const keystore = (store as any)._keystore;
+    let keyPair: KeyPairRecord | null = null;
+
+    // 优先复用 pending 槽位中已暂存的待绑定密钥（崩溃/重试幂等）
+    if (groupId && keystore && typeof keystore.loadPendingGroupBind === 'function') {
+      keyPair = await keystore.loadPendingGroupBind(groupId);
+    }
+
+    if (!keyPair || !keyPair.public_key_der_b64 || !keyPair.private_key_pem) {
+      // 未命中 pending，生成新密钥
+      const generated = await new CryptoProvider().generateIdentity();
+      keyPair = {
+        private_key_pem: generated.private_key_pem,
+        public_key_der_b64: generated.public_key_der_b64,
+        curve: generated.curve,
+      };
+      // 发 RPC 前先落盘暂存，确保崩溃后重试能复用同一密钥
+      if (groupId && keystore && typeof keystore.savePendingGroupBind === 'function') {
+        await keystore.savePendingGroupBind(groupId, keyPair);
+      }
+    }
+
+    if (!keyPair) {
+      throw new ValidationError('bindGroupAid: failed to generate or load key pair');
+    }
+
     const payload: RpcParams = { ...params };
     payload.public_key = keyPair.public_key_der_b64;
     payload.curve = keyPair.curve;
@@ -1360,6 +1390,101 @@ export class AUNClient {
     });
     if (!imported.ok) {
       throw new ValidationError(imported.error.message);
+    }
+    // 落盘成功，清除 pending 槽位
+    if (groupId && keystore && typeof keystore.clearPendingGroupBind === 'function') {
+      await keystore.clearPendingGroupBind(groupId);
+    }
+    return result;
+  }
+
+  async renewGroupAid(params: RpcParams = {}, options: BindGroupAidOptions = {}): Promise<RpcResult> {
+    if (!isJsonObject(params)) {
+      throw new ValidationError('renewGroupAid params must be an object');
+    }
+    const store = options.aidStore;
+    if (!store) {
+      throw new ValidationError('renewGroupAid requires aidStore');
+    }
+    const groupId = String(params.group_id ?? '').trim();
+    if (!groupId) {
+      throw new ValidationError('renewGroupAid requires group_id');
+    }
+    let groupAid = String(params.group_aid ?? '').trim();
+    if (!groupAid) {
+      const info = await this.call('group.get', { group_id: groupId });
+      const infoMap = isJsonObject(info) ? info : {};
+      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
+      groupAid = String(grp.group_aid ?? '').trim();
+    }
+    if (!groupAid) {
+      throw new ValidationError('renewGroupAid: unable to determine group_aid');
+    }
+
+    const loaded = await store.load(groupAid);
+    if (!loaded.ok || !loaded.data) {
+      throw new ValidationError(`renewGroupAid: group_aid identity not found: ${groupAid}`);
+    }
+    const oldAidObj = loaded.data.aid;
+    if (!oldAidObj.isPrivateKeyValid() || !oldAidObj.privateKeyPem) {
+      throw new ValidationError(`renewGroupAid: group_aid has no private key: ${groupAid}`);
+    }
+    const oldPublicKey = oldAidObj.publicKey;
+    if (!oldPublicKey) {
+      throw new ValidationError(`renewGroupAid: cannot determine old public key for ${groupAid}`);
+    }
+
+    const newKeyPair = await new CryptoProvider().generateIdentity();
+    const newPublicKey = newKeyPair.public_key_der_b64;
+    const newPrivateKey = newKeyPair.private_key_pem;
+    const curve = newKeyPair.curve || 'P-256';
+    if (!newPublicKey || !newPrivateKey) {
+      throw new ValidationError('renewGroupAid: generated incomplete group identity');
+    }
+
+    const nonce = globalThis.crypto.randomUUID().replace(/-/g, '');
+    const issuedMs = Date.now();
+    const oldHash = bytesToHex(new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(oldPublicKey))));
+    const newHash = bytesToHex(new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(newPublicKey))));
+    const canonical = [
+      'aun-group-aid-renew-v1',
+      groupId.toLowerCase(),
+      groupAid.toLowerCase(),
+      oldHash,
+      newHash,
+      nonce,
+      String(issuedMs),
+    ].join('|');
+    const signed = await oldAidObj.sign(canonical);
+    if (!signed.ok) {
+      throw new ValidationError(`renewGroupAid: sign failed: ${signed.error.message}`);
+    }
+
+    const payload: RpcParams = { ...params };
+    payload.group_aid = groupAid;
+    payload.old_public_key = oldPublicKey;
+    payload.new_public_key = newPublicKey;
+    payload.curve = curve;
+    payload.renew_proof = { nonce, issued_ms: issuedMs, signature: signed.data.signature };
+
+    const result = await this.call('group.renew_group_aid', payload);
+    const resultMap = isJsonObject(result) ? result : {};
+    const group = isJsonObject(resultMap.group) ? resultMap.group : {};
+    const aidCert = isJsonObject(resultMap.aid_cert) ? resultMap.aid_cert : {};
+    const returnedGroupAid = String(group.group_aid ?? resultMap.group_aid ?? groupAid).trim();
+    const certPem = String(aidCert.cert ?? aidCert.cert_pem ?? resultMap.cert ?? resultMap.cert_pem ?? '').trim();
+    if (!returnedGroupAid || !certPem) {
+      throw new ValidationError('renewGroupAid response missing group.group_aid or aid_cert.cert');
+    }
+
+    const imported = await store.importGroupIdentity(returnedGroupAid, {
+      private_key_pem: newPrivateKey,
+      public_key_der_b64: newPublicKey,
+      curve,
+      cert_pem: certPem,
+    });
+    if (!imported.ok) {
+      throw new ValidationError(`renewGroupAid failed to persist group identity: ${imported.error.message}`);
     }
     return result;
   }
@@ -1543,6 +1668,8 @@ export class AUNClient {
 
     if (targetAid) {
       const eventMethod = AUNClient._validateNotifyEventMethod(method);
+      // 校验目标 AID 格式（拒绝 __system__ 等非法格式）
+      validateAIDFormat(targetAid, 'notify.to');
       const target: JsonObject = { type: 'aid', aid: targetAid };
       if (targetDeviceId) target.device_id = targetDeviceId;
       if (targetSlotId) target.slot_id = targetSlotId;
@@ -1557,6 +1684,8 @@ export class AUNClient {
 
     if (targetGroupId) {
       const eventMethod = AUNClient._validateNotifyEventMethod(method);
+      // 校验目标 Group ID 格式
+      validateGroupIDFormat(targetGroupId, 'notify.group_id');
       const normalizedGroupId = normalizeGroupId(targetGroupId);
       if (!normalizedGroupId) {
         throw new ValidationError('group_id is required for group notify');
@@ -1786,9 +1915,13 @@ export class AUNClient {
     this._v2E2EE.deleteBootstrapCacheEntry(`group:${groupId}`);
     this._v2GroupSecurityLevels.delete(groupId);
     this._v2StateChains.delete(groupId);
-    this._seqTracker.removeNamespace(`group:${groupId}`);
-    this._seqTracker.removeNamespace(`group_event:${groupId}`);
-    this._saveSeqTrackerState();
+    const groupNs = `group:${groupId}`;
+    const groupEventNs = `group_event:${groupId}`;
+    this._seqTracker.removeNamespace(groupNs);
+    this._seqTracker.removeNamespace(groupEventNs);
+    this._persistRepairedSeq(groupNs);
+    this._persistRepairedSeq(groupEventNs);
+    void this._saveSeqTrackerState();
 
     // 2. 清理补洞去重缓存中的相关条目
     for (const key of this._gapFillDone.keys()) {
@@ -1798,10 +1931,10 @@ export class AUNClient {
     }
 
     // 3. 清理推送 seq 去重缓存
-    this._pushedSeqs.delete(`group:${groupId}`);
-    this._pushedSeqs.delete(`group_event:${groupId}`);
-    this._pendingOrderedMsgs.delete(`group:${groupId}`);
-    this._pendingOrderedMsgs.delete(`group_event:${groupId}`);
+    this._pushedSeqs.delete(groupNs);
+    this._pushedSeqs.delete(groupEventNs);
+    this._pendingOrderedMsgs.delete(groupNs);
+    this._pendingOrderedMsgs.delete(groupEventNs);
 
     this._clientLog.info(`cleanup dissolved group ${groupId}  local state`);
   }
@@ -2690,6 +2823,7 @@ export class AUNClient {
   }
 
   private _resetSeqTrackingState(): void {
+    void this._saveSeqTrackerState();
     this._resetV2IdentityRuntime();
     this._seqTracker = new SeqTracker();
     this._seqTrackerContext = null;
@@ -2710,6 +2844,7 @@ export class AUNClient {
   private _refreshSeqTrackerContext(): void {
     const nextContext = this._currentSeqTrackerContext();
     if (nextContext === this._seqTrackerContext) return;
+    void this._saveSeqTrackerState();
     this._seqTracker = new SeqTracker();
     this._gapFillDone.clear();
     this._pushedSeqs.clear();
@@ -2727,8 +2862,12 @@ export class AUNClient {
   }
 
   /** 将 SeqTracker 状态保存到 keystore */
-  private _saveSeqTrackerState(): void {
+  private _saveSeqTrackerState(): Promise<void> {
     return this._delivery.saveSeqTrackerState();
+  }
+
+  private _persistSeq(ns: string, forceSeq?: number): void {
+    return this._delivery.persistSeq(ns, forceSeq);
   }
 
   private _persistRepairedSeq(ns: string): void {

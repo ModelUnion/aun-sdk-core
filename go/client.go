@@ -492,27 +492,30 @@ var nonIdempotentMethods = map[string]bool{
 	"group.thought.put":                true,
 	"group.add_member":                 true,
 	"group.bind_group_aid":             true,
+	"group.renew_group_aid":            true,
 	"group.complete_transfer":          true,
 	"group.fs.mkdir":                   true,
 	"group.fs.rm":                      true,
 	"group.fs.cp":                      true,
 	"group.fs.mv":                      true,
+	"group.fs.set_acl":                 true,
+	"group.fs.remove_acl":              true,
 	"group.fs.mount":                   true,
 	"group.fs.umount":                  true,
 	"group.fs.check_upload":            true,
 	"group.fs.create_upload_session":   true,
 	"group.fs.complete_upload":         true,
 	"group.fs.create_download_ticket":  true,
-	"collab.create":           true,
-	"collab.commit":           true,
-	"collab.clone":            true,
-	"collab.prune":            true,
-	"collab.revert":           true,
-	"collab.unregister":       true,
-	"collab.tag.create":       true,
-	"collab.tag.restore":      true,
-	"collab.tag.rm":           true,
-	"collab.tag.prune":        true,
+	"collab.create":                    true,
+	"collab.commit":                    true,
+	"collab.clone":                     true,
+	"collab.prune":                     true,
+	"collab.revert":                    true,
+	"collab.unregister":                true,
+	"collab.tag.create":                true,
+	"collab.tag.restore":               true,
+	"collab.tag.rm":                    true,
+	"collab.tag.prune":                 true,
 }
 
 // cachedPeerCert 缓存的对端证书条目
@@ -593,8 +596,15 @@ type AUNClient struct {
 	defaultConnectDeliveryMode map[string]any
 
 	// 消息序列号跟踪器（群消息 + P2P 空洞检测）
-	seqTracker        *SeqTracker
-	seqTrackerContext string
+	seqTracker               *SeqTracker
+	seqTrackerContext        string
+	seqTrackerPersistMu      sync.Mutex
+	seqTrackerPendingPersist map[string]int
+	seqTrackerPendingContext string
+	seqTrackerPendingAid     string
+	seqTrackerPendingDevice  string
+	seqTrackerPendingSlot    string
+	seqTrackerFlushTimer     *time.Timer
 
 	// 补洞去重：已完成/进行中的 key 集合，防止重复 pull 同一区间
 	gapFillDone   map[string]bool
@@ -742,6 +752,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		connectDeliveryMode:          copyMapShallow(connectDeliveryMode),
 		defaultConnectDeliveryMode:   copyMapShallow(connectDeliveryMode),
 		seqTracker:                   NewSeqTracker(),
+		seqTrackerPendingPersist:     make(map[string]int),
 		gapFillDone:                  make(map[string]bool),
 		pushedSeqs:                   make(map[string]map[int]bool),
 		pendingOrderedMsgs:           make(map[string]map[int]pendingOrderedMessage),
@@ -1341,6 +1352,8 @@ func (c *AUNClient) CreateGroup(ctx context.Context, params map[string]any) (any
 }
 
 // BindGroupAID 是 group.bind_group_aid 的高层编排：为匿名群升级生成 group_aid 密钥并导入本地身份。
+// 幂等：首次生成的 group_aid 密钥在 import 落盘前先以 group_id 暂存到 keystore pending 槽位。
+// 若 import 前崩溃，重试时复用同一密钥（不重新生成），服务端据此幂等返回同证书。
 func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (any, error) {
 	store, err := c.openGroupIdentityAIDStore("BindGroupAID")
 	if err != nil {
@@ -1349,15 +1362,45 @@ func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (an
 	defer store.Close()
 
 	payload := copyRpcParams(params)
-	keyPair, err := (&CryptoProvider{}).GenerateIdentity()
-	if err != nil {
-		return nil, err
+	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+
+	// 优先复用 pending 槽位中已暂存的待绑定密钥（崩溃/重试幂等）
+	keystore := store.keyStore
+	var keyPair map[string]any
+	var publicKey, privateKey, curve string
+
+	pending, loadErr := keystore.LoadPendingGroupBind(groupID)
+	if loadErr == nil && pending != nil {
+		publicKey = strings.TrimSpace(authGetStr(pending, "public_key_der_b64"))
+		privateKey = strings.TrimSpace(authGetStr(pending, "private_key_pem"))
+		curve = strings.TrimSpace(authGetStrDefault(pending, "curve", "P-256"))
 	}
-	publicKey := strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64"))
-	curve := strings.TrimSpace(authGetStrDefault(keyPair, "curve", "P-256"))
-	if publicKey == "" {
-		return nil, NewValidationError("generated group identity missing public key")
+
+	if publicKey == "" || privateKey == "" {
+		// 未命中 pending，生成新密钥
+		keyPair, err = (&CryptoProvider{}).GenerateIdentity()
+		if err != nil {
+			return nil, err
+		}
+		publicKey = strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64"))
+		privateKey = strings.TrimSpace(authGetStr(keyPair, "private_key_pem"))
+		curve = strings.TrimSpace(authGetStrDefault(keyPair, "curve", "P-256"))
+		if publicKey == "" || privateKey == "" {
+			return nil, NewValidationError("generated group identity missing key pair")
+		}
+		// 发 RPC 前先落盘暂存，确保崩溃后重试能复用同一密钥
+		if groupID != "" {
+			saveErr := keystore.SavePendingGroupBind(groupID, map[string]any{
+				"public_key_der_b64": publicKey,
+				"private_key_pem":    privateKey,
+				"curve":              curve,
+			})
+			if saveErr != nil {
+				return nil, fmt.Errorf("BindGroupAID: 暂存密钥失败: %w", saveErr)
+			}
+		}
 	}
+
 	payload["public_key"] = publicKey
 	payload["curve"] = curve
 
@@ -1369,9 +1412,146 @@ func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (an
 	if err != nil {
 		return nil, err
 	}
+
+	// 证书公钥校验：确保服务端返回的证书公钥 == 本地公钥
+	if err := verifyCertPublicKeyMatch(certPEM, publicKey, "BindGroupAID"); err != nil {
+		return nil, err
+	}
+
 	imported := store.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
-		PrivateKeyPEM:   strings.TrimSpace(authGetStr(keyPair, "private_key_pem")),
+		PrivateKeyPEM:   privateKey,
 		PublicKeyDerB64: publicKey,
+		Curve:           curve,
+		CertPEM:         certPEM,
+	})
+	if !imported.Ok {
+		return nil, NewValidationError(imported.Error.Message)
+	}
+	// 落盘成功，清除 pending 槽位
+	if groupID != "" {
+		_ = keystore.ClearPendingGroupBind(groupID)
+	}
+	return result, nil
+}
+
+// RenewGroupAID 显式轮换 group_aid 密钥：用本地旧 group_aid 私钥签名授权，生成新密钥替换。
+// 与 BindGroupAID 的区别：bind 只首次补齐证书（幂等复用密钥），renew 才更换密钥。
+// 本地必须已持有旧 group_aid 私钥，否则无法签名授权。
+func (c *AUNClient) RenewGroupAID(ctx context.Context, params map[string]any) (any, error) {
+	store, err := c.openGroupIdentityAIDStore("RenewGroupAID")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	payload := copyRpcParams(params)
+	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+	if groupID == "" {
+		return nil, NewValidationError("RenewGroupAID requires group_id")
+	}
+
+	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
+	if groupAID == "" {
+		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		if infoErr != nil {
+			return nil, infoErr
+		}
+		if infoMap, ok := info.(map[string]any); ok {
+			grp := infoMap
+			if inner, ok := infoMap["group"].(map[string]any); ok {
+				grp = inner
+			}
+			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+		}
+	}
+	if groupAID == "" {
+		return nil, NewValidationError("RenewGroupAID: unable to determine group_aid")
+	}
+
+	// 加载旧 group_aid 私钥（用于签名授权轮换）
+	loaded := store.Load(groupAID)
+	if !loaded.Ok || loaded.Data.AID == nil {
+		return nil, NewValidationError(fmt.Sprintf("RenewGroupAID: group_aid identity not found: %s", groupAID))
+	}
+	oldAIDObj := loaded.Data.AID
+	if !oldAIDObj.IsPrivateKeyValid() || strings.TrimSpace(oldAIDObj.PrivateKeyPem) == "" {
+		return nil, NewValidationError(fmt.Sprintf("RenewGroupAID: group_aid has no private key: %s", groupAID))
+	}
+	oldPublicKey := strings.TrimSpace(oldAIDObj.PublicKey)
+	if oldPublicKey == "" {
+		return nil, NewValidationError(fmt.Sprintf("RenewGroupAID: cannot determine old public key for %s", groupAID))
+	}
+
+	// 生成新密钥
+	newKeyPair, err := (&CryptoProvider{}).GenerateIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("RenewGroupAID: 生成新密钥失败: %w", err)
+	}
+	newPublicKey := strings.TrimSpace(authGetStr(newKeyPair, "public_key_der_b64"))
+	newPrivateKey := strings.TrimSpace(authGetStr(newKeyPair, "private_key_pem"))
+	curve := strings.TrimSpace(authGetStrDefault(newKeyPair, "curve", "P-256"))
+	if newPublicKey == "" || newPrivateKey == "" {
+		return nil, NewValidationError("RenewGroupAID: generated incomplete group identity")
+	}
+
+	// 用旧私钥对 canonical payload 签名
+	nonceBytes := make([]byte, 16)
+	if _, rerr := cryptorand.Read(nonceBytes); rerr != nil {
+		return nil, fmt.Errorf("RenewGroupAID: nonce generation failed: %w", rerr)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	issuedMs := time.Now().UnixMilli()
+
+	oldHash := fmt.Sprintf("%x", sha256.Sum256([]byte(oldPublicKey)))
+	newHash := fmt.Sprintf("%x", sha256.Sum256([]byte(newPublicKey)))
+
+	canonical := strings.Join([]string{
+		"aun-group-aid-renew-v1",
+		strings.ToLower(groupID),
+		strings.ToLower(groupAID),
+		oldHash,
+		newHash,
+		nonce,
+		fmt.Sprintf("%d", issuedMs),
+	}, "|")
+
+	signature, serr := oldAIDObj.Sign([]byte(canonical))
+	if serr != nil {
+		return nil, fmt.Errorf("RenewGroupAID: sign failed: %w", serr)
+	}
+
+	payload["group_aid"] = groupAID
+	payload["old_public_key"] = oldPublicKey
+	payload["new_public_key"] = newPublicKey
+	payload["curve"] = curve
+	payload["renew_proof"] = map[string]any{
+		"nonce":     nonce,
+		"issued_ms": issuedMs,
+		"signature": signature,
+	}
+
+	result, err := c.Call(ctx, "group.renew_group_aid", payload)
+	if err != nil {
+		return nil, err
+	}
+
+	returnedGroupAID, certPEM, err := extractGroupIdentityRPCMaterial("group.renew_group_aid", result)
+	if err != nil {
+		return nil, err
+	}
+	if returnedGroupAID == "" {
+		returnedGroupAID = groupAID
+	}
+
+	// 证书公钥校验：确保服务端返回的新证书公钥 == 本地新公钥
+	if err := verifyCertPublicKeyMatch(certPEM, newPublicKey, "RenewGroupAID"); err != nil {
+		return nil, err
+	}
+
+	// 用新密钥覆盖本地身份（合法轮换）
+	imported := store.ImportGroupIdentity(returnedGroupAID, AIDStoreImportGroupIdentityOptions{
+		PrivateKeyPEM:   newPrivateKey,
+		PublicKeyDerB64: newPublicKey,
 		Curve:           curve,
 		CertPEM:         certPEM,
 	})
@@ -1530,6 +1710,12 @@ func (c *AUNClient) CompleteGroupTransfer(ctx context.Context, params map[string
 	if err != nil {
 		return nil, err
 	}
+
+	// 证书公钥校验：确保服务端返回的证书公钥 == 本地公钥
+	if err := verifyCertPublicKeyMatch(certPEM, publicKey, "CompleteGroupTransfer"); err != nil {
+		return nil, err
+	}
+
 	imported := store.ImportGroupIdentity(groupAID, AIDStoreImportGroupIdentityOptions{
 		PrivateKeyPEM:   strings.TrimSpace(authGetStr(keyPair, "private_key_pem")),
 		PublicKeyDerB64: publicKey,
@@ -1599,6 +1785,30 @@ func extractGroupIdentityRPCMaterial(operation string, result any) (string, stri
 	return groupAID, certPEM, nil
 }
 
+// verifyCertPublicKeyMatch 校验证书中的公钥是否匹配本地公钥（DER base64）。
+func verifyCertPublicKeyMatch(certPEM, localPublicKeyDerB64, operation string) error {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return NewAuthError(operation + ": failed to decode certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return NewAuthError(operation + ": failed to parse certificate: " + err.Error())
+	}
+	certPubDer, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return NewAuthError(operation + ": failed to marshal cert public key: " + err.Error())
+	}
+	localPubDer, err := base64.StdEncoding.DecodeString(localPublicKeyDerB64)
+	if err != nil {
+		return NewAuthError(operation + ": failed to decode local public key base64: " + err.Error())
+	}
+	if !bytes.Equal(certPubDer, localPubDer) {
+		return NewAuthError(operation + ": server returned certificate with mismatched public key")
+	}
+	return nil
+}
+
 func rpcResultMap(value any) map[string]any {
 	if typed, ok := value.(map[string]any); ok && typed != nil {
 		return typed
@@ -1660,6 +1870,10 @@ func (c *AUNClient) Notify(ctx context.Context, method string, params map[string
 	}
 
 	if targetAID != "" {
+		// 校验目标 AID 格式
+		if _, err := ValidateAIDFormat(targetAID, "notify.to"); err != nil {
+			return err
+		}
 		eventMethod, err := validateNotifyEventMethod(method)
 		if err != nil {
 			return err
@@ -1682,6 +1896,10 @@ func (c *AUNClient) Notify(ctx context.Context, method string, params map[string
 	}
 
 	if targetGroupID != "" {
+		// 校验目标 Group ID 格式
+		if _, err := ValidateGroupIDFormat(targetGroupID, "notify.group_id"); err != nil {
+			return err
+		}
 		eventMethod, err := validateNotifyEventMethod(method)
 		if err != nil {
 			return err
@@ -2045,18 +2263,22 @@ func (c *AUNClient) cleanupDissolvedGroup(groupID string) {
 	if groupID == "" {
 		return
 	}
-	c.seqTracker.RemoveNamespace("group:" + groupID)
-	c.seqTracker.RemoveNamespace("group_event:" + groupID)
+	groupNS := "group:" + groupID
+	groupEventNS := "group_event:" + groupID
+	c.seqTracker.RemoveNamespace(groupNS)
+	c.seqTracker.RemoveNamespace(groupEventNS)
+	c.persistRepairedSeq(groupNS)
+	c.persistRepairedSeq(groupEventNS)
 	c.saveSeqTrackerState()
 
 	c.pushedSeqsMu.Lock()
-	delete(c.pushedSeqs, "group:"+groupID)
-	delete(c.pushedSeqs, "group_event:"+groupID)
+	delete(c.pushedSeqs, groupNS)
+	delete(c.pushedSeqs, groupEventNS)
 	c.pushedSeqsMu.Unlock()
 
 	c.pendingOrderedMsgsMu.Lock()
-	delete(c.pendingOrderedMsgs, "group:"+groupID)
-	delete(c.pendingOrderedMsgs, "group_event:"+groupID)
+	delete(c.pendingOrderedMsgs, groupNS)
+	delete(c.pendingOrderedMsgs, groupEventNS)
 	c.pendingOrderedMsgsMu.Unlock()
 
 	sec := c.v2GetSecurityState()
@@ -2717,6 +2939,14 @@ func (c *AUNClient) migrateSeqStateGroupIDs(aid, deviceID, slotID string, state 
 // saveSeqTrackerState 将 SeqTracker 状态保存到 keystore seq_tracker 表（每 namespace 一行）
 func (c *AUNClient) saveSeqTrackerState() {
 	c.delivery().saveSeqTrackerState()
+}
+
+func (c *AUNClient) persistSeq(ns string) {
+	c.delivery().persistSeq(ns)
+}
+
+func (c *AUNClient) persistRepairedSeq(ns string) {
+	c.delivery().persistRepairedSeq(ns)
 }
 
 // logE2EEError 记录 E2EE 自动编排错误

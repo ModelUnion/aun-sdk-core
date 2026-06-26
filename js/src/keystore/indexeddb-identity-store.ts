@@ -542,4 +542,72 @@ export class IndexedDBIdentityStore implements KeyStore {
     const plain = stripStructuredFields(metadata);
     await idbPut(STORE_METADATA, metadataStoreKey(aid), plain);
   }
+
+  // ── Pending Group Bind (幂等暂存槽位) ────────────────────
+
+  async savePendingGroupBind(groupId: string, keyPair: KeyPairRecord): Promise<void> {
+    const gid = groupId.trim();
+    if (!gid) throw new Error('savePendingGroupBind requires non-empty group_id');
+
+    const privateKeyPem = String(keyPair.private_key_pem || '').trim();
+    const publicKeyDerB64 = String(keyPair.public_key_der_b64 || '').trim();
+    if (!privateKeyPem || !publicKeyDerB64) {
+      throw new Error('savePendingGroupBind requires private_key_pem and public_key_der_b64');
+    }
+    const curve = String(keyPair.curve || 'P-256').trim() || 'P-256';
+
+    const record: JsonObject = {
+      public_key_der_b64: publicKeyDerB64,
+      curve,
+    };
+
+    if (hasEncryptionSeed(this._encryptionSeed)) {
+      (record as any)._encrypted_pk = await encryptPEM(privateKeyPem, this._encryptionSeed);
+    } else {
+      record.private_key_pem = privateKeyPem;
+    }
+
+    await idbPut('pending_binds', gid, record);
+  }
+
+  async loadPendingGroupBind(groupId: string): Promise<KeyPairRecord | null> {
+    const gid = groupId.trim();
+    if (!gid) return null;
+
+    try {
+      const data = await idbGet<JsonObject>('pending_binds', gid);
+      if (!isRecord(data)) return null;
+
+      const result = deepClone(data);
+      if (isRecord(result._encrypted_pk) && hasEncryptionSeed(this._encryptionSeed)) {
+        try {
+          const envelope = result._encrypted_pk as unknown as EncryptedEnvelope;
+          result.private_key_pem = await decryptPEM(envelope, this._encryptionSeed);
+          delete result._encrypted_pk;
+        } catch (e) {
+          this._log.warn(`loadPendingGroupBind decrypt failed for ${gid}: ${e instanceof Error ? e.message : String(e)}`);
+          return null;
+        }
+      }
+
+      return {
+        public_key_der_b64: String(result.public_key_der_b64 || ''),
+        private_key_pem: String(result.private_key_pem || ''),
+        curve: String(result.curve || 'P-256'),
+      };
+    } catch (e) {
+      this._log.warn(`loadPendingGroupBind failed for ${gid}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+
+  async clearPendingGroupBind(groupId: string): Promise<void> {
+    const gid = groupId.trim();
+    if (!gid) return;
+    try {
+      await idbDelete('pending_binds', gid);
+    } catch (e) {
+      this._log.warn(`clearPendingGroupBind failed for ${gid}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 }
