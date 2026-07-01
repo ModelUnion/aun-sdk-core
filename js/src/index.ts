@@ -30,16 +30,21 @@ export {
   GroupStateError,
   E2EEError,
   E2EEDecryptFailedError,
-  E2EEGroupSecretMissingError,
-  E2EEGroupEpochMismatchError,
-  E2EEGroupCommitmentInvalidError,
-  E2EEGroupNotMemberError,
-  E2EEGroupDecryptFailedError,
   CertificateRevokedError,
   E2EEDegradedError,
   ClientSignatureError,
   mapRemoteError,
 } from './errors.js';
+
+// 校验工具
+export { validateAIDFormat, validateGroupAIDFormat, validateGroupIDFormat } from './validators.js';
+export {
+  convertToGroupAid,
+  normalizeGroupAid,
+  normalizeGroupId,
+  splitGroupId,
+  buildDiscoveryHost,
+} from './group-id.js';
 
 // 类型
 export {
@@ -53,14 +58,13 @@ export {
   type GatewayEntry,
   type GatewayDiscoveryDocument,
   type KeyPairRecord,
-  type PrekeyRecord,
-  type PrekeyMap,
-  type GroupOldEpochRecord,
-  type GroupSecretRecord,
   type MetadataRecord,
   type IdentityRecord,
   type SecretRecord,
   type Message,
+  type GroupMessage,
+  type GroupInfo,
+  type GroupMemberInfo,
   type SendResult,
   type AckResult,
   type PullResult,

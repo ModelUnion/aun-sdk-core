@@ -82,6 +82,30 @@ def test_resolve_profile_initializes_current_tab(tmp_path, monkeypatch):
     assert get_tab_profile_name() == "work"
 
 
+def test_resolve_profile_aun_path_wins_over_data_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUN_CLI_CONFIG", str(tmp_path / ".aun" / "cli.toml"))
+    monkeypatch.setenv("AUN_CLI_STATE_DIR", str(tmp_path / ".aun" / "cli-sessions"))
+    monkeypatch.setenv("AUN_CLI_SESSION_ID", "tab-profile-path")
+    monkeypatch.setenv("AUN_DATA_ROOT", "/data/aun")
+
+    from aun_cli.adapter import resolve_profile_config
+    from aun_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg["default"]["profile"] = "bench"
+    cfg["profiles"] = {
+        "bench": {
+            "aun_path": "/data/aun/bench-pairs16",
+        },
+    }
+    save_config(cfg)
+
+    ctx = SimpleNamespace(obj={"profile": "bench", "gateway": None, "timeout": None, "debug": False})
+    resolved = resolve_profile_config(ctx)
+
+    assert resolved["aun_path"] == "/data/aun/bench-pairs16"
+
+
 def test_doctor_private_key_check_uses_keystore_split_format(tmp_path):
     from aun_cli.commands.diag import _check_private_key
     from aun_core.crypto import CryptoProvider

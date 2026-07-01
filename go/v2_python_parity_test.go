@@ -1218,10 +1218,12 @@ func TestV2P2PPublicPullGateSerializesFullPipeline(t *testing.T) {
 			pullCalls = append(pullCalls, call)
 		}
 	}
-	if len(pullCalls) != 2 {
-		t.Fatalf("应串行执行两次 message.v2.pull，实际: %#v", pullCalls)
+	if len(pullCalls) != 3 {
+		t.Fatalf("应串行执行三次 message.v2.pull（含空页确认），实际: %#v", pullCalls)
 	}
-	if toInt64(pullCalls[0].Params["after_seq"]) != 0 || toInt64(pullCalls[1].Params["after_seq"]) != 1 {
+	if toInt64(pullCalls[0].Params["after_seq"]) != 0 ||
+		toInt64(pullCalls[1].Params["after_seq"]) != 1 ||
+		toInt64(pullCalls[2].Params["after_seq"]) != 1 {
 		t.Fatalf("public pull gate 应保护完整流水线并推进第二次 after_seq，calls=%#v", pullCalls)
 	}
 }
@@ -1324,7 +1326,7 @@ func TestV2P2PPullReacksWhenServerAckLagsExistingContiguousSeq(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	result, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": int64(5), "limit": int64(10)})
+	result, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": int64(4), "limit": int64(10)})
 	if err != nil {
 		t.Fatalf("message.pull 失败: %v", err)
 	}
@@ -1377,6 +1379,7 @@ func TestV2P2PPullEmptyResultConsumesServerAckFloor(t *testing.T) {
 
 func TestV2GroupPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 	groupID := "group.example.com/g1"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "group.v2.pull":
@@ -1423,13 +1426,14 @@ func TestV2GroupPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 			ackCalls = append(ackCalls, call)
 		}
 	}
-	if len(ackCalls) != 1 || strings.TrimSpace(v2AsString(ackCalls[0].Params["group_id"])) != groupID || toInt64(ackCalls[0].Params["up_to_seq"]) != 3 {
+	if len(ackCalls) != 1 || strings.TrimSpace(v2AsString(ackCalls[0].Params["group_id"])) != groupAID || toInt64(ackCalls[0].Params["up_to_seq"]) != 3 {
 		t.Fatalf("group.v2.pull 应 ack 最终 contiguous_seq=3，ackCalls=%#v", ackCalls)
 	}
 }
 
 func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	groupID := "group.example.com/g1"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "group.v2.pull":
@@ -1447,7 +1451,7 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	c := newConnectedV2PullClientForTest(t, wsURL)
 	defer func() { _ = c.Close() }()
 
-	ns := "group:" + groupID
+	ns := "group:" + groupAID
 	var observed []int
 	c.On("group.message_created", func(payload any) {
 		observed = append(observed, c.seqTracker.GetContiguousSeq(ns))
@@ -1473,7 +1477,7 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 		for _, call := range getCalls() {
 			if call.Method == "group.v2.ack" {
 				ackCount++
-				ackOK = strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupID && toInt64(call.Params["up_to_seq"]) == 3
+				ackOK = strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupAID && toInt64(call.Params["up_to_seq"]) == 3
 			}
 		}
 		return ackCount == 1 && ackOK
@@ -1484,7 +1488,7 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	for _, call := range getCalls() {
 		if call.Method == "group.v2.ack" {
 			ackCount++
-			if strings.TrimSpace(v2AsString(call.Params["group_id"])) != groupID || toInt64(call.Params["up_to_seq"]) != 3 {
+			if strings.TrimSpace(v2AsString(call.Params["group_id"])) != groupAID || toInt64(call.Params["up_to_seq"]) != 3 {
 				t.Fatalf("group.v2.ack 应使用最终 contiguous_seq=3，call=%#v", call)
 			}
 		}
@@ -1496,6 +1500,7 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 
 func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T) {
 	groupID := "group.example.com/g1"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "group.v2.pull":
@@ -1521,7 +1526,7 @@ func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T
 
 	c := newConnectedV2PullClientForTest(t, wsURL)
 	defer func() { _ = c.Close() }()
-	ns := "group:" + groupID
+	ns := "group:" + groupAID
 	c.seqTracker.ForceContiguousSeq(ns, 5)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1540,7 +1545,7 @@ func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T
 	if !waitForParityCondition(time.Second, func() bool {
 		for _, call := range getCalls() {
 			if call.Method == "group.v2.ack" &&
-				strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupID &&
+				strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupAID &&
 				toInt64(call.Params["up_to_seq"]) == 5 {
 				return true
 			}
@@ -1553,6 +1558,7 @@ func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T
 
 func TestV2GroupPullEmptyResultConsumesCursorFloor(t *testing.T) {
 	groupID := "group.example.com/g1"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "group.v2.pull":
@@ -1578,7 +1584,7 @@ func TestV2GroupPullEmptyResultConsumesCursorFloor(t *testing.T) {
 	if len(msgs) != 0 {
 		t.Fatalf("空 group pull 不应返回消息: %#v", msgs)
 	}
-	if got := c.seqTracker.GetContiguousSeq("group:" + groupID); got != 9 {
+	if got := c.seqTracker.GetContiguousSeq("group:" + groupAID); got != 9 {
 		t.Fatalf("空 group.v2.pull 应按 cursor.current_seq 推进 contiguous_seq=9，got=%d", got)
 	}
 }

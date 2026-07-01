@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -147,7 +148,7 @@ async def main() -> None:
     tag = uuid.uuid4().hex[:10]
     root = f"fs-p3-e2e-{tag}"
     env = _prepare_cli_env(tag)
-    work = (Path(os.environ.get("AUN_TEST_TMP_DIR", ".")) / ".tmp_fs_p3_e2e" / tag).resolve()
+    work = (Path(os.environ.get("AUN_TEST_TMP_DIR", tempfile.gettempdir())) / ".tmp_fs_p3_e2e" / tag).resolve()
     work.mkdir(parents=True, exist_ok=True)
     src = work / "src.txt"
     src.write_text("P3-CLI", encoding="utf-8")

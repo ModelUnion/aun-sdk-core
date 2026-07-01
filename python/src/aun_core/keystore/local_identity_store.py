@@ -119,7 +119,7 @@ class LocalIdentityStore:
             if isinstance(cert, str) and cert:
                 self.save_cert(aid, cert)
             db = self._get_db(aid)
-            skip = {"private_key_pem", "public_key_der_b64", "curve", "cert", "e2ee_prekeys", "group_secrets", "e2ee_sessions"}
+            skip = {"private_key_pem", "public_key_der_b64", "curve", "cert"}
             for k, v in identity.items():
                 if k in skip:
                     continue

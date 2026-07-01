@@ -17,11 +17,6 @@ import {
   GroupStateError,
   E2EEError,
   E2EEDecryptFailedError,
-  E2EEGroupSecretMissingError,
-  E2EEGroupEpochMismatchError,
-  E2EEGroupCommitmentInvalidError,
-  E2EEGroupNotMemberError,
-  E2EEGroupDecryptFailedError,
   CertificateRevokedError,
   E2EEDegradedError,
   ClientSignatureError,
@@ -101,23 +96,6 @@ describe('错误类层级', () => {
     expect(decFailed).toBeInstanceOf(E2EEError);
     expect(decFailed.localCode).toBe('E2EE_DECRYPT_FAILED');
     expect(decFailed.closeReason).toBe('decrypt_failed');
-
-    const secretMissing = new E2EEGroupSecretMissingError();
-    expect(secretMissing).toBeInstanceOf(E2EEError);
-    expect(secretMissing.code).toBe(-32040);
-    expect(secretMissing.localCode).toBe('E2EE_GROUP_SECRET_MISSING');
-
-    const epochMismatch = new E2EEGroupEpochMismatchError();
-    expect(epochMismatch.code).toBe(-32041);
-
-    const commitInvalid = new E2EEGroupCommitmentInvalidError();
-    expect(commitInvalid.code).toBe(-32042);
-
-    const notMember = new E2EEGroupNotMemberError();
-    expect(notMember.code).toBe(-32043);
-
-    const decGroupFailed = new E2EEGroupDecryptFailedError();
-    expect(decGroupFailed.code).toBe(-32044);
   });
 
   it('CertificateRevokedError 继承自 AuthError', () => {
@@ -214,6 +192,15 @@ describe('mapRemoteError', () => {
     const err = mapRemoteError({ code: -99999, message: 'unknown' });
     expect(err).toBeInstanceOf(AUNError);
     expect(err.constructor).toBe(AUNError);
+  });
+
+  it('Gateway 启动期证书未加载错误应标记为可重试', () => {
+    const err = mapRemoteError({
+      code: -32603,
+      message: 'Gateway service degraded: certificate not loaded',
+    });
+    expect(err).toBeInstanceOf(AUNError);
+    expect(err.retryable).toBe(true);
   });
 
   it('应正确提取 traceId', () => {

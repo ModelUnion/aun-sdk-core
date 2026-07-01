@@ -13,8 +13,8 @@ var aidNameRE = regexp.MustCompile(`^[a-z0-9_][a-z0-9_-]{3,63}$`)
 // Legacy 格式：g- 后接 4-32 位小写字母数字
 var groupIDLegacyPattern = regexp.MustCompile(`^g-[a-z0-9]{4,32}$`)
 
-// 新格式 base：5 位或更多小写字母数字
-var groupIDNewBasePattern = regexp.MustCompile(`^[a-z0-9]{5,}$`)
+// 新格式 base：5 到 64 位小写字母数字
+var groupIDNewBasePattern = regexp.MustCompile(`^[a-z0-9]{5,64}$`)
 
 // Group name 格式：4-64 字符，首字符 [a-z0-9]，可包含 _-
 var groupNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{3,63}$`)
@@ -97,11 +97,70 @@ func ValidateAIDFormat(aid any, paramName string) (string, error) {
 	return aidStr, nil
 }
 
+func validateGroupAIDParts(raw any, groupAID string, paramName string) error {
+	var base, domain string
+	if dot := strings.Index(groupAID, "."); dot >= 0 {
+		base = strings.Trim(groupAID[:dot], ".")
+		domain = strings.Trim(groupAID[dot+1:], ".")
+	} else {
+		base = groupAID
+	}
+
+	if base == "" {
+		return NewValidationError(fmt.Sprintf("Invalid %s '%v': base part cannot be empty", paramName, raw))
+	}
+
+	isValidBase := groupIDLegacyPattern.MatchString(base) ||
+		groupIDNewBasePattern.MatchString(base) ||
+		groupNamePattern.MatchString(base)
+
+	if !isValidBase {
+		return NewValidationError(
+			fmt.Sprintf("Invalid %s '%v': base '%s' must be one of: legacy format 'g-[a-z0-9]{4,32}', new format '[a-z0-9]{5,64}', or group name format '[a-z0-9][a-z0-9_-]{3,63}'", paramName, raw, base),
+		)
+	}
+
+	if domain != "" && !domainRE.MatchString(domain) {
+		return NewValidationError(
+			fmt.Sprintf("Invalid %s '%v': domain '%s' is not a valid domain", paramName, raw, domain),
+		)
+	}
+
+	return nil
+}
+
+// ValidateGroupAIDFormat 校验群组标识并返回目标态 group_aid。
+func ValidateGroupAIDFormat(groupAID any, paramName string, localIssuer string) (string, error) {
+	if paramName == "" {
+		paramName = "group_aid"
+	}
+
+	if groupAID == nil {
+		return "", NewValidationError(fmt.Sprintf("%s cannot be empty", paramName))
+	}
+
+	rawText := strings.TrimSpace(fmt.Sprint(groupAID))
+	if strings.Contains(rawText, "//") {
+		return "", NewValidationError(fmt.Sprintf("Invalid %s '%v': empty path segment is not allowed", paramName, groupAID))
+	}
+
+	groupAIDStr := ConvertToGroupAID(rawText, localIssuer)
+	if groupAIDStr == "" {
+		return "", NewValidationError(fmt.Sprintf("%s cannot be empty", paramName))
+	}
+
+	if err := validateGroupAIDParts(groupAID, groupAIDStr, paramName); err != nil {
+		return "", err
+	}
+
+	return groupAIDStr, nil
+}
+
 // ValidateGroupIDFormat 校验 Group ID 格式是否合法。
 //
 // 接受的 base 格式（不含域名部分）：
 //  1. Legacy 格式：g-[a-z0-9]{4,32} — 以 g- 开头，后接 4 到 32 位小写字母或数字
-//  2. 新格式：[a-z0-9]{5,} — 5 位或更多小写字母或数字
+//  2. 新格式：[a-z0-9]{5,64} — 5 到 64 位小写字母或数字
 //  3. Group name 格式：[a-z0-9][a-z0-9_-]{3,63} — 4 到 64 个字符，可包含 _-
 //
 // 完整格式：
@@ -122,94 +181,5 @@ func ValidateGroupIDFormat(groupID any, paramName string) (string, error) {
 		paramName = "group_id"
 	}
 
-	if groupID == nil {
-		return "", NewValidationError(fmt.Sprintf("%s cannot be empty", paramName))
-	}
-
-	gidStr := strings.ToLower(strings.TrimSpace(fmt.Sprint(groupID)))
-	if gidStr == "" {
-		return "", NewValidationError(fmt.Sprintf("%s cannot be empty", paramName))
-	}
-
-	// 解析 base 和 domain
-	var base, domain string
-
-	// 情况1: group.{issuer}/{base} (canonical)
-	if strings.HasPrefix(gidStr, "group.") && strings.Contains(gidStr, "/") {
-		issuerAndBase := gidStr[6:] // 去掉 "group."
-		parts := strings.SplitN(issuerAndBase, "/", 2)
-		if len(parts) == 2 {
-			domain = strings.Trim(parts[0], ".")
-			base = strings.Trim(parts[1], ".")
-			// 处理污染格式 group.{A}/{base}@{B}
-			if strings.Contains(base, "@") {
-				baseParts := strings.SplitN(base, "@", 2)
-				base = strings.Trim(baseParts[0], ".")
-				bDomain := strings.Trim(baseParts[1], ".")
-				if domain != "" {
-					domain = bDomain + "." + domain
-				} else {
-					domain = bDomain
-				}
-			}
-		}
-	} else if strings.Contains(gidStr, "@") {
-		// 情况2: {base}@{issuer}
-		parts := strings.SplitN(gidStr, "@", 2)
-		base = strings.Trim(parts[0], ".")
-		domain = strings.Trim(parts[1], ".")
-	} else if strings.Contains(gidStr, ".") {
-		// 情况3: {base}.{issuer} 或 {base} (需要区分)
-		// 如果是 g- 开头，点号后是域名
-		if strings.HasPrefix(gidStr, "g-") {
-			rest := gidStr[2:]
-			if strings.Contains(rest, ".") {
-				parts := strings.SplitN(rest, ".", 2)
-				base = "g-" + parts[0]
-				domain = strings.Trim(parts[1], ".")
-			} else {
-				base = gidStr
-			}
-		} else {
-			// 尝试判断是 {base}.{domain} 还是单个 base
-			// 这里简化处理：如果有点号就认为后面是域名
-			parts := strings.SplitN(gidStr, ".", 2)
-			if len(parts) == 2 {
-				base = parts[0]
-				domain = strings.Trim(parts[1], ".")
-			} else {
-				base = gidStr
-			}
-		}
-	} else {
-		// 情况4: 纯 {base}（本域简写）
-		base = gidStr
-	}
-
-	// 校验 base 部分
-	if base == "" {
-		return "", NewValidationError(fmt.Sprintf("Invalid %s '%v': base part cannot be empty", paramName, groupID))
-	}
-
-	// 检查 base 是否符合任一格式
-	isValidBase := groupIDLegacyPattern.MatchString(base) ||
-		groupIDNewBasePattern.MatchString(base) ||
-		groupNamePattern.MatchString(base)
-
-	if !isValidBase {
-		return "", NewValidationError(
-			fmt.Sprintf("Invalid %s '%v': base '%s' must be one of: legacy format 'g-[a-z0-9]{4,32}', new format '[a-z0-9]{5,}', or group name format '[a-z0-9][a-z0-9_-]{3,63}'", paramName, groupID, base),
-		)
-	}
-
-	// 如果有 domain，校验 domain 部分
-	if domain != "" {
-		if !domainRE.MatchString(domain) {
-			return "", NewValidationError(
-				fmt.Sprintf("Invalid %s '%v': domain '%s' is not a valid domain", paramName, groupID, domain),
-			)
-		}
-	}
-
-	return gidStr, nil
+	return ValidateGroupAIDFormat(groupID, paramName, "")
 }

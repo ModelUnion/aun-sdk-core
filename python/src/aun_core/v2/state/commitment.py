@@ -4,7 +4,7 @@ AUN E2EE V2: State Commitment 计算
 规范引用: §6.2
 state_commitment = SHA256(
   "AUN-V2-SC-v1" ||
-  group_id ||
+  group_aid ||
   uint32(epoch) ||
   canonical_json({
     "members": [...sorted by aid, devices sorted by device_id...],
@@ -24,6 +24,7 @@ import struct
 import copy
 
 from ..crypto.canonical import canonical_json
+from ...group_id import normalize_group_id
 
 
 PREFIX = b"AUN-V2-SC-v1"
@@ -51,7 +52,8 @@ def compute_state_commitment(group_id: str, epoch: int, state_payload: dict) -> 
     _sort_payload(payload)
 
     # 拼接
-    group_bytes = group_id.encode("utf-8")
+    group_key = normalize_group_id(group_id) or str(group_id or "").strip()
+    group_bytes = group_key.encode("utf-8")
     epoch_bytes = struct.pack(">I", epoch)  # uint32 big-endian
     payload_bytes = canonical_json(payload)
 

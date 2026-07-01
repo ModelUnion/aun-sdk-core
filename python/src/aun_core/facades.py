@@ -67,11 +67,11 @@ class GroupFacade(_RpcFacade):
     async def bind_group_aid(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("bind_group_aid", params, **kwargs)
 
+    async def renew_group_aid(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        return await self._call("renew_group_aid", params, **kwargs)
+
     async def bind_aid(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self.bind_group_aid(params, **kwargs)
- 
-    async def get(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get", params, **kwargs)
 
     async def get_info(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("get_info", params, **kwargs)
@@ -88,9 +88,6 @@ class GroupFacade(_RpcFacade):
     async def search(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("search", params, **kwargs)
 
-    async def get_public_info(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get_public_info", params, **kwargs)
-
     async def suspend(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("suspend", params, **kwargs)
 
@@ -99,9 +96,6 @@ class GroupFacade(_RpcFacade):
 
     async def dissolve(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("dissolve", params, **kwargs)
-
-    async def get_stats(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get_stats", params, **kwargs)
 
     async def add_member(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("add_member", params, **kwargs)
@@ -166,9 +160,6 @@ class GroupFacade(_RpcFacade):
     async def get_settings(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("get_settings", params, **kwargs)
 
-    async def info(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("info", params, **kwargs)
-
     async def send(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         merged = self._params(params, **kwargs)
         validate_group_id_format(merged.get("group_id"))
@@ -191,23 +182,172 @@ class GroupFacade(_RpcFacade):
     async def ack_events(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("ack_events", params, **kwargs)
 
+    @staticmethod
+    def _settings_to_map(result: dict[str, Any]) -> dict[str, Any]:
+        """将 get_settings 返回的 settings 数组转为 {key: value} 映射"""
+        return {s["key"]: s["value"] for s in result.get("settings", [])}
+
     async def get_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get_announcement", params, **kwargs)
+        """便利方法：获取群公告（基于 get_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        result = await self.get_settings(
+            group_id=group_id,
+            keys=["announcement.content", "announcement.attachments"],
+        )
+
+        settings = self._settings_to_map(result)
+        return {
+            "group_id": result["group_id"],
+            "announcement": {
+                "group_id": result["group_id"],
+                "content": settings.get("announcement.content", ""),
+                "attachments": settings.get("announcement.attachments", []),
+                "updated_by": settings.get("announcement.content.updated_by", ""),
+                "updated_at": settings.get("announcement.content.updated_at", 0)
+            }
+        }
 
     async def update_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("update_announcement", params, **kwargs)
+        """便利方法：更新群公告（基于 set_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        content = merged.get("content")
+        attachments = merged.get("attachments")
+
+        if not group_id:
+            raise ValueError("group_id is required")
+        if content is None:
+            raise ValueError("content is required")
+
+        settings_update = {"announcement.content": content}
+        if attachments is not None:
+            settings_update["announcement.attachments"] = attachments
+
+        result = await self.set_settings(group_id=group_id, settings=settings_update)
+
+        return {
+            "group_id": result["group_id"],
+            "announcement": {
+                "group_id": result["group_id"],
+                "content": content,
+                "attachments": attachments or []
+            }
+        }
 
     async def get_rules(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get_rules", params, **kwargs)
+        """便利方法：获取群规则（基于 get_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        result = await self.get_settings(
+            group_id=group_id,
+            keys=["rules.content", "rules.attachments"],
+        )
+
+        settings = self._settings_to_map(result)
+        return {
+            "group_id": result["group_id"],
+            "rules": {
+                "group_id": result["group_id"],
+                "content": settings.get("rules.content", ""),
+                "attachments": settings.get("rules.attachments", []),
+                "updated_by": settings.get("rules.content.updated_by", ""),
+                "updated_at": settings.get("rules.content.updated_at", 0)
+            }
+        }
 
     async def update_rules(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("update_rules", params, **kwargs)
+        """便利方法：更新群规则（基于 set_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        content = merged.get("content")
+        attachments = merged.get("attachments")
+
+        if not group_id:
+            raise ValueError("group_id is required")
+        if content is None:
+            raise ValueError("content is required")
+
+        settings_update = {"rules.content": content}
+        if attachments is not None:
+            settings_update["rules.attachments"] = attachments
+
+        result = await self.set_settings(group_id=group_id, settings=settings_update)
+
+        return {
+            "group_id": result["group_id"],
+            "rules": {
+                "group_id": result["group_id"],
+                "content": content,
+                "attachments": attachments or []
+            }
+        }
 
     async def get_join_requirements(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("get_join_requirements", params, **kwargs)
+        """便利方法：获取入群要求（基于 get_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        result = await self.get_settings(
+            group_id=group_id,
+            keys=["join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"],
+        )
+
+        settings = self._settings_to_map(result)
+        return {
+            "group_id": result["group_id"],
+            "join_requirements": {
+                "group_id": result["group_id"],
+                "mode": settings.get("join.mode", "open"),
+                "question": settings.get("join.question", ""),
+                "auto_approve_patterns": settings.get("join.auto_approve_patterns", []),
+                "max_pending": settings.get("join.max_pending", 100),
+                "updated_by": settings.get("join.mode.updated_by", ""),
+                "updated_at": settings.get("join.mode.updated_at", 0)
+            }
+        }
 
     async def update_join_requirements(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        return await self._call("update_join_requirements", params, **kwargs)
+        """便利方法：更新入群要求（基于 set_settings）"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        settings_update = {}
+        if "mode" in merged:
+            settings_update["join.mode"] = merged["mode"]
+        if "question" in merged:
+            settings_update["join.question"] = merged["question"]
+        if "auto_approve_patterns" in merged:
+            settings_update["join.auto_approve_patterns"] = merged["auto_approve_patterns"]
+        if "max_pending" in merged:
+            settings_update["join.max_pending"] = merged["max_pending"]
+
+        if not settings_update:
+            raise ValueError("at least one field to update is required")
+
+        result = await self.set_settings(group_id=group_id, settings=settings_update)
+
+        return {
+            "group_id": result["group_id"],
+            "join_requirements": {
+                "group_id": result["group_id"],
+                "mode": merged.get("mode"),
+                "question": merged.get("question"),
+                "auto_approve_patterns": merged.get("auto_approve_patterns"),
+                "max_pending": merged.get("max_pending")
+            }
+        }
 
     async def get_online_members(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("get_online_members", params, **kwargs)

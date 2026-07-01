@@ -134,6 +134,15 @@ func (l *AUNLogger) Debug() bool {
 	return l.debug
 }
 
+func (l *AUNLogger) IsDebugEnabled() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.debug && l.minLevel <= int(levelDebug)
+}
+
 // BindAID 将 AID 附加到所有日志行末尾，便于多实例区分。
 func (l *AUNLogger) BindAID(aid string) {
 	l.mu.Lock()

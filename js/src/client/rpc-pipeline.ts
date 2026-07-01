@@ -4,6 +4,7 @@ import { normalizeGroupId } from '../group-id.js';
 import { validateAIDFormat, validateGroupIDFormat } from '../validators.js';
 import { p1363ToDer, pemToArrayBuffer, uint8ToBase64 } from '../crypto.js';
 import {
+  ConnectionState,
   isJsonObject,
   type JsonObject,
   type JsonValue,
@@ -20,10 +21,6 @@ const INTERNAL_ONLY_METHODS = new Set([
   'auth.connect',
   'auth.refresh_token',
   'initialize',
-]);
-
-const REMOVED_E2EE_METHODS = new Set([
-  'group.rotate_epoch',
 ]);
 
 const PROTECTED_HEADERS_METHODS = new Set([
@@ -44,9 +41,9 @@ const SIGNED_METHODS = new Set([
   'group.v2.propose_state', 'group.v2.confirm_state',
   'group.v2.get_proposal',
   'group.kick', 'group.add_member',
-  'group.leave', 'group.remove_member', 'group.update_rules',
-  'group.update', 'group.update_announcement',
-  'group.update_join_requirements', 'group.set_role',
+  'group.leave', 'group.remove_member',
+  'group.update',
+  'group.set_role',
   'group.transfer_owner', 'group.bind_group_aid', 'group.renew_group_aid', 'group.complete_transfer',
   'group.review_join_request',
   'group.batch_review_join_request',
@@ -54,6 +51,8 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
   'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
@@ -83,13 +82,70 @@ const SIGNED_METHODS = new Set([
   'group.dissolve', 'group.suspend', 'group.resume',
 ]);
 
+const SIGNING_KEY_CACHE_MAX = 32;
+const signingKeyCache = new Map<string, Promise<CryptoKey>>();
+const certFingerprintCache = new Map<string, Promise<string>>();
+
+function cacheGet<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function cachePut<K, V>(cache: Map<K, V>, key: K, value: V): V {
+  cache.set(key, value);
+  while (cache.size > SIGNING_KEY_CACHE_MAX) {
+    const first = cache.keys().next().value as K | undefined;
+    if (first === undefined) break;
+    cache.delete(first);
+  }
+  return value;
+}
+
+async function sha256HexText(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function signingPrivateKey(privateKeyPem: string): Promise<CryptoKey> {
+  const key = await sha256HexText(privateKeyPem);
+  let cached = cacheGet(signingKeyCache, key);
+  if (!cached) {
+    const pkcs8 = pemToArrayBuffer(privateKeyPem);
+    cached = crypto.subtle.importKey(
+      'pkcs8', pkcs8,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false, ['sign'],
+    );
+    cachePut(signingKeyCache, key, cached);
+  }
+  return await cached;
+}
+
+async function signingCertFingerprint(certPem: string): Promise<string> {
+  const key = await sha256HexText(certPem);
+  let cached = cacheGet(certFingerprintCache, key);
+  if (!cached) {
+    cached = (async () => {
+      const certDer = pemToArrayBuffer(certPem);
+      const fpBuf = await crypto.subtle.digest('SHA-256', certDer);
+      return 'sha256:' + Array.from(new Uint8Array(fpBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    })();
+    cachePut(certFingerprintCache, key, cached);
+  }
+  return await cached;
+}
+
 const PULL_GATE_STALE_MS = 30000;
 const NON_IDEMPOTENT_TIMEOUT = 35;
 const NON_IDEMPOTENT_METHODS = new Set([
   'message.send', 'group.send', 'group.create', 'group.invite',
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
-  'group.update_name', 'group.update_avatar', 'group.update_announcement',
-  'group.update_settings',
+  'group.set_settings',
+  'group.update_announcement', 'group.update_rules',
   'storage.put_object', 'storage.delete_object',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.get_by_share',
@@ -118,6 +174,18 @@ const NON_IDEMPOTENT_METHODS = new Set([
   'collab.tag.create', 'collab.tag.restore',
   'collab.tag.rm', 'collab.tag.prune',
 ]);
+
+function hasMatchingV2Session(client: Record<string, any>): boolean {
+  const session = client._v2Session as { aid?: string; deviceId?: string; currentIkPubDer?: unknown } | undefined;
+  if (!session) return false;
+  if (session.currentIkPubDer === undefined) return true;
+  return session.aid === client._aid && session.deviceId === client._deviceId;
+}
+
+function isTransientV2PullFallbackError(error: unknown): boolean {
+  const text = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return text.includes('no_service') || text.includes('service plane unavailable');
+}
 
 export interface RpcPreflightResult {
   params: RpcParams;
@@ -185,7 +253,7 @@ export class RpcPipeline {
           'V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)',
         );
         client._clientLog.debug('call route: group.send -> V2 encrypted send');
-        return await client._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown> ?? {}, {
+        return await client._sendGroupV2(String(p.group_aid ?? p.group_id ?? ''), p.payload as Record<string, unknown> ?? {}, {
           messageId: String(p.message_id ?? '') || undefined,
           timestamp: p.timestamp as number | undefined,
           protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
@@ -233,31 +301,39 @@ export class RpcPipeline {
 
   private async callImplInner(method: string, p: RpcParams, skipSendResultEnvelope = false): Promise<RpcResult> {
     const client = this.runtime.client;
-    if (method === 'message.pull') {
-      await client._ensureV2SessionReady('message.pull');
-      client._clientLog.debug('call route: message.pull -> V2 pull');
-      const messages = await client._pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50, { force: p.force === true });
-      return { messages } as RpcResult;
+    if (method === 'message.v2.pull' || (method === 'message.pull' && hasMatchingV2Session(client))) {
+      try {
+        await client._ensureV2SessionReady('message.pull');
+        client._clientLog.debug(`call route: ${method} -> V2 pull`);
+        const messages = await client._pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50, { force: p.force === true });
+        return { messages } as RpcResult;
+      } catch (exc) {
+        if (method !== 'message.pull' || !isTransientV2PullFallbackError(exc)) {
+          throw exc;
+        }
+        client._clientLog.warn(`message.pull V2 route unavailable, fallback to plain pull: ${exc instanceof Error ? exc.message : String(exc)}`);
+      }
     }
 
-    if (method === 'message.ack') {
+    if (method === 'message.v2.ack' || (method === 'message.ack' && hasMatchingV2Session(client))) {
       await client._ensureV2SessionReady('message.ack');
-      client._clientLog.debug('call route: message.ack -> V2 ack');
+      client._clientLog.debug(`call route: ${method} -> V2 ack`);
       return await client._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined) as RpcResult;
     }
 
-    if (method === 'group.pull' && p.group_id) {
+    if ((method === 'group.v2.pull' || method === 'group.pull') && p.group_id && (method === 'group.v2.pull' || hasMatchingV2Session(client))) {
       await client._ensureV2SessionReady('group.pull');
-      client._clientLog.debug('call route: group.pull -> V2 pull');
+      client._clientLog.debug(`call route: ${method} -> V2 pull`);
       const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
       const cursorParams = client._explicitGroupCursorParams(p);
       const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
-      const pullOpts: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = {};
+      const pullOpts: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean; wireGroupId?: string } = {};
       if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
       if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
       if (!ownsCursor) pullOpts.ownsCursor = false;
+      if (String(p.group_id ?? '').trim()) pullOpts.wireGroupId = String(p.group_id).trim();
       const messages = await client._pullGroupV2(
-        String(p.group_id),
+        String(p.group_aid ?? p.group_id),
         Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
         Number(p.limit ?? 50) || 50,
         Object.keys(pullOpts).length > 0 ? pullOpts : undefined,
@@ -265,16 +341,16 @@ export class RpcPipeline {
       return { messages } as RpcResult;
     }
 
-    if (method === 'group.ack_messages' && p.group_id) {
+    if ((method === 'group.v2.ack' || method === 'group.ack_messages') && p.group_id && (method === 'group.v2.ack' || hasMatchingV2Session(client))) {
       await client._ensureV2SessionReady('group.ack_messages');
-      client._clientLog.debug('call route: group.ack_messages -> V2 ack');
+      client._clientLog.debug(`call route: ${method} -> V2 ack`);
       const cursorParams = client._explicitGroupCursorParams(p);
       const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
       if (!ownsCursor) {
         return await client._rawGroupAckMessages(p) as RpcResult;
       }
       return await client._ackGroupV2(
-        String(p.group_id),
+        String(p.group_aid ?? p.group_id),
         Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
       ) as RpcResult;
     }
@@ -301,16 +377,12 @@ export class RpcPipeline {
 
   preflight(method: string, params?: RpcParams): RpcPreflightResult {
     const client = this.runtime.client;
-    if (client._state !== 'connected') {
+    if (client.state !== ConnectionState.READY) {
       throw new ConnectionError('client is not connected');
     }
     if (INTERNAL_ONLY_METHODS.has(method)) {
       throw new PermissionError(`method is internal_only: ${method}`);
     }
-    if (method.startsWith('message.e2ee.') || method.startsWith('group.e2ee.') || REMOVED_E2EE_METHODS.has(method)) {
-      throw new PermissionError(`legacy E2EE method is removed in this SDK: ${method}`);
-    }
-
     const p: RpcParams = { ...(params ?? {}) };
     this.mergeInstanceProtectedHeaders(method, p);
     const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || client._backgroundRpcDepth > 0;
@@ -318,6 +390,7 @@ export class RpcPipeline {
     if (method === 'message.send' || method === 'group.send') {
       this.normalizeOutboundMessagePayload(p, method);
     }
+    this.normalizeGroupCallIdentifier(method, p);
     this.validateOutboundCall(method, p);
     this.injectMessageCursorContext(method, p);
     this.captureGroupCursorParams(method, p);
@@ -478,12 +551,7 @@ export class RpcPipeline {
         .join('');
 
       const signData = new TextEncoder().encode(`${method}|${aid}|${ts}|${paramsHash}`);
-      const pkcs8 = pemToArrayBuffer(currentAid.privateKeyPem);
-      const cryptoKey = await crypto.subtle.importKey(
-        'pkcs8', pkcs8,
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        false, ['sign'],
-      );
+      const cryptoKey = await signingPrivateKey(currentAid.privateKeyPem);
       const sigP1363 = await crypto.subtle.sign(
         { name: 'ECDSA', hash: 'SHA-256' },
         cryptoKey, signData,
@@ -493,9 +561,7 @@ export class RpcPipeline {
       let certFingerprint = '';
       const certPem = currentAid.certPem;
       if (certPem) {
-        const certDer = pemToArrayBuffer(certPem);
-        const fpBuf = await crypto.subtle.digest('SHA-256', certDer);
-        certFingerprint = 'sha256:' + Array.from(new Uint8Array(fpBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        certFingerprint = await signingCertFingerprint(certPem);
       }
 
       params.client_signature = {
@@ -518,11 +584,11 @@ export class RpcPipeline {
       return client._aid ? `p2p:${client._aid}` : '';
     }
     if (method === 'group.pull' || method === 'group.v2.pull') {
-      const gid = String(params.group_id ?? '').trim();
+      const gid = String(params.group_aid ?? params.group_id ?? '').trim();
       return gid ? `group:${gid}` : '';
     }
     if (method === 'group.pull_events') {
-      const gid = String(params.group_id ?? '').trim();
+      const gid = String(params.group_aid ?? params.group_id ?? '').trim();
       return gid ? `group_event:${gid}` : '';
     }
     return '';
@@ -660,7 +726,7 @@ export class RpcPipeline {
 
   private postprocessGroupPull(params: RpcParams, result: JsonObject): void {
     const client = this.runtime.client;
-    const gid = String(params.group_id ?? '').trim();
+    const gid = String(params.group_aid ?? params.group_id ?? '').trim();
     if (!gid || !client._seqTracker) {
       return;
     }
@@ -703,20 +769,48 @@ export class RpcPipeline {
       return;
     }
     const client = this.runtime.client;
-    if (params.group_id !== undefined && params.group_id !== null) {
-      const rawGroupId = String(params.group_id);
-      const normalizedGroupId = normalizeGroupId(rawGroupId);
-      if (normalizedGroupId && normalizedGroupId !== rawGroupId) {
-        client._clientLog?.debug?.(`call group_id normalized: ${rawGroupId} -> ${normalizedGroupId} method=${method}`);
-      }
-      params.group_id = normalizedGroupId;
-    }
+    this.normalizeGroupCallIdentifier(method, params);
     if (params.device_id === undefined) {
       params.device_id = client._deviceId;
     }
     if (params.slot_id === undefined) {
       params.slot_id = client._slotId;
     }
+  }
+
+  private normalizeGroupCallIdentifier(method: string, params: RpcParams): void {
+    if (!method.startsWith('group.')) {
+      return;
+    }
+    const record = params as Record<string, unknown>;
+    const rawEntries: Array<[string, unknown]> = [
+      ['group_aid', record.group_aid],
+      ['groupAid', record.groupAid],
+      ['group_id', record.group_id],
+      ['groupId', record.groupId],
+    ];
+    const found = rawEntries.find(([, value]) => String(value ?? '').trim());
+    if (found) {
+      const [key, raw] = found;
+      const rawGroupId = String(raw).trim();
+      const normalizedGroupId = normalizeGroupId(rawGroupId);
+      if (normalizedGroupId) {
+        if (normalizedGroupId !== rawGroupId) {
+          this.runtime.client._clientLog?.debug?.(`call group identifier normalized: ${key}=${rawGroupId} -> ${normalizedGroupId} method=${method}`);
+        }
+        const existingGroupId = String(record.group_id ?? record.groupId ?? '').trim();
+        if (key === 'group_id' || key === 'groupId') {
+          params.group_id = rawGroupId;
+        } else if (existingGroupId) {
+          params.group_id = existingGroupId;
+        } else {
+          params.group_id = normalizedGroupId;
+        }
+        params.group_aid = normalizedGroupId;
+      }
+    }
+    delete record.groupAid;
+    delete record.groupId;
   }
 
   private groupCursorParams(params: RpcParams): RpcParams {

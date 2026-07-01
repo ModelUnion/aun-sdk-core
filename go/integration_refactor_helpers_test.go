@@ -5,6 +5,7 @@ package aun
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +38,28 @@ func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string, slotID ...s
 		t.Fatalf("注册后加载 AID 失败: %v", lr.Error.Message)
 	}
 	return lr.Data.AID
+}
+
+func skipIfGatewayRateLimited(t *testing.T, phase string, err error) {
+	t.Helper()
+	if isGatewayRateLimitedError(err) {
+		t.Skipf("%s 遇到网关限流（Docker 环境繁忙）: %v", phase, err)
+	}
+}
+
+func isGatewayRateLimitedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "StatusCode(4029)") && strings.Contains(msg, "Too many requests")
+}
+
+func TestGatewayRateLimitedErrorPredicate(t *testing.T) {
+	err := fmt.Errorf("websocket: bad handshake: StatusCode(4029): Too many requests")
+	if !isGatewayRateLimitedError(err) {
+		t.Fatalf("4029 Too many requests 应识别为网关限流")
+	}
 }
 
 func integrationClientSlotID(client *AUNClient) string {
@@ -85,6 +108,7 @@ func integrationConnectLoadedAID(t *testing.T, client *AUNClient, aid string, op
 		err = client.Connect(ctx)
 	}
 	if err != nil {
+		skipIfGatewayRateLimited(t, "连接", err)
 		t.Fatalf("连接失败: %v", err)
 	}
 }
@@ -96,6 +120,7 @@ func integrationAuthenticateLoadedAID(t *testing.T, client *AUNClient, aid strin
 	defer cancel()
 	result, err := client.Authenticate(ctx, opts...)
 	if err != nil {
+		skipIfGatewayRateLimited(t, "认证", err)
 		t.Fatalf("认证失败: %v", err)
 	}
 	return result

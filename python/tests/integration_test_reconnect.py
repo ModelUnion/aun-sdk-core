@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,8 +50,9 @@ _CONTAINER_NAME = "kite-app"
 os.environ.setdefault("AUN_ENV", "development")
 
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip()
-_ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
-_BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bob.{_ISSUER}").strip()
+_RUN_ID = uuid.uuid4().hex[:8]
+_ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"rc-alice-{_RUN_ID}.{_ISSUER}").strip()
+_BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"rc-bob-{_RUN_ID}.{_ISSUER}").strip()
 
 
 # ── 辅助函数 ──────────────────────────────────────────────
@@ -142,12 +144,39 @@ async def _wait_for_state(client: AUNClient, target_state: str, timeout: float =
     return False
 
 
+async def _probe_disconnect(client: AUNClient, *, timeout: float = 1.0) -> None:
+    """用短超时业务 RPC 暴露半开连接，触发 SDK 的自动重连路径。"""
+    if _matches_state(client, "disconnected"):
+        return
+    transport = getattr(client, "_transport", None)
+    old_timeout = getattr(transport, "_timeout", None)
+    try:
+        if hasattr(transport, "set_timeout"):
+            transport.set_timeout(timeout)
+        try:
+            await client.call("meta.ping")
+        except Exception as exc:
+            print(f"  [OK] 探测到连接不可用: {exc}")
+    finally:
+        if old_timeout is not None and hasattr(transport, "set_timeout"):
+            transport.set_timeout(old_timeout)
+    await asyncio.sleep(0.2)
+
+
+async def _wait_until_state_changes_from_ready(client: AUNClient, *, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _state_value(client.state) != "ready":
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
 # ── 测试用例 ──────────────────────────────────────────────
 
 async def test_basic_reconnect_after_network_interrupt():
     """Test 1: 网络中断后自动重连"""
     print("\n=== Test 1: 网络中断后自动重连 ===")
-    import uuid
     rid = str(uuid.uuid4())[:8]
     aid = f"rc-t1-{rid}.agentid.pub"
 
@@ -166,6 +195,8 @@ async def test_basic_reconnect_after_network_interrupt():
         if not ok:
             print("  [SKIP] 无法断开网络，跳过")
             return True
+
+        await _probe_disconnect(client)
 
         # 等待 SDK 检测到断线
         disconnected = await _wait_for_state(client, "disconnected", timeout=15.0)
@@ -202,7 +233,6 @@ async def test_basic_reconnect_after_network_interrupt():
 async def test_reconnect_after_gateway_restart():
     """Test 2: Gateway 重启后自动重连"""
     print("\n=== Test 2: Gateway 重启后自动重连 ===")
-    import uuid
     rid = str(uuid.uuid4())[:8]
     aid = f"rc-t2-{rid}.agentid.pub"
 
@@ -221,6 +251,7 @@ async def test_reconnect_after_gateway_restart():
             print("  [SKIP] 无法重启 Gateway")
             return True
 
+        await _probe_disconnect(client)
         print("  等待 Gateway 重启完成...")
         await asyncio.sleep(15)  # 等待 Gateway 完全启动
 
@@ -250,7 +281,6 @@ async def test_reconnect_after_gateway_restart():
 async def test_state_events_sequence():
     """Test 3: 验证状态事件序列正确（通过 Gateway 重启触发断线）"""
     print("\n=== Test 3: 状态事件序列验证 ===")
-    import uuid
     rid = str(uuid.uuid4())[:8]
     aid = f"rc-t3-{rid}.agentid.pub"
 
@@ -269,8 +299,8 @@ async def test_state_events_sequence():
             print("  [SKIP] 无法重启 Gateway")
             return True
 
-        # 等待断线检测（重启需要时间）
-        await asyncio.sleep(5)
+        await _probe_disconnect(client)
+        await _wait_until_state_changes_from_ready(client)
 
         # 等待重连成功
         await _wait_for_state(client, "connected", timeout=60.0)
@@ -292,7 +322,6 @@ async def test_state_events_sequence():
 async def test_message_after_reconnect():
     """Test 4: 重连后消息收发正常"""
     print("\n=== Test 4: 重连后消息收发 ===")
-    import uuid
     rid = str(uuid.uuid4())[:8]
     alice_aid = f"rc-a-{rid}.agentid.pub"
     bob_aid = f"rc-b-{rid}.agentid.pub"
@@ -311,6 +340,9 @@ async def test_message_after_reconnect():
         if not ok:
             print("  [SKIP] 无法重启 Gateway")
             return True
+
+        await _probe_disconnect(alice)
+        await _probe_disconnect(bob)
 
         # 等待 Gateway 完全重启
         await asyncio.sleep(15)
@@ -356,7 +388,6 @@ async def test_message_after_reconnect():
 async def test_reconnect_exhausted():
     """Test 5: 无限重试 — 停止 Gateway 后持续重连，恢复后自动连上"""
     print("\n=== Test 5: 无限重试验证 ===")
-    import uuid
     rid = str(uuid.uuid4())[:8]
     aid = f"rc-t5-{rid}.agentid.pub"
 
@@ -384,6 +415,8 @@ async def test_reconnect_exhausted():
         if result.returncode != 0:
             print("  [SKIP] 无法停止 Gateway")
             return True
+
+        await _probe_disconnect(client)
 
         # 等待一段时间，验证客户端在持续重连（非 terminal_failed）
         await asyncio.sleep(10)
@@ -419,8 +452,9 @@ async def test_reconnect_exhausted():
 
 async def test_message_chain_recovery_after_reconnect():
     """重连后消息链恢复验证（非仅 ping）"""
-    aid = _ALICE_AID
-    bob_aid = _BOB_AID
+    rid = uuid.uuid4().hex[:8]
+    aid = f"rc-chain-a-{rid}.{_ISSUER}"
+    bob_aid = f"rc-chain-b-{rid}.{_ISSUER}"
 
     client = _make_client("message-chain-recovery")
     bob_client = _make_client("bob-receiver")
@@ -440,6 +474,7 @@ async def test_message_chain_recovery_after_reconnect():
         # 断网
         print("  断开网络...")
         _docker_network_disconnect()
+        await _probe_disconnect(client)
         await asyncio.sleep(2)
 
         # 恢复网络
@@ -469,7 +504,7 @@ async def test_message_chain_recovery_after_reconnect():
 
 async def test_no_duplicate_background_tasks():
     """重连后不重复创建后台任务"""
-    aid = _ALICE_AID
+    aid = f"rc-bg-{uuid.uuid4().hex[:8]}.{_ISSUER}"
 
     client = _make_client("no-duplicate-tasks")
     try:
@@ -485,6 +520,7 @@ async def test_no_duplicate_background_tasks():
         # 断网 → 重连
         print("  断开网络...")
         _docker_network_disconnect()
+        await _probe_disconnect(client)
         await asyncio.sleep(2)
 
         print("  恢复网络...")

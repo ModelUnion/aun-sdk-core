@@ -15,6 +15,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { normalizeGroupId } from '../../group-id.js';
 import { generateP256Keypair } from '../crypto/ecdh.js';
 import { ecdsaSignRaw } from '../crypto/ecdsa.js';
 import { V2KeyStore } from './keystore.js';
@@ -135,10 +136,24 @@ export class V2Session {
     return `sha256:${hashHex.substring(0, 16)}`;
   }
 
+  private _groupKey(groupId: string): string {
+    return normalizeGroupId(groupId) || String(groupId ?? '').trim();
+  }
+
+  private _groupLookupCandidates(groupId: string): string[] {
+    const raw = String(groupId ?? '').trim();
+    const normalized = this._groupKey(raw);
+    const out: string[] = [];
+    for (const item of [normalized, raw]) {
+      if (item && !out.includes(item)) out.push(item);
+    }
+    return out;
+  }
+
   private _normalizeGroupSPKLookup(groupId: string, spkId: string): { groupId: string; spkId: string } {
     const nul = spkId.indexOf('\0');
-    if (nul < 0) return { groupId, spkId };
-    return { groupId: spkId.slice(0, nul), spkId: spkId.slice(nul + 1) };
+    if (nul < 0) return { groupId: this._groupKey(groupId), spkId };
+    return { groupId: this._groupKey(spkId.slice(0, nul)), spkId: spkId.slice(nul + 1) };
   }
 
   /** 注册本设备 SPK 到服务端。IK = AID 长期密钥，无需注册。 */
@@ -313,25 +328,32 @@ export class V2Session {
   /** 确保指定群有独立 group SPK，返回 { spkId, priv, pubDER }。 */
   ensureGroupSPK(groupId: string): { spkId: string; priv: Uint8Array; pubDer: Uint8Array } {
     this.ensureKeys();
-    const cur = this._store.loadCurrentGroupSPK(this._deviceId, groupId);
-    if (cur) return cur;
+    const gk = this._groupKey(groupId);
+    for (const candidate of this._groupLookupCandidates(groupId)) {
+      const cur = this._store.loadCurrentGroupSPK(this._deviceId, candidate);
+      if (cur) return cur;
+    }
     // 生成新 group SPK
     const [priv, pubDer] = generateP256Keypair();
     const hashHex = createHash('sha256').update(pubDer).digest('hex');
     const spkId = `sha256:${hashHex.substring(0, 16)}`;
-    this._store.saveGroupSPK(this._deviceId, groupId, spkId, priv, pubDer);
+    this._store.saveGroupSPK(this._deviceId, gk, spkId, priv, pubDer);
     return { spkId, priv, pubDer };
   }
 
   /** 注册指定群的 group SPK 到服务端。group 服务负责成员鉴权。 */
   async ensureGroupRegistered(groupId: string, callFn: CallFn): Promise<void> {
-    const uploadedSPKId = this._store.loadLatestUploadedGroupSPKId(this._deviceId, groupId);
-    if (uploadedSPKId) {
-      this._lastUploadedGroupSPKIds.set(groupId, uploadedSPKId);
-      return;
+    const gk = this._groupKey(groupId);
+    for (const candidate of this._groupLookupCandidates(groupId)) {
+      const uploadedSPKId = this._store.loadLatestUploadedGroupSPKId(this._deviceId, candidate);
+      if (uploadedSPKId) {
+        this._lastUploadedGroupSPKIds.set(gk, uploadedSPKId);
+        this._lastUploadedGroupSPKIds.set(candidate, uploadedSPKId);
+        return;
+      }
     }
-    const { spkId, pubDer } = this.ensureGroupSPK(groupId);
-    await this._publishGroupSPK(groupId, spkId, pubDer, callFn);
+    const { spkId, pubDer } = this.ensureGroupSPK(gk);
+    await this._publishGroupSPK(gk, spkId, pubDer, callFn);
   }
 
   /** 轮换指定群的 group SPK，保留旧私钥用于缓存窗口内的历史 wrap 解密。 */
@@ -340,11 +362,12 @@ export class V2Session {
     callFn: CallFn,
   ): Promise<{ spkId: string; priv: Uint8Array; pubDer: Uint8Array }> {
     this.ensureKeys();
+    const gk = this._groupKey(groupId);
     const [priv, pubDer] = generateP256Keypair();
     const hashHex = createHash('sha256').update(pubDer).digest('hex');
     const spkId = `sha256:${hashHex.substring(0, 16)}`;
-    this._store.saveGroupSPK(this._deviceId, groupId, spkId, priv, pubDer);
-    await this._publishGroupSPK(groupId, spkId, pubDer, callFn);
+    this._store.saveGroupSPK(this._deviceId, gk, spkId, priv, pubDer);
+    await this._publishGroupSPK(gk, spkId, pubDer, callFn);
     return { spkId, priv, pubDer };
   }
 
@@ -352,10 +375,12 @@ export class V2Session {
   getGroupDecryptKeys(groupId: string, spkId: string): { ikPriv: Uint8Array; spkPriv: Uint8Array | null } {
     this.ensureKeys();
     if (!spkId) return { ikPriv: this._ikPriv, spkPriv: null };
-    const lookup = this._normalizeGroupSPKLookup(groupId, spkId);
+    const lookup = this._normalizeGroupSPKLookup(this._groupKey(groupId), spkId);
     // 优先查 group SPK
-    const groupSPK = this._store.loadGroupSPK(this._deviceId, lookup.groupId, lookup.spkId);
-    if (groupSPK) return { ikPriv: this._ikPriv, spkPriv: groupSPK };
+    for (const candidate of this._groupLookupCandidates(lookup.groupId)) {
+      const groupSPK = this._store.loadGroupSPK(this._deviceId, candidate, lookup.spkId);
+      if (groupSPK) return { ikPriv: this._ikPriv, spkPriv: groupSPK };
+    }
     // fallback 到 device SPK，再 fallback 到 IK 特殊 fallback（兼容历史消息）
     if (lookup.spkId === this._spkId) return { ikPriv: this._ikPriv, spkPriv: this._spkPriv ?? null };
     const oldSPK = this._store.loadSPK(this._deviceId, lookup.spkId);
@@ -377,8 +402,9 @@ export class V2Session {
   /** 判断 spk_id 是否为本进程在该群最后一次成功上传的 group SPK。 */
   isLastUploadedGroupSPK(groupId: string, spkId: string): boolean {
     if (!spkId) return false;
-    const lookup = this._normalizeGroupSPKLookup(groupId, spkId);
-    return this._lastUploadedGroupSPKIds.get(lookup.groupId) === lookup.spkId;
+    const lookup = this._normalizeGroupSPKLookup(this._groupKey(groupId), spkId);
+    return this._groupLookupCandidates(lookup.groupId)
+      .some((candidate) => this._lastUploadedGroupSPKIds.get(candidate) === lookup.spkId);
   }
 
   /** 签名并上传 group SPK 到 group.v2.put_group_pk。 */
@@ -388,6 +414,7 @@ export class V2Session {
     pubDer: Uint8Array,
     callFn: CallFn,
   ): Promise<void> {
+    const gk = this._groupKey(groupId);
     const spkTimestamp = Math.floor(this._nowFn() / 1000);
     const signData = Buffer.concat([
       Buffer.from(pubDer),
@@ -396,14 +423,18 @@ export class V2Session {
     ]);
     const signature = ecdsaSignRaw(this._ikPriv, signData);
     await callFn('group.v2.put_group_pk', {
-      group_id: groupId,
+      group_id: gk,
+      group_aid: gk,
       key_source: 'group_device_prekey',
       spk_id: spkId,
       spk_pk: Buffer.from(pubDer).toString('base64'),
       spk_signature: Buffer.from(signature).toString('base64'),
       spk_timestamp: spkTimestamp,
     });
-    this._store.markGroupSPKUploaded(this._deviceId, groupId, spkId);
-    this._lastUploadedGroupSPKIds.set(groupId, spkId);
+    this._store.markGroupSPKUploaded(this._deviceId, gk, spkId);
+    this._lastUploadedGroupSPKIds.set(gk, spkId);
+    if (String(groupId ?? '').trim() && String(groupId ?? '').trim() !== gk) {
+      this._lastUploadedGroupSPKIds.set(String(groupId ?? '').trim(), spkId);
+    }
   }
 }

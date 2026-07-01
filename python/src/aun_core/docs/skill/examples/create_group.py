@@ -40,9 +40,11 @@ async def main():
         print(f"[2] {name} 已加入")
 
     # ── 设置公告 ──
-    await owner.call("group.update_announcement", {
+    await owner.call("group.set_settings", {
         "group_id": gid,
-        "content": "欢迎加入项目讨论组！请遵守群规。",
+        "settings": {
+            "announcement.content": "欢迎加入项目讨论组！请遵守群规。",
+        }
     })
     print("[3] 公告已设置")
 

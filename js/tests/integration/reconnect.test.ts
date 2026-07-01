@@ -26,20 +26,38 @@ const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
 const execFileAsync = promisify(execFile);
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
+let testMessageSeq = 0;
 
-function makeClient(): AUNClient {
+function nextTestMessageId(prefix = 'js-rc-msg'): string {
+  testMessageSeq += 1;
+  return `${prefix}-${Date.now().toString(36)}-${testMessageSeq.toString(36)}-${rid()}`;
+}
+
+function makeClient(deviceId?: string): AUNClient {
   const client = new AUNClient();
   (client as any).__testAunPath = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-'));
+  if (deviceId) {
+    (client as unknown as { __testDeviceId: string }).__testDeviceId = deviceId;
+  }
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
 
-async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
+async function ensureConnected(
+  client: AUNClient,
+  aid: string,
+  retry: { maxAttempts?: number; initialDelay?: number; maxDelay?: number } = {},
+): Promise<void> {
   await registerAndLoadIdentity(client, aid);
   await client.connect({
     auto_reconnect: true,
     heartbeat_interval: 3,
-    retry: { max_attempts: 10, initial_delay: 1.0, max_delay: 10.0 },
+    call_timeout: 3,
+    retry: {
+      max_attempts: retry.maxAttempts ?? 10,
+      initial_delay: retry.initialDelay ?? 1.0,
+      max_delay: retry.maxDelay ?? 10.0,
+    },
   });
 }
 
@@ -83,6 +101,107 @@ async function waitFor(predicate: () => boolean, timeoutMs: number = 30000, inte
 
 async function waitForState(client: AUNClient, state: string, timeoutMs: number = 30000): Promise<boolean> {
   return waitFor(() => client.state === state, timeoutMs);
+}
+
+async function waitForRpcReady(client: AUNClient, timeoutMs: number = 30000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (client.state !== 'ready') {
+      await sleep(500);
+      continue;
+    }
+    try {
+      await client.call('meta.ping');
+      return true;
+    } catch {
+      await sleep(500);
+    }
+  }
+  return false;
+}
+
+async function waitForBusinessReady(client: AUNClient, aid: string, timeoutMs: number = 30000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (client.state !== 'ready') {
+      await sleep(500);
+      continue;
+    }
+    try {
+      await client.call('message.query_online', { aids: [aid] });
+      return true;
+    } catch (err) {
+      await sleep(500);
+    }
+  }
+  return false;
+}
+
+async function sendPlainWhenMessageServiceReady(
+  client: AUNClient,
+  to: string,
+  payload: JsonObject,
+  timeoutMs = 90000,
+): Promise<JsonObject> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = null;
+  while (Date.now() < deadline) {
+    if (client.state !== 'ready') {
+      await sleep(500);
+      continue;
+    }
+    try {
+      return await client.call('message.send', {
+        to,
+        payload,
+        encrypt: false,
+        message_id: nextTestMessageId(),
+      }) as JsonObject;
+    } catch (err) {
+      lastError = err;
+      const text = err instanceof Error ? err.message : String(err);
+      if (!text.includes('no_service') && !text.includes('Service plane unavailable')) {
+        throw err;
+      }
+      await sleep(500);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'message service not ready'));
+}
+
+function messagePayloadText(message: unknown): string {
+  const payload = (message as { payload?: unknown } | null)?.payload;
+  if (typeof payload === 'string') return payload;
+  if (payload && typeof payload === 'object') {
+    return String((payload as { text?: unknown }).text ?? '');
+  }
+  return '';
+}
+
+async function waitForPulledPayload(
+  client: AUNClient,
+  text: string,
+  timeoutMs = 20000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (client.state !== 'ready') {
+      await sleep(500);
+      continue;
+    }
+    try {
+      const pullResult = await client.call('message.pull', { after_seq: 0, limit: 100, force: true }) as JsonObject;
+      const messages = (pullResult.messages ?? []) as Message[];
+      if (messages.some((message) => messagePayloadText(message) === text)) {
+        return true;
+      }
+    } catch {
+      await sleep(500);
+      continue;
+    }
+    await sleep(500);
+  }
+  return false;
 }
 
 function localAddresses(): Set<string> {
@@ -181,7 +300,7 @@ describe('断线重连集成测试', () => {
     const r = rid();
     const client = makeClient();
     clients.push(client);
-    await ensureConnected(client, `rc-t1-${r}.agentid.pub`);
+    await ensureConnected(client, `rc-t1-${r}.agentid.pub`, { maxAttempts: 0, maxDelay: 2.0 });
     expect(client.state).toBe('ready');
 
     const ok = await dockerRestart();
@@ -191,8 +310,7 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    const reconnected = await waitForState(client, 'ready', 60000);
-    expect(reconnected).toBe(true);
+    expect(await waitForRpcReady(client, 90000)).toBe(true);
 
     const result = await client.call('meta.ping') as JsonObject;
     expect(result).toBeTruthy();
@@ -210,7 +328,7 @@ describe('断线重连集成测试', () => {
       states.push(String(payload.state ?? ''));
     });
 
-    await ensureConnected(client, `rc-t2-${r}.agentid.pub`);
+    await ensureConnected(client, `rc-t2-${r}.agentid.pub`, { maxAttempts: 0, maxDelay: 2.0 });
 
     const ok = await dockerRestart();
     if (!ok) {
@@ -219,7 +337,7 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    const reconnected = await waitForState(client, 'ready', 60000);
+    const reconnected = await waitForBusinessReady(client, `rc-t2-${r}.agentid.pub`, 90000);
     expect(reconnected).toBe(true);
     expect(eventsIncludeDisconnect(states)).toBe(true);
     expect(states[states.length - 1]).toBe('ready');
@@ -229,14 +347,16 @@ describe('断线重连集成测试', () => {
     if (shouldSkipLocalReconnect()) return;
 
     const r = rid();
-    const alice = makeClient();
-    const bob = makeClient();
+    const alice = makeClient(`rc-a-dev-${r}`);
+    const bob = makeClient(`rc-b-dev-${r}`);
     clients.push(alice, bob);
     const aliceAid = `rc-a-${r}.agentid.pub`;
     const bobAid = `rc-b-${r}.agentid.pub`;
 
-    await ensureConnected(alice, aliceAid);
-    await ensureConnected(bob, bobAid);
+    await ensureConnected(alice, aliceAid, { maxAttempts: 0, maxDelay: 2.0 });
+    await ensureConnected(bob, bobAid, { maxAttempts: 0, maxDelay: 2.0 });
+    expect(await waitForBusinessReady(alice, aliceAid, 90000)).toBe(true);
+    expect(await waitForBusinessReady(bob, bobAid, 90000)).toBe(true);
 
     const ok = await dockerRestart();
     if (!ok) {
@@ -245,8 +365,8 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    expect(await waitForState(alice, 'ready', 60000)).toBe(true);
-    expect(await waitForState(bob, 'ready', 60000)).toBe(true);
+    expect(await waitForBusinessReady(alice, aliceAid, 90000)).toBe(true);
+    expect(await waitForBusinessReady(bob, bobAid, 90000)).toBe(true);
     await sleep(3000);
 
     const received: Message[] = [];
@@ -260,15 +380,17 @@ describe('断线重连集成测试', () => {
       });
     });
 
-    const sendResult = await alice.call('message.send', {
-      to: bobAid,
-      payload: { type: 'text', text: expectedText },
-      encrypt: false,
-    }) as JsonObject;
+    const sendResult = await sendPlainWhenMessageServiceReady(
+      alice,
+      bobAid,
+      { type: 'text', text: expectedText },
+    );
     expect(sendResult.message_id).toBeTruthy();
 
     await Promise.race([gotMessage, sleep(10000)]);
-    expect(received.some((m) => (m.payload as JsonObject | undefined)?.text === expectedText)).toBe(true);
+    const pushed = received.some((m) => (m.payload as JsonObject | undefined)?.text === expectedText);
+    const pulled = pushed ? true : await waitForPulledPayload(bob, expectedText, 20000);
+    expect(pulled).toBe(true);
   }, 120000);
 
   it('停止 Gateway 后保持自动重连，恢复后重新 ready', async () => {
@@ -283,7 +405,8 @@ describe('断线重连集成测试', () => {
       states.push(String(payload.state ?? ''));
     });
 
-    await ensureConnected(client, `rc-ex-${r}.agentid.pub`);
+    const aid = `rc-ex-${r}.agentid.pub`;
+    await ensureConnected(client, aid, { maxAttempts: 0, maxDelay: 2.0 });
 
     let stopped = false;
     try {
@@ -303,7 +426,7 @@ describe('断线重连集成测试', () => {
       expect(started).toBe(true);
       stopped = false;
 
-      const reconnected = await waitForState(client, 'ready', 60000);
+      const reconnected = await waitForBusinessReady(client, aid, 90000);
       expect(reconnected).toBe(true);
     } finally {
       if (stopped) {

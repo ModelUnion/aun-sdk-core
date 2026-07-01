@@ -17,15 +17,13 @@
 |------|------|
 | [group.create](#groupcreate) | 创建群组 |
 | [group.bind_aid](#groupbind_aid) | 为普通群绑定命名 AID |
-| [group.get](#groupget) | 查询群组信息 |
+| [group.get_info](#groupget_info) | 查询群组信息（平铺格式，唯一推荐入口） |
 | [group.update](#groupupdate) | 更新群组资料 |
 | [group.list_my](#grouplist_my) | 列出我的群组 |
 | [group.search](#groupsearch) | 搜索公开群 |
-| [group.get_public_info](#groupget_public_info) | 查询公开群信息 |
 | [group.suspend](#groupsuspend) | 暂停群组 |
 | [group.resume](#groupresume) | 恢复群组 |
 | [group.dissolve](#groupdissolve) | 解散群组 |
-| [group.get_stats](#groupget_stats) | 获取统计信息 |
 
 ### 成员管理
 
@@ -62,7 +60,6 @@
 |------|------|
 | [group.set_settings](#groupset_settings) | 统一设置群参数，含 `dispatch_mode` |
 | [group.get_settings](#groupget_settings) | 统一读取群参数 |
-| [group.get_dispatch_log](#groupget_dispatch_log) | 查看值班分发日志 |
 
 ### 消息
 
@@ -98,25 +95,15 @@
 | 方法 | 说明 |
 |------|------|
 | [group.get_summary](#groupget_summary) | 获取群组摘要 |
-| [group.get_metrics](#groupget_metrics) | 获取性能指标 |
 
-### E2EE
-
-| 方法 | 说明 |
-|------|------|
-| [group.e2ee.rotate_epoch](#groupe2eerotate_epoch) | 轮换 E2EE 纪元 |
-| [group.e2ee.get_epoch](#groupe2eeget_epoch) | 获取当前 E2EE 纪元 |
-
-### 公告与规则
+### 群设置
 
 | 方法 | 说明 |
 |------|------|
-| [group.get_announcement](#groupget_announcement) | 获取公告 |
-| [group.update_announcement](#groupupdate_announcement) | 更新公告 |
-| [group.get_rules](#groupget_rules) | 获取群规则 |
-| [group.update_rules](#groupupdate_rules) | 更新群规则 |
-| [group.get_join_requirements](#groupget_join_requirements) | 获取入群要求 |
-| [group.update_join_requirements](#groupupdate_join_requirements) | 更新入群要求 |
+| [group.set_settings](#groupset_settings) | 统一设置群参数（含公告、规则、入群要求、dispatch_mode 等） |
+| [group.get_settings](#groupget_settings) | 统一读取群参数 |
+
+**便利方法**：SDK 提供向后兼容的便利方法（`getAnnouncement`/`updateAnnouncement`/`getRules`/`updateRules`/`getJoinRequirements`/`updateJoinRequirements`），内部调用 `set_settings`/`get_settings`，返回旧格式。新代码建议直接使用 `set_settings`/`get_settings`。
 
 ### 群文件系统
 
@@ -243,27 +230,36 @@
 }
 ```
 
-### group.get
+### group.get_info
 
-查询群组信息。
+查询群组信息，返回平铺格式。默认返回公开字段；需要成员或管理员权限的字段必须通过 `required` 显式声明。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `group_id` | string | 是 | 群组 ID |
+| `required` | string[] | 否 | 受限字段声明：`member`、`state`、`e2ee`、`avatar` |
 
-**响应**：
+**默认响应**：
 
 ```json
 {
     "found": true,
     "group_id": "g-abc123.agentid.pub",
-    "group": { ... }
+    "group_aid": "g-abc123.agentid.pub",
+    "name": "开发讨论组",
+    "visibility": "public",
+    "status": "active",
+    "description": "技术讨论群",
+    "member_count": 42,
+    "created_at": 1234567890
 }
 ```
 
-> 若群组不存在，`found` 为 `false`，`group` 为 `null`。
+`required=["member"]` 会额外返回 `owner_aid`、`creator_aid`、`message_seq`、`event_seq`、`e2ee_epoch`、`updated_at`、`my_role` 等成员可见字段。
+
+> `group.get` 和 `group.info` 已合并到 `group.get_info`；`group.get_info` 默认行为等价于原公开信息查询。
 
 ### group.update
 
@@ -340,21 +336,6 @@
 
 > **注意**：当前 `page` 固定为 1，不支持翻页。仅返回公开群组。
 
-### group.get_public_info
-
-查询公开群组信息。仅限 `visibility=public` 的群组可查询。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "group": { ... }
-}
-```
-
 ### group.suspend
 
 暂停群组。暂停期间不能发送消息。需要 **admin 及以上**权限。
@@ -404,29 +385,6 @@
 }
 ```
 
-### group.get_stats
-
-获取群组统计信息。需要 **admin 及以上**权限。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "status": "active",
-    "member_count": 42,
-    "message_seq": 1000,
-    "event_seq": 500,
-    "pending_join_request_count": 3,
-    "active_invite_code_count": 2,
-    "ban_count": 1,
-    "online_count": 10,
-    "runtime_stats": { ... },
-    "cleanup": { ... }
-}
-```
 
 ---
 
@@ -1059,32 +1017,6 @@ await client.call("group.set_settings", {
 }
 ```
 
-### group.get_dispatch_log
-
-读取值班分发日志。成员可读，主要用于诊断 `dispatch.mode=duty`、超时回退、批量分发等运行时行为。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `group_id` | string | 是 | — | 群组 ID |
-| `date` | string | 否 | 当天 | 日志日期，格式由服务端日志文件名解析 |
-| `size` / `limit` | integer | 否 | 100 | 返回最后 N 条，最大 500 |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "items": [],
-    "total": 0,
-    "page": 1,
-    "size": 100
-}
-```
-
----
-
 ## 消息
 
 ### group.send
@@ -1348,104 +1280,6 @@ result = await client.call("group.thought.get", {
 **SDK 行为**：SDK 把 pull / push 收到的撤回 tombstone（占位与通知）归一化为 `group.message_recalled` 应用事件，**不**作为普通 `group.message_created` 交付；tombstone 仍占 seq，正常推进 SeqTracker 与 ack。SDK 按 `(group_id, message_ids)` 去重，因此即使同时收到在线 push 事件、占位 tombstone、通知 tombstone，应用层也**只回调一次**。去重键**不含 `recalled_at`**：占位 tombstone、通知 tombstone 与在线 push 三条通道对同一次撤回可能携带不同来源的时间戳（push 在事务提交后重取），若纳入 `recalled_at` 会使去重失效、导致重复回调；一条消息只能被撤回一次（服务端 `group_message_recalls` 唯一键保证），`(group_id, message_ids)` 已能唯一标识一次撤回。
 
 > 所有语言 SDK 统一通过 `client.call("group.recall", {...})` 调用，不提供独立的便捷方法名。
-
----
-
-## 公告与规则
-
-### group.get_announcement
-
-获取群公告。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "announcement": { ... }
-}
-```
-
-### group.update_announcement
-
-更新群公告。需要 **admin 及以上**权限。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `content` | string | 是 | 公告内容（上限由 announcement_max_length 配置，默认 4000） |
-| `attachments` | array | 否 | 存储引用数组 |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "announcement": { ... }
-}
-```
-
-### group.get_rules
-
-获取群规则。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "rules": { ... }
-}
-```
-
-### group.update_rules
-
-更新群规则。需要 **admin 及以上**权限。
-
-**参数**：`group_id` (string) + 规则字段（max_members, allow_member_invite 等，均可选）
-
-### group.get_join_requirements
-
-获取入群要求。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "join_requirements": {
-        "group_id": "g-abc123.agentid.pub",
-        "mode": "approval",
-        "question": "请描述你的用途",
-        "auto_approve_patterns": [],
-        "max_pending": 100,
-        "updated_by": "alice.agentid.pub",
-        "updated_at": 1234567890
-    }
-}
-```
-
-### group.update_join_requirements
-
-更新入群要求。需要 **admin 及以上**权限。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `mode` | string | 否 | `"open"` / `"approval"` / `"invite_only"` / `"closed"` |
-| `question` | string | 否 | 入群问题 |
-| `auto_approve_patterns` | array | 否 | 自动批准正则列表 |
-| `max_pending` | integer | 否 | 最大待审批数 |
 
 ---
 
@@ -1746,36 +1580,6 @@ result = await client.call("group.thought.get", {
 }
 ```
 
-### group.get_metrics
-
-获取群组性能指标，包含 E2EE epoch 范围记录。需要 **admin 及以上**权限。
-
-**参数**：`group_id` (必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "message_seq": 1000,
-    "event_seq": 2000,
-    "member_count": 10,
-    "online_count": 5,
-    "e2ee_epoch": 3,
-    "epoch_count": 4,
-    "epoch_ranges": [
-        {
-            "epoch": 0,
-            "start_msg_seq": 0,
-            "start_event_seq": 0,
-            "end_msg_seq": 100,
-            "end_event_seq": 200,
-            "rotated_by": "alice.agentid.pub",
-            "rotated_at": 1234567890
-        }
-    ]
-}
-```
 
 ### group.refresh_member_types
 
@@ -1796,37 +1600,6 @@ result = await client.call("group.thought.get", {
     ]
 }
 ```
-
----
-
-## E2EE
-
-### group.e2ee.rotate_epoch
-
-CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `current_epoch` | integer | 是 | 当前 epoch 值（CAS 校验） |
-| `rotation_signature` | string | 是 | 轮换签名（Base64，ECDSA SHA-256） |
-| `rotation_timestamp` | string | 是 | 轮换时间戳（秒） |
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "success": true, "epoch": 4 }`
-
-> 签名格式：`{group_id}|{current_epoch}|{new_epoch}|{aid}|{rotation_timestamp}`。时间戳必须在 5 分钟窗口内。签名去重防止重放攻击（10 分钟窗口）。
-
-### group.e2ee.get_epoch
-
-获取当前 E2EE Epoch 值。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "epoch": 3 }`
-
----
 
 ---
 
@@ -2063,5 +1836,6 @@ Group 服务定义了以下专用错误码（-33xxx 段）：
 | -33009 | Resource request not found | 检查 request_id |
 
 > SDK 客户端将 -33001 映射为 `GroupNotFoundError`，-33002~-33003 映射为 `GroupStateError`，其余映射为 `GroupError`。未识别的错误码 fallback 到 `AUNError`。
+
 
 

@@ -6,13 +6,9 @@
  */
 
 import type {
-  GroupSecretRecord,
   IdentityRecord,
   KeyPairRecord,
   MetadataRecord,
-  PrekeyMap,
-  PrekeyRecord,
-  SessionRecord,
 } from '../types.js';
 export interface AgentMdCacheRecord {
   aid: string;
@@ -58,70 +54,6 @@ export interface TokenStore {
     updater: (state: MetadataRecord) => MetadataRecord | void,
   ): Promise<MetadataRecord>;
 
-  /** 加载结构化 prekeys（deviceId 可选，不传等价于 deviceId=''） */
-  loadE2EEPrekeys?(aid: string, deviceId?: string): Promise<PrekeyMap>;
-  /**
-   * 按 prekey_id 单点查询（O(log N)），跳过全量扫描。
-   *
-   * 解密入站消息时，envelope 只带 prekey_id，没有 device_id。直接走单查可省去
-   * 全量加载的开销。未命中时调用方应回退到 `loadE2EEPrekeys`，保持兼容。
-   */
-  loadE2EEPrekeyById?(aid: string, prekeyId: string): Promise<Record<string, unknown> | null>;
-  /** 保存单个 prekey（deviceId 可选，不传等价于 deviceId=''） */
-  saveE2EEPrekey?(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): Promise<void>;
-  /** 清理过期 prekeys（deviceId 可选，不传等价于 deviceId=''） */
-  cleanupE2EEPrekeys?(aid: string, cutoffMs: number, keepLatest?: number, deviceId?: string): Promise<string[]>;
-
-  /** 列出本地已存储群组密钥的 group_id */
-  listGroupSecretIds?(aid: string): Promise<string[]>;
-  /** 清理单个群组过期 old epochs */
-  cleanupGroupOldEpochsState?(aid: string, groupId: string, cutoffMs: number): Promise<number>;
-  /** 按 row 加载当前或指定 epoch 的群组密钥 */
-  loadGroupSecretEpoch?(aid: string, groupId: string, epoch?: number | null): Promise<GroupSecretRecord | null>;
-  /** 按 row 加载某个群组的当前和历史 epoch 密钥 */
-  loadGroupSecretEpochs?(aid: string, groupId: string): Promise<GroupSecretRecord[]>;
-  /** 事务化保存群组密钥状态转移 */
-  storeGroupSecretTransition?(
-    aid: string,
-    groupId: string,
-    opts: {
-      epoch: number;
-      secret: string;
-      commitment: string;
-      memberAids: string[];
-      epochChain?: string;
-      pendingRotationId?: string;
-      epochChainUnverified?: boolean | null;
-      epochChainUnverifiedReason?: string | null;
-      oldEpochRetentionMs: number;
-    },
-  ): Promise<boolean>;
-  /** 事务化保存指定 epoch 密钥；低于 current 时写入 old epoch row */
-  storeGroupSecretEpoch?(
-    aid: string,
-    groupId: string,
-    opts: {
-      epoch: number;
-      secret: string;
-      commitment: string;
-      memberAids: string[];
-      epochChain?: string;
-      pendingRotationId?: string;
-      epochChainUnverified?: boolean | null;
-      epochChainUnverifiedReason?: string | null;
-      oldEpochRetentionMs: number;
-    },
-  ): Promise<boolean>;
-  /** 事务化丢弃指定 pending rotation */
-  discardPendingGroupSecretState?(aid: string, groupId: string, epoch: number, rotationId: string): Promise<boolean>;
-  /** 删除单个群组的所有密钥状态（群组解散时使用） */
-  deleteGroupSecretState?(aid: string, groupId: string): Promise<void>;
-
-  /** 加载全部 E2EE sessions */
-  loadE2EESessions?(aid: string): Promise<SessionRecord[]>;
-  /** 保存单个 E2EE session */
-  saveE2EESession?(aid: string, sessionId: string, data: SessionRecord): Promise<void>;
-
   /** 保存单个 namespace 的 contiguous_seq */
   saveSeq?(aid: string, deviceId: string, slotId: string, namespace: string, contiguousSeq: number): Promise<void>;
   /** 加载单个 namespace 的 contiguous_seq */
@@ -159,6 +91,7 @@ export interface TokenStore {
 /** 群组状态记录 */
 export interface GroupStateRecord {
   group_id: string;
+  group_aid?: string;
   state_version: number;
   state_hash: string;
   key_epoch: number;

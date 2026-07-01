@@ -711,21 +711,27 @@ func (d *messageDeliveryEngine) processAndPublishMessage(data any) {
 		// auto-ack contiguous_seq
 		contig := c.seqTracker.GetContiguousSeq(p2pNS)
 		if contig > 0 {
-			ackSeq := c.clampAckSeq("message.ack", "seq", p2pNS, int64(contig))
+			ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", p2pNS, int64(contig))
 			c.log.Debug("P2P push auto-ack send: ns=%s seq=%d contiguous=%d", p2pNS, ackSeq, contig)
 			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ackCtx, ackCancel := context.WithTimeout(contextWithRPCBackground(context.Background()), 5*time.Second)
 				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-					"seq":             ackSeq,
-					"device_id":       c.deviceID,
-					"slot_id":         c.slotID,
-					"_rpc_background": true,
-				}); ackErr != nil {
-					c.log.Warn("P2P auto-ack failed: %v", ackErr)
+				var ackErr error
+				if c.v2GetState() != nil {
+					_, ackErr = c.ackV2(ackCtx, ackSeq)
 				} else {
-					c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", p2pNS, ackSeq)
+					_, ackErr = c.transport.Call(ackCtx, "message.ack", map[string]any{
+						"seq":             ackSeq,
+						"device_id":       c.deviceID,
+						"slot_id":         c.slotID,
+						"_rpc_background": true,
+					})
 				}
+				if ackErr != nil {
+					c.log.Warn("P2P auto-ack failed: %v", ackErr)
+					return
+				}
+				c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", p2pNS, ackSeq)
 			}()
 		}
 		c.persistSeq(p2pNS)
@@ -985,6 +991,10 @@ func (d *messageDeliveryEngine) autoPullGroupMessages(notification map[string]an
 // fillGroupGap 后台补齐群消息空洞
 func (d *messageDeliveryEngine) fillGroupGap(groupID string) {
 	c := d.runtime.client
+	groupID = NormalizeGroupID(strings.TrimSpace(groupID), "")
+	if groupID == "" {
+		return
+	}
 	ns := "group:" + groupID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
 	c.logEG.Debug("fillGroupGap triggered: group=%s afterSeq=%d", groupID, afterSeq)
@@ -1608,7 +1618,7 @@ func (d *messageDeliveryEngine) drainOnlineUnreadHints() {
 	}()
 	for {
 		c.mu.RLock()
-		ready := c.state == StateConnected
+		ready := clientStateIsReady(c.state)
 		c.mu.RUnlock()
 		if !ready || !d.backgroundSyncEnabled() {
 			return
@@ -1656,7 +1666,7 @@ func (d *messageDeliveryEngine) fillP2pGap() {
 	myAID := c.aid
 	state := c.state
 	c.mu.RUnlock()
-	if state != StateConnected || c.closing.Load() {
+	if !clientStateIsReady(state) || c.closing.Load() {
 		return
 	}
 	if myAID == "" {

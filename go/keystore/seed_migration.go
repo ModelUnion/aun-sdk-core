@@ -224,12 +224,7 @@ func migrateOneAIDDB(dbPath, scope string, oldMaster, newSeed []byte) (int, int,
 		keyCols string
 		encCol  string
 		nameFn  func([]any) string
-	}{
-		{"prekeys", "prekey_id, device_id", "private_key_enc", func(row []any) string { return "prekey/" + fmt.Sprint(row[0]) }},
-		{"group_current", "group_id", "secret_enc", func(row []any) string { return "group/" + fmt.Sprint(row[0]) + "/current" }},
-		{"group_old_epochs", "group_id, epoch", "secret_enc", func(row []any) string { return "group/" + fmt.Sprint(row[0]) + "/epoch/" + fmt.Sprint(row[1]) }},
-		{"e2ee_sessions", "session_id", "data_enc", func(row []any) string { return "session/" + fmt.Sprint(row[0]) }},
-	}
+	}{}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return 0, 0, 1

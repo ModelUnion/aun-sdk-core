@@ -130,6 +130,9 @@ class _CreateGroupClient(AUNClient):
                     "transfer_auth": payload.get("transfer_auth") or {},
                 },
             }
+        if method == "group.get_info":
+            group_id = payload.get("group_id", "123456")
+            return {"group_id": group_id, "group_aid": self.group_aid}
         if "group_name" not in payload:
             return {"group": {"group_id": "123456", "group_aid": "123456.agentid.pub"}}
         cert_pem = _cert_for_public_key(self.group_aid, payload["public_key"])
@@ -338,7 +341,7 @@ async def test_complete_group_transfer_generates_key_and_persists(tmp_path):
     result = await client.complete_group_transfer({"group_id": "group.agentid.pub/123456"}, aid_store=store)
 
     assert result["group"]["group_aid"] == group_aid
-    assert [item[0] for item in client.calls] == ["group.get", "group.complete_transfer"]
+    assert [item[0] for item in client.calls] == ["group.get_info", "group.complete_transfer"]
     complete_payload = client.calls[1][1]
     assert complete_payload["public_key"]
     assert complete_payload["curve"] == "P-256"

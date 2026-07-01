@@ -104,38 +104,6 @@ class E2EEDecryptFailedError(E2EEError):
         )
 
 
-# ── 群组 E2EE 错误 ──────────────────────────────────────────
-
-class E2EEGroupSecretMissingError(E2EEError):
-    """缺少该群的 group_secret"""
-    def __init__(self, message: str = "group secret missing", **kwargs: Any) -> None:
-        super().__init__(message, code=-32040, local_code="E2EE_GROUP_SECRET_MISSING", **kwargs)
-
-
-class E2EEGroupEpochMismatchError(E2EEError):
-    """消息 epoch 与本地不匹配"""
-    def __init__(self, message: str = "group epoch mismatch", **kwargs: Any) -> None:
-        super().__init__(message, code=-32041, local_code="E2EE_GROUP_EPOCH_MISMATCH", **kwargs)
-
-
-class E2EEGroupCommitmentInvalidError(E2EEError):
-    """Membership Commitment 验证失败"""
-    def __init__(self, message: str = "group commitment invalid", **kwargs: Any) -> None:
-        super().__init__(message, code=-32042, local_code="E2EE_GROUP_COMMITMENT_INVALID", **kwargs)
-
-
-class E2EEGroupNotMemberError(E2EEError):
-    """密钥请求者不是群成员"""
-    def __init__(self, message: str = "not a group member", **kwargs: Any) -> None:
-        super().__init__(message, code=-32043, local_code="E2EE_GROUP_NOT_MEMBER", **kwargs)
-
-
-class E2EEGroupDecryptFailedError(E2EEError):
-    """群消息解密失败"""
-    def __init__(self, message: str = "group message decrypt failed", **kwargs: Any) -> None:
-        super().__init__(message, code=-32044, local_code="E2EE_GROUP_DECRYPT_FAILED", **kwargs)
-
-
 class CertificateRevokedError(AuthError):
     """对端证书已被吊销"""
     def __init__(self, message: str = "peer certificate has been revoked", **kwargs: Any) -> None:
@@ -189,5 +157,14 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
     else:
         cls = AUNError
 
-    retryable = cls in {RateLimitError, TimeoutError} or (5000 <= code < 6000)
+    message_lower = message.strip().lower()
+    transient_gateway_degraded = (
+        "gateway service degraded" in message_lower
+        or "certificate not loaded" in message_lower
+    )
+    retryable = (
+        cls in {RateLimitError, TimeoutError}
+        or (5000 <= code < 6000)
+        or transient_gateway_degraded
+    )
     return cls(message, code=code, data=data, retryable=retryable, trace_id=trace_id)

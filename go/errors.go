@@ -1,6 +1,9 @@
 package aun
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // ── AUN 错误层次 ──────────────────────────────────────────
 // 与 Python SDK errors.py 完全对应，提供结构化错误码、重试标记和链路追踪。
@@ -135,21 +138,6 @@ type E2EEError struct {
 
 // E2EEDecryptFailedError 解密失败
 type E2EEDecryptFailedError struct{ E2EEError }
-
-// E2EEGroupSecretMissingError 缺少群组密钥（code=-32040）
-type E2EEGroupSecretMissingError struct{ E2EEError }
-
-// E2EEGroupEpochMismatchError 消息 epoch 与本地不匹配（code=-32041）
-type E2EEGroupEpochMismatchError struct{ E2EEError }
-
-// E2EEGroupCommitmentInvalidError Membership Commitment 验证失败（code=-32042）
-type E2EEGroupCommitmentInvalidError struct{ E2EEError }
-
-// E2EEGroupNotMemberError 密钥请求者不是群成员（code=-32043）
-type E2EEGroupNotMemberError struct{ E2EEError }
-
-// E2EEGroupDecryptFailedError 群消息解密失败（code=-32044）
-type E2EEGroupDecryptFailedError struct{ E2EEError }
 
 // CertificateRevokedError 对端证书已被吊销（code=-32050，嵌入 AuthError）
 type CertificateRevokedError struct{ AuthError }
@@ -321,61 +309,6 @@ func NewE2EEDecryptFailedError(msg string) *E2EEDecryptFailedError {
 	}}
 }
 
-// NewE2EEGroupSecretMissingError 创建群组密钥缺失错误
-func NewE2EEGroupSecretMissingError(msg string) *E2EEGroupSecretMissingError {
-	if msg == "" {
-		msg = "group secret missing"
-	}
-	return &E2EEGroupSecretMissingError{E2EEError{
-		AUNError:  AUNError{Message: msg, Code: -32040},
-		LocalCode: "E2EE_GROUP_SECRET_MISSING",
-	}}
-}
-
-// NewE2EEGroupEpochMismatchError 创建 epoch 不匹配错误
-func NewE2EEGroupEpochMismatchError(msg string) *E2EEGroupEpochMismatchError {
-	if msg == "" {
-		msg = "group epoch mismatch"
-	}
-	return &E2EEGroupEpochMismatchError{E2EEError{
-		AUNError:  AUNError{Message: msg, Code: -32041},
-		LocalCode: "E2EE_GROUP_EPOCH_MISMATCH",
-	}}
-}
-
-// NewE2EEGroupCommitmentInvalidError 创建 Membership Commitment 验证失败错误
-func NewE2EEGroupCommitmentInvalidError(msg string) *E2EEGroupCommitmentInvalidError {
-	if msg == "" {
-		msg = "group commitment invalid"
-	}
-	return &E2EEGroupCommitmentInvalidError{E2EEError{
-		AUNError:  AUNError{Message: msg, Code: -32042},
-		LocalCode: "E2EE_GROUP_COMMITMENT_INVALID",
-	}}
-}
-
-// NewE2EEGroupNotMemberError 创建非群成员错误
-func NewE2EEGroupNotMemberError(msg string) *E2EEGroupNotMemberError {
-	if msg == "" {
-		msg = "not a group member"
-	}
-	return &E2EEGroupNotMemberError{E2EEError{
-		AUNError:  AUNError{Message: msg, Code: -32043},
-		LocalCode: "E2EE_GROUP_NOT_MEMBER",
-	}}
-}
-
-// NewE2EEGroupDecryptFailedError 创建群消息解密失败错误
-func NewE2EEGroupDecryptFailedError(msg string) *E2EEGroupDecryptFailedError {
-	if msg == "" {
-		msg = "group message decrypt failed"
-	}
-	return &E2EEGroupDecryptFailedError{E2EEError{
-		AUNError:  AUNError{Message: msg, Code: -32044},
-		LocalCode: "E2EE_GROUP_DECRYPT_FAILED",
-	}}
-}
-
 // NewCertificateRevokedError 创建证书吊销错误
 func NewCertificateRevokedError(msg string) *CertificateRevokedError {
 	if msg == "" {
@@ -446,6 +379,9 @@ func MapRemoteError(errMap map[string]any) error {
 
 	// 根据错误码判断是否可重试
 	retryable := false
+	messageLower := strings.ToLower(strings.TrimSpace(message))
+	transientGatewayDegraded := strings.Contains(messageLower, "gateway service degraded") ||
+		strings.Contains(messageLower, "certificate not loaded")
 
 	// 按错误码创建对应类型的错误
 	switch {
@@ -484,17 +420,7 @@ func MapRemoteError(errMap map[string]any) error {
 	case code >= -33009 && code <= -33004:
 		return &GroupError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
-	// E2EE 错误码映射（-32040 ~ -32044, -32050, -32051）
-	case code == -32040:
-		return &E2EEGroupSecretMissingError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_SECRET_MISSING"}}
-	case code == -32041:
-		return &E2EEGroupEpochMismatchError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_EPOCH_MISMATCH"}}
-	case code == -32042:
-		return &E2EEGroupCommitmentInvalidError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_COMMITMENT_INVALID"}}
-	case code == -32043:
-		return &E2EEGroupNotMemberError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_NOT_MEMBER"}}
-	case code == -32044:
-		return &E2EEGroupDecryptFailedError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_DECRYPT_FAILED"}}
+	// E2EE/签名错误码映射
 	case code == -32050:
 		return &CertificateRevokedError{AuthError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}}
 	case code == -32013 || code == -32051:
@@ -502,7 +428,7 @@ func MapRemoteError(errMap map[string]any) error {
 
 	default:
 		// 5000 <= code < 6000 为可重试的服务端错误
-		if code >= 5000 && code < 6000 {
+		if transientGatewayDegraded || (code >= 5000 && code < 6000) {
 			retryable = true
 		}
 		return &AUNError{Message: message, Code: code, Data: data, Retryable: retryable, TraceID: traceID}

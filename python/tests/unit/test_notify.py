@@ -124,7 +124,7 @@ async def test_client_notify_group_wraps_group_route_notification():
 
     method, params = client._transport.notify.call_args.args
     assert method == "notification/group.route"
-    assert params["group_id"] == "group.agentid.pub/g-room"
+    assert params["group_id"] == "g-room.agentid.pub"
     assert params["deliver"] == {
         "method": "event/app.presence",
         "params": {"state": "active"},

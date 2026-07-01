@@ -249,8 +249,8 @@ func TestIntegration_GroupGetSettings(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestIntegration_GroupInfo — group.info 视角
-// 覆盖：成员看到完整信息、include=stats 返回统计、非成员看公开群（无 owner_aid）、非成员看私有群被拒
+// TestIntegration_GroupInfo — group.get_info 视角
+// 覆盖：成员看到完整信息、非成员看公开群（无 owner_aid）、非成员看私有群被拒
 // ---------------------------------------------------------------------------
 
 func TestIntegration_GroupInfo(t *testing.T) {
@@ -294,17 +294,18 @@ func TestIntegration_GroupInfo(t *testing.T) {
 	privGroupID := extractGroupID(t, privResult)
 	defer cleanupGroup(t, owner, privGroupID)
 
-	// ---- owner 调用 group.info ----
-	infoResult, err := owner.Call(ctx, "group.info", map[string]any{
+	// ---- owner 调用 group.get_info ----
+	infoResult, err := owner.Call(ctx, "group.get_info", map[string]any{
 		"group_id": pubGroupID,
+		"required": []string{"member"},
 	})
-	skipIfNotImplemented(t, err, "group.info")
+	skipIfNotImplemented(t, err, "group.get_info")
 	if err != nil {
-		t.Fatalf("group.info 失败: %v", err)
+		t.Fatalf("group.get_info 失败: %v", err)
 	}
 	infoMap, _ := infoResult.(map[string]any)
 	if infoMap == nil {
-		t.Fatalf("group.info 返回 nil")
+		t.Fatalf("group.get_info 返回 nil")
 	}
 	// 验证基本字段
 	if gid, _ := infoMap["group_id"].(string); gid != pubGroupID {
@@ -319,36 +320,14 @@ func TestIntegration_GroupInfo(t *testing.T) {
 	if _, ok := infoMap["member_count"]; !ok {
 		t.Fatalf("info 缺少 member_count 字段: %#v", infoMap)
 	}
-	t.Logf("owner group.info 基本字段验证通过")
-
-	// ---- info include=["stats"] ----
-	statsResult, err := owner.Call(ctx, "group.info", map[string]any{
-		"group_id": pubGroupID,
-		"include":  []string{"stats"},
-	})
-	if err != nil {
-		t.Fatalf("group.info(include=stats) 失败: %v", err)
-	}
-	statsMap, _ := statsResult.(map[string]any)
-	stats, _ := statsMap["stats"].(map[string]any)
-	if stats == nil {
-		t.Fatalf("include=stats 但未返回 stats 字段: %#v", statsMap)
-	}
-	// 验证 stats 子字段
-	if _, ok := stats["human_count"]; !ok {
-		t.Fatalf("stats 缺少 human_count: %#v", stats)
-	}
-	if _, ok := stats["admin_count"]; !ok {
-		t.Fatalf("stats 缺少 admin_count: %#v", stats)
-	}
-	t.Logf("include=stats 验证通过: stats=%#v", stats)
+	t.Logf("owner group.get_info 基本字段验证通过")
 
 	// ---- 非成员看公开群基础信息（不含 owner_aid） ----
-	bobPubInfo, err := bob.Call(ctx, "group.info", map[string]any{
+	bobPubInfo, err := bob.Call(ctx, "group.get_info", map[string]any{
 		"group_id": pubGroupID,
 	})
 	if err != nil {
-		t.Fatalf("非成员看公开群 info 失败: %v", err)
+		t.Fatalf("非成员看公开群 get_info 失败: %v", err)
 	}
 	bobPubMap, _ := bobPubInfo.(map[string]any)
 	if gid, _ := bobPubMap["group_id"].(string); gid != pubGroupID {
@@ -364,7 +343,7 @@ func TestIntegration_GroupInfo(t *testing.T) {
 	t.Logf("非成员看公开群验证通过（无 owner_aid）")
 
 	// ---- 非成员看私有群应被拒绝 ----
-	_, err = bob.Call(ctx, "group.info", map[string]any{
+	_, err = bob.Call(ctx, "group.get_info", map[string]any{
 		"group_id": privGroupID,
 	})
 	if err == nil {

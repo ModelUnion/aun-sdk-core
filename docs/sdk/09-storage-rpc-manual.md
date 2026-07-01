@@ -1140,6 +1140,8 @@ fs 目录节点视图。
 | `mount` | object | 挂载视图 |
 | `status` | string | `active`（直接生效）/ `pending`（待批准） |
 
+> `status` 字段仅在直接调用 lowlevel RPC（`fs_mount`/`FSMount`/`fsMount` 原始返回）时可见。四语言 SDK 的高层 VFS 门面（`vfs.mount()`/`StorageVFS.Mount()`/`vfs.mount()`）会把响应解析为通用 NodeView，该视图不保留顶层 `status` 字段；需要判断是否 `pending` 时请改用 lowlevel 接口读取原始响应，或检查服务端在 `pending` 场景下额外写入的 `request_id`。
+
 ---
 
 ## storage.fs.approve

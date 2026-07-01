@@ -2,7 +2,6 @@
 //
 // 与 Python aun_core.client 的对应方法对齐：
 //   - _on_v2_push_notification → onV2PushNotification
-//   - _on_v2_epoch_rotated     → onV2EpochRotated
 //   - _on_raw_group_changed 中的 V2 逻辑 → 追加到 onRawGroupChanged
 
 package aun
@@ -13,10 +12,6 @@ func (c *AUNClient) registerV2EventSubscriptions() {
 	// V2 P2P push 通知：自动 pull + decrypt + emit
 	c.events.Subscribe("_raw.peer.v2.message_received", func(payload any) {
 		c.onV2PushNotification(payload)
-	})
-	// V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation
-	c.events.Subscribe("_raw.group.v2.epoch_rotated", func(payload any) {
-		c.onV2EpochRotated(payload)
 	})
 	// V2 群消息推送：自动 pull + decrypt + emit
 	c.events.Subscribe("_raw.group.v2.message_created", func(payload any) {
@@ -47,11 +42,6 @@ func (c *AUNClient) onV2PushNotification(data any) {
 // onV2GroupPushNotification 处理 V2 群 push 通知：自动 pull + decrypt + emit。
 func (c *AUNClient) onV2GroupPushNotification(data any) {
 	c.delivery().onV2GroupPushNotification(data)
-}
-
-// onV2EpochRotated 处理 V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation。
-func (c *AUNClient) onV2EpochRotated(data any) {
-	c.getV2E2EECoordinator().handleV2EpochRotated(data)
 }
 
 func (c *AUNClient) onV2StateProposed(data any) {

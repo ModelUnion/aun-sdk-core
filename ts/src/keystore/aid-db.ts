@@ -9,6 +9,7 @@ import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { slotIsolationKey } from '../config.js';
+import { convertToGroupAid } from '../group-id.js';
 
 const SCHEMA_VERSION = 3;
 
@@ -20,6 +21,34 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
 };
 
 const _dbPool = new Map<string, { db: NodeDatabaseSync; refCount: number }>();
+
+function issuerFromScope(scope: string): string {
+  const value = String(scope ?? '').replace(/_/g, '.').trim().toLowerCase();
+  const dotIdx = value.indexOf('.');
+  return dotIdx > 0 ? value.slice(dotIdx + 1).replace(/^\.+|\.+$/g, '') : '';
+}
+
+function groupLookupCandidates(groupId: string, localIssuer = ''): string[] {
+  const raw = String(groupId ?? '').trim();
+  if (!raw) return [];
+  const normalized = convertToGroupAid(raw, { localIssuer });
+  const candidates: string[] = [];
+  const add = (value: string) => {
+    const trimmed = String(value ?? '').trim();
+    if (trimmed && !candidates.includes(trimmed)) candidates.push(trimmed);
+  };
+  add(raw);
+  add(normalized);
+  const dotIdx = normalized.indexOf('.');
+  if (dotIdx > 0 && dotIdx < normalized.length - 1) {
+    const base = normalized.slice(0, dotIdx);
+    const issuer = normalized.slice(dotIdx + 1);
+    add(`group.${issuer}/${base}`);
+    add(`${base}@${issuer}`);
+    if (localIssuer && issuer === localIssuer.replace(/^\.+|\.+$/g, '').toLowerCase()) add(base);
+  }
+  return candidates;
+}
 
 function configureDatabase(db: NodeDatabaseSync, busyTimeoutMs: number): void {
   db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
@@ -38,39 +67,6 @@ const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS tokens (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS prekeys (
-    prekey_id TEXT NOT NULL,
-    device_id TEXT NOT NULL DEFAULT '',
-    private_key_enc TEXT NOT NULL DEFAULT '',
-    data TEXT NOT NULL DEFAULT '{}',
-    created_at INTEGER,
-    updated_at INTEGER NOT NULL,
-    expires_at INTEGER,
-    PRIMARY KEY (prekey_id, device_id)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_prekeys_device ON prekeys (device_id, created_at)`,
-  `CREATE TABLE IF NOT EXISTS group_current (
-    group_id TEXT PRIMARY KEY,
-    epoch INTEGER NOT NULL,
-    secret_enc TEXT NOT NULL DEFAULT '',
-    data TEXT NOT NULL DEFAULT '{}',
-    updated_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS group_old_epochs (
-    group_id TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    secret_enc TEXT NOT NULL DEFAULT '',
-    data TEXT NOT NULL DEFAULT '{}',
-    updated_at INTEGER NOT NULL,
-    expires_at INTEGER,
-    PRIMARY KEY (group_id, epoch)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_group_old_expires ON group_old_epochs (group_id, expires_at)`,
-  `CREATE TABLE IF NOT EXISTS e2ee_sessions (
-    session_id TEXT PRIMARY KEY,
-    data_enc TEXT NOT NULL DEFAULT '{}',
     updated_at INTEGER NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS instance_state (
@@ -289,11 +285,14 @@ export class AIDDatabase {
     ).run(groupId, stateVersion, stateHash, keyEpoch, membershipJson, policyJson, Date.now());
   }
 
-  loadGroupState(groupId: string): { group_id: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | null {
-    const row = this._db.prepare(
-      'SELECT state_version, state_hash, key_epoch, membership_json, policy_json, updated_at FROM group_state WHERE group_id = ?',
-    ).get(groupId) as { state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | undefined;
-    if (!row) return null;
-    return { group_id: groupId, ...row };
+  loadGroupState(groupId: string): { group_id: string; group_aid?: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | null {
+    const localIssuer = issuerFromScope(this._scope);
+    for (const candidate of groupLookupCandidates(groupId, localIssuer)) {
+      const row = this._db.prepare(
+        'SELECT group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at FROM group_state WHERE group_id = ?',
+      ).get(candidate) as { group_id: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | undefined;
+      if (row) return { group_aid: convertToGroupAid(row.group_id, { localIssuer }), ...row };
+    }
+    return null;
   }
 }

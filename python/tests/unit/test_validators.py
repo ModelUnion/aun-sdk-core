@@ -5,7 +5,7 @@
 import pytest
 
 from aun_core.errors import ValidationError
-from aun_core.validators import validate_aid_format, validate_group_id_format
+from aun_core.validators import validate_aid_format, validate_group_aid_format, validate_group_id_format
 
 
 class TestValidateAidFormat:
@@ -112,15 +112,15 @@ class TestValidateGroupIdFormat:
     def test_valid_group_id_legacy_with_domain(self):
         """测试带域名的 legacy 格式"""
         assert validate_group_id_format("g-abc123.aid.pub") == "g-abc123.aid.pub"
-        assert validate_group_id_format("g-test@example.com") == "g-test@example.com"
+        assert validate_group_id_format("g-test@example.com") == "g-test.example.com"
 
     def test_valid_group_id_new_format(self):
-        """测试新格式 base ([a-z0-9]{5,})"""
+        """测试新格式 base ([a-z0-9]{5,64})"""
         assert validate_group_id_format("12345") == "12345"
         assert validate_group_id_format("abcde") == "abcde"
         assert validate_group_id_format("a1b2c3") == "a1b2c3"
-        # 可以很长
-        long_base = "a" * 100
+        # 最长 64 位
+        long_base = "a" * 64
         assert validate_group_id_format(long_base) == long_base
 
     def test_valid_group_id_group_name(self):
@@ -131,14 +131,22 @@ class TestValidateGroupIdFormat:
 
     def test_valid_group_id_canonical(self):
         """测试 canonical 格式 group.{issuer}/{base}"""
-        assert validate_group_id_format("group.aid.pub/g-abc123") == "group.aid.pub/g-abc123"
-        assert validate_group_id_format("group.example.com/12345") == "group.example.com/12345"
-        assert validate_group_id_format("group.aid.pub/my_team") == "group.aid.pub/my_team"
+        assert validate_group_id_format("group.aid.pub/g-abc123") == "g-abc123.aid.pub"
+        assert validate_group_id_format("group.example.com/12345") == "12345.example.com"
+        assert validate_group_id_format("group.aid.pub/my_team") == "my_team.aid.pub"
+
+    def test_group_aid_target_format(self):
+        """旧函数名也必须返回目标态 group_aid。"""
+        assert validate_group_aid_format("room-123.agentid.pub") == "room-123.agentid.pub"
+        assert validate_group_aid_format("group.agentid.pub/room-123") == "room-123.agentid.pub"
+        assert validate_group_aid_format("room-123@agentid.pub") == "room-123.agentid.pub"
+        assert validate_group_aid_format("g-abc123", local_issuer="agentid.pub") == "g-abc123.agentid.pub"
+        assert validate_group_aid_format("group.pub/room-123@agentid") == "room-123.agentid.pub"
 
     def test_valid_group_id_case_normalization(self):
         """测试大小写规范化"""
         assert validate_group_id_format("G-ABC123") == "g-abc123"
-        assert validate_group_id_format("  G-TEST@EXAMPLE.COM  ") == "g-test@example.com"
+        assert validate_group_id_format("  G-TEST@EXAMPLE.COM  ") == "g-test.example.com"
         assert validate_group_id_format("MyTeam") == "myteam"
 
     def test_invalid_group_id_empty(self):
@@ -166,6 +174,11 @@ class TestValidateGroupIdFormat:
         long_slug = "a" * 63  # g- + 63 = 65 字符，超过 group name 上限
         with pytest.raises(ValidationError, match="must be one of"):
             validate_group_id_format(f"g-{long_slug}")
+
+    def test_invalid_group_id_new_format_too_long(self):
+        """测试新格式 base 超过 64 位"""
+        with pytest.raises(ValidationError, match="must be one of"):
+            validate_group_id_format("a" * 65)
 
     def test_invalid_group_id_new_format_too_short(self):
         """测试新格式太短（少于 5 个字符）"""

@@ -108,18 +108,14 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			_, err := group.BindAID(ctx, map[string]any{"group_id": "g1", "aid": "team.agentid.pub"})
 			return err
 		}, "group.bind_aid"},
-		{"get", func() error { _, err := group.Get(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get"},
 		{"get_info", func() error { _, err := group.GetInfo(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_info"},
 		{"update", func() error { _, err := group.Update(ctx, map[string]any{"group_id": "g1", "name": "new"}); return err }, "group.update"},
 		{"list", func() error { _, err := group.List(ctx, nil); return err }, "group.list"},
 		{"list_my", func() error { _, err := group.ListMy(ctx, nil); return err }, "group.list_my"},
 		{"search", func() error { _, err := group.Search(ctx, map[string]any{"q": "team"}); return err }, "group.search"},
-		{"get_public_info", func() error { _, err := group.GetPublicInfo(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_public_info"},
 		{"suspend", func() error { _, err := group.Suspend(ctx, map[string]any{"group_id": "g1"}); return err }, "group.suspend"},
 		{"resume", func() error { _, err := group.Resume(ctx, map[string]any{"group_id": "g1"}); return err }, "group.resume"},
 		{"dissolve", func() error { _, err := group.Dissolve(ctx, map[string]any{"group_id": "g1"}); return err }, "group.dissolve"},
-		{"get_stats", func() error { _, err := group.GetStats(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_stats"},
-		{"info", func() error { _, err := group.Info(ctx, map[string]any{"group_id": "g1"}); return err }, "group.info"},
 		{"add_member", func() error {
 			_, err := group.AddMember(ctx, map[string]any{"group_id": "g1", "aid": "bob1.agentid.pub"})
 			return err
@@ -171,10 +167,6 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			return err
 		}, "group.set_settings"},
 		{"get_settings", func() error { _, err := group.GetSettings(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_settings"},
-		{"update_announcement", func() error {
-			_, err := group.UpdateAnnouncement(ctx, map[string]any{"group_id": "g1", "announcement": "a"})
-			return err
-		}, "group.update_announcement"},
 		{"send", func() error {
 			_, err := group.Send(ctx, map[string]any{"group_id": "g-test", "payload": map[string]any{"text": "hi"}})
 			return err
@@ -199,14 +191,6 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			_, err := group.AckEvents(ctx, map[string]any{"group_id": "g1", "event_seq": 3})
 			return err
 		}, "group.ack_events"},
-		{"get_announcement", func() error { _, err := group.GetAnnouncement(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_announcement"},
-		{"get_rules", func() error { _, err := group.GetRules(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_rules"},
-		{"update_rules", func() error { _, err := group.UpdateRules(ctx, map[string]any{"group_id": "g1"}); return err }, "group.update_rules"},
-		{"get_join_requirements", func() error { _, err := group.GetJoinRequirements(ctx, map[string]any{"group_id": "g1"}); return err }, "group.get_join_requirements"},
-		{"update_join_requirements", func() error {
-			_, err := group.UpdateJoinRequirements(ctx, map[string]any{"group_id": "g1"})
-			return err
-		}, "group.update_join_requirements"},
 		{"thought_put", func() error {
 			_, err := group.Thought().Put(ctx, map[string]any{"group_id": "g1", "context": map[string]any{"type": "chat", "id": "c1"}, "payload": map[string]any{"text": "t"}})
 			return err
@@ -230,8 +214,15 @@ func TestGroupFacadeRPCMappings(t *testing.T) {
 			t.Fatalf("第 %d 次调用方法不正确: got=%s want=%s", i, client.calls[i].method, tc.method)
 		}
 	}
-	if !reflect.DeepEqual(client.calls[6].params, map[string]any{}) {
-		t.Fatalf("nil params 应转换为空 map: %#v", client.calls[6].params)
+	var listParams map[string]any
+	for i, tc := range cases {
+		if tc.name == "list" {
+			listParams = client.calls[i].params
+			break
+		}
+	}
+	if !reflect.DeepEqual(listParams, map[string]any{}) {
+		t.Fatalf("nil params 应转换为空 map: %#v", listParams)
 	}
 }
 
@@ -272,6 +263,8 @@ func TestGroupFacadeDoesNotExposeInternalRPCs(t *testing.T) {
 		"RefreshMemberTypes",
 		"GetSummary",
 		"GetMetrics",
+		"GetPublicInfo",
+		"GetStats",
 		"GetState",
 		"CommitState",
 		"GetCursor",

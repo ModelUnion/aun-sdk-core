@@ -993,18 +993,24 @@ class StorageLowLevel:
     async def fs_invalidate_membership(
         self,
         *,
-        group_id: str,
-        group_owner_aid: str,
+        group_id: str | None = None,
+        group_aid: str | None = None,
+        group_owner_aid: str | None = None,
         member_aid: str | None = None,
         reason: str = "membership_changed",
         status: str | None = None,
     ) -> dict[str, Any]:
+        if not (group_id or group_aid):
+            raise ValueError("fs_invalidate_membership requires group_id or group_aid")
+        if not group_owner_aid:
+            raise ValueError("fs_invalidate_membership requires group_owner_aid")
         return await self._call(
             "storage.fs.invalidate_membership",
             {
                 key: value
                 for key, value in {
-                    "group_id": group_id,
+                    "group_id": group_id or group_aid,
+                    "group_aid": group_aid,
                     "group_owner_aid": group_owner_aid,
                     "member_aid": member_aid,
                     "reason": reason,

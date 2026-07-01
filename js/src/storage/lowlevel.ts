@@ -569,9 +569,11 @@ export class StorageLowLevel {
     }), options.mountPath);
   }
 
-  fsInvalidateMembership(options: { groupId: string; groupOwnerAid: string; memberAid?: string; reason?: string; status?: string }): Promise<StorageRaw> {
+  fsInvalidateMembership(options: { groupId?: string; groupAid?: string; groupOwnerAid: string; memberAid?: string; reason?: string; status?: string }): Promise<StorageRaw> {
+    const groupId = options.groupId ?? options.groupAid;
     return this.call('storage.fs.invalidate_membership', stripUndefined({
-      group_id: options.groupId,
+      group_id: groupId,
+      group_aid: options.groupAid,
       group_owner_aid: options.groupOwnerAid,
       member_aid: options.memberAid,
       reason: options.reason ?? 'membership_changed',

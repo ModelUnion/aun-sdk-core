@@ -113,6 +113,8 @@ func (v *v2E2EECoordinator) initV2Session(ctx context.Context) error {
 		keystore:            store,
 		bootstrapCache:      make(map[string]v2BootstrapEntry),
 		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
+		targetSetCache:      make(map[string]v2P2PTargetSetCacheEntry),
+		groupTargetSetCache: make(map[string]v2GroupTargetSetCacheEntry),
 	}
 	c.mu.Lock()
 	v.runtime.v2.setStateLocked(state)
@@ -136,6 +138,7 @@ func (v *v2E2EECoordinator) deletePeerBootstrapCache(peerAID string) {
 	}
 	state.bootstrapCacheM.Lock()
 	delete(state.bootstrapCache, peerAID)
+	delete(state.targetSetCache, peerAID)
 	state.bootstrapCacheM.Unlock()
 }
 
@@ -154,7 +157,11 @@ func (v *v2E2EECoordinator) setPeerBootstrapCache(state *v2P2PState, peerAID str
 		return
 	}
 	state.bootstrapCacheM.Lock()
+	if state.bootstrapCache == nil {
+		state.bootstrapCache = make(map[string]v2BootstrapEntry)
+	}
 	state.bootstrapCache[peerAID] = entry
+	delete(state.targetSetCache, peerAID)
 	state.bootstrapCacheM.Unlock()
 }
 
@@ -165,6 +172,7 @@ func (v *v2E2EECoordinator) deleteGroupBootstrapCache(groupID string) {
 	}
 	state.bootstrapCacheM.Lock()
 	delete(state.groupBootstrapCache, groupID)
+	delete(state.groupTargetSetCache, groupID)
 	state.bootstrapCacheM.Unlock()
 }
 
@@ -183,8 +191,197 @@ func (v *v2E2EECoordinator) setGroupBootstrapCache(state *v2P2PState, groupID st
 		return
 	}
 	state.bootstrapCacheM.Lock()
+	if state.groupBootstrapCache == nil {
+		state.groupBootstrapCache = make(map[string]*v2GroupBootstrapEntry)
+	}
 	state.groupBootstrapCache[groupID] = entry
+	delete(state.groupTargetSetCache, groupID)
 	state.bootstrapCacheM.Unlock()
+}
+
+func cloneV2Targets(in []e2ee.Target) []e2ee.Target {
+	out := make([]e2ee.Target, len(in))
+	copy(out, in)
+	return out
+}
+
+func (v *v2E2EECoordinator) getPeerTargetSetCache(state *v2P2PState, key string) (v2P2PTargetSetCacheEntry, bool) {
+	if state == nil {
+		return v2P2PTargetSetCacheEntry{}, false
+	}
+	state.bootstrapCacheM.Lock()
+	entry, ok := state.targetSetCache[key]
+	if ok && time.Since(entry.CachedAt) >= v2BootstrapTTL {
+		delete(state.targetSetCache, key)
+		ok = false
+	}
+	state.bootstrapCacheM.Unlock()
+	if !ok {
+		return v2P2PTargetSetCacheEntry{}, false
+	}
+	entry.Targets = cloneV2Targets(entry.Targets)
+	entry.AuditRecipients = cloneV2Targets(entry.AuditRecipients)
+	return entry, true
+}
+
+func (v *v2E2EECoordinator) setPeerTargetSetCache(state *v2P2PState, key string, entry v2P2PTargetSetCacheEntry) v2P2PTargetSetCacheEntry {
+	if state == nil {
+		return entry
+	}
+	entry.Targets = cloneV2Targets(entry.Targets)
+	entry.AuditRecipients = cloneV2Targets(entry.AuditRecipients)
+	entry.CachedAt = time.Now()
+	state.bootstrapCacheM.Lock()
+	if state.targetSetCache == nil {
+		state.targetSetCache = make(map[string]v2P2PTargetSetCacheEntry)
+	}
+	state.targetSetCache[key] = entry
+	state.bootstrapCacheM.Unlock()
+	entry.Targets = cloneV2Targets(entry.Targets)
+	entry.AuditRecipients = cloneV2Targets(entry.AuditRecipients)
+	return entry
+}
+
+func (v *v2E2EECoordinator) getGroupTargetSetCache(state *v2P2PState, key string) (v2GroupTargetSetCacheEntry, bool) {
+	if state == nil {
+		return v2GroupTargetSetCacheEntry{}, false
+	}
+	state.bootstrapCacheM.Lock()
+	entry, ok := state.groupTargetSetCache[key]
+	if ok && time.Since(entry.CachedAt) >= v2GroupBootstrapTTL {
+		delete(state.groupTargetSetCache, key)
+		ok = false
+	}
+	state.bootstrapCacheM.Unlock()
+	if !ok {
+		return v2GroupTargetSetCacheEntry{}, false
+	}
+	entry.Targets = cloneV2Targets(entry.Targets)
+	return entry, true
+}
+
+func (v *v2E2EECoordinator) setGroupTargetSetCache(state *v2P2PState, key string, entry v2GroupTargetSetCacheEntry) v2GroupTargetSetCacheEntry {
+	if state == nil {
+		return entry
+	}
+	entry.Targets = cloneV2Targets(entry.Targets)
+	entry.CachedAt = time.Now()
+	state.bootstrapCacheM.Lock()
+	if state.groupTargetSetCache == nil {
+		state.groupTargetSetCache = make(map[string]v2GroupTargetSetCacheEntry)
+	}
+	state.groupTargetSetCache[key] = entry
+	state.bootstrapCacheM.Unlock()
+	entry.Targets = cloneV2Targets(entry.Targets)
+	return entry
+}
+
+func (v *v2E2EECoordinator) v2PeerTargetSet(ctx context.Context, state *v2P2PState, to string, peerDevices, auditRaw []map[string]any, wrapPolicy *v2WrapPolicy, useCache bool) (v2P2PTargetSetCacheEntry, error) {
+	c := v.runtime.client
+	if useCache {
+		if entry, ok := v.getPeerTargetSetCache(state, to); ok {
+			return entry, nil
+		}
+	}
+
+	targets := make([]e2ee.Target, 0, len(peerDevices))
+	for _, dev := range peerDevices {
+		devID := v2AsString(dev["device_id"])
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, to, devID, "peer", "peer_device_prekey")
+		if err != nil {
+			return v2P2PTargetSetCacheEntry{}, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
+	}
+
+	auditTargets := make([]e2ee.Target, 0, len(auditRaw))
+	for _, dev := range auditRaw {
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return v2P2PTargetSetCacheEntry{}, err
+		}
+		if ok {
+			auditTargets = append(auditTargets, target)
+		}
+	}
+
+	c.mu.RLock()
+	myAID := c.aid
+	myDeviceID := c.deviceID
+	c.mu.RUnlock()
+	if myAID != "" && myAID != to {
+		selfDevices := v.v2FetchSelfDevices(ctx, state, myAID)
+		for _, dev := range selfDevices {
+			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+			if !hasDeviceID || devID == myDeviceID {
+				continue
+			}
+			target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, myAID, devID, "self_sync", "peer_device_prekey")
+			if err != nil {
+				return v2P2PTargetSetCacheEntry{}, err
+			}
+			if ok {
+				targets = append(targets, target)
+			}
+		}
+	}
+
+	entry := v2P2PTargetSetCacheEntry{
+		Targets:         v2ApplyWrapPolicyToTargets(targets, wrapPolicy),
+		AuditRecipients: v2ApplyWrapPolicyToTargets(auditTargets, wrapPolicy),
+	}
+	return v.setPeerTargetSetCache(state, to, entry), nil
+}
+
+func (v *v2E2EECoordinator) v2GroupTargetSet(ctx context.Context, state *v2P2PState, groupID string, allDevices, auditRaw []map[string]any, wrapPolicy *v2WrapPolicy, useCache bool) (v2GroupTargetSetCacheEntry, error) {
+	c := v.runtime.client
+	if useCache {
+		if entry, ok := v.getGroupTargetSetCache(state, groupID); ok {
+			return entry, nil
+		}
+	}
+
+	c.mu.RLock()
+	myAID := c.aid
+	myDeviceID := c.deviceID
+	c.mu.RUnlock()
+
+	targets := make([]e2ee.Target, 0, len(allDevices)+len(auditRaw))
+	for _, dev := range allDevices {
+		devAID := v2AsString(dev["aid"])
+		devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+		if devAID == myAID && hasDeviceID && devID == myDeviceID {
+			continue
+		}
+		role := "member"
+		if devAID == myAID {
+			role = "self_sync"
+		}
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, devAID, devID, role, "peer_device_prekey")
+		if err != nil {
+			return v2GroupTargetSetCacheEntry{}, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
+	}
+
+	for _, dev := range auditRaw {
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return v2GroupTargetSetCacheEntry{}, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
+	}
+
+	entry := v2GroupTargetSetCacheEntry{
+		Targets: v2ApplyWrapPolicyToTargets(targets, wrapPolicy),
+	}
+	return v.setGroupTargetSetCache(state, groupID, entry), nil
 }
 
 func encryptedPushEnvelope(msg map[string]any) (map[string]any, bool) {
@@ -504,39 +701,6 @@ func (v *v2E2EECoordinator) handleGroupChangedSpk(groupID, action string, data m
 	} else {
 		v.scheduleGroupSpkRotation(groupID, "group_changed:"+action)
 	}
-}
-
-func (v *v2E2EECoordinator) handleV2EpochRotated(data any) {
-	c := v.runtime.client
-	dataMap, ok := data.(map[string]any)
-	if !ok {
-		return
-	}
-	groupID := strings.TrimSpace(v2AsString(dataMap["group_id"]))
-	if groupID == "" {
-		return
-	}
-	newEpoch := dataMap["epoch"]
-	c.logE2.Debug("onV2EpochRotated: group=%s epoch=%v", groupID, newEpoch)
-	v.deleteGroupBootstrapCache(groupID)
-	state := c.v2GetState()
-	if state == nil || state.session == nil {
-		return
-	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				c.logE2.Warn("SPK rotation after epoch change panic: %v", r)
-			}
-		}()
-		rotateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := state.session.RotateSPK(rotateCtx, c.v2CallFn()); err != nil {
-			c.logE2.Debug("SPK rotation after epoch change failed (non-fatal): %v", err)
-		} else {
-			c.logE2.Info("SPK rotated after epoch change: group=%s epoch=%v", groupID, newEpoch)
-		}
-	}()
 }
 
 func isV2GroupMembershipAction(action string) bool {
@@ -872,58 +1036,18 @@ func (v *v2E2EECoordinator) v2SendOnce(ctx context.Context, state *v2P2PState, t
 		return nil, fmt.Errorf("V2 bootstrap: no devices found for %s", to)
 	}
 
-	targets := make([]e2ee.Target, 0, len(peerDevices))
-	for _, dev := range peerDevices {
-		devID := v2AsString(dev["device_id"])
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, to, devID, "peer", "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
+	targetSet, err := v.v2PeerTargetSet(ctx, state, to, peerDevices, auditRaw, wrapPolicy, useCache)
+	if err != nil {
+		return nil, err
 	}
-
-	auditTargets := make([]e2ee.Target, 0, len(auditRaw))
-	for _, dev := range auditRaw {
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			auditTargets = append(auditTargets, target)
-		}
-	}
-
-	// self-sync：同 AID 其它设备
-	c.mu.RLock()
-	myAID := c.aid
-	myDeviceID := c.deviceID
-	c.mu.RUnlock()
-	if myAID != "" && myAID != to {
-		selfDevices := v.v2FetchSelfDevices(ctx, state, myAID)
-		for _, dev := range selfDevices {
-			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
-			if !hasDeviceID || devID == myDeviceID {
-				continue
-			}
-			target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, myAID, devID, "self_sync", "peer_device_prekey")
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				targets = append(targets, target)
-			}
-		}
-	}
+	sendTargets := targetSet.Targets
+	sendAuditTargets := targetSet.AuditRecipients
 
 	sender, err := state.session.GetSenderIdentity()
 	if err != nil {
 		return nil, fmt.Errorf("send_v2: 获取 sender identity 失败: %w", err)
 	}
 
-	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
-	sendAuditTargets := v2ApplyWrapPolicyToTargets(auditTargets, wrapPolicy)
 	envelope, err := e2ee.EncryptP2PMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -1031,8 +1155,37 @@ func (v *v2E2EECoordinator) v2FetchSelfDevices(ctx context.Context, state *v2P2P
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（对齐 Python pull_v2）。
 // limit=0 时默认 50。
 func (v *v2E2EECoordinator) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
-	msgs, _, err := v.pullV2WithForce(ctx, afterSeq, limit, false)
-	return msgs, err
+	c := v.runtime.client
+	c.mu.RLock()
+	myAIDBefore := c.aid
+	c.mu.RUnlock()
+	ns := ""
+	if myAIDBefore != "" {
+		ns = "p2p:" + myAIDBefore
+	}
+	nextAfterSeq := afterSeq
+	if nextAfterSeq == 0 && ns != "" {
+		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
+	}
+	allMsgs := make([]map[string]any, 0)
+	for pageCount := 0; pageCount < 100; pageCount++ {
+		msgs, pageMeta, err := v.pullV2WithForce(ctx, nextAfterSeq, limit, false)
+		if err != nil {
+			return nil, err
+		}
+		nextAfter := nextAfterSeq
+		if pageMeta.latestSeq > nextAfter {
+			nextAfter = pageMeta.latestSeq
+		}
+		if nextAfter > nextAfterSeq {
+			allMsgs = append(allMsgs, msgs...)
+		}
+		if len(msgs) <= 0 || nextAfter <= nextAfterSeq {
+			break
+		}
+		nextAfterSeq = nextAfter
+	}
+	return allMsgs, nil
 }
 
 func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
@@ -1078,15 +1231,23 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 		return nil, meta, err
 	}
 	result, _ := raw.(map[string]any)
-	messages := v2ToMapList(result["messages"])
+	pageMessages := v2ToMapList(result["messages"])
+	messages := make([]map[string]any, 0, len(pageMessages))
+	for _, msg := range pageMessages {
+		if toInt64(msg["seq"]) > effectiveAfterSeq {
+			messages = append(messages, msg)
+		}
+	}
 	_, hasServerAckSeq := result["server_ack_seq"]
 	serverAckSeq := toInt64(result["server_ack_seq"])
+	hasMore, _ := result["has_more"].(bool)
 	meta = v2PullPageMeta{
-		rawCount:     len(messages),
+		rawCount:     len(pageMessages),
 		serverAckSeq: serverAckSeq,
 		hasServerAck: hasServerAckSeq,
+		hasMore:      hasMore,
 	}
-	c.logE2.Debug("message.v2.pull response: raw_count=%d server_ack_seq=%d has_more=%v", len(messages), serverAckSeq, result["has_more"])
+	c.logE2.Debug("message.v2.pull response: raw_count=%d stale_count=%d server_ack_seq=%d has_more=%v", len(messages), len(pageMessages)-len(messages), serverAckSeq, result["has_more"])
 	for _, msg := range messages {
 		c.logMessageDebug("pull-raw", "message.v2.pull", "message.received", msg, nil)
 	}
@@ -1106,6 +1267,7 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 			maxSeq = seq
 		}
 	}
+	meta.latestSeq = maxSeq
 
 	if v.canParallelDecryptV2Page(messages, "", true) {
 		for _, plaintext := range v.decryptV2PageParallel(ctx, state, messages, "", true) {

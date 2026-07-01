@@ -284,10 +284,19 @@ func (g *groupStateCoordinator) checkMembershipTamper(ctx context.Context, group
 	}
 
 	mode := ""
-	reqResp, err := c.Call(ctx, "group.get_join_requirements", map[string]any{"group_id": groupID})
+	reqResp, err := c.Call(ctx, "group.get_settings", map[string]any{"group_id": groupID, "keys": []string{"join.mode"}})
 	if err == nil {
-		if reqMap, ok := reqResp.(map[string]any); ok {
-			mode = strings.TrimSpace(v2AsString(reqMap["mode"]))
+		if respMap, ok := reqResp.(map[string]any); ok {
+			if settingsList, ok := respMap["settings"].([]any); ok {
+				for _, item := range settingsList {
+					if s, ok := item.(map[string]any); ok {
+						if s["key"] == "join.mode" {
+							mode = strings.TrimSpace(v2AsString(s["value"]))
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 	if mode == "open" || mode == "invite_code" || mode == "invite_only" {

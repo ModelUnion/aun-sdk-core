@@ -375,7 +375,7 @@ describe('签名审计: 设置角色携带签名', () => {
 // ── 4. 只读操作不需签名 ──────────────────────────────────────────
 
 describe('签名审计: 只读操作不需签名', () => {
-  it('group.list_my / group.info 正常执行无需签名', async () => {
+  it('group.list_my / group.get_info 正常执行无需签名', async () => {
     const rid = runId();
     const aliceAid = `sig-ro-a-${rid}.${ISSUER}`;
 
@@ -417,15 +417,16 @@ describe('签名审计: 只读操作不需签名', () => {
       groupId = ((createResult.group as any)?.group_id ?? '') as string;
       expect(groupId).toBeTruthy();
 
-      // ---- group.info 应正常返回 ----
+      // ---- group.get_info 应正常返回 ----
       let infoResult: Record<string, unknown>;
       try {
-        infoResult = await alice.call('group.info', {
+        infoResult = await alice.call('group.get_info', {
           group_id: groupId,
+          required: ['member'],
         }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.info 未实现，跳过');
+          console.log('group.get_info 未实现，跳过');
           return;
         }
         throw e;

@@ -297,26 +297,32 @@ test.describe('Group: 角色与群主转让（浏览器）', () => {
       const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
       const aliceAid = `grprla${rid}.${iss}`;
       const bobAid = `grprlb${rid}.${iss}`;
+      const groupName = `grprl${rid}`;
 
       const alice = await makeAndConnect(`grp-rl-alice-${rid}`);
       const bob = await makeAndConnect(`grp-rl-bob-${rid}`);
 
       let groupId: string | undefined;
+      let ownerStore: any = null;
+      let newOwnerStore: any = null;
 
       try {
         await ensureConnected(alice, aliceAid);
         await ensureConnected(bob, bobAid);
 
-        // 创建群
+        // 创建命名群；群主转让需要 group_aid 私钥签名授权。
         try {
-          const createResult = await alice.call('group.create', {
+          const createResult = await alice.group.create({
             name: `role-${rid}`,
+            group_name: groupName,
             visibility: 'private',
           });
           groupId = createResult?.group?.group_id ?? createResult?.group_id;
           if (!groupId) {
             return { skip: true, reason: '创建群未返回 group_id' };
           }
+          ownerStore = (window as any).AUN_TEST_HELPERS.createStore(alice);
+          newOwnerStore = (window as any).AUN_TEST_HELPERS.createStore(bob);
         } catch (e: any) {
           const msg = (e.message ?? '').toLowerCase();
           if (msg.includes('not implement') || msg.includes('method not found')) {
@@ -380,16 +386,24 @@ test.describe('Group: 角色与群主转让（浏览器）', () => {
 
           // 转让群主给 bob
           let transferOk = false;
+          let completeOk = false;
           let oldOwner: string | null = null;
           let newOwner: string | null = null;
           try {
-            const transferResult = await alice.call('group.transfer_owner', {
+            const transferResult = await alice.group.transferOwner({
               group_id: groupId,
               new_owner: bobAid,
+              aidStore: ownerStore,
             });
             transferOk = true;
             oldOwner = transferResult?.old_owner ?? aliceAid;
             newOwner = transferResult?.new_owner ?? bobAid;
+
+            await bob.group.completeTransfer({
+              group_id: groupId,
+              aidStore: newOwnerStore,
+            });
+            completeOk = true;
           } catch (e: any) {
             const msg = (e.message ?? '').toLowerCase();
             if (msg.includes('not implement') || msg.includes('method not found')) {
@@ -425,6 +439,7 @@ test.describe('Group: 角色与群主转让（浏览器）', () => {
             setRoleOk,
             bobRole,
             transferOk,
+            completeOk,
             oldOwner,
             newOwner,
             bobRoleAfterTransfer,
@@ -439,6 +454,8 @@ test.describe('Group: 角色与群主转让（浏览器）', () => {
           }
         }
       } finally {
+        try { ownerStore?.close?.(); } catch {}
+        try { newOwnerStore?.close?.(); } catch {}
         await alice.close();
         await bob.close();
       }
@@ -457,6 +474,7 @@ test.describe('Group: 角色与群主转让（浏览器）', () => {
 
     expect(r.setRoleOk).toBe(true);
     expect(r.transferOk).toBe(true);
+    expect(r.completeOk).toBe(true);
     // 转让后 bob 应为 owner
     if (r.bobRoleAfterTransfer !== null) {
       expect(r.bobRoleAfterTransfer).toBe('owner');

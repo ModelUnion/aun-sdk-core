@@ -53,6 +53,7 @@ import {
   NotFoundError,
   PermissionError,
   StateError,
+  TimeoutError,
   ValidationError,
 } from './errors.js';
 import {
@@ -151,6 +152,8 @@ export interface ConnectionOptions {
 
 export interface NotifyOptions {
   to?: string;
+  group_aid?: string;
+  groupAid?: string;
   group_id?: string;
   groupId?: string;
   device_id?: string;
@@ -234,8 +237,8 @@ const NON_IDEMPOTENT_TIMEOUT = 35;
 const NON_IDEMPOTENT_METHODS = new Set([
   'message.send', 'group.send', 'group.create', 'group.invite',
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
-  'group.update_name', 'group.update_avatar', 'group.update_announcement',
-  'group.update_settings',
+  'group.set_settings',
+  'group.update_announcement', 'group.update_rules',
   'storage.put_object', 'storage.delete_object',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.get_by_share',
@@ -277,9 +280,9 @@ const SIGNED_METHODS = new Set([
   'group.v2.propose_state', 'group.v2.confirm_state',
   'group.v2.get_proposal',
   'group.kick', 'group.add_member',
-  'group.leave', 'group.remove_member', 'group.update_rules',
-  'group.update', 'group.update_announcement',
-  'group.update_join_requirements', 'group.set_role',
+  'group.leave', 'group.remove_member',
+  'group.update',
+  'group.set_role',
   'group.transfer_owner', 'group.bind_group_aid', 'group.complete_transfer',
   'group.review_join_request',
   'group.batch_review_join_request',
@@ -287,6 +290,8 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'group.fs.mkdir', 'group.fs.rm', 'group.fs.cp', 'group.fs.mv',
   'group.fs.set_acl', 'group.fs.remove_acl',
   'group.fs.mount', 'group.fs.umount',
@@ -931,7 +936,7 @@ export class AUNClient {
     this._dispatcher.subscribe('_raw.group.message_recalled', (data) => {
       this._safeAsync(this._onRawGroupMessageRecalled(data));
     });
-    // 群组变更事件：验签 + 透传 + gap 检测
+    // 群组变更事件：验签 + 透传 + gap 检测 + V2 state/SPK 维护
     this._dispatcher.subscribe('_raw.group.changed', (data) => {
       this._onRawGroupChanged(data);
     });
@@ -941,9 +946,6 @@ export class AUNClient {
     });
     this._dispatcher.subscribe('_raw.group.v2.message_created', (data) => {
       this._safeAsync(this._onRawGroupV2MessageCreated(data));
-    });
-    this._dispatcher.subscribe('_raw.group.v2.epoch_rotated', (data) => {
-      this._safeAsync(this._onV2EpochRotated(data));
     });
     this._dispatcher.subscribe('_raw.group.v2.state_proposed', (data) => {
       this._safeAsync(this._onV2StateProposed(data));
@@ -1282,7 +1284,19 @@ export class AUNClient {
     method: string,
     params?: RpcParams,
   ): Promise<RpcResult> {
-    return await this._rpcPipeline.call(method, params);
+    try {
+      return await this._rpcPipeline.call(method, params);
+    } catch (err) {
+      await this._maybeHandleHalfOpenRpcFailure(err);
+      throw err;
+    }
+  }
+
+  private async _maybeHandleHalfOpenRpcFailure(err: unknown): Promise<void> {
+    if (this._closing || this.state !== ConnectionState.READY) return;
+    if (!this._sessionOptions?.auto_reconnect || this._reconnectActive) return;
+    if (!(err instanceof ConnectionError) && !(err instanceof TimeoutError)) return;
+    await this._handleTransportDisconnect(err);
   }
 
   async createGroup(params: RpcParams = {}): Promise<RpcResult> {
@@ -1341,7 +1355,7 @@ export class AUNClient {
       throw new ValidationError('bindGroupAid requires aidStore');
     }
 
-    const groupId = String(params.group_id ?? '').trim();
+    const groupId = String(params.group_id ?? params.group_aid ?? '').trim();
     const keystore = (store as any)._keystore;
     let keyPair: KeyPairRecord | null = null;
 
@@ -1369,6 +1383,9 @@ export class AUNClient {
     }
 
     const payload: RpcParams = { ...params };
+    if (!String(payload.group_id ?? '').trim() && groupId) {
+      payload.group_id = groupId;
+    }
     payload.public_key = keyPair.public_key_der_b64;
     payload.curve = keyPair.curve;
     const result = await this.call('group.bind_group_aid', payload);
@@ -1406,16 +1423,14 @@ export class AUNClient {
     if (!store) {
       throw new ValidationError('renewGroupAid requires aidStore');
     }
-    const groupId = String(params.group_id ?? '').trim();
+    const groupId = String(params.group_id ?? params.group_aid ?? '').trim();
     if (!groupId) {
-      throw new ValidationError('renewGroupAid requires group_id');
+      throw new ValidationError('renewGroupAid requires group_id or group_aid');
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
-      const infoMap = isJsonObject(info) ? info : {};
-      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('renewGroupAid: unable to determine group_aid');
@@ -1461,6 +1476,9 @@ export class AUNClient {
     }
 
     const payload: RpcParams = { ...params };
+    if (!String(payload.group_id ?? '').trim()) {
+      payload.group_id = groupId;
+    }
     payload.group_aid = groupAid;
     payload.old_public_key = oldPublicKey;
     payload.new_public_key = newPublicKey;
@@ -1504,10 +1522,8 @@ export class AUNClient {
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
-      const infoMap = isJsonObject(info) ? info : {};
-      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('startGroupTransfer: unable to determine group_aid');
@@ -1556,10 +1572,8 @@ export class AUNClient {
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
-      const infoMap = isJsonObject(info) ? info : {};
-      const grp = isJsonObject(infoMap.group) ? infoMap.group : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('completeGroupTransfer: unable to determine group_aid');
@@ -1654,7 +1668,7 @@ export class AUNClient {
     }
 
     const targetAid = String(options.to ?? '').trim();
-    const targetGroupId = String(options.group_id ?? options.groupId ?? '').trim();
+    const targetGroupId = String(options.group_aid ?? options.groupAid ?? options.group_id ?? options.groupId ?? '').trim();
     const targetDeviceId = String(options.device_id ?? options.deviceId ?? '').trim();
     const targetSlotId = String(options.slot_id ?? options.slotId ?? '').trim();
     const ttl = AUNClient._normalizeNotifyTtl(options.ttl_ms ?? options.ttlMs);
@@ -1691,6 +1705,7 @@ export class AUNClient {
         throw new ValidationError('group_id is required for group notify');
       }
       const routeParams: RpcParams = {
+        group_aid: normalizedGroupId,
         group_id: normalizedGroupId,
         deliver: { method: eventMethod, params: payload },
       };
@@ -1717,8 +1732,10 @@ export class AUNClient {
     delete (p as Record<string, unknown>)._skip_auto_ack;
     delete (p as Record<string, unknown>).skip_auto_ack;
     delete (p as Record<string, unknown>)._group_cursor_params;
-    if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
-      p.group_id = normalizeGroupId(String(p.group_id)) || String(p.group_id);
+    if (method.startsWith('group.') && p.group_aid !== undefined && p.group_aid !== null) {
+      p.group_aid = normalizeGroupId(String(p.group_aid)) || String(p.group_aid);
+    } else if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
+      p.group_aid = normalizeGroupId(String(p.group_id)) || String(p.group_id);
     }
     if (method.startsWith('group.') && p.device_id === undefined) {
       p.device_id = this._deviceId;
@@ -1855,18 +1872,18 @@ export class AUNClient {
 
   private _extractGroupIdFromResult(result: JsonObject): string {
     const group = isJsonObject(result.group) ? result.group : null;
-    const gid = group ? String(group.group_id ?? '') : '';
+    const gid = group ? String(group.group_aid ?? group.group_id ?? '') : '';
     if (gid) return gid;
-    const directGid = String(result.group_id ?? '');
+    const directGid = String(result.group_aid ?? result.group_id ?? '');
     if (directGid) return directGid;
     const member = isJsonObject(result.member) ? result.member : null;
-    return member ? String(member.group_id ?? '') : '';
+    return member ? String(member.group_aid ?? member.group_id ?? '') : '';
   }
 
   private async _onRawGroupChanged(data: EventPayload): Promise<void> {
     const tStart = Date.now();
     const action = String((data as any)?.action ?? '');
-    const groupIdInit = String((data as any)?.group_id ?? '');
+    const groupIdInit = String((data as any)?.group_aid ?? (data as any)?.group_id ?? '');
     this._clientLog.debug(`_onRawGroupChanged enter: group_id=${groupIdInit} action=${action}`);
     try {
       if (isJsonObject(data)) {
@@ -1881,7 +1898,7 @@ export class AUNClient {
             d._verified = this._isEventSignatureVerified(verified);
           }
         }
-        const groupId = (d.group_id ?? '') as string;
+        const groupId = (d.group_aid ?? d.group_id ?? '') as string;
 
         await this._delivery.handleGroupChangedEventSeq(d, groupId);
       } else {
@@ -2463,7 +2480,7 @@ export class AUNClient {
     const maxFailures = 2;
 
     this._heartbeatTimer = setInterval(async () => {
-      if (this._state !== 'connected' || this._closing) return;
+      if (this.state !== ConnectionState.READY || this._closing) return;
       try {
         const pong = await this._transport.call('meta.ping', {});
         this._heartbeatCount++;
@@ -2496,7 +2513,7 @@ export class AUNClient {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
     }
-    if (newInterval > 0 && this._state === 'connected' && !this._closing) {
+    if (newInterval > 0 && this.state === ConnectionState.READY && !this._closing) {
       this._startHeartbeat();
     }
   }
@@ -2515,7 +2532,7 @@ export class AUNClient {
       this._tokenRefreshTimer = globalThis.setTimeout(async () => {
         if (this._closing) return;
         this._tokenRefreshTimer = null;
-        if (this._state !== 'connected' || !this._gatewayUrl) {
+        if (this.state !== ConnectionState.READY || !this._gatewayUrl) {
           scheduleRefresh();
           return;
         }
@@ -2536,14 +2553,14 @@ export class AUNClient {
           return;
         }
 
-        if (this._state !== 'connected' || !this._gatewayUrl || this._closing) {
+        if (this.state !== ConnectionState.READY || !this._gatewayUrl || this._closing) {
           scheduleRefresh();
           return;
         }
         try {
           identity = await this._auth.refreshCachedTokens(this._gatewayUrl!, identity!);
           // 刷新期间可能已断线，复检状态，避免写回 stale identity
-          if (this._state !== 'connected') { scheduleRefresh(); return; }
+          if (this.state !== ConnectionState.READY) { scheduleRefresh(); return; }
           this._identity = identity;
           if (this._sessionParams && identity.access_token) {
             this._sessionParams.access_token = identity.access_token;
@@ -2629,6 +2646,9 @@ export class AUNClient {
     this._state = 'standby';
     // 先停止后台任务，避免心跳/token刷新在重连期间继续触发
     this._stopBackgroundTasks();
+    void this._transport.close().catch((exc) => {
+      this._clientLog.debug(`transport cleanup skipped: ${formatCaughtError(exc)}`);
+    });
     await this._dispatcher.publish('state_change', {
       state: this._publicState(this._state),
       error,
@@ -3313,7 +3333,7 @@ export class AUNClient {
     groupId: string,
     afterSeq: number = 0,
     limit: number = 50,
-    opts?: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean },
+    opts?: { explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean; wireGroupId?: string },
   ): Promise<unknown[]> {
     return await this._v2E2EE.pullGroupV2(groupId, afterSeq, limit, opts);
   }
@@ -3468,13 +3488,6 @@ export class AUNClient {
 
   private async _onV2PushNotification(data: EventPayload): Promise<void> {
     return this._delivery.onV2PushNotification(data);
-  }
-
-  /**
-   * 处理 V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation。
-   */
-  private async _onV2EpochRotated(data: EventPayload): Promise<void> {
-    return this._v2E2EE.handleV2EpochRotated(data);
   }
 
   /** 安全执行异步操作（不阻塞调用方，错误打 warning 便于排障） */

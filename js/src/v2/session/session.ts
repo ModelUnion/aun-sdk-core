@@ -15,6 +15,7 @@
  */
 
 import { generateP256Keypair, ecdsaSignRaw } from '../crypto/index';
+import { normalizeGroupId } from '../../group-id';
 import { V2KeyStore } from './keystore';
 
 /** 对端 IK 公钥缓存 TTL（毫秒）。 */
@@ -171,10 +172,24 @@ export class V2Session {
     return `sha256:${hex.substring(0, 16)}`;
   }
 
+  private _groupKey(groupId: string): string {
+    return normalizeGroupId(groupId) || String(groupId ?? '').trim();
+  }
+
+  private _groupLookupCandidates(groupId: string): string[] {
+    const raw = String(groupId ?? '').trim();
+    const normalized = this._groupKey(raw);
+    const out: string[] = [];
+    for (const item of [normalized, raw]) {
+      if (item && !out.includes(item)) out.push(item);
+    }
+    return out;
+  }
+
   private _normalizeGroupSPKLookup(groupId: string, spkId: string): { groupId: string; spkId: string } {
     const nul = spkId.indexOf('\0');
-    if (nul < 0) return { groupId, spkId };
-    return { groupId: spkId.slice(0, nul).trim(), spkId: spkId.slice(nul + 1) };
+    if (nul < 0) return { groupId: this._groupKey(groupId), spkId };
+    return { groupId: this._groupKey(spkId.slice(0, nul)), spkId: spkId.slice(nul + 1) };
   }
 
   /** SPK 由 AID 私钥（IK）签名背书并上报到 message.v2.put_peer_pk。 */
@@ -283,10 +298,13 @@ export class V2Session {
   }
 
   private async _loadGroupSPK(groupId: string, spkId: string): Promise<Uint8Array | null> {
-    const scoped = await this._store.loadGroupSPK(this._storeDeviceId, groupId, spkId);
-    if (scoped) return scoped;
-    if (this._storeDeviceId !== this._deviceId) {
-      return this._store.loadGroupSPK(this._deviceId, groupId, spkId);
+    for (const candidate of this._groupLookupCandidates(groupId)) {
+      const scoped = await this._store.loadGroupSPK(this._storeDeviceId, candidate, spkId);
+      if (scoped) return scoped;
+      if (this._storeDeviceId !== this._deviceId) {
+        const legacy = await this._store.loadGroupSPK(this._deviceId, candidate, spkId);
+        if (legacy) return legacy;
+      }
     }
     return null;
   }
@@ -385,7 +403,7 @@ export class V2Session {
   /** 判断 spkId 是否为本进程在该群最后一次成功上传的 group SPK。 */
   isLastUploadedGroupSPK(groupId: string, spkId: string | null | undefined): boolean {
     if (!spkId) return false;
-    const gk = (groupId || '').trim();
+    const gk = this._groupKey(groupId);
     const lookup = this._normalizeGroupSPKLookup(gk, spkId);
     return this._lastUploadedGroupSPKIds.get(lookup.groupId) === lookup.spkId;
   }
@@ -397,9 +415,15 @@ export class V2Session {
     groupId: string,
   ): Promise<{ spkId: string; priv: Uint8Array; pubDer: Uint8Array }> {
     await this.ensureKeys();
-    const gk = (groupId || '').trim();
-    const existing = await this._store.loadCurrentGroupSPK(this._storeDeviceId, gk);
-    if (existing) return existing;
+    const gk = this._groupKey(groupId);
+    for (const candidate of this._groupLookupCandidates(groupId)) {
+      const existing = await this._store.loadCurrentGroupSPK(this._storeDeviceId, candidate);
+      if (existing) return existing;
+      if (this._storeDeviceId !== this._deviceId) {
+        const legacy = await this._store.loadCurrentGroupSPK(this._deviceId, candidate);
+        if (legacy) return legacy;
+      }
+    }
     const [priv, pubDer] = await generateP256Keypair();
     const hex = await sha256Hex(pubDer);
     const spkId = `sha256:${hex.substring(0, 16)}`;
@@ -410,11 +434,17 @@ export class V2Session {
   /** 注册指定群的 group SPK。group 服务负责成员鉴权。 */
   async ensureGroupRegistered(groupId: string, callFn: CallFn): Promise<void> {
     await this.ensureKeys();
-    const gk = (groupId || '').trim();
-    const uploadedSPKId = await this._store.loadLatestUploadedGroupSPKId(this._storeDeviceId, gk);
-    if (uploadedSPKId) {
-      this._lastUploadedGroupSPKIds.set(gk, uploadedSPKId);
-      return;
+    const gk = this._groupKey(groupId);
+    for (const candidate of this._groupLookupCandidates(groupId)) {
+      const uploadedSPKId = await this._store.loadLatestUploadedGroupSPKId(this._storeDeviceId, candidate)
+        || (this._storeDeviceId !== this._deviceId
+          ? await this._store.loadLatestUploadedGroupSPKId(this._deviceId, candidate)
+          : null);
+      if (uploadedSPKId) {
+        this._lastUploadedGroupSPKIds.set(gk, uploadedSPKId);
+        this._lastUploadedGroupSPKIds.set(candidate, uploadedSPKId);
+        return;
+      }
     }
     const { spkId, pubDer } = await this.ensureGroupSPK(gk);
     await this._publishGroupSPK(gk, spkId, pubDer, callFn);
@@ -426,7 +456,7 @@ export class V2Session {
     callFn: CallFn,
   ): Promise<{ spkId: string; priv: Uint8Array; pubDer: Uint8Array }> {
     await this.ensureKeys();
-    const gk = (groupId || '').trim();
+    const gk = this._groupKey(groupId);
     const [priv, pubDer] = await generateP256Keypair();
     const hex = await sha256Hex(pubDer);
     const spkId = `sha256:${hex.substring(0, 16)}`;
@@ -441,7 +471,7 @@ export class V2Session {
     spkId: string | null | undefined,
   ): Promise<DecryptKeys> {
     await this.ensureKeys();
-    const gk = (groupId || '').trim();
+    const gk = this._groupKey(groupId);
     if (!spkId) return { ikPriv: this._ikPriv };
     const lookup = this._normalizeGroupSPKLookup(gk, spkId);
     const groupSpk = await this._loadGroupSPK(lookup.groupId, lookup.spkId);
@@ -456,6 +486,7 @@ export class V2Session {
     spkPubDer: Uint8Array,
     callFn: CallFn,
   ): Promise<void> {
+    const gk = this._groupKey(groupId);
     const spkTimestamp = Math.floor(this._nowFn() / 1000);
     const enc = new TextEncoder();
     const signData = concatBytes(
@@ -465,15 +496,19 @@ export class V2Session {
     );
     const signature = await ecdsaSignRaw(this._ikPriv, signData);
     await callFn('group.v2.put_group_pk', {
-      group_id: groupId,
+      group_id: gk,
+      group_aid: gk,
       key_source: 'group_device_prekey',
       spk_id: spkId,
       spk_pk: bytesToBase64(spkPubDer),
       spk_signature: bytesToBase64(signature),
       spk_timestamp: spkTimestamp,
     });
-    await this._store.markGroupSPKUploaded(this._storeDeviceId, groupId, spkId);
-    this._lastUploadedGroupSPKIds.set(groupId, spkId);
+    await this._store.markGroupSPKUploaded(this._storeDeviceId, gk, spkId);
+    this._lastUploadedGroupSPKIds.set(gk, spkId);
+    if (String(groupId ?? '').trim() && String(groupId ?? '').trim() !== gk) {
+      this._lastUploadedGroupSPKIds.set(String(groupId ?? '').trim(), spkId);
+    }
   }
 
   cachePeerIK(peerAid: string, deviceId: string, ikPubDer: Uint8Array): void {

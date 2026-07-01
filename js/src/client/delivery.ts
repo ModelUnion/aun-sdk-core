@@ -1,13 +1,16 @@
 import { slotIsolationKey } from '../config.js';
 import type { EventPayload } from '../events.js';
 import { normalizeGroupId } from '../group-id.js';
-import { isJsonObject, type JsonObject, type JsonValue, type Message, type RpcParams } from '../types.js';
+import { ConnectionState, isJsonObject, type JsonObject, type JsonValue, type Message, type RpcParams } from '../types.js';
 import type { ClientRuntime } from './runtime.js';
 
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
 const GROUP_RECALL_SEEN_LIMIT = 10_000;
 const SEQ_TRACKER_PERSIST_FLUSH_DELAY_MS = 200;
+const P2P_GAP_FILL_RETRY_LIMIT = 12;
+const P2P_GAP_FILL_RETRY_BASE_MS = 1000;
+const P2P_GAP_FILL_RETRY_MAX_MS = 5000;
 const APP_MESSAGE_ENVELOPE_KEYS = [
   'module_id', 'message_type', 'type', 'kind', 'version',
   'from', 'from_aid', 'sender_aid', 'to', 'to_aid', 'group_id',
@@ -28,6 +31,35 @@ const APP_GROUP_EVENT_ENVELOPE_KEYS = [
 
 function formatDeliveryError(error: unknown): Error | string {
   return error instanceof Error ? error : String(error);
+}
+
+function isTransientGapFillError(error: unknown): boolean {
+  const text = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return text.includes('no_service')
+    || text.includes('service plane unavailable')
+    || text.includes('transport not connected')
+    || text.includes('transport closed')
+    || text.includes('websocket closed')
+    || text.includes('websocket is not open')
+    || text.includes('connection closed')
+    || text.includes('socket closed');
+}
+
+function p2pAppEventFromPlainPullMessage(message: Record<string, unknown>): { event: string; payload: EventPayload } {
+  const payload = message.payload;
+  const payloadType = isJsonObject(payload as JsonValue | object | null | undefined)
+    ? String((payload as Record<string, unknown>).type ?? '').trim()
+    : '';
+  if (payloadType === 'message.recalled' || payloadType === 'message.recall' || message.type === 'message.recalled') {
+    return {
+      event: 'message.recalled',
+      payload: {
+        ...message,
+        ...(isJsonObject(payload as JsonValue | object | null | undefined) ? payload as Record<string, unknown> : {}),
+      } as EventPayload,
+    };
+  }
+  return { event: 'message.received', payload: message as EventPayload };
 }
 
 export class MessageDeliveryEngine {
@@ -122,7 +154,8 @@ export class MessageDeliveryEngine {
       const eventPayload = payload as JsonObject;
       client._groupState?.handleGroupChangedV2Membership?.(eventPayload);
       if (eventPayload.action === 'dissolved') {
-        const groupId = normalizeGroupId(String(eventPayload.group_id ?? '')) || String(eventPayload.group_id ?? '').trim();
+        const rawGroupId = eventPayload.group_aid ?? eventPayload.group_id ?? '';
+        const groupId = normalizeGroupId(String(rawGroupId)) || String(rawGroupId).trim();
         if (groupId) client._cleanupDissolvedGroup?.(groupId);
       }
     }
@@ -765,9 +798,27 @@ export class MessageDeliveryEngine {
     await client._publishAppEvent('group.message_created', notification);
   }
 
-  async fillP2pGap(): Promise<void> {
+  private scheduleP2pGapRetry(ns: string, retryAttempt: number): void {
     const client = this.runtime.client;
-    if (client._state !== 'connected' || client._closing) return;
+    if (retryAttempt > P2P_GAP_FILL_RETRY_LIMIT) return;
+    const retryKey = `p2p_pull_retry:${ns}`;
+    if (client._gapFillDone.has(retryKey)) return;
+    const delayMs = Math.min(
+      P2P_GAP_FILL_RETRY_BASE_MS * retryAttempt,
+      P2P_GAP_FILL_RETRY_MAX_MS,
+    );
+    client._gapFillDone.add(retryKey);
+    client._clientLog.debug(`P2P message gap-fill retry scheduled: ns=${ns} attempt=${retryAttempt} delay_ms=${delayMs}`);
+    globalThis.setTimeout(() => {
+      client._gapFillDone.delete(retryKey);
+      if (client.state !== ConnectionState.READY || client._closing) return;
+      client._safeAsync(this.fillP2pGap(retryAttempt));
+    }, delayMs);
+  }
+
+  async fillP2pGap(retryAttempt = 0): Promise<void> {
+    const client = this.runtime.client;
+    if (client.state !== ConnectionState.READY || client._closing) return;
     if (!client._aid) return;
     const ns = `p2p:${client._aid}`;
     const afterSeq = client._seqTracker.getContiguousSeq(ns);
@@ -781,19 +832,57 @@ export class MessageDeliveryEngine {
       filled = messages.length;
       this.prunePushedSeqs(ns);
     } catch (exc) {
-      client._clientLog.warn(`P2P message gap-fill failed:${String(formatDeliveryError(exc))}`);
+      const transient = isTransientGapFillError(exc);
+      if (transient) {
+        try {
+          filled = await this.fillP2pGapWithPlainPull(ns, afterSeq);
+          this.prunePushedSeqs(ns);
+          client._clientLog.warn(`P2P message gap-fill V2 unavailable, used plain pull fallback:${String(formatDeliveryError(exc))}`);
+        } catch (fallbackExc) {
+          client._clientLog.warn(`P2P message gap-fill plain fallback failed:${String(formatDeliveryError(fallbackExc))}`);
+          this.scheduleP2pGapRetry(ns, retryAttempt + 1);
+        }
+      } else {
+        client._clientLog.warn(`P2P message gap-fill failed:${String(formatDeliveryError(exc))}`);
+      }
     } finally {
       client._gapFillDone.delete(dedupKey);
       this.runtime.delivery.setGapFillActive(false);
-      if (filled > 0 && client._seqTracker.getContiguousSeq(ns) > afterSeq) {
-        client._safeAsync(this.fillP2pGap());
+    }
+  }
+
+  private async fillP2pGapWithPlainPull(ns: string, afterSeq: number): Promise<number> {
+    const client = this.runtime.client;
+    const params: RpcParams = {
+      after_seq: afterSeq,
+      limit: 50,
+      device_id: client._deviceId,
+      slot_id: client._slotId,
+      _rpc_background: true,
+    };
+    const raw = await client._transport.call('message.pull', params, undefined, undefined, true);
+    const result = typeof client._rpcPipeline?.postprocessResult === 'function'
+      ? await client._rpcPipeline.postprocessResult('message.pull', params, raw)
+      : raw;
+    const messages = (isJsonObject(result as JsonValue | object | null | undefined) && Array.isArray((result as JsonObject).messages))
+      ? ((result as JsonObject).messages as unknown[])
+      : [];
+    let published = 0;
+    for (const item of messages) {
+      if (!isJsonObject(item as JsonValue | object | null | undefined)) continue;
+      const msg = item as Record<string, unknown>;
+      const seq = Number(msg.seq ?? 0);
+      const appEvent = p2pAppEventFromPlainPullMessage(msg);
+      if (await this.publishPulledMessage(appEvent.event, ns, seq, appEvent.payload)) {
+        published += 1;
       }
     }
+    return published;
   }
 
   async fillGroupGap(groupId: string): Promise<void> {
     const client = this.runtime.client;
-    if (client._state !== 'connected' || client._closing) return;
+    if (client.state !== ConnectionState.READY || client._closing) return;
     groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     if (!groupId) return;
     const ns = `group:${groupId}`;
@@ -820,7 +909,9 @@ export class MessageDeliveryEngine {
 
   async fillGroupEventGap(groupId: string): Promise<void> {
     const client = this.runtime.client;
-    if (client._state !== 'connected' || client._closing) return;
+    if (client.state !== ConnectionState.READY || client._closing) return;
+    groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    if (!groupId) return;
     const ns = `group_event:${groupId}`;
     const afterSeq = client._seqTracker.getContiguousSeq(ns);
     const dedupKey = `group_event_pull:${ns}`;
@@ -911,6 +1002,7 @@ export class MessageDeliveryEngine {
 
   async handleGroupChangedEventSeq(data: JsonObject, groupId: string): Promise<void> {
     const client = this.runtime.client;
+    groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     let needPull = false;
     const rawEventSeq = data.event_seq;
     const eventSeq = Number(rawEventSeq);
@@ -994,7 +1086,7 @@ export class MessageDeliveryEngine {
     this.runtime.delivery.setOnlineUnreadHintDrainActive(true);
     try {
       while (client._onlineUnreadHintQueue.size > 0) {
-        if (client.state !== 'ready') return;
+        if (client.state !== ConnectionState.READY) return;
         if (client._sessionOptions?.background_sync === false) return;
         const groupId = client._onlineUnreadHintQueue.keys().next().value as string | undefined;
         if (!groupId) return;

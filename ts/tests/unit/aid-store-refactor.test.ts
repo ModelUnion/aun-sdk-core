@@ -32,10 +32,10 @@ describe('AUN SDK v4 三主体 API', () => {
   });
 
   it('AUNClient(AID) 初始为 standby，并暴露 capability getter', () => {
-    const { aid } = createStoredAid('bob.agentid.pub');
+    const { aid } = createStoredAid('bob1.agentid.pub');
     const client = new AUNClient(aid);
     expect(client.state).toBe(ConnectionState.STANDBY);
-    expect(client.currentAid?.aid).toBe('bob.agentid.pub');
+    expect(client.currentAid?.aid).toBe('bob1.agentid.pub');
     expect(client.hasIdentity).toBe(true);
     expect(client.canSign).toBe(true);
     expect(client.canConnect).toBe(true);
@@ -350,9 +350,9 @@ describe('AUNClient.completeGroupTransfer 高层编排', () => {
     const client = new AUNClient(ownerAid);
     const groupStore = new AIDStore({ aunPath, encryptionSeed: 'test-seed' });
     const callSpy = vi.fn(async (method: string, params: Record<string, unknown>) => {
-      if (method === 'group.get') {
-        expect(params).toEqual({ group_id: 'group.agentid.pub/10005' });
-        return { group: { group_id: 'group.agentid.pub/10005', group_aid: groupAid } };
+      if (method === 'group.get_info') {
+        expect(params).toEqual({ group_id: 'group.agentid.pub/10005', required: ['member'] });
+        return { group_id: 'group.agentid.pub/10005', group_aid: groupAid };
       }
       expect(method).toBe('group.complete_transfer');
       expect(params.group_id).toBe('group.agentid.pub/10005');
@@ -404,7 +404,7 @@ describe('AUNClient.startGroupTransfer 高层编排', () => {
     const groupStore = new AIDStore({ aunPath, encryptionSeed: 'test-seed' });
     const client = new AUNClient(ownerAid);
     const callSpy = vi.fn(async (method: string) => {
-      if (method === 'group.get') return { group: { group_id: 'group.agentid.pub/10007', group_aid: groupAid } };
+      if (method === 'group.get_info') return { group_id: 'group.agentid.pub/10007', group_aid: groupAid };
       return { ok: true };
     });
     (client as any)._rpcPipeline.call = callSpy;
@@ -415,7 +415,10 @@ describe('AUNClient.startGroupTransfer 高层编排', () => {
     )).rejects.toThrow(/private key not found/);
 
     expect(callSpy).toHaveBeenCalledTimes(1);
-    expect(callSpy).toHaveBeenCalledWith('group.get', { group_id: 'group.agentid.pub/10007' });
+    expect(callSpy).toHaveBeenCalledWith('group.get_info', {
+      group_id: 'group.agentid.pub/10007',
+      required: ['member'],
+    });
     groupStore.close();
   });
 });

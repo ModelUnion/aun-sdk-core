@@ -58,8 +58,8 @@ describe('CollabClient TypeScript 契约', () => {
     await collab.revert('alice.aid.com:/proj', 'd.md', 1, 'revert');
     await collab.lsRemote('g-team.aid.com');
     await collab.unregister('g-team.aid.com', 'g-team.aid.com:/proj');
-    await collab.setAcl('alice.aid.com:/proj', 'bob.aid.com', { perms: 'w', expiresAt: 123, maxUses: 2 });
-    await collab.removeAcl('alice.aid.com:/proj', 'bob.aid.com');
+    await collab.setAcl('alice.aid.com:/proj', 'bob1.aid.com', { perms: 'w', expiresAt: 123, maxUses: 2 });
+    await collab.removeAcl('alice.aid.com:/proj', 'bob1.aid.com');
     await collab.tag.create('alice.aid.com:/proj', { message: 'm', major: true });
     await collab.tag.list('alice.aid.com:/proj');
     await collab.tag.show('alice.aid.com:/proj', '1.0.0');
@@ -125,14 +125,14 @@ describe('CollabClient TypeScript 契约', () => {
     });
     expect(client.calls[16].params).toEqual({
       collab_root: 'alice.aid.com:/proj',
-      grantee_aid: 'bob.aid.com',
+      grantee_aid: 'bob1.aid.com',
       perms: 'w',
       expires_at: 123,
       max_uses: 2,
     });
     expect(client.calls[17].params).toEqual({
       collab_root: 'alice.aid.com:/proj',
-      grantee_aid: 'bob.aid.com',
+      grantee_aid: 'bob1.aid.com',
     });
   });
 

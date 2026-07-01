@@ -9,6 +9,8 @@ import hashlib
 import time
 from typing import TYPE_CHECKING
 
+from ..group_id import normalize_group_id
+
 if TYPE_CHECKING:
     from ..keystore.sqlite_db import AIDDatabase
 
@@ -27,6 +29,10 @@ class V2KeyStore:
     @staticmethod
     def _ik_spk_id(ik_pub_der: bytes) -> str:
         return "sha256:" + hashlib.sha256(ik_pub_der).hexdigest()[:16]
+
+    @staticmethod
+    def _group_key(group_id: str) -> str:
+        return normalize_group_id(group_id) or str(group_id or "").strip()
 
     def _ensure_schema(self) -> None:
         conn = self._db._get_conn()
@@ -71,6 +77,9 @@ class V2KeyStore:
                 migrated_key_id = str(key_id or "")
                 if key_type in ("group_spk", "group_spk_uploaded") and "\0" in migrated_key_id:
                     migrated_group_id, migrated_key_id = migrated_key_id.split("\0", 1)
+                # Normalize group_id for consistency with all other operations
+                if migrated_group_id and key_type in ("group_spk", "group_spk_uploaded", "group_identity"):
+                    migrated_group_id = self._group_key(migrated_group_id)
                 if private_key is None or public_key is None:
                     if key_type not in ("spk_uploaded", "group_spk_uploaded"):
                         continue
@@ -146,6 +155,7 @@ class V2KeyStore:
         return bytes(row[0])
 
     def save_group_spk(self, device_id: str, group_id: str, spk_id: str, spk_priv: bytes, spk_pub_der: bytes) -> None:
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         conn.execute(
             "INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at) "
@@ -156,6 +166,7 @@ class V2KeyStore:
 
     def delete_group_spk(self, device_id: str, group_id: str, spk_id: str) -> None:
         """删除指定群 SPK 密钥对（用于上传失败后回滚）。"""
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         conn.execute(
             "DELETE FROM v2_device_keys WHERE device_id=? AND key_type='group_spk' AND group_id=? AND key_id=?",
@@ -164,6 +175,7 @@ class V2KeyStore:
         conn.commit()
 
     def load_group_spk(self, device_id: str, group_id: str, spk_id: str) -> bytes | None:
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         row = conn.execute(
             "SELECT private_key FROM v2_device_keys WHERE device_id=? AND key_type='group_spk' AND group_id=? AND key_id=?",
@@ -174,6 +186,7 @@ class V2KeyStore:
         return bytes(row[0])
 
     def load_current_group_spk(self, device_id: str, group_id: str) -> tuple[str, bytes, bytes] | None:
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         row = conn.execute(
             "SELECT key_id, private_key, public_key FROM v2_device_keys "
@@ -186,6 +199,7 @@ class V2KeyStore:
         return (str(row[0]), bytes(row[1]), bytes(row[2]))
 
     def save_group_identity(self, device_id: str, group_aid: str, private_key_pem: str, public_key_der: bytes) -> None:
+        group_aid = self._group_key(group_aid)
         conn = self._db._get_conn()
         conn.execute(
             "INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at) "
@@ -195,6 +209,7 @@ class V2KeyStore:
         conn.commit()
 
     def load_group_identity(self, device_id: str, group_aid: str) -> tuple[str, bytes] | None:
+        group_aid = self._group_key(group_aid)
         conn = self._db._get_conn()
         row = conn.execute(
             "SELECT private_key, public_key FROM v2_device_keys "
@@ -257,6 +272,7 @@ class V2KeyStore:
 
     def mark_group_spk_uploaded(self, device_id: str, group_id: str, spk_id: str) -> None:
         """记录指定群 SPK 已成功上传到服务端。"""
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         conn.execute(
             "INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at) "
@@ -267,6 +283,7 @@ class V2KeyStore:
 
     def load_latest_uploaded_group_spk_id(self, device_id: str, group_id: str) -> str | None:
         """返回本群最近一次上传成功且本地私钥仍存在的 group SPK ID。"""
+        group_id = self._group_key(group_id)
         conn = self._db._get_conn()
         row = conn.execute(
             "SELECT marker.key_id FROM v2_device_keys AS marker "

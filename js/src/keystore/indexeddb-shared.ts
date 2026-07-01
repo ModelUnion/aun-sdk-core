@@ -6,14 +6,9 @@ import type { ModuleLogger } from '../logger.js';
 import type { AgentMdCacheRecord, AgentMdCacheUpsert, GroupStateRecord } from './index.js';
 import {
   isJsonObject,
-  type GroupOldEpochRecord,
-  type GroupSecretRecord,
   type JsonObject,
   type KeyPairRecord,
   type MetadataRecord,
-  type PrekeyMap,
-  type PrekeyRecord,
-  type SessionRecord,
 } from '../types.js';
 
 export const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
@@ -23,16 +18,10 @@ export const STORE_KEY_PAIRS = 'key_pairs';
 export const STORE_CERTS = 'certs';
 export const STORE_METADATA = 'metadata';
 export const STORE_INSTANCE_STATE = 'instance_state';
-export const STORE_PREKEYS = 'prekeys';
-export const STORE_GROUP_CURRENT = 'group_current';
-export const STORE_GROUP_OLD_EPOCHS = 'group_old_epochs';
-export const STORE_SESSIONS = 'e2ee_sessions';
 export const STORE_GROUP_STATE = 'group_state';
 export const STORE_AGENT_MD_CACHE = 'agent_md_cache';
 export const STORE_PENDING_IDENTITIES = 'pending_identities';
 export const STORE_PENDING_BINDS = 'pending_binds';
-
-export const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 
 const DB_NAME = 'aun-keystore';
 const DB_VERSION = 8;
@@ -57,13 +46,6 @@ export function isRecord(value: unknown): value is JsonObject {
 
 export function toBufferSource(bytes: Uint8Array): BufferSource {
   return bytes.slice().buffer;
-}
-
-export function sameJson(
-  a: JsonObject | string | number | boolean | null | undefined,
-  b: JsonObject | string | number | boolean | null | undefined,
-): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 export function randomHex(byteLength: number): string {
@@ -107,44 +89,6 @@ export function instanceStateStoreKey(aid: string, deviceId: string, slotId = ''
   return `${safeAid(aid)}|${encodePart(normalizedDevice)}|${encodePart(slotKey)}`;
 }
 
-export function prekeyPrefix(aid: string): string {
-  return `${safeAid(aid)}|`;
-}
-
-export function prekeyStoreKey(aid: string, prekeyId: string, deviceId = ''): string {
-  const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (!normalizedDeviceId) {
-    return `${safeAid(aid)}|${encodePart(prekeyId)}`;
-  }
-  return `${safeAid(aid)}|${encodePart(normalizedDeviceId)}|${encodePart(prekeyId)}`;
-}
-
-export function groupCurrentPrefix(aid: string): string {
-  return `${safeAid(aid)}|`;
-}
-
-export function groupCurrentStoreKey(aid: string, groupId: string): string {
-  return `${safeAid(aid)}|${encodePart(groupId)}`;
-}
-
-export function groupOldPrefix(aid: string, groupId?: string): string {
-  const base = `${safeAid(aid)}|`;
-  if (groupId === undefined) return base;
-  return `${base}${encodePart(groupId)}|`;
-}
-
-export function groupOldStoreKey(aid: string, groupId: string, epoch: number): string {
-  return `${safeAid(aid)}|${encodePart(groupId)}|${epoch}`;
-}
-
-export function sessionPrefix(aid: string): string {
-  return `${safeAid(aid)}|`;
-}
-
-export function sessionStoreKey(aid: string, sessionId: string): string {
-  return `${safeAid(aid)}|${encodePart(sessionId)}`;
-}
-
 export function seqTrackerPrefix(aid: string, deviceId: string, slotId: string): string {
   const normalizedDevice = normalizeInstanceId(deviceId, 'device_id');
   const slotKey = slotIsolationKey(slotId) || '_singleton';
@@ -168,11 +112,7 @@ export function pendingIdentityPrefix(aid: string): string {
 }
 
 export function stripStructuredFields(metadata: MetadataRecord): MetadataRecord {
-  const plain = deepClone(metadata);
-  delete plain.e2ee_prekeys;
-  delete plain.group_secrets;
-  delete plain.e2ee_sessions;
-  return plain;
+  return deepClone(metadata);
 }
 
 export function defaultAgentMdCacheRecord(aid: string): AgentMdCacheRecord {
@@ -294,7 +234,6 @@ export function openDB(): Promise<IDBDatabase> {
       const db = request.result;
       for (const name of [
         STORE_KEY_PAIRS, STORE_CERTS, STORE_METADATA, STORE_INSTANCE_STATE,
-        STORE_PREKEYS, STORE_GROUP_CURRENT, STORE_GROUP_OLD_EPOCHS, STORE_SESSIONS,
         STORE_GROUP_STATE, STORE_AGENT_MD_CACHE, STORE_PENDING_IDENTITIES, STORE_PENDING_BINDS,
       ]) {
         if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
@@ -432,10 +371,6 @@ export function extractSpkiB64FromCertPem(certPem: string): string {
   }
 }
 
-// ── 类型别名（供两个实现文件使用）────────────────────────────────
-
-export type LegacyGroupSecretMap = Record<string, GroupSecretRecord>;
-
 export type PendingIdentityRecord = {
   aid: string;
   key_pair?: JsonObject;
@@ -446,12 +381,7 @@ export type PendingIdentityRecord = {
 
 // 重新导出类型，方便实现文件使用
 export type {
-  GroupOldEpochRecord,
-  GroupSecretRecord,
   JsonObject,
   KeyPairRecord,
   MetadataRecord,
-  PrekeyMap,
-  PrekeyRecord,
-  SessionRecord,
 };

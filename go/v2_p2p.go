@@ -32,6 +32,8 @@ type v2PullPageMeta struct {
 	rawCount     int
 	serverAckSeq int64
 	hasServerAck bool
+	latestSeq    int64
+	hasMore      bool
 }
 
 // v2BootstrapEntry 单条 peer_aid 缓存项。
@@ -40,6 +42,17 @@ type v2BootstrapEntry struct {
 	AuditRecipients []map[string]any
 	CachedAt        time.Time
 	WrapPolicy      *v2WrapPolicy
+}
+
+type v2P2PTargetSetCacheEntry struct {
+	Targets         []e2ee.Target
+	AuditRecipients []e2ee.Target
+	CachedAt        time.Time
+}
+
+type v2GroupTargetSetCacheEntry struct {
+	Targets  []e2ee.Target
+	CachedAt time.Time
 }
 
 type v2WrapPolicy struct {
@@ -123,9 +136,11 @@ type v2P2PState struct {
 	keystore        *V2SQLiteStore
 	bootstrapCache  map[string]v2BootstrapEntry
 	bootstrapCacheM sync.Mutex
+	targetSetCache  map[string]v2P2PTargetSetCacheEntry
 	// groupBootstrapCache 群 bootstrap 缓存（key = groupID）。
 	// 与 P2P bootstrapCache 分开存储，因为群缓存多 epoch + stateCommitment 字段。
 	groupBootstrapCache map[string]*v2GroupBootstrapEntry
+	groupTargetSetCache map[string]v2GroupTargetSetCacheEntry
 }
 
 type v2SenderIKPendingEntry struct {

@@ -27,6 +27,27 @@ const V2DeviceKeysDDL = `CREATE TABLE IF NOT EXISTS v2_device_keys (
     PRIMARY KEY (device_id, key_type, group_id, key_id)
 )`
 
+// normalizeGroupIDForMigration converts group.example.com/name -> name.example.com
+// This matches the ConvertToGroupAID logic from the main package.
+func normalizeGroupIDForMigration(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return value
+	}
+	// Handle group.domain/name or group.domain.com/name format
+	if strings.HasPrefix(value, "group.") {
+		slashIdx := strings.Index(value, "/")
+		if slashIdx > 6 { // "group." is 6 chars
+			name := value[slashIdx+1:]
+			issuer := value[6:slashIdx] // extract domain after "group."
+			if name != "" && issuer != "" {
+				return name + "." + issuer
+			}
+		}
+	}
+	return value
+}
+
 // V2KeyStore 设备密钥持久化。
 //
 // key_type 取值：
@@ -157,6 +178,11 @@ func migrateV2DeviceKeys(db *sql.DB) error {
 		if (keyType == "group_spk" || keyType == "group_spk_uploaded") && strings.Contains(keyID, "\x00") {
 			parts := strings.SplitN(keyID, "\x00", 2)
 			groupID, keyID = parts[0], parts[1]
+		}
+		// Normalize group_id for consistency with all other operations
+		// Convert group.example.com/name -> name.example.com (same logic as ConvertToGroupAID)
+		if groupID != "" && (keyType == "group_spk" || keyType == "group_spk_uploaded" || keyType == "group_identity") {
+			groupID = normalizeGroupIDForMigration(groupID)
 		}
 		if priv == nil || pub == nil {
 			if !isUploadedMarkerKeyType(keyType) {

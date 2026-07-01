@@ -25,6 +25,13 @@ if TYPE_CHECKING:
 _METADATA_LOCKS_LIMIT = 256
 
 
+def _issuer_from_aid(aid: str) -> str:
+    value = str(aid or "").strip().lower()
+    if "." not in value:
+        return ""
+    return value.partition(".")[2].strip(".")
+
+
 class LocalTokenStore:
     """TokenStore Protocol 的文件系统实现。
 
@@ -167,114 +174,6 @@ class LocalTokenStore:
         except Exception as exc:
             self._log.debug("keystore", "set_metadata_value failed: aid=%s key=%s err=%s", aid, key, exc)
 
-    # ── Prekeys ──────────────────────────────────────────────
-
-    def load_e2ee_prekeys(self, aid: str, device_id: str) -> dict[str, dict[str, Any]]:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).load_prekeys(str(device_id or "").strip())
-
-    def load_e2ee_prekey_by_id(self, aid: str, prekey_id: str) -> dict[str, Any] | None:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).load_prekey_by_id(prekey_id)
-
-    def save_e2ee_prekey(self, aid: str, prekey_id: str, prekey_data: dict[str, Any], device_id: str) -> None:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            device_id = str(device_id or "").strip()
-            extra = {k: v for k, v in prekey_data.items() if k not in ("private_key_pem", "created_at", "updated_at", "expires_at")}
-            self._get_db(aid).save_prekey(
-                prekey_id,
-                prekey_data.get("private_key_pem", ""),
-                device_id=device_id,
-                created_at=prekey_data.get("created_at"),
-                expires_at=prekey_data.get("expires_at"),
-                extra_data=extra or None,
-            )
-
-    def cleanup_e2ee_prekeys(self, aid: str, cutoff_ms: int, keep_latest: int = 7, device_id: str = "") -> list[str]:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).cleanup_prekeys(cutoff_ms, keep_latest=keep_latest, device_id=str(device_id or "").strip())
-
-    # ── Group Secrets ────────────────────────────────────────
-
-    def list_group_secret_ids(self, aid: str) -> list[str]:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            db = self._get_db(aid)
-            ids = set(db.load_all_group_current().keys())
-            ids.update(db.load_all_group_ids_with_old_epochs())
-            return sorted(ids)
-
-    def cleanup_group_old_epochs_state(self, aid: str, group_id: str, cutoff_ms: int) -> int:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            db = self._get_db(aid)
-            old_epochs = db.load_group_old_epochs(group_id)
-            if not old_epochs:
-                return 0
-            to_delete: list[int] = []
-            for old in old_epochs:
-                marker = old.get("updated_at") or 0
-                if isinstance(marker, (int, float)) and int(marker) <= cutoff_ms:
-                    epoch = old.get("epoch")
-                    if isinstance(epoch, (int, float)):
-                        to_delete.append(int(epoch))
-            if to_delete:
-                conn = db._get_conn()
-                placeholders = ",".join("?" for _ in to_delete)
-                conn.execute(
-                    f"DELETE FROM group_old_epochs WHERE group_id = ? AND epoch IN ({placeholders})",
-                    [group_id, *to_delete],
-                )
-                conn.commit()
-            return len(to_delete)
-
-    def load_group_secret_epoch(self, aid: str, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).load_group_secret_epoch(group_id, epoch)
-
-    def load_group_secret_epochs(self, aid: str, group_id: str) -> list[dict[str, Any]]:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).load_group_secret_epochs(group_id)
-
-    def store_group_secret_transition(self, aid: str, group_id: str, *, epoch: int, secret: str, commitment: str,
-                                       member_aids: list[str], epoch_chain: str | None = None,
-                                       pending_rotation_id: str = "", epoch_chain_unverified: bool | None = None,
-                                       epoch_chain_unverified_reason: str | None = None, old_epoch_retention_ms: int) -> bool:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).store_group_secret_transition(
-                group_id, epoch=epoch, secret=secret, commitment=commitment, member_aids=member_aids,
-                epoch_chain=epoch_chain, pending_rotation_id=pending_rotation_id,
-                epoch_chain_unverified=epoch_chain_unverified,
-                epoch_chain_unverified_reason=epoch_chain_unverified_reason,
-                old_epoch_retention_ms=old_epoch_retention_ms,
-            )
-
-    def store_group_secret_epoch(self, aid: str, group_id: str, *, epoch: int, secret: str, commitment: str,
-                                  member_aids: list[str], epoch_chain: str | None = None,
-                                  pending_rotation_id: str = "", epoch_chain_unverified: bool | None = None,
-                                  epoch_chain_unverified_reason: str | None = None, old_epoch_retention_ms: int) -> bool:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).store_group_secret_epoch(
-                group_id, epoch=epoch, secret=secret, commitment=commitment, member_aids=member_aids,
-                epoch_chain=epoch_chain, pending_rotation_id=pending_rotation_id,
-                epoch_chain_unverified=epoch_chain_unverified,
-                epoch_chain_unverified_reason=epoch_chain_unverified_reason,
-                old_epoch_retention_ms=old_epoch_retention_ms,
-            )
-
-    def discard_pending_group_secret_state(self, aid: str, group_id: str, epoch: int, rotation_id: str) -> bool:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            return self._get_db(aid).discard_pending_group_secret_state(group_id, epoch, rotation_id)
-
     def save_group_state(self, aid: str, **kwargs) -> None:
         lock = self._get_metadata_lock(aid)
         with lock:
@@ -283,7 +182,7 @@ class LocalTokenStore:
     def load_group_state(self, aid: str, group_id: str) -> dict | None:
         lock = self._get_metadata_lock(aid)
         with lock:
-            return self._get_db(aid).load_group_state(group_id)
+            return self._get_db(aid).load_group_state(group_id, local_issuer=_issuer_from_aid(aid))
 
     # ── Instance State ───────────────────────────────────────
 

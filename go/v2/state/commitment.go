@@ -4,7 +4,7 @@
 //
 //	state_commitment = SHA256(
 //	  "AUN-V2-SC-v1" ||
-//	  group_id ||
+//	  group_aid ||
 //	  uint32_BE(epoch) ||
 //	  canonical_json(payload)
 //	)
@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"sort"
+	"strings"
 
 	"github.com/modelunion/aun-sdk-core/go/v2/crypto"
 )
@@ -39,6 +40,7 @@ const Prefix = "AUN-V2-SC-v1"
 func ComputeStateCommitment(groupID string, epoch uint32, statePayload map[string]any) string {
 	payload := deepCopyAny(statePayload).(map[string]any)
 	sortPayload(payload)
+	groupKey := normalizeGroupKey(groupID)
 
 	var epochBytes [4]byte
 	binary.BigEndian.PutUint32(epochBytes[:], epoch)
@@ -47,10 +49,51 @@ func ComputeStateCommitment(groupID string, epoch uint32, statePayload map[strin
 
 	h := sha256.New()
 	h.Write([]byte(Prefix))
-	h.Write([]byte(groupID))
+	h.Write([]byte(groupKey))
 	h.Write(epochBytes[:])
 	h.Write(canonical)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func normalizeGroupKey(groupID string) string {
+	value := strings.ToLower(strings.Trim(strings.TrimSpace(groupID), "/"))
+	if value == "" {
+		return ""
+	}
+	trimDots := func(s string) string {
+		return strings.Trim(s, ".")
+	}
+	if strings.HasPrefix(value, "group.") && strings.Contains(value, "/") {
+		issuerAndBase := value[6:]
+		if slash := strings.Index(issuerAndBase, "/"); slash > 0 && slash < len(issuerAndBase)-1 {
+			domain := trimDots(issuerAndBase[:slash])
+			baseTail := strings.Trim(issuerAndBase[slash+1:], "/")
+			if at := strings.Index(baseTail, "@"); at > 0 {
+				base := trimDots(baseTail[:at])
+				suffixDomain := trimDots(baseTail[at+1:])
+				if base != "" && suffixDomain != "" {
+					merged := suffixDomain
+					if domain != "" {
+						merged = suffixDomain + "." + domain
+					}
+					return base + "." + merged
+				}
+			}
+			base := trimDots(baseTail)
+			if base != "" && domain != "" {
+				return base + "." + domain
+			}
+		}
+		return value
+	}
+	if at := strings.Index(value, "@"); at > 0 {
+		base := trimDots(value[:at])
+		domain := trimDots(value[at+1:])
+		if base != "" && domain != "" {
+			return base + "." + domain
+		}
+	}
+	return value
 }
 
 // sortPayload 在原 map 上递归排序需要规范化的字段。

@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from collections import Counter
@@ -98,6 +99,7 @@ class AutoscaleConfig:
     drain_limit: int = 100
     drain_max_pages: int = 100
     settle_ms: int | None = None
+    processes: int = 1
 
 
 @dataclass(slots=True)
@@ -108,6 +110,12 @@ class SendPerfCollected:
     trace_count: int
     event_count: int
     log_paths: list[str]
+
+
+@dataclass(slots=True)
+class P2PLane:
+    sender: "BenchClientHandle"
+    receiver: "BenchClientHandle"
 
 
 class BenchClientHandle:
@@ -945,6 +953,35 @@ async def _build_fleet(
     return senders, receivers
 
 
+def _build_p2p_lanes(senders: list[BenchClientHandle], receivers: list[BenchClientHandle]) -> list[P2PLane]:
+    if not senders:
+        raise RuntimeError("P2P bench 缺少 sender AID")
+    if not receivers:
+        raise RuntimeError("P2P bench 缺少 receiver AID")
+    if len(senders) != len(receivers):
+        raise RuntimeError(
+            f"P2P bench 需要 sender/receiver 一一配对: senders={len(senders)} receivers={len(receivers)}"
+        )
+    return [P2PLane(sender=sender, receiver=receiver) for sender, receiver in zip(senders, receivers)]
+
+
+def _lane_model_summary(*, group: bool, lanes: list[P2PLane] | None = None, active_lanes: int | None = None) -> dict[str, Any]:
+    if group:
+        return {"type": "group_shared_receiver_set"}
+    lane_count = len(lanes or [])
+    active = lane_count if active_lanes is None else min(max(0, active_lanes), lane_count)
+    return {
+        "type": "p2p_sender_receiver_pairs",
+        "lane_count": lane_count,
+        "active_lanes": active,
+        "per_lane_send_concurrency": 1,
+        "pairing": [
+            {"sender": lane.sender.aid, "receiver": lane.receiver.aid}
+            for lane in (lanes or [])[:active]
+        ],
+    }
+
+
 async def run_e2e_scenario(ctx: typer.Context, config: E2EConfig) -> dict[str, Any]:
     if config.scenario == "connect":
         return await _run_connect_scenario(ctx, config)
@@ -1034,6 +1071,7 @@ async def _run_message_scenario(ctx: typer.Context, config: E2EConfig, *, group:
     send_finished_at = 0.0
     receiver_seq = _empty_receiver_seq_diagnostics()
     drain_result = _empty_receiver_drain_result(enabled=config.drain_receivers)
+    service_push_queue_delta: dict[str, Any] = {}
     try:
         senders, receivers = await _build_fleet(
             ctx,
@@ -1043,35 +1081,61 @@ async def _run_message_scenario(ctx: typer.Context, config: E2EConfig, *, group:
         _install_sender_ack_handlers(senders, recorder)
         drain_result = await _drain_receivers_before_run(receivers, config, group=group)
         recorder.reset_handler_stats()
+        service_push_queue_before = await _sample_message_async_push_queue(receivers or senders) if not group else {}
 
+        lanes = [] if group else _build_p2p_lanes(senders, receivers)
+        active_lane_count = min(len(lanes), config.concurrency) if not group else 0
         next_index = 0
         index_lock = asyncio.Lock()
 
-        async def worker() -> None:
+        async def worker(lane: P2PLane | None = None, *, lane_index: int = 0, lane_count: int = 1) -> None:
             nonlocal next_index
+            if not group:
+                if lane is None or lane_count <= 0:
+                    return
+                index = lane_index
+                while index < config.count:
+                    await _send_one(
+                        lane.sender,
+                        recorder,
+                        config,
+                        index=index,
+                        method="message.send",
+                        target=lane.receiver.aid,
+                        group=False,
+                    )
+                    index += lane_count
+                return
             while True:
                 async with index_lock:
                     if next_index >= config.count:
                         return
                     index = next_index
                     next_index += 1
-                sender = senders[index % len(senders)]
                 if group:
+                    sender = senders[index % len(senders)]
                     target = str(config.group_id or "")
                     method = "group.send"
-                else:
-                    receiver = receivers[index % len(receivers)]
-                    target = receiver.aid
-                    method = "message.send"
-                await _send_one(sender, recorder, config, index=index, method=method, target=target, group=group)
+                    await _send_one(sender, recorder, config, index=index, method=method, target=target, group=group)
 
-        worker_count = min(config.count, config.concurrency)
+        worker_count = min(config.count, config.concurrency) if group else active_lane_count
         send_started_at = time.perf_counter()
-        await asyncio.gather(*(worker() for _ in range(worker_count)))
+        if group:
+            await asyncio.gather(*(worker() for _ in range(worker_count)))
+        else:
+            await asyncio.gather(
+                *(worker(lane, lane_index=i, lane_count=worker_count) for i, lane in enumerate(lanes[:worker_count]))
+            )
         send_finished_at = time.perf_counter()
         await recorder.wait()
         settle_result = await _settle_receivers_after_send(receivers, config, group=group)
         await recorder.wait()
+        if service_push_queue_before:
+            service_push_queue_after = await _sample_message_async_push_queue(receivers or senders)
+            service_push_queue_delta = _diff_message_async_push_queue_stats(
+                service_push_queue_before,
+                service_push_queue_after,
+            )
         receiver_seq = _collect_receiver_seq_diagnostics(
             receivers,
             group=group,
@@ -1091,6 +1155,8 @@ async def _run_message_scenario(ctx: typer.Context, config: E2EConfig, *, group:
         errors=recorder.errors,
         receiver_seq=receiver_seq,
     )
+    if service_push_queue_delta:
+        result["service_push_queue_delta"] = service_push_queue_delta
     if send_started_at and send_finished_at:
         send_seconds = max(send_finished_at - send_started_at, 0.000001)
         ok_count = int(result.get("ok") or 0)
@@ -1100,6 +1166,10 @@ async def _run_message_scenario(ctx: typer.Context, config: E2EConfig, *, group:
         result["send_rps"] = round(ok_count / send_seconds, 2)
         result["delivered_rps"] = round(delivered_count / send_seconds, 2)
         result["acked_rps"] = round(acked_count / send_seconds, 2)
+    result["lane_model"] = _lane_model_summary(group=group, lanes=[] if group else lanes, active_lanes=worker_count)
+    if not group:
+        result["requested_concurrency"] = config.concurrency
+        result["concurrency"] = worker_count
     return result
 
 
@@ -1120,6 +1190,7 @@ async def _run_message_load_stage(
     stop_at = started_at + max(0.001, step_seconds)
     receiver_seq = _empty_receiver_seq_diagnostics()
     drain_result = _empty_receiver_drain_result(enabled=config.drain_receivers)
+    service_push_queue_delta: dict[str, Any] = {}
     try:
         senders, receivers = await _build_fleet(
             ctx,
@@ -1129,11 +1200,14 @@ async def _run_message_load_stage(
         _install_sender_ack_handlers(senders, recorder)
         drain_result = await _drain_receivers_before_run(receivers, config, group=group)
         recorder.reset_handler_stats()
+        service_push_queue_before = await _sample_message_async_push_queue(receivers or senders) if not group else {}
 
+        lanes = [] if group else _build_p2p_lanes(senders, receivers)
+        active_lane_count = min(len(lanes), config.concurrency) if not group else 0
         next_index = 0
         index_lock = asyncio.Lock()
 
-        async def worker() -> None:
+        async def worker(lane: P2PLane | None = None) -> None:
             nonlocal next_index, sent_count
             while True:
                 async with index_lock:
@@ -1142,24 +1216,41 @@ async def _run_message_load_stage(
                     index = next_index
                     next_index += 1
                     sent_count = next_index
-                sender = senders[index % len(senders)]
                 if group:
+                    sender = senders[index % len(senders)]
                     target = str(config.group_id or "")
                     method = "group.send"
+                    await _send_one(sender, recorder, config, index=index, method=method, target=target, group=group)
                 else:
-                    receiver = receivers[index % len(receivers)]
-                    target = receiver.aid
-                    method = "message.send"
-                await _send_one(sender, recorder, config, index=index, method=method, target=target, group=group)
+                    if lane is None:
+                        return
+                    await _send_one(
+                        lane.sender,
+                        recorder,
+                        config,
+                        index=index,
+                        method="message.send",
+                        target=lane.receiver.aid,
+                        group=False,
+                    )
 
-        worker_count = max(1, config.concurrency)
+        worker_count = max(1, config.concurrency) if group else active_lane_count
         send_started_at = time.perf_counter()
-        await asyncio.gather(*(worker() for _ in range(worker_count)))
+        if group:
+            await asyncio.gather(*(worker() for _ in range(worker_count)))
+        else:
+            await asyncio.gather(*(worker(lane) for lane in lanes[:worker_count]))
         send_finished_at = time.perf_counter()
         recorder.expected = sent_count
         await recorder.wait()
         settle_result = await _settle_receivers_after_send(receivers, config, group=group)
         await recorder.wait()
+        if service_push_queue_before:
+            service_push_queue_after = await _sample_message_async_push_queue(receivers or senders)
+            service_push_queue_delta = _diff_message_async_push_queue_stats(
+                service_push_queue_before,
+                service_push_queue_after,
+            )
         receiver_seq = _collect_receiver_seq_diagnostics(
             receivers,
             group=group,
@@ -1192,6 +1283,8 @@ async def _run_message_load_stage(
         errors=recorder.errors,
         receiver_seq=receiver_seq,
     )
+    if service_push_queue_delta:
+        result["service_push_queue_delta"] = service_push_queue_delta
     send_seconds = max(send_finished_at - send_started_at, 0.000001) if send_started_at and send_finished_at else max(step_seconds, 0.000001)
     result["send_window_seconds"] = round(send_seconds, 3)
     result["send_rps"] = round(sent_count / send_seconds, 2)
@@ -1199,6 +1292,10 @@ async def _run_message_load_stage(
     result["stage_seconds"] = round(max(time.perf_counter() - started_at, 0.0), 3)
     result["load_window_seconds"] = round(step_seconds, 3)
     result["count_limit"] = config.count
+    result["lane_model"] = _lane_model_summary(group=group, lanes=[] if group else lanes, active_lanes=worker_count)
+    if not group:
+        result["requested_concurrency"] = config.concurrency
+        result["concurrency"] = worker_count
     return result
 
 
@@ -1328,6 +1425,47 @@ def _combine_drain_results(pre: dict[str, Any], settle: dict[str, Any]) -> dict[
         receivers.extend(settle["receivers"])
     combined["receivers"] = receivers
     return combined
+
+
+async def _sample_message_async_push_queue(handles: list[BenchClientHandle]) -> dict[str, Any]:
+    if not handles:
+        return {}
+    client = handles[0].client
+    try:
+        result = await client.call("message.status", {})
+    except Exception:
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    stats = result.get("stats")
+    if not isinstance(stats, dict):
+        return {}
+    queue_stats = stats.get("async_push_queue")
+    if not isinstance(queue_stats, dict):
+        return {}
+    return {str(key): value for key, value in queue_stats.items()}
+
+
+def _diff_message_async_push_queue_stats(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(before, dict) or not isinstance(after, dict) or not after:
+        return {}
+    delta: dict[str, Any] = {}
+    for key, value in after.items():
+        if isinstance(value, bool):
+            delta[key] = value
+            continue
+        try:
+            after_value = int(value or 0)
+            before_value = int(before.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        delta[key] = max(0, after_value - before_value)
+    enqueue = int(delta.get("enqueue") or 0)
+    replace = int(delta.get("conflation_replace") or 0)
+    append = int(delta.get("conflation_append") or 0)
+    delta["conflation_replace_rate"] = _ratio(replace, enqueue)
+    delta["conflation_append_rate"] = _ratio(append, enqueue)
+    return delta
 
 
 def _empty_receiver_drain_result(*, enabled: bool = True) -> dict[str, Any]:
@@ -2070,6 +2208,7 @@ def _empty_receiver_seq_diagnostics() -> dict[str, Any]:
             "ordered_gap_blocked": 0,
         },
         "push_processing": {},
+        "p2p_gap_fill": {},
         "auto_ack": {},
         "bench_handlers": {},
         "drain": _empty_receiver_drain_result(enabled=True),
@@ -2097,11 +2236,13 @@ def _collect_receiver_seq_diagnostics(
         "ordered_gap_blocked": sum(int(item.get("ordered_gap_blocked") or 0) for item in items),
     }
     push_processing = _merge_push_processing_stats(receivers)
+    p2p_gap_fill = _merge_p2p_gap_fill_stats(receivers)
     auto_ack = _merge_auto_ack_stats(receivers)
     return {
         "namespaces": items,
         "totals": totals,
         "push_processing": push_processing,
+        "p2p_gap_fill": p2p_gap_fill,
         "auto_ack": auto_ack,
         "bench_handlers": _copy_int_stats(handler_stats or {}),
         "drain": dict(drain_result) if isinstance(drain_result, dict) else _empty_receiver_drain_result(enabled=True),
@@ -2140,6 +2281,7 @@ def _receiver_seq_namespace_diagnostics(handle: BenchClientHandle, ns: str) -> d
         "last_blocked_seq": int(gap_stats.get("last_seq") or 0) if isinstance(gap_stats, dict) else 0,
         "last_blocked_contiguous_seq": int(gap_stats.get("last_contiguous_seq") or 0) if isinstance(gap_stats, dict) else 0,
         "push_processing": _copy_push_processing_stats(getattr(client, "_push_processing_stats", {})),
+        "p2p_gap_fill": _copy_int_stats(getattr(client, "_p2p_gap_fill_stats", {})),
         "auto_ack": _copy_int_stats(getattr(client, "_auto_ack_stats", {})),
     }
 
@@ -2170,6 +2312,15 @@ def _merge_auto_ack_stats(handles: list[BenchClientHandle]) -> dict[str, int]:
     merged: dict[str, int] = {}
     for handle in handles:
         stats = _copy_int_stats(getattr(handle.client, "_auto_ack_stats", {}))
+        for key, value in stats.items():
+            merged[key] = int(merged.get(key) or 0) + int(value or 0)
+    return merged
+
+
+def _merge_p2p_gap_fill_stats(handles: list[BenchClientHandle]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for handle in handles:
+        stats = _copy_int_stats(getattr(handle.client, "_p2p_gap_fill_stats", {}))
         for key, value in stats.items():
             merged[key] = int(merged.get(key) or 0) + int(value or 0)
     return merged
@@ -2241,7 +2392,8 @@ async def run_autoscale(ctx: typer.Context, config: AutoscaleConfig) -> dict[str
                 log_paths=[],
                 enabled=False,
             )
-        step["concurrency"] = concurrency
+        step["requested_concurrency"] = concurrency
+        step.setdefault("concurrency", concurrency)
         _enrich_autoscale_step(step, previous_rps=previous_rps, baseline_p99=baseline_p99, config=config)
         steps.append(step)
         soft_condition = _soft_knee_condition(step, previous_rps=previous_rps, config=config)
@@ -2539,6 +2691,7 @@ def _autoscale_summary(steps: list[dict[str, Any]], *, p99_scope: str = "max") -
         "acked": acked,
         "ordered_gap_blocked": ordered_gap_blocked,
         "receiver_seq": _merge_receiver_seq_diagnostics(steps),
+        "service_push_queue_delta": _merge_step_service_push_queue_delta(steps),
         "bench_handlers": _merge_step_bench_handler_stats(steps),
         "ok_to_raw_gap": ok_to_raw_gap,
         "raw_to_delivered_gap": raw_to_delivered_gap,
@@ -2594,6 +2747,7 @@ def _merge_receiver_seq_diagnostics(steps: list[dict[str, Any]]) -> dict[str, An
     )
     merged = dict(merged)
     merged["push_processing"] = _merge_step_push_processing_stats(steps)
+    merged["p2p_gap_fill"] = _merge_step_p2p_gap_fill_stats(steps)
     merged["auto_ack"] = _merge_step_auto_ack_stats(steps)
     merged["bench_handlers"] = _merge_step_bench_handler_stats(steps)
     merged["drain"] = _merge_step_receiver_drain_stats(steps)
@@ -2619,6 +2773,17 @@ def _merge_step_auto_ack_stats(steps: list[dict[str, Any]]) -> dict[str, int]:
     for step in steps:
         receiver_seq = step.get("receiver_seq")
         stats = receiver_seq.get("auto_ack", {}) if isinstance(receiver_seq, dict) else {}
+        stats = _copy_int_stats(stats)
+        for key, value in stats.items():
+            merged[key] = int(merged.get(key) or 0) + int(value or 0)
+    return merged
+
+
+def _merge_step_p2p_gap_fill_stats(steps: list[dict[str, Any]]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for step in steps:
+        receiver_seq = step.get("receiver_seq")
+        stats = receiver_seq.get("p2p_gap_fill", {}) if isinstance(receiver_seq, dict) else {}
         stats = _copy_int_stats(stats)
         for key, value in stats.items():
             merged[key] = int(merged.get(key) or 0) + int(value or 0)
@@ -2655,6 +2820,30 @@ def _merge_step_receiver_drain_stats(steps: list[dict[str, Any]]) -> dict[str, A
             merged["status"] = str(stats.get("status"))
         for key in ("duration_ms", "pages", "raw_count", "published_count"):
             merged[key] = int(merged.get(key) or 0) + int(stats.get(key) or 0)
+    return merged
+
+
+def _merge_step_service_push_queue_delta(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for step in steps:
+        stats = step.get("service_push_queue_delta")
+        if not isinstance(stats, dict):
+            continue
+        for key, value in stats.items():
+            if isinstance(value, bool):
+                merged[key] = bool(value)
+                continue
+            try:
+                numeric = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            merged[key] = int(merged.get(key) or 0) + numeric
+    enqueue = int(merged.get("enqueue") or 0)
+    replace = int(merged.get("conflation_replace") or 0)
+    append = int(merged.get("conflation_append") or 0)
+    if enqueue > 0 or replace > 0 or append > 0:
+        merged["conflation_replace_rate"] = _ratio(replace, enqueue)
+        merged["conflation_append_rate"] = _ratio(append, enqueue)
     return merged
 
 
@@ -2702,9 +2891,11 @@ def _print_result(result: dict[str, Any]) -> None:
         backpressure = result.get("backpressure", {}) if isinstance(result.get("backpressure"), dict) else {}
         trigger = backpressure.get("trigger_condition") if isinstance(backpressure, dict) else None
         push_stats = _p2p_push_stats(summary.get("receiver_seq"))
+        gap_stats = _p2p_gap_fill_stats(summary.get("receiver_seq"))
         auto_ack = _auto_ack_stats(summary.get("receiver_seq"))
         handler_stats = _bench_handler_stats(summary.get("receiver_seq"))
         drain_stats = _receiver_drain_stats(summary.get("receiver_seq"))
+        push_queue = _service_push_queue_stats(summary.get("service_push_queue_delta"))
         output_dict({
             "Scenario": result.get("scenario", ""),
             "Client Shape": result.get("client_shape", ""),
@@ -2731,10 +2922,31 @@ def _print_result(result: dict[str, Any]) -> None:
             "Pending Gaps": (summary.get("receiver_seq", {}).get("totals", {}) if isinstance(summary.get("receiver_seq"), dict) else {}).get("pending_gap_count", ""),
             "Push Started": push_stats.get("started", ""),
             "Push Filtered": push_stats.get("instance_filtered", ""),
+            "Push Queue Enqueue": push_queue.get("enqueue", ""),
+            "Push Queue Sent": push_queue.get("sent", ""),
+            "Push Queue Send Error": push_queue.get("send_error", ""),
+            "Push Queue Dropped": push_queue.get("dropped_by_capacity", ""),
+            "Push Conflate Append": push_queue.get("conflation_append", ""),
+            "Push Conflate Replace": push_queue.get("conflation_replace", ""),
+            "Push Conflate Replace Rate": push_queue.get("conflation_replace_rate", ""),
             "Decrypt OK": push_stats.get("decrypt_ok", ""),
             "Decrypt Fail": push_stats.get("decrypt_fail", ""),
             "App Published": push_stats.get("app_published", ""),
             "Undecryptable Published": push_stats.get("undecryptable_published", ""),
+            "Gap Pull Started": gap_stats.get("gap_fill_started", ""),
+            "Gap Pull Pages": gap_stats.get("gap_fill_pages", ""),
+            "Gap Pull Raw": gap_stats.get("gap_fill_raw_messages", ""),
+            "Gap Pull Published": gap_stats.get("gap_fill_published_messages", ""),
+            "Gap Pull Empty": gap_stats.get("gap_fill_empty_pages", ""),
+            "Gap Pull Failed": gap_stats.get("gap_fill_failed", ""),
+            "Push Auto Pull Started": gap_stats.get("push_auto_pull_started", ""),
+            "Push Auto Pull Pages": gap_stats.get("push_auto_pull_pages", ""),
+            "Push Auto Pull Raw": gap_stats.get("push_auto_pull_raw_messages", ""),
+            "Push Auto Pull Published": gap_stats.get("push_auto_pull_published_messages", ""),
+            "Push Auto Pull Empty": gap_stats.get("push_auto_pull_empty_pages", ""),
+            "Push Auto Pull Failed": gap_stats.get("push_auto_pull_failed", ""),
+            "Pending Pull Upper": gap_stats.get("pending_upper_recorded", ""),
+            "Followup Pull Scheduled": gap_stats.get("followup_scheduled", ""),
             "Auto Ack Scheduled": auto_ack.get("scheduled", ""),
             "Auto Ack OK": auto_ack.get("ok", ""),
             "Auto Ack Failed": auto_ack.get("failed", ""),
@@ -2783,9 +2995,11 @@ def _print_result(result: dict[str, Any]) -> None:
         return
     latency = result.get("latency_ms", {})
     push_stats = _p2p_push_stats(result.get("receiver_seq"))
+    gap_stats = _p2p_gap_fill_stats(result.get("receiver_seq"))
     auto_ack = _auto_ack_stats(result.get("receiver_seq"))
     handler_stats = _bench_handler_stats(result.get("receiver_seq"))
     drain_stats = _receiver_drain_stats(result.get("receiver_seq"))
+    push_queue = _service_push_queue_stats(result.get("service_push_queue_delta"))
     output_dict({
         "Scenario": result.get("scenario", ""),
         "Method": result.get("method", ""),
@@ -2811,10 +3025,31 @@ def _print_result(result: dict[str, Any]) -> None:
         "Pending Gaps": (result.get("receiver_seq", {}).get("totals", {}) if isinstance(result.get("receiver_seq"), dict) else {}).get("pending_gap_count", ""),
         "Push Started": push_stats.get("started", ""),
         "Push Filtered": push_stats.get("instance_filtered", ""),
+        "Push Queue Enqueue": push_queue.get("enqueue", ""),
+        "Push Queue Sent": push_queue.get("sent", ""),
+        "Push Queue Send Error": push_queue.get("send_error", ""),
+        "Push Queue Dropped": push_queue.get("dropped_by_capacity", ""),
+        "Push Conflate Append": push_queue.get("conflation_append", ""),
+        "Push Conflate Replace": push_queue.get("conflation_replace", ""),
+        "Push Conflate Replace Rate": push_queue.get("conflation_replace_rate", ""),
         "Decrypt OK": push_stats.get("decrypt_ok", ""),
         "Decrypt Fail": push_stats.get("decrypt_fail", ""),
         "App Published": push_stats.get("app_published", ""),
         "Undecryptable Published": push_stats.get("undecryptable_published", ""),
+        "Gap Pull Started": gap_stats.get("gap_fill_started", ""),
+        "Gap Pull Pages": gap_stats.get("gap_fill_pages", ""),
+        "Gap Pull Raw": gap_stats.get("gap_fill_raw_messages", ""),
+        "Gap Pull Published": gap_stats.get("gap_fill_published_messages", ""),
+        "Gap Pull Empty": gap_stats.get("gap_fill_empty_pages", ""),
+        "Gap Pull Failed": gap_stats.get("gap_fill_failed", ""),
+        "Push Auto Pull Started": gap_stats.get("push_auto_pull_started", ""),
+        "Push Auto Pull Pages": gap_stats.get("push_auto_pull_pages", ""),
+        "Push Auto Pull Raw": gap_stats.get("push_auto_pull_raw_messages", ""),
+        "Push Auto Pull Published": gap_stats.get("push_auto_pull_published_messages", ""),
+        "Push Auto Pull Empty": gap_stats.get("push_auto_pull_empty_pages", ""),
+        "Push Auto Pull Failed": gap_stats.get("push_auto_pull_failed", ""),
+        "Pending Pull Upper": gap_stats.get("pending_upper_recorded", ""),
+        "Followup Pull Scheduled": gap_stats.get("followup_scheduled", ""),
         "Auto Ack Scheduled": auto_ack.get("scheduled", ""),
         "Auto Ack OK": auto_ack.get("ok", ""),
         "Auto Ack Failed": auto_ack.get("failed", ""),
@@ -2851,6 +3086,15 @@ def _auto_ack_stats(receiver_seq: Any) -> dict[str, int]:
     return {str(key): int(value or 0) for key, value in stats.items()}
 
 
+def _p2p_gap_fill_stats(receiver_seq: Any) -> dict[str, int]:
+    if not isinstance(receiver_seq, dict):
+        return {}
+    stats = receiver_seq.get("p2p_gap_fill")
+    if not isinstance(stats, dict):
+        return {}
+    return {str(key): int(value or 0) for key, value in stats.items()}
+
+
 def _bench_handler_stats(receiver_seq: Any) -> dict[str, int]:
     if not isinstance(receiver_seq, dict):
         return {}
@@ -2865,6 +3109,10 @@ def _receiver_drain_stats(receiver_seq: Any) -> dict[str, Any]:
         return {}
     stats = receiver_seq.get("drain")
     return stats if isinstance(stats, dict) else {}
+
+
+def _service_push_queue_stats(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _format_condition(condition: dict[str, Any]) -> str:
@@ -2924,6 +3172,15 @@ def _common_config(
     sender_aids = _resolve_aids(ctx, senders, role="sender")
     receiver_aids = _resolve_aids(ctx, receivers, role="receiver")
     resolved_group_id = _resolve_group_id(ctx, group_id) if scenario == "group-online" else group_id
+    if scenario == "p2p-online":
+        if len(sender_aids) != len(receiver_aids):
+            raise typer.BadParameter(
+                f"P2P 在线 bench 需要 sender/receiver 一一配对: senders={len(sender_aids)} receivers={len(receiver_aids)}"
+            )
+        if concurrency > len(sender_aids):
+            raise typer.BadParameter(
+                f"--concurrency 需要小于等于 sender/receiver 对数；当前 concurrency={concurrency}, pairs={len(sender_aids)}"
+            )
     return E2EConfig(
         scenario=scenario,
         count=count,
@@ -3027,7 +3284,7 @@ def e2e_send(
     senders: str | None = typer.Option(None, "--senders", help="发送端 AID，逗号分隔；默认当前 profile"),
     receivers: str | None = typer.Option(None, "--receivers", help="接收端 AID，逗号分隔；默认本地其他身份"),
     count: int = typer.Option(100, "--count", "-n", help="发送条数"),
-    concurrency: int = typer.Option(1, "--concurrency", "-c", help="跨连接活跃发送并发"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="P2P 活跃 sender/receiver 对数；每对内部串行发送"),
     size: int = typer.Option(64, "--size", help="payload.text 目标字符数"),
     no_encrypt: bool = typer.Option(False, "--no-encrypt", help="不加密"),
     prefix: str = typer.Option("bench-e2e", "--prefix", help="消息内容前缀"),
@@ -3438,6 +3695,15 @@ def _autoscale_common_config(
     sender_aids = _resolve_aids(ctx, senders, role="sender")
     receiver_aids = _resolve_aids(ctx, receivers, role="receiver")
     resolved_group_id = _resolve_group_id(ctx, group_id) if scenario == "group-online" else group_id
+    if scenario == "p2p-online":
+        if len(sender_aids) != len(receiver_aids):
+            raise typer.BadParameter(
+                f"P2P autoscale 需要 sender/receiver 一一配对: senders={len(sender_aids)} receivers={len(receiver_aids)}"
+            )
+        if max_concurrency > len(sender_aids):
+            raise typer.BadParameter(
+                f"--max 需要小于等于 sender/receiver 对数；当前 max={max_concurrency}, pairs={len(sender_aids)}"
+            )
     return AutoscaleConfig(
         scenario=scenario,
         count=count,
@@ -3479,8 +3745,8 @@ def autoscale_send(
     count: int = typer.Option(10000, "--count", "-n", help="每个台阶最多发送条数；实际按 --step-seconds 持续加压"),
     step_seconds: float = typer.Option(30.0, "--step-seconds", help="每个台阶持续加压秒数"),
     start: int = typer.Option(1, "--start", help="起始并发"),
-    max_concurrency: int = typer.Option(256, "--max", help="最大并发"),
-    factor: int = typer.Option(2, "--factor", help="并发倍增因子；<=1 时使用 --step"),
+    max_concurrency: int = typer.Option(256, "--max", help="最大活跃 sender/receiver 对数"),
+    factor: int = typer.Option(1, "--factor", help="并发倍增因子；<=1 时使用 --step"),
     step: int = typer.Option(1, "--step", help="线性步进"),
     plateau_ratio: float = typer.Option(0.1, "--plateau-ratio", help="RPS 增幅低于该比例记录 soft knee"),
     p99_factor: float = typer.Option(3.0, "--p99-factor", help="p99 超过有效基线倍数判定硬停止"),

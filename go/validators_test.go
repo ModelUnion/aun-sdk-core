@@ -95,6 +95,7 @@ func TestValidateGroupIDFormat(t *testing.T) {
 		{name: "with domain dot", groupID: "mygroup.aid.com", paramName: "group_id", wantErr: false},
 		{name: "with domain @", groupID: "mygroup@aid.com", paramName: "group_id", wantErr: false},
 		{name: "canonical format", groupID: "group.aid.com/mygroup", paramName: "group_id", wantErr: false},
+		{name: "polluted canonical format", groupID: "group.pub/room-123@agentid", paramName: "group_id", wantErr: false},
 		{name: "legacy with domain", groupID: "g-abcd1234.aid.com", paramName: "group_id", wantErr: false},
 
 		// 空值
@@ -136,6 +137,34 @@ func TestValidateGroupIDFormat(t *testing.T) {
 				if result != strings.ToLower(result) {
 					t.Errorf("ValidateGroupIDFormat() result not lowercase: %s", result)
 				}
+				if strings.HasPrefix(result, "group.") && strings.Contains(result, "/") {
+					t.Errorf("ValidateGroupIDFormat() must return group_aid target format, got %s", result)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateGroupAIDFormat(t *testing.T) {
+	tests := []struct {
+		raw         string
+		localIssuer string
+		want        string
+	}{
+		{raw: "room-123.agentid.pub", want: "room-123.agentid.pub"},
+		{raw: "group.agentid.pub/room-123", want: "room-123.agentid.pub"},
+		{raw: "room-123@agentid.pub", want: "room-123.agentid.pub"},
+		{raw: "g-abc123", localIssuer: "agentid.pub", want: "g-abc123.agentid.pub"},
+		{raw: "group.pub/room-123@agentid", want: "room-123.agentid.pub"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			got, err := ValidateGroupAIDFormat(tt.raw, "group_aid", tt.localIssuer)
+			if err != nil {
+				t.Fatalf("ValidateGroupAIDFormat() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("ValidateGroupAIDFormat() = %q, want %q", got, tt.want)
 			}
 		})
 	}

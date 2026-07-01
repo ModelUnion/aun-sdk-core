@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import os
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -93,7 +94,7 @@ async def _expect_missing(client: AUNClient, path: str) -> None:
 
 async def test_roundtrip_small_and_large(client: AUNClient, root: str) -> None:
     name = "fs_p1_roundtrip_small_and_large"
-    tmp = Path(".tmp_fs_p1") / uuid.uuid4().hex
+    tmp = Path(os.environ.get("AUN_TEST_TMP_DIR", tempfile.gettempdir())) / ".tmp_fs_p1" / uuid.uuid4().hex
     tmp.mkdir(parents=True, exist_ok=True)
     small = tmp / "small.txt"
     large = tmp / "large.bin"

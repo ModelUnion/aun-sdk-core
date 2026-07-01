@@ -44,11 +44,17 @@ export interface GroupFSCpOptions extends GroupFSParams {
   verifyHash?: boolean;
   verify_hash?: boolean;
   groupId?: string | null;
+  groupAid?: string | null;
   group_id?: string | null;
+  group_aid?: string | null;
   srcGroupId?: string | null;
+  srcGroupAid?: string | null;
   src_group_id?: string | null;
+  src_group_aid?: string | null;
   dstGroupId?: string | null;
+  dstGroupAid?: string | null;
   dst_group_id?: string | null;
+  dst_group_aid?: string | null;
   sourceType?: 'data' | 'path';
   source_type?: 'data' | 'path';
   localPath?: boolean;
@@ -362,11 +368,11 @@ export class GroupFSVFS {
   }
 
   async cp(src: GroupFSCpSource, dst: GroupFSCpDestination, options: GroupFSCpOptions = {}): Promise<unknown> {
-    const groupId = options.group_id ?? options.groupId;
-    const srcGroupId = options.src_group_id ?? options.srcGroupId;
-    const dstGroupId = options.dst_group_id ?? options.dstGroupId;
-    const srcRemote = typeof src === 'string' && isGroupRemoteCopyPath(src, srcGroupId, groupId);
-    const dstRemote = typeof dst === 'string' && isGroupRemoteCopyPath(dst, dstGroupId, groupId);
+    const groupRef = options.group_aid ?? options.groupAid ?? options.group_id ?? options.groupId;
+    const srcGroupRef = options.src_group_aid ?? options.srcGroupAid ?? options.src_group_id ?? options.srcGroupId;
+    const dstGroupRef = options.dst_group_aid ?? options.dstGroupAid ?? options.dst_group_id ?? options.dstGroupId;
+    const srcRemote = typeof src === 'string' && isGroupRemoteCopyPath(src, srcGroupRef, groupRef);
+    const dstRemote = typeof dst === 'string' && isGroupRemoteCopyPath(dst, dstGroupRef, groupRef);
 
     if (srcRemote && dstRemote) return this.copyRemoteToRemote(src as string, dst as string, options);
     if (!srcRemote && dstRemote) return this.uploadToGroup(src, dst as string, options);
@@ -375,10 +381,10 @@ export class GroupFSVFS {
   }
 
   async mv(src: string, dst: string, options: GroupFSCpOptions = {}): Promise<unknown> {
-    const groupId = options.group_id ?? options.groupId;
-    const srcGroupId = options.src_group_id ?? options.srcGroupId;
-    const dstGroupId = options.dst_group_id ?? options.dstGroupId;
-    if (!isGroupRemoteCopyPath(src, srcGroupId, groupId) || !isGroupRemoteCopyPath(dst, dstGroupId, groupId)) {
+    const groupRef = options.group_aid ?? options.groupAid ?? options.group_id ?? options.groupId;
+    const srcGroupRef = options.src_group_aid ?? options.srcGroupAid ?? options.src_group_id ?? options.srcGroupId;
+    const dstGroupRef = options.dst_group_aid ?? options.dstGroupAid ?? options.dst_group_id ?? options.dstGroupId;
+    if (!isGroupRemoteCopyPath(src, srcGroupRef, groupRef) || !isGroupRemoteCopyPath(dst, dstGroupRef, groupRef)) {
       throw new StorageError('group.fs.mv only supports group remote paths', 'EINVAL', src);
     }
     const params = this.remoteCopyParams(src, dst, options);
@@ -413,10 +419,16 @@ export class GroupFSVFS {
     delete params.source_type;
     delete params.localPath;
     delete params.local_path;
+    if (options.groupAid !== undefined) params.group_aid = options.groupAid;
     if (options.groupId !== undefined) params.group_id = options.groupId;
+    if (options.srcGroupAid !== undefined) params.src_group_aid = options.srcGroupAid;
     if (options.srcGroupId !== undefined) params.src_group_id = options.srcGroupId;
+    if (options.dstGroupAid !== undefined) params.dst_group_aid = options.dstGroupAid;
     if (options.dstGroupId !== undefined) params.dst_group_id = options.dstGroupId;
     if (options.followSymlinks !== undefined) params.follow_symlinks = options.followSymlinks;
+    delete params.groupAid;
+    delete params.srcGroupAid;
+    delete params.dstGroupAid;
     delete params.followSymlinks;
     if (!options.force) delete params.force;
     if (!options.recursive) delete params.recursive;
@@ -445,10 +457,13 @@ export class GroupFSVFS {
   private async uploadToGroup(src: GroupFSCpSource, dst: string, options: GroupFSCpOptions): Promise<unknown> {
     const { data, contentType } = await this.sourceBytes(src, options);
     const digest = await sha256Hex(data);
+    const groupAid = options.group_aid ?? options.groupAid ?? options.dst_group_aid ?? options.dstGroupAid;
+    const groupId = options.group_id ?? options.groupId ?? options.dst_group_id ?? options.dstGroupId;
     const baseParams = stripNil({
       ...options,
       path: dst,
-      group_id: options.group_id ?? options.groupId ?? options.dst_group_id ?? options.dstGroupId,
+      group_aid: groupAid,
+      group_id: groupAid ? undefined : groupId,
       size_bytes: data.byteLength,
       sha256: digest,
       content_type: options.content_type ?? options.contentType ?? contentType,
@@ -458,9 +473,14 @@ export class GroupFSVFS {
       expected_version: options.expected_version ?? options.expectedVersion,
     });
     delete baseParams.groupId;
+    delete baseParams.groupAid;
     delete baseParams.dstGroupId;
+    delete baseParams.dstGroupAid;
+    delete baseParams.dst_group_aid;
     delete baseParams.dst_group_id;
     delete baseParams.srcGroupId;
+    delete baseParams.srcGroupAid;
+    delete baseParams.src_group_aid;
     delete baseParams.src_group_id;
     delete baseParams.contentType;
     delete baseParams.expectedVersion;
@@ -522,15 +542,23 @@ export class GroupFSVFS {
       }
     }
 
+    const groupAid = options.group_aid ?? options.groupAid ?? options.src_group_aid ?? options.srcGroupAid;
+    const groupId = options.group_id ?? options.groupId ?? options.src_group_id ?? options.srcGroupId;
     const params = stripNil({
       ...options,
       path: src,
-      group_id: options.group_id ?? options.groupId ?? options.src_group_id ?? options.srcGroupId,
+      group_aid: groupAid,
+      group_id: groupAid ? undefined : groupId,
     });
     delete params.groupId;
+    delete params.groupAid;
     delete params.srcGroupId;
+    delete params.srcGroupAid;
+    delete params.src_group_aid;
     delete params.src_group_id;
     delete params.dstGroupId;
+    delete params.dstGroupAid;
+    delete params.dst_group_aid;
     delete params.dst_group_id;
     delete params.force;
     delete params.recursive;

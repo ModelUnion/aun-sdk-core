@@ -99,6 +99,7 @@ func TestTokenGatewayReuseIntegration_FirstAuthPersists(t *testing.T) {
 	}
 	authResult, err := client.Authenticate(ctx)
 	if err != nil {
+		skipIfGatewayRateLimited(t, "首次 Authenticate", err)
 		t.Fatalf("首次 Authenticate 失败: %v", err)
 	}
 
@@ -154,6 +155,7 @@ func TestTokenGatewayReuseIntegration_SecondAuthSkipsNetwork(t *testing.T) {
 	first, err := client1.Authenticate(ctx1)
 	if err != nil {
 		_ = client1.Close()
+		skipIfGatewayRateLimited(t, "第一次 Authenticate", err)
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
 	}
 	firstToken, _ := first["access_token"].(string)
@@ -240,6 +242,7 @@ func TestTokenGatewayReuseIntegration_ReusedCachedConnects(t *testing.T) {
 	}
 	if _, err := client1.Authenticate(ctx1); err != nil {
 		_ = client1.Close()
+		skipIfGatewayRateLimited(t, "第一次 Authenticate", err)
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
 	}
 	_ = client1.Close()
@@ -298,6 +301,7 @@ func TestTokenGatewayReuseIntegration_ExpiredFallsBackToLogin(t *testing.T) {
 	first, err := client1.Authenticate(ctx1)
 	if err != nil {
 		_ = client1.Close()
+		skipIfGatewayRateLimited(t, "第一次 Authenticate", err)
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
 	}
 	firstToken, _ := first["access_token"].(string)
@@ -330,6 +334,7 @@ func TestTokenGatewayReuseIntegration_ExpiredFallsBackToLogin(t *testing.T) {
 	integrationLoadAIDIntoClient(t, client2, aid)
 	second, err := client2.Authenticate(ctx2)
 	if err != nil {
+		skipIfGatewayRateLimited(t, "第二次 Authenticate", err)
 		t.Fatalf("第二次 Authenticate 失败: %v", err)
 	}
 	secondToken, _ := second["access_token"].(string)

@@ -100,6 +100,8 @@ class LifecycleController:
                 params["auto_reconnect"] = opts["auto_reconnect"]
             if "connect_timeout" in opts:
                 params.setdefault("timeouts", {})["connect"] = opts["connect_timeout"]
+            if "retry" in opts:
+                params["retry"] = dict(opts["retry"])
             if any(k in opts for k in ("retry_initial_delay", "retry_max_delay", "retry_max_attempts")):
                 params["retry"] = {
                     "initial_delay": opts.get("retry_initial_delay", 1),
@@ -511,7 +513,7 @@ class LifecycleController:
                     continue
                 except asyncio.TimeoutError:
                     pass  # 正常到点，发心跳
-                if client._state != "connected":
+                if client._public_state != ConnectionState.READY:
                     consecutive_failures = 0
                     continue
                 try:

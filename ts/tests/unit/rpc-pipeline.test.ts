@@ -36,16 +36,21 @@ function createPipeline(overrides: Record<string, unknown> = {}): { pipeline: Rp
 describe('RpcPipeline 组件边界', () => {
   it('preflight 拒绝未连接和 internal-only 方法', () => {
     const disconnected = createPipeline({ state: ConnectionState.DISCONNECTED }).pipeline;
-    expect(() => disconnected.preflight('message.send', { to: 'bob.agentid.pub' })).toThrow(ConnectionError);
+    expect(() => disconnected.preflight('message.send', { to: 'bob1.agentid.pub' })).toThrow(ConnectionError);
 
     const { pipeline } = createPipeline();
     expect(() => pipeline.preflight('auth.connect', {})).toThrow(PermissionError);
   });
 
+  it('preflight 使用标准 ready 状态作为可发送门禁', () => {
+    const { pipeline } = createPipeline({ state: ConnectionState.READY });
+    expect(() => pipeline.preflight('message.send', { to: 'bob1.agentid.pub' })).not.toThrow();
+  });
+
   it('preflight 合并 protected_headers 并规范化 outbound payload，且不修改调用方 params', () => {
     const { pipeline } = createPipeline();
     const original = {
-      to: 'bob.agentid.pub',
+      to: 'bob1.agentid.pub',
       content: { text: 'hello' },
       protected_headers: { priority: 'urgent' },
     };
@@ -78,7 +83,7 @@ describe('RpcPipeline 组件边界', () => {
       slot_id: 'slot-x',
       device_name: 'laptop',
     }).params;
-    expect(explicit.group_id).toBe('group.agentid.pub/g-room');
+    expect(explicit.group_id).toBe('g-room.agentid.pub');
     expect(explicit._group_cursor_params).toEqual({
       device_id: 'device-x',
       slot_id: 'slot-x',
@@ -87,10 +92,27 @@ describe('RpcPipeline 组件边界', () => {
 
     const injected = pipeline.preflight('group.send', { group_id: 'room.agentid.pub', payload: { text: 'hi' } }).params;
     expect(injected).toMatchObject({
-      group_id: 'group.agentid.pub/room',
+      group_id: 'room.agentid.pub',
+      group_aid: 'room.agentid.pub',
       device_id: 'device-a',
       slot_id: 'slot-a',
     });
+  });
+
+  it('preflight 接受 group_aid/groupAid/groupId 并补齐兼容 group_id 字段', () => {
+    const { pipeline } = createPipeline();
+
+    for (const [params, expectedGroupId] of [
+      [{ group_aid: 'group.agentid.pub/room-123' }, 'room-123.agentid.pub'],
+      [{ groupAid: 'room-123@agentid.pub' }, 'room-123.agentid.pub'],
+      [{ groupId: 'group.agentid.pub/room-123' }, 'group.agentid.pub/room-123'],
+    ] as const) {
+      const result = pipeline.preflight('group.send', { ...params, payload: { text: 'hi' } }).params;
+      expect(result.group_id).toBe(expectedGroupId);
+      expect(result.group_aid).toBe('room-123.agentid.pub');
+      expect(result).not.toHaveProperty('groupAid');
+      expect(result).not.toHaveProperty('groupId');
+    }
   });
 
   it('message.pull 后处理推进 seq 时应记 pending persist，而不是直接强刷', () => {
@@ -120,7 +142,7 @@ describe('RpcPipeline 组件边界', () => {
   });
 
   it('group.pull 后处理用 retention floor 推进 seq 时应记 pending persist，而不是直接强刷', () => {
-    const groupNs = 'group:group.agentid.pub/g1';
+    const groupNs = 'group:g1.agentid.pub';
     const contigByNs = new Map<string, number>([[groupNs, 2]]);
     const { client, pipeline } = createPipeline({
       _persistSeq: vi.fn(),
@@ -138,7 +160,7 @@ describe('RpcPipeline 组件边界', () => {
       messages: [],
       cursor: { current_seq: 5 },
     };
-    (pipeline as any).postprocessGroupPull({ group_id: 'group.agentid.pub/g1', after_message_seq: 2 }, result);
+    (pipeline as any).postprocessGroupPull({ group_id: 'g1.agentid.pub', after_message_seq: 2 }, result);
 
     expect(client._persistSeq).toHaveBeenCalledWith(groupNs);
     expect(client._saveSeqTrackerState).not.toHaveBeenCalled();
@@ -153,7 +175,7 @@ describe('RpcPipeline 组件边界', () => {
     expect(echoParams).not.toHaveProperty('client_signature');
     expect(client._signClientOperation).not.toHaveBeenCalled();
 
-    const normalParams = { to: 'bob.agentid.pub', payload: { text: 'hello' } };
+    const normalParams = { to: 'bob1.agentid.pub', payload: { text: 'hello' } };
     pipeline.applyClientSignature('message.send', normalParams);
     expect(client._signClientOperation).toHaveBeenCalledWith('message.send', normalParams);
     expect(normalParams.client_signature).toEqual({ signed: true });

@@ -66,7 +66,7 @@ describe('群事件推送路径 ack（ISSUE-TS-002）', () => {
   });
 
   it('event_seq 处理后应调用 _saveSeqTrackerState 持久化', () => {
-    expect(deliveryMethodBody).toContain('this.saveSeqTrackerState');
+    expect(deliveryMethodBody).toContain('this.persistSeq(ns)');
   });
 
   it('event_seq 处理后应发送 group.ack_events', () => {
@@ -95,7 +95,7 @@ describe('group.changed 事件补洞行为', () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._closing = false;
-    (client as any)._aid = 'bob.aid.com';
+    (client as any)._aid = 'bob1.aid.com';
     (client as any)._deviceId = 'device-1';
     (client as any)._slotId = 'slot-a';
     const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
@@ -115,7 +115,7 @@ describe('group.changed 事件补洞行为', () => {
       group_id: 'g1',
       event_seq: 5,
       action: 'member_added',
-      joined_aid: 'bob.aid.com',
+      joined_aid: 'bob1.aid.com',
     }, 'g1');
     await waitForCondition(() => transportCalls.some(({ method }) => method === 'group.ack_events'));
 
@@ -129,6 +129,42 @@ describe('group.changed 事件补洞行为', () => {
       slot_id: 'slot-a',
     });
     fillSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+
+  it('只带 group_aid 的 group.changed 应使用标准 group_event namespace 并 ack', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'slot-a';
+    const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
+    const transportCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    (client as any)._transport.call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      transportCalls.push({ method, params: JSON.parse(JSON.stringify(params)) });
+      return { ok: true };
+    });
+    const published: number[] = [];
+    client.on('group.changed', (payload: any) => {
+      published.push(Number(payload.event_seq));
+    });
+
+    await (client as any)._onRawGroupChanged({
+      group_aid: 'G1',
+      event_seq: 1,
+      action: 'foo',
+    });
+    await waitForCondition(() => transportCalls.some(({ method }) => method === 'group.ack_events'));
+
+    expect(published).toEqual([1]);
+    expect((client as any)._seqTracker.getContiguousSeq('group_event:g1')).toBe(1);
+    expect(transportCalls.find(({ method }) => method === 'group.ack_events')?.params).toMatchObject({
+      group_id: 'g1',
+      event_seq: 1,
+      device_id: 'device-1',
+      slot_id: 'slot-a',
+    });
     saveSpy.mockRestore();
   });
 

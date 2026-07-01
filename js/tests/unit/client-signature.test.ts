@@ -101,7 +101,7 @@ const COLLAB_MUTATION_METHODS = [
   'collab.tag.prune',
 ] as const;
 
-/** V2-only 预期需要签名的方法。旧 group.e2ee.* rotation RPC 已移除。 */
+/** V2-only 预期需要签名的方法。 */
 const EXPECTED_SIGNED_METHODS = [
   'message.send',
   'message.v2.put_peer_pk',
@@ -122,10 +122,7 @@ const EXPECTED_SIGNED_METHODS = [
   'group.add_member',
   'group.leave',
   'group.remove_member',
-  'group.update_rules',
   'group.update',
-  'group.update_announcement',
-  'group.update_join_requirements',
   'group.set_role',
   'group.transfer_owner',
   'group.bind_group_aid',
@@ -137,6 +134,8 @@ const EXPECTED_SIGNED_METHODS = [
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'group.commit_state',
   'group.ban',
   'group.unban',

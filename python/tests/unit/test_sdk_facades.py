@@ -23,11 +23,11 @@ async def test_facades_accept_dict_and_omit_none():
     client = _FakeClient()
     group = GroupFacade(client)
 
-    await group.get({"group_id": "g1", "resource_id": None}, include_status=None)
+    await group.get_info({"group_id": "g1", "resource_id": None}, include_status=None)
     await group.send({"group_id": "g-test", "payload": {"text": "hi"}, "encrypt": None})
 
     assert client.calls == [
-        ("group.get", {"group_id": "g1"}),
+        ("group.get_info", {"group_id": "g1"}),
         ("group.send", {"group_id": "g-test", "payload": {"text": "hi"}}),
     ]
 
@@ -63,8 +63,8 @@ async def test_message_group_stream_facades_use_client_call():
     await group.bind_aid(group_id="g1")
     await group.bind_group_aid(group_id="g2")
     await group.get_info(group_id="g1")
+    await group.get_info(group_id="g1", required=["member"])
     await group.list()
-    await group.info(group_id="g1", include=["stats"])
     await group.check_membership(group_id="g1", requester_aid="alice.agentid.pub")
     await group.transfer_owner(group_id="g1", aid="bob.agentid.pub")
     await group.complete_transfer(group_id="g1", public_key="PUB")
@@ -90,8 +90,8 @@ async def test_message_group_stream_facades_use_client_call():
         "group.bind_group_aid",
         "group.bind_group_aid",
         "group.get_info",
+        "group.get_info",
         "group.list",
-        "group.info",
         "group.check_membership",
         "group.transfer_owner",
         "group.complete_transfer",

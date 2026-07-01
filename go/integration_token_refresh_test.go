@@ -24,6 +24,7 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 	}
 	authResult, err := client.Authenticate(ctx)
 	if err != nil {
+		skipIfGatewayRateLimited(t, "认证", err)
 		t.Fatalf("认证失败: %v", err)
 	}
 	initialToken := fmt.Sprint(authResult["access_token"])
@@ -48,6 +49,7 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 	if err := client.Connect(ctx, ConnectionOptions{
 		AutoReconnect: boolPtr(false),
 	}); err != nil {
+		skipIfGatewayRateLimited(t, "连接", err)
 		t.Fatalf("连接失败: %v", err)
 	}
 

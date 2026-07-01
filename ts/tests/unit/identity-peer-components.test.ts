@@ -80,24 +80,24 @@ describe('PeerDirectory 组件边界', () => {
   it('cachePeer/getPeer/lookupPeer 使用本地缓存并按 aid 排序返回 peers', async () => {
     const client = createPeerClient();
     const directory = new PeerDirectory(new ClientRuntime(client));
-    const bob = fakeAid('bob.aid.com');
+    const bob = fakeAid('bob1.aid.com');
     const alice = fakeAid('alice.aid.com');
 
     expect(directory.cachePeer(bob as any)).toBe(bob);
     directory.cachePeer(alice as any);
 
-    expect(directory.getPeer(' bob.aid.com ')).toBe(bob);
-    await expect(directory.lookupPeer('bob.aid.com')).resolves.toBe(bob);
+    expect(directory.getPeer(' bob1.aid.com ')).toBe(bob);
+    await expect(directory.lookupPeer('bob1.aid.com')).resolves.toBe(bob);
     expect(directory.peers()).toEqual([alice, bob]);
   });
 
   it('PeerDirectory 对身份状态、证书有效性和 lookup 空值/未命中做边界校验', async () => {
     expect(() => new PeerDirectory(new ClientRuntime(createPeerClient(false)))
-      .cachePeer(fakeAid('bob.aid.com') as any))
+      .cachePeer(fakeAid('bob1.aid.com') as any))
       .toThrow(StateError);
 
     const directory = new PeerDirectory(new ClientRuntime(createPeerClient()));
-    expect(() => directory.cachePeer(fakeAid('bob.aid.com', { certValid: false }) as any))
+    expect(() => directory.cachePeer(fakeAid('bob1.aid.com', { certValid: false }) as any))
       .toThrow(ValidationError);
     await expect(directory.lookupPeer('   ')).rejects.toThrow(ValidationError);
     await expect(directory.lookupPeer('missing.aid.com')).rejects.toThrow(NotFoundError);

@@ -489,10 +489,6 @@ def _migrate_aun_db(path: Path, scope: str, old_master: bytes, new_seed: bytes, 
         return 0, 0, 0
 
     specs: list[tuple[str, str, str, Callable[[tuple[Any, ...]], str]]] = [
-        ("prekeys", "prekey_id, device_id", "private_key_enc", lambda row: f"prekey/{row[0]}"),
-        ("group_current", "group_id", "secret_enc", lambda row: f"group/{row[0]}/current"),
-        ("group_old_epochs", "group_id, epoch", "secret_enc", lambda row: f"group/{row[0]}/epoch/{int(row[1])}"),
-        ("e2ee_sessions", "session_id", "data_enc", lambda row: f"session/{row[0]}"),
         ("v2_spk", "spk_id", "private_key_enc", lambda row: f"v2/spk/{row[0]}"),
     ]
     migrated = 0

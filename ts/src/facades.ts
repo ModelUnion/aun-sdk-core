@@ -4,6 +4,9 @@ import { validateAIDFormat, validateGroupIDFormat } from './validators.js';
 
 export interface FacadeRpcClient {
   call(method: string, params?: RpcParams): Promise<RpcResult>;
+  createGroup?(params?: RpcParams): Promise<RpcResult>;
+  startGroupTransfer?(params?: RpcParams, options?: { aidStore?: unknown }): Promise<RpcResult>;
+  completeGroupTransfer?(params?: RpcParams, options?: { aidStore?: unknown }): Promise<RpcResult>;
 }
 
 export type FacadeParams = RpcParams;
@@ -14,6 +17,23 @@ export function stripNil(params: FacadeParams = {}): FacadeParams {
     if (value !== undefined && value !== null) out[key] = value;
   }
   return out;
+}
+
+function splitAidStore(params?: FacadeParams): { params: RpcParams; aidStore?: unknown } {
+  const out = stripNil(params ?? {});
+  const aidStore = out.aidStore ?? out.aid_store;
+  delete out.aidStore;
+  delete out.aid_store;
+  return { params: out, aidStore };
+}
+
+// 将 getSettings 返回的 settings 数组转为 {key: value} 映射
+function settingsToMap(result: RpcResult): Record<string, any> {
+  const settings: Record<string, any> = {};
+  for (const s of (result as any).settings || []) {
+    settings[s.key] = s.value;
+  }
+  return settings;
 }
 
 abstract class RpcFacade {
@@ -110,9 +130,16 @@ export class GroupFacade extends RpcFacade {
     return this._thought;
   }
 
-  create(params?: FacadeParams): Promise<RpcResult> { return this.call('group.create', params); }
+  create(params?: FacadeParams): Promise<RpcResult> {
+    const clean = stripNil(params ?? {});
+    if (clean.group_name && typeof this.client.createGroup === 'function') {
+      return this.client.createGroup(clean);
+    }
+    return this.call('group.create', clean);
+  }
   bindAid(params?: FacadeParams): Promise<RpcResult> { return this.call('group.bind_aid', params); }
-  get(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get', params); }
+  bindGroupAid(params?: FacadeParams): Promise<RpcResult> { return this.call('group.bind_group_aid', params); }
+  renewGroupAid(params?: FacadeParams): Promise<RpcResult> { return this.call('group.renew_group_aid', params); }
   getInfo(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_info', params); }
   update(params?: FacadeParams): Promise<RpcResult> { return this.call('group.update', params); }
   list(params?: FacadeParams): Promise<RpcResult> { return this.call('group.list', params); }
@@ -122,18 +149,89 @@ export class GroupFacade extends RpcFacade {
   leave(params?: FacadeParams): Promise<RpcResult> { return this.call('group.leave', params); }
   kick(params?: FacadeParams): Promise<RpcResult> { return this.call('group.kick', params); }
   setRole(params?: FacadeParams): Promise<RpcResult> { return this.call('group.set_role', params); }
-  transferOwner(params?: FacadeParams): Promise<RpcResult> { return this.call('group.transfer_owner', params); }
-  completeTransfer(params?: FacadeParams): Promise<RpcResult> { return this.call('group.complete_transfer', params); }
-  getRules(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_rules', params); }
-  updateRules(params?: FacadeParams): Promise<RpcResult> { return this.call('group.update_rules', params); }
-  getAnnouncement(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_announcement', params); }
-  updateAnnouncement(params?: FacadeParams): Promise<RpcResult> { return this.call('group.update_announcement', params); }
+  transferOwner(params?: FacadeParams): Promise<RpcResult> {
+    const split = splitAidStore(params);
+    if (split.aidStore && typeof this.client.startGroupTransfer === 'function') {
+      return this.client.startGroupTransfer(split.params, { aidStore: split.aidStore });
+    }
+    return this.call('group.transfer_owner', split.params);
+  }
+  completeTransfer(params?: FacadeParams): Promise<RpcResult> {
+    const split = splitAidStore(params);
+    if (split.aidStore && typeof this.client.completeGroupTransfer === 'function') {
+      return this.client.completeGroupTransfer(split.params, { aidStore: split.aidStore });
+    }
+    return this.call('group.complete_transfer', split.params);
+  }
+
+  async getRules(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const groupId = merged.group_id;
+    if (!groupId) throw new Error('group_id is required');
+    const result = await this.getSettings({ group_id: groupId, keys: ['rules.content', 'rules.attachments'] });
+    const settings = settingsToMap(result);
+    return { group_id: (result as Record<string, any>).group_id, rules: { group_id: (result as Record<string, any>).group_id, content: settings['rules.content'] || '', attachments: settings['rules.attachments'] || [], updated_by: settings['rules.content.updated_by'] || '', updated_at: settings['rules.content.updated_at'] || 0 } };
+  }
+
+  async updateRules(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const { group_id: groupId, content, attachments } = merged;
+    if (!groupId) throw new Error('group_id is required');
+    if (content === undefined) throw new Error('content is required');
+    const settingsUpdate: Record<string, any> = { 'rules.content': content };
+    if (attachments !== undefined) settingsUpdate['rules.attachments'] = attachments;
+    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    return { group_id: (result as Record<string, any>).group_id, rules: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
+  }
+
+  async getAnnouncement(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const groupId = merged.group_id;
+    if (!groupId) throw new Error('group_id is required');
+    const result = await this.getSettings({ group_id: groupId, keys: ['announcement.content', 'announcement.attachments'] });
+    const settings = settingsToMap(result);
+    return { group_id: (result as Record<string, any>).group_id, announcement: { group_id: (result as Record<string, any>).group_id, content: settings['announcement.content'] || '', attachments: settings['announcement.attachments'] || [], updated_by: settings['announcement.content.updated_by'] || '', updated_at: settings['announcement.content.updated_at'] || 0 } };
+  }
+
+  async updateAnnouncement(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const { group_id: groupId, content, attachments } = merged;
+    if (!groupId) throw new Error('group_id is required');
+    if (content === undefined) throw new Error('content is required');
+    const settingsUpdate: Record<string, any> = { 'announcement.content': content };
+    if (attachments !== undefined) settingsUpdate['announcement.attachments'] = attachments;
+    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    return { group_id: (result as Record<string, any>).group_id, announcement: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
+  }
+
   requestJoin(params?: FacadeParams): Promise<RpcResult> { return this.call('group.request_join', params); }
   listJoinRequests(params?: FacadeParams): Promise<RpcResult> { return this.call('group.list_join_requests', params); }
   reviewJoinRequest(params?: FacadeParams): Promise<RpcResult> { return this.call('group.review_join_request', params); }
   batchReviewJoinRequest(params?: FacadeParams): Promise<RpcResult> { return this.call('group.batch_review_join_request', params); }
-  getJoinRequirements(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_join_requirements', params); }
-  updateJoinRequirements(params?: FacadeParams): Promise<RpcResult> { return this.call('group.update_join_requirements', params); }
+
+  async getJoinRequirements(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const groupId = merged.group_id;
+    if (!groupId) throw new Error('group_id is required');
+    const result = await this.getSettings({ group_id: groupId, keys: ['join.mode', 'join.question', 'join.auto_approve_patterns', 'join.max_pending'] });
+    const settings = settingsToMap(result);
+    return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: settings['join.mode'] || 'open', question: settings['join.question'] || '', auto_approve_patterns: settings['join.auto_approve_patterns'] || [], max_pending: settings['join.max_pending'] || 100, updated_by: settings['join.mode.updated_by'] || '', updated_at: settings['join.mode.updated_at'] || 0 } };
+  }
+
+  async updateJoinRequirements(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const groupId = merged.group_id;
+    if (!groupId) throw new Error('group_id is required');
+    const settingsUpdate: Record<string, any> = {};
+    if ('mode' in merged) settingsUpdate['join.mode'] = merged.mode;
+    if ('question' in merged) settingsUpdate['join.question'] = merged.question;
+    if ('auto_approve_patterns' in merged) settingsUpdate['join.auto_approve_patterns'] = merged.auto_approve_patterns;
+    if ('max_pending' in merged) settingsUpdate['join.max_pending'] = merged.max_pending;
+    if (Object.keys(settingsUpdate).length === 0) throw new Error('at least one field to update is required');
+    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: merged.mode, question: merged.question, auto_approve_patterns: merged.auto_approve_patterns, max_pending: merged.max_pending } };
+  }
+
   createInviteCode(params?: FacadeParams): Promise<RpcResult> { return this.call('group.create_invite_code', params); }
   listInviteCodes(params?: FacadeParams): Promise<RpcResult> { return this.call('group.list_invite_codes', params); }
   useInviteCode(params?: FacadeParams): Promise<RpcResult> { return this.call('group.use_invite_code', params); }
@@ -154,14 +252,11 @@ export class GroupFacade extends RpcFacade {
   ackMessages(params?: FacadeParams): Promise<RpcResult> { return this.call('group.ack_messages', params); }
   ackEvents(params?: FacadeParams): Promise<RpcResult> { return this.call('group.ack_events', params); }
   search(params?: FacadeParams): Promise<RpcResult> { return this.call('group.search', params); }
-  getPublicInfo(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_public_info', params); }
   suspend(params?: FacadeParams): Promise<RpcResult> { return this.call('group.suspend', params); }
   resume(params?: FacadeParams): Promise<RpcResult> { return this.call('group.resume', params); }
   dissolve(params?: FacadeParams): Promise<RpcResult> { return this.call('group.dissolve', params); }
-  getStats(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_stats', params); }
   setSettings(params?: FacadeParams): Promise<RpcResult> { return this.call('group.set_settings', params); }
   getSettings(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_settings', params); }
-  info(params?: FacadeParams): Promise<RpcResult> { return this.call('group.info', params); }
   getOnlineMembers(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_online_members', params); }
 }
 

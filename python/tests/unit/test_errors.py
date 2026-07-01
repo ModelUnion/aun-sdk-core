@@ -1,4 +1,5 @@
 from aun_core.errors import (
+    AUNError,
     PermissionError as AUNPermissionError,
     RateLimitError as AUNRateLimitError,
     TimeoutError as AUNTimeoutError,
@@ -40,3 +41,13 @@ def test_gateway_backpressure_32429_maps_to_rate_limit_error():
     assert err.code == -32429
     assert err.retryable is True
 
+
+def test_gateway_certificate_not_loaded_maps_to_retryable_error():
+    """Gateway 启动期证书未加载是暂态降级，重连循环应继续退避重试。"""
+    err = map_remote_error({
+        "code": -32603,
+        "message": "Gateway service degraded: certificate not loaded",
+    })
+
+    assert isinstance(err, AUNError)
+    assert err.retryable is True

@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { AUNClient } from '../../src/client.js';
 import { AIDStore } from '../../src/aid-store.js';
 import { RPCTransport } from '../../src/transport.js';
-import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
+import { AuthError, ConnectionError, StateError, PermissionError, TimeoutError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/e2ee.js';
 import { encryptP2PMessage } from '../../src/v2/e2ee/encrypt-p2p';
 import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group';
@@ -120,6 +120,26 @@ describe('AUNClient.call 状态检查', () => {
     await expect(client.call('meta.ping')).rejects.toThrow(ConnectionError);
   });
 
+  it('ready 状态下 RPC 超时应触发半开连接重连', async () => {
+    const client = new AUNClient();
+    const err = new TimeoutError('rpc timeout: message.query_online', { retryable: true });
+    (client as any)._state = 'ready';
+    (client as any)._sessionOptions = {
+      auto_reconnect: true,
+      retry: { initial_delay: 0.01, max_delay: 0.05, max_attempts: 0 },
+      timeouts: { connect: 5, call: 10, http: 30 },
+      heartbeat_interval: 0,
+      token_refresh_before: 60,
+    };
+    vi.spyOn((client as any)._rpcPipeline, 'call').mockRejectedValue(err);
+    const closeSpy = vi.spyOn((client as any)._transport, 'close').mockResolvedValue(undefined);
+    const reconnectSpy = vi.spyOn(client as any, '_reconnectLoop').mockResolvedValue(undefined);
+
+    await expect(client.call('message.query_online', { aids: ['alice.agentid.pub'] })).rejects.toBe(err);
+    expect(closeSpy).toHaveBeenCalled();
+    expect(reconnectSpy).toHaveBeenCalled();
+  });
+
   it('内部方法应被拒绝（PermissionError）', async () => {
     // 由于未连接，会先抛 ConnectionError
     // 此测试验证内部方法列表存在即可
@@ -168,7 +188,30 @@ describe('AUNClient.notify', () => {
     expect((client as any)._transport.notify).toHaveBeenCalledWith(
       'notification/group.route',
       {
-        group_id: 'group.agentid.pub/g-room',
+        group_aid: 'g-room.agentid.pub',
+        group_id: 'g-room.agentid.pub',
+        deliver: {
+          method: 'event/app.presence',
+          params: { state: 'active' },
+        },
+      },
+    );
+  });
+
+  it('group_aid 目标应优先包装为 notification/group.route', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.notify = vi.fn().mockResolvedValue(undefined);
+
+    await client.notify('event/app.presence', { state: 'active' }, {
+      group_aid: 'group.agentid.pub/room-123',
+      group_id: 'legacy-ignored.agentid.pub',
+    });
+
+    expect((client as any)._transport.notify).toHaveBeenCalledWith(
+      'notification/group.route',
+      {
+        group_aid: 'room-123.agentid.pub',
+        group_id: 'room-123.agentid.pub',
         deliver: {
           method: 'event/app.presence',
           params: { state: 'active' },
@@ -291,31 +334,6 @@ describe('AUNClient 子模块可访问', () => {
     expect(client.discovery).toBeDefined();
   });
 
-});
-
-describe('AUNClient._syncIdentityAfterConnect', () => {
-  it('同步 token 时不应覆盖已有 prekey', async () => {
-    const client = new AUNClient();
-    const ks = (client as any)._tokenStore;
-    const aid = 'sync.agentid.pub';
-    const deviceId = (client as any)._deviceId;
-    const slotId = (client as any)._slotId;
-
-    const identity = { aid, private_key_pem: 'PRIVATE_KEY', public_key_der_b64: 'pub', curve: 'P-256' };
-    (client as any)._identity = identity;
-    await ks.saveE2EEPrekey(aid, 'pk1', {
-      private_key_pem: 'KEEP_ME',
-      created_at: 1,
-    }, deviceId);
-
-    (client as any)._aid = aid;
-    await (client as any)._syncIdentityAfterConnect('tok-connect');
-
-    const prekeys = await ks.loadE2EEPrekeys(aid, deviceId);
-    const instanceState = await ks.loadInstanceState(aid, deviceId, slotId);
-    expect(instanceState.access_token).toBe('tok-connect');
-    expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
-  });
 });
 
 describe('AUNClient.disconnect', () => {
@@ -822,6 +840,62 @@ describe('AUNClient M25 重连行为', () => {
   });
 });
 describe('AUNClient V2 空 device_id E2EE 路径', () => {
+  it('message.pull 在 V2 session 未就绪时应走普通 pull 兜底', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-plain-pull';
+    (client as any)._slotId = 'slot-plain-pull';
+    (client as any)._v2Session = undefined;
+    const transportCall = vi.fn().mockResolvedValue({ messages: [] });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('message.pull', { after_seq: 0, limit: 10, force: true });
+
+    expect(transportCall).toHaveBeenCalledWith('message.pull', {
+      after_seq: 0,
+      limit: 10,
+      force: true,
+      device_id: 'dev-plain-pull',
+      slot_id: 'slot-plain-pull',
+    }, undefined, undefined, false);
+    expect(transportCall.mock.calls.some(([method]) => method === 'message.v2.pull')).toBe(false);
+  });
+
+  it('message.pull 的 V2 路由遇到 no_service 时应退回普通 pull', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-v2-fallback';
+    (client as any)._slotId = 'slot-v2-fallback';
+    (client as any)._v2Session = {
+      isCurrentSPK: vi.fn().mockReturnValue(true),
+      maybeDestroyOldSPKs: vi.fn().mockReturnValue([]),
+    };
+    const transportCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'message.v2.pull') {
+        throw new Error('Service plane unavailable for message.v2.pull: no_service');
+      }
+      if (method === 'message.pull') {
+        return { messages: [{ seq: 1, payload: 'plain-fallback' }] };
+      }
+      return { ok: true };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await client.call('message.pull', { after_seq: 0, limit: 10, force: true }) as any;
+
+    expect(result.messages?.[0]?.payload).toBe('plain-fallback');
+    expect(transportCall).toHaveBeenCalledWith('message.v2.pull', { after_seq: 0, limit: 10, force: true });
+    expect(transportCall).toHaveBeenCalledWith('message.pull', {
+      after_seq: 0,
+      limit: 10,
+      force: true,
+      device_id: 'dev-v2-fallback',
+      slot_id: 'slot-v2-fallback',
+    }, undefined, undefined, false);
+  });
+
   it('message.pull(force=true) 应透传 force 且不改写显式 after_seq=0', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
@@ -1069,6 +1143,7 @@ describe('group.pull V2-only 路由', () => {
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
       ['group.v2.pull', {
         group_id: 'g1',
+        group_aid: 'g1',
         after_seq: 0,
         limit: 2,
         device_id: 'sync-dev-a',

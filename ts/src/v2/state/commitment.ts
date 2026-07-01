@@ -5,7 +5,7 @@
  *
  * state_commitment = SHA256(
  *   "AUN-V2-SC-v1" ||
- *   group_id ||
+ *   group_aid ||
  *   uint32(epoch, big-endian) ||
  *   canonical_json({
  *     "members": [...sorted by aid, devices sorted by device_id...],
@@ -22,6 +22,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { normalizeGroupId } from '../../group-id.js';
 import { canonicalJson } from '../crypto/canonical.js';
 
 export const STATE_PREFIX: Uint8Array = new TextEncoder().encode('AUN-V2-SC-v1');
@@ -112,7 +113,8 @@ export function computeStateCommitment(
   const payload: StatePayload = JSON.parse(JSON.stringify(statePayload));
   sortPayload(payload);
 
-  const groupBytes = new TextEncoder().encode(groupId);
+  const groupKey = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+  const groupBytes = new TextEncoder().encode(groupKey);
   const epochBytes = uint32BE(epoch);
   const payloadBytes = canonicalJson(payload);
 

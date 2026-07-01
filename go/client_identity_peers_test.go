@@ -170,7 +170,8 @@ func TestGroupStateCoordinatorPublishesSecurityLevelOnlyOnChange(t *testing.T) {
 func TestGroupStateCoordinatorStateConfirmedClearsCacheAndSnapshot(t *testing.T) {
 	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer c.Close()
-	groupID := "group.agentid.pub/12345"
+	legacyGroupID := "group.agentid.pub/12345"
+	groupID := "12345.agentid.pub"
 	c.v2State = &v2P2PState{
 		bootstrapCache:      make(map[string]v2BootstrapEntry),
 		groupBootstrapCache: map[string]*v2GroupBootstrapEntry{groupID: {CachedAt: time.Now()}},
@@ -183,7 +184,7 @@ func TestGroupStateCoordinatorStateConfirmedClearsCacheAndSnapshot(t *testing.T)
 		}
 	})
 
-	c.getGroupStateCoordinator().onV2StateConfirmed(map[string]any{"group_id": groupID})
+	c.getGroupStateCoordinator().onV2StateConfirmed(map[string]any{"group_id": legacyGroupID})
 
 	c.v2State.bootstrapCacheM.Lock()
 	_, cached := c.v2State.groupBootstrapCache[groupID]
@@ -194,7 +195,7 @@ func TestGroupStateCoordinatorStateConfirmedClearsCacheAndSnapshot(t *testing.T)
 	if _, ok := c.v2AutoProposeLastSnapshot[groupID]; ok {
 		t.Fatal("state_confirmed 应清理 auto propose snapshot")
 	}
-	if len(events) != 1 || events[0]["group_id"] != groupID {
+	if len(events) != 1 || events[0]["group_id"] != legacyGroupID {
 		t.Fatalf("state_confirmed 事件发布不正确: %#v", events)
 	}
 }
@@ -256,17 +257,17 @@ func TestMessageDeliveryEngineMigratesPersistsAndRestoresSeqState(t *testing.T) 
 		"group_event:g2@agentid.pub":     6,
 		"p2p:alice.agentid.pub":          9,
 	})
-	if migrated["group_msg:group.agentid.pub/g1"] != 5 || migrated["group_event:group.agentid.pub/g2"] != 6 || migrated["p2p:alice.agentid.pub"] != 9 {
+	if migrated["group_msg:g1.agentid.pub"] != 5 || migrated["group_event:g2.agentid.pub"] != 6 || migrated["p2p:alice.agentid.pub"] != 9 {
 		t.Fatalf("迁移结果不正确: %#v", migrated)
 	}
-	if _, exists := migrated["group_msg:g1.agentid.pub"]; exists {
+	if _, exists := migrated["group_msg:group.agentid.pub/g1"]; exists {
 		t.Fatalf("旧 group namespace 应被删除: %#v", migrated)
 	}
 	persisted, err := seqStore.LoadAllSeqs(c.aid, c.deviceID, c.slotID)
 	if err != nil {
 		t.Fatalf("读取迁移落盘 seq 失败: %v", err)
 	}
-	if persisted["group_event:group.agentid.pub/g2"] != 6 {
+	if persisted["group_event:g2.agentid.pub"] != 6 {
 		t.Fatalf("迁移后的 group_event namespace 应落盘: %#v", persisted)
 	}
 
@@ -285,7 +286,7 @@ func TestMessageDeliveryEngineMigratesPersistsAndRestoresSeqState(t *testing.T) 
 	if got := c.seqTracker.GetContiguousSeq("p2p:alice.agentid.pub"); got != 11 {
 		t.Fatalf("restoreSeqTrackerState 未恢复 p2p seq: %d", got)
 	}
-	if got := c.seqTracker.GetContiguousSeq("group_event:group.agentid.pub/g2"); got != 6 {
+	if got := c.seqTracker.GetContiguousSeq("group_event:g2.agentid.pub"); got != 6 {
 		t.Fatalf("restoreSeqTrackerState 未恢复迁移后的 group_event seq: %d", got)
 	}
 }

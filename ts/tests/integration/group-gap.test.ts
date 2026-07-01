@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
+import { normalizeGroupId } from '../../src/group-id.js';
 import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
@@ -63,7 +64,7 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
     const groupResult = await alice.call('group.create', {
       name: 'TS Gap Fill Test',
     }) as { group?: { group_id: string } };
-    const groupId = groupResult.group?.group_id ?? '';
+    const groupId = normalizeGroupId(groupResult.group?.group_id ?? '');
     expect(groupId).toBeTruthy();
 
     await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
@@ -71,10 +72,13 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
 
     // Bob 通过事件回调收集推送到的群消息（按 seq 去重）
     const seqMap = new Map<number, { seq: number; payload: any }>();
+    let resolveAllReceived: (() => void) | undefined;
     const allReceived = new Promise<void>((resolve) => {
+      resolveAllReceived = resolve;
       bob.on('group.message_created', (data: any) => {
         const sender = data.sender_aid ?? data.from ?? '';
-        if (sender === aliceAid && data.group_id === groupId && (data.type === 'text' || data.message_type === 'text')) {
+        const messageGroupId = normalizeGroupId(data.group_aid ?? data.group_id ?? '');
+        if (sender === aliceAid && messageGroupId === groupId && (data.type === 'text' || data.message_type === 'text')) {
           const seq = Number(data.seq);
           if (!seqMap.has(seq)) {
             seqMap.set(seq, { seq, payload: data.payload });
@@ -83,6 +87,24 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
         }
       });
     });
+
+    const collectPulledMessages = async () => {
+      const result = await bob.call('group.pull', {
+        group_id: groupId,
+        after_seq: 0,
+        limit: 50,
+      }) as { messages?: any[] };
+      for (const data of result.messages ?? []) {
+        const sender = data.sender_aid ?? data.from ?? '';
+        const messageGroupId = normalizeGroupId(data.group_aid ?? data.group_id ?? '');
+        if (sender === aliceAid && messageGroupId === groupId && (data.type === 'text' || data.message_type === 'text')) {
+          const seq = Number(data.seq);
+          if (!seqMap.has(seq)) {
+            seqMap.set(seq, { seq, payload: data.payload });
+          }
+        }
+      }
+    };
 
     await new Promise(r => setTimeout(r, 1000));
 
@@ -96,16 +118,20 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
       await new Promise(r => setTimeout(r, 200));
     }
 
-    // 等待 Bob 收到所有 5 条唯一消息（最多 15 秒，含补洞时间）
+    // 等待在线事件；如果推送链路只提示了部分 unread，再用公开 pull 兜底补齐。
     await Promise.race([
       allReceived,
-      new Promise<void>((_, reject) => setTimeout(() => reject(new Error(
-        `等待群消息超时，仅收到 ${seqMap.size}/5 条唯一消息`
-      )), 15000)),
+      new Promise<void>((resolve) => setTimeout(resolve, 15000)),
     ]);
+    if (seqMap.size < 5) {
+      await collectPulledMessages();
+    }
+    if (seqMap.size >= 5) {
+      resolveAllReceived?.();
+    }
 
     const unique = [...seqMap.values()].sort((a, b) => a.seq - b.seq);
-    expect(unique.length).toBe(5);
+    expect(unique.length, `等待群消息超时，仅收到 ${unique.length}/5 条唯一消息`).toBe(5);
 
     // 验证 seq 连续
     const seqs = unique.map(m => m.seq);

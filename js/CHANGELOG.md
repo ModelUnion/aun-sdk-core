@@ -6,6 +6,62 @@
 
 ---
 
+## 0.5.1 — 2026-07-01
+
+### ⚠️ 重大变更（Breaking Changes）
+
+#### 群组标识符统一为 GROUP_AID
+- **GROUP_ID 废弃**：历史 `group.{domain}/{base}` 格式已废弃，统一为 `{base}.{issuer}` 格式（group_aid）
+- **兼容转换**：`normalizeGroupId()` 函数保留向后兼容，自动转换旧格式到新格式
+- **新增函数**：`convertToGroupAid()` 显式转换任意历史格式到标准 group_aid
+- **RPC 参数**：`group_id` 字段名保留但值为 group_aid；新增 `group_aid` 参数与 `group_id` 等价
+- **影响范围**：所有群组相关 API（`group.send` / `group.pull` / `group.fs.*` 等）
+
+#### 移除 V1 E2EE 实现
+- **完全移除**：删除所有 V1 端到端加密代码（epoch key、群组加密管理器、V1 群组加密）
+- **仅保留 V2**：E2EE 功能完全迁移到 V2 协议（消息级密钥 + 逐设备 wrap + 状态签名）
+- **简化接口**：V2 E2EE 协调器大幅重构，移除 V1 兼容层
+- **注意**：此版本不向后兼容 V1 加密消息
+
+### 新功能
+
+#### Storage & Group FS 能力扩展
+- **Storage VFS P4**：新增 `touch()` 方法，支持创建空文件或更新文件时间戳
+- **Storage VFS P4**：新增 `du()` 方法，支持查询目录或文件的磁盘使用统计
+- **Storage VFS P6**：扩展 `getAcl()` / `listAcl()` 方法，支持 ACL 权限查询
+- **Group FS**：新增 `getAcl()` / `listAcl()` / `removeAcl()` 方法，完善群文件 ACL 管理
+- **Storage LowLevel**：补齐底层 RPC 映射，覆盖 `storage.fs.*` / `storage.object.*` 完整能力
+
+### 修复
+
+#### Storage & Group FS
+- 修复 `group.send` / `group.pull` 缺失 `group_id` 必填校验问题
+- 修复 `group.fs` 权限角色 (`role`) 在 ACL 展示中的格式错误
+- 修复 `storage.fs.symlink` 符号链接操作的路径解析问题
+- 修复 `storage.fs.memberdata` 路由逻辑错误
+- 修复 `storage.fs.mount` 挂载点权限校验问题
+
+#### 服务端性能优化（影响 SDK 行为）
+- Gateway 连接池改为可配置，降低高并发下的连接瓶颈
+- Group 推送改为异步化，提升大群消息分发性能
+- Message seq 号段化分配，减少数据库争抢
+- Message 短暂消息 (`persist=false`) 改用内存缓冲 + 异步推送
+
+### 改进
+
+- 路径校验增强：`storage.fs` / `group.fs` 路径参数增加规范化校验，拒绝 `..` / 空路径 / 非法字符
+- 系统目录保护：`memberdata` / `group_data` 写操作增加保护，防止误删系统目录
+- Validators：新增跨语言 `validatePath()` / `validateAid()` 等校验函数，四语言行为对齐
+- 浏览器环境保持 Blob/Uint8Array/ArrayBuffer 数据源支持，无本地文件路径依赖
+
+### 测试
+
+- 新增 `storage.spec.ts` E2E 测试（浏览器环境 `touch` / `du`）
+- 新增 `group-fs.spec.ts` E2E 测试（浏览器环境 ACL 操作）
+- 扩展 `storage-vfs-p5.test.ts` 单元测试覆盖新增能力
+
+---
+
 ## 0.5.0 — 2026-06-17
 
 ### 新功能

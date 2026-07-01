@@ -91,6 +91,20 @@ def _debug_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _debug_enabled(logger: Any) -> bool:
+    checker = getattr(logger, "is_debug_enabled", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    if getattr(logger, "is_null_logger", False):
+        return False
+    if hasattr(logger, "_debug"):
+        return bool(getattr(logger, "_debug", False))
+    return True
+
+
 def _should_wait_for_close_code(exc: Exception) -> bool:
     text = str(exc).lower()
     return "closed" in text or "closing" in text
@@ -570,7 +584,8 @@ class RPCTransport:
                 "method": method,
                 "params": params or {},
             }
-            self._log.debug("transport", "RPC request full: %s", _debug_json(request_envelope))
+            if _debug_enabled(self._log):
+                self._log.debug("transport", "RPC request full: %s", _debug_json(request_envelope))
             payload = json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":"))
             payload_bytes = payload.encode("utf-8")
             if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
@@ -607,7 +622,8 @@ class RPCTransport:
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
         _elapsed = _diag_time.time() - _t0
-        self._log.debug("transport", "RPC response full: method=%s rpc_id=%s %s", method, rpc_id, _debug_json(response))
+        if _debug_enabled(self._log):
+            self._log.debug("transport", "RPC response full: method=%s rpc_id=%s %s", method, rpc_id, _debug_json(response))
         if "error" in response:
             self._log.debug(
                 "transport",
@@ -775,7 +791,8 @@ class RPCTransport:
     async def _route_message(self, message: dict[str, Any]) -> None:
         if "id" in message:
             rpc_id = str(message["id"])
-            self._log.debug("transport", "RPC inbound response full: %s", _debug_json(message))
+            if _debug_enabled(self._log):
+                self._log.debug("transport", "RPC inbound response full: %s", _debug_json(message))
             future = self._pending.pop(rpc_id, None)
             self._pending_meta.pop(rpc_id, None)
             if future is not None and not future.done():
@@ -785,7 +802,8 @@ class RPCTransport:
         method = str(message.get("method", ""))
         if method == "challenge":
             self._challenge = message
-            self._log.debug("transport", "challenge received: %s", _debug_json(message))
+            if _debug_enabled(self._log):
+                self._log.debug("transport", "challenge received: %s", _debug_json(message))
             await self._dispatcher.publish("connection.challenge", message.get("params", {}))
             return
 
@@ -793,7 +811,8 @@ class RPCTransport:
             protocol_event = method.removeprefix("event/")
             sdk_event = EVENT_NAME_MAP.get(protocol_event, protocol_event)
             params = message.get("params", {})
-            self._log.debug("transport", "RPC event full: %s", _debug_json(message))
+            if _debug_enabled(self._log):
+                self._log.debug("transport", "RPC event full: %s", _debug_json(message))
             if self._meta_observer is not None:
                 meta = message.get("_meta")
                 if isinstance(meta, dict):
@@ -832,7 +851,8 @@ class RPCTransport:
                     self._meta_observer(meta)
                 except Exception as exc:
                     self._log.debug("transport", "notification meta_observer raised: %s", exc)
-        self._log.debug("transport", "notification recv: method=%s full=%s", method or "<no-method>", _debug_json(message))
+        if _debug_enabled(self._log):
+            self._log.debug("transport", "notification recv: method=%s full=%s", method or "<no-method>", _debug_json(message))
         await self._dispatcher.publish("notification", message)
 
     @staticmethod

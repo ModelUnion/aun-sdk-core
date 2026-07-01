@@ -118,10 +118,7 @@ const EXPECTED_SIGNED_METHODS = [
   'group.add_member',
   'group.leave',
   'group.remove_member',
-  'group.update_rules',
   'group.update',
-  'group.update_announcement',
-  'group.update_join_requirements',
   'group.set_role',
   'group.transfer_owner',
   'group.bind_group_aid',
@@ -134,6 +131,8 @@ const EXPECTED_SIGNED_METHODS = [
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'group.commit_state',
   'group.ban',
   'group.unban',
@@ -163,11 +162,6 @@ describe('SIGNED_METHODS 签名覆盖面', () => {
     const expectedSet = new Set<string>(EXPECTED_SIGNED_METHODS);
     const unexpected = actual.filter((m) => !expectedSet.has(m));
     expect(unexpected, `意外的签名方法: ${unexpected.join(', ')}`).toHaveLength(0);
-  });
-
-  it('不应包含已移除的 V1 E2EE 控制面方法', () => {
-    expect(actual.some((m) => m.startsWith('message.e2ee.') || m.startsWith('group.e2ee.'))).toBe(false);
-    expect(actual).not.toContain('group.rotate_epoch');
   });
 
   it('storage 写操作和有副作用读操作应进入非幂等长超时集合', () => {

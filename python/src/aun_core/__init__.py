@@ -25,11 +25,6 @@ from .errors import (
     GroupError,
     GroupNotFoundError,
     GroupStateError,
-    E2EEGroupSecretMissingError,
-    E2EEGroupEpochMismatchError,
-    E2EEGroupCommitmentInvalidError,
-    E2EEGroupNotMemberError,
-    E2EEGroupDecryptFailedError,
 )
 
 from .version import __version__
@@ -71,9 +66,4 @@ __all__ = [
     "GroupError",
     "GroupNotFoundError",
     "GroupStateError",
-    "E2EEGroupSecretMissingError",
-    "E2EEGroupEpochMismatchError",
-    "E2EEGroupCommitmentInvalidError",
-    "E2EEGroupNotMemberError",
-    "E2EEGroupDecryptFailedError",
 ]

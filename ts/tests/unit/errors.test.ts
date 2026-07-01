@@ -90,6 +90,15 @@ describe('mapRemoteError', () => {
     expect(err.retryable).toBe(false);
   });
 
+  it('Gateway 启动期证书未加载错误应标记为 retryable', () => {
+    const err = mapRemoteError({
+      code: -32603,
+      message: 'Gateway service degraded: certificate not loaded',
+    });
+    expect(err).toBeInstanceOf(AUNError);
+    expect(err.retryable).toBe(true);
+  });
+
   // ── traceId 提取 ────────────────────────────────────────
   it('从 data.trace_id 提取 traceId', () => {
     const err = mapRemoteError({

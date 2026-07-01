@@ -130,6 +130,11 @@ type CollabReflogEntry struct {
 	CreatedAt    int64  `json:"created_at,omitempty"`
 }
 
+type CollabSetACLOptions struct {
+	ExpiresAt *int64
+	MaxUses   *int
+}
+
 type CollabFacade struct {
 	client    StorageRPCClient
 	tagOnce   sync.Once
@@ -257,15 +262,24 @@ func (f *CollabFacade) Unregister(ctx context.Context, groupAID, collabRoot stri
 	return f.callAction(ctx, "collab.unregister", map[string]any{"group_aid": groupAID, "collab_root": collabRoot})
 }
 
-func (f *CollabFacade) SetACL(ctx context.Context, collabRoot, granteeAID, perms string) (map[string]any, error) {
+func (f *CollabFacade) SetACL(ctx context.Context, collabRoot, granteeAID, perms string, opts ...CollabSetACLOptions) (map[string]any, error) {
 	if perms == "" {
 		perms = "w"
 	}
-	raw, err := f.call(ctx, "collab.set_acl", map[string]any{
+	params := map[string]any{
 		"collab_root": collabRoot,
 		"grantee_aid": granteeAID,
 		"perms":       perms,
-	})
+	}
+	if len(opts) > 0 {
+		if opts[0].ExpiresAt != nil {
+			params["expires_at"] = *opts[0].ExpiresAt
+		}
+		if opts[0].MaxUses != nil {
+			params["max_uses"] = *opts[0].MaxUses
+		}
+	}
+	raw, err := f.call(ctx, "collab.set_acl", params)
 	if err != nil {
 		return nil, err
 	}

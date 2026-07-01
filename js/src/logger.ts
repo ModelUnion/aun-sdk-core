@@ -20,6 +20,7 @@ export interface ModuleLogger {
   warn(msg: string, ...args: unknown[]): void;
   info(msg: string, ...args: unknown[]): void;
   debug(msg: string, ...args: unknown[]): void;
+  isDebugEnabled?(): boolean;
 }
 
 export interface AUNLoggerOptions {
@@ -73,7 +74,12 @@ export class AUNLogger {
       warn:  (msg, ...args) => this._emit('WARN',  module, msg, args),
       info:  (msg, ...args) => this._emit('INFO',  module, msg, args),
       debug: (msg, ...args) => this._emit('DEBUG', module, msg, args),
+      isDebugEnabled: () => this.isDebugEnabled(),
     };
+  }
+
+  isDebugEnabled(): boolean {
+    return this._debug && this._minLevel <= LEVEL_ORDER.DEBUG;
   }
 
   bindAid(aid: string): void {

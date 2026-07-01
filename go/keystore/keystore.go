@@ -3,7 +3,7 @@ package keystore
 import "time"
 
 // TokenStore 不含私钥操作的存储接口，AuthFlow / AUNClient 持有此类型。
-// 包含：证书、token/实例状态、seq、群组状态、E2EE prekey、group secret、
+// 包含：证书、token/实例状态、seq、群组状态、
 // metadata、agent.md 缓存、信任根等所有非私钥操作。
 type TokenStore interface {
 	// LoadCert 加载证书（PEM 字符串）
@@ -96,68 +96,12 @@ type GroupState struct {
 }
 
 // StructuredKeyStore 提供结构化主存能力。
-// 与 Python SDK 结构化 prekeys / group secret state 语义对齐。
-//
-// 说明：
-// - KeyStore 仍保持向后兼容，不强制所有实现立刻支持这些方法。
-// - 业务层（E2EE / group）会优先探测并使用该扩展接口，避免继续依赖整块 metadata 的读改写。
 type StructuredKeyStore interface {
-	// LoadE2EEPrekeys 加载某个 AID 指定设备的全部 prekey 私钥状态；deviceID 为空时加载默认设备
-	LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error)
-
-	// LoadE2EEPrekeyByID 按 prekey_id 单点查询（O(1) 数据库行级查询）。
-	// 解密入站消息时优先走该路径，避免 LoadE2EEPrekeys 的全量扫描。
-	// 与 Python SDK keystore.base.KeyStore.load_e2ee_prekey_by_id 对应。未命中返回 (nil, nil)。
-	LoadE2EEPrekeyByID(aid, prekeyID string) (map[string]any, error)
-
-	// SaveE2EEPrekey 保存单个 prekey 私钥状态；deviceID 为空时写入默认设备
-	SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error
-
-	// CleanupE2EEPrekeys 清理”早于 cutoffMs 且不在最新 keepLatest 个里”的 prekey 私钥状态；deviceID 为空时清理默认设备
-	CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error)
-
-	// ListGroupSecretIDs 列出本地已存储群组密钥的 group_id
-	ListGroupSecretIDs(aid string) ([]string, error)
-
-	// CleanupGroupOldEpochsState 清理单个群组过期的旧 epoch 状态
-	CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error)
-
-	// LoadGroupSecretEpoch 按 row 加载当前或指定 epoch 的群组密钥
-	LoadGroupSecretEpoch(aid, groupID string, epoch *int) (map[string]any, error)
-
-	// LoadGroupSecretEpochs 按 row 加载某个群组的当前和历史 epoch 密钥
-	LoadGroupSecretEpochs(aid, groupID string) ([]map[string]any, error)
-
-	// StoreGroupSecretTransition 事务化保存群组密钥状态转移
-	StoreGroupSecretTransition(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error)
-
-	// StoreGroupSecretEpoch 事务化保存指定 epoch 密钥；低于 current 时写入 old epoch row
-	StoreGroupSecretEpoch(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error)
-
-	// DiscardPendingGroupSecretState 事务化丢弃指定 pending rotation
-	DiscardPendingGroupSecretState(aid, groupID string, epoch int, rotationID string) (bool, error)
-
-	// DeleteGroupSecretState 删除单个群组的所有密钥状态
-	DeleteGroupSecretState(aid, groupID string) error
-
 	// SaveGroupState 保存群组 state_hash 状态
 	SaveGroupState(aid, groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error
 
 	// LoadGroupState 加载群组 state_hash 状态
 	LoadGroupState(aid, groupID string) (*GroupState, error)
-}
-
-type GroupSecretTransitionOptions struct {
-	Epoch                      int
-	Secret                     string
-	Commitment                 string
-	MemberAIDs                 []string
-	EpochChain                 string
-	PendingRotationID          string
-	EpochChainUnverified       bool
-	EpochChainUnverifiedSet    bool
-	EpochChainUnverifiedReason string
-	OldEpochRetentionMillis    int64
 }
 
 // VersionedCertKeyStore 提供按证书指纹加载/保存版本化证书的能力。
@@ -182,15 +126,6 @@ type InstanceStateStore interface {
 		aid, deviceID, slotID string,
 		updater func(map[string]any) (map[string]any, error),
 	) (map[string]any, error)
-}
-
-// SessionKeyStore 提供 E2EE session 独立存储能力（对标 Python AIDDatabase.e2ee_sessions 表）。
-type SessionKeyStore interface {
-	// LoadE2EESessions 加载某个 AID 的全部 E2EE session
-	LoadE2EESessions(aid string) ([]map[string]any, error)
-
-	// SaveE2EESession 保存单个 E2EE session
-	SaveE2EESession(aid, sessionID string, data map[string]any) error
 }
 
 // SeqTrackerStore 提供 seq tracker 结构化存储能力（对标 Python AIDDatabase.seq_tracker 表）。

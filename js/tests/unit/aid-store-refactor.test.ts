@@ -383,9 +383,9 @@ describe('AUNClient.completeGroupTransfer 高层编排', () => {
     const client = new AUNClient(ownerAid);
     const groupStore = new AIDStore({ aunPath: ownerAid.aunPath, encryptionSeed: 'test-seed' });
     const callSpy = vi.fn(async (method: string, params: Record<string, unknown>) => {
-      if (method === 'group.get') {
-        expect(params).toEqual({ group_id: 'group.agentid.pub/10005' });
-        return { group: { group_id: 'group.agentid.pub/10005', group_aid: groupAid } };
+      if (method === 'group.get_info') {
+        expect(params).toEqual({ group_id: 'group.agentid.pub/10005', required: ['member'] });
+        return { group_id: 'group.agentid.pub/10005', group_aid: groupAid };
       }
       expect(method).toBe('group.complete_transfer');
       expect(params.group_id).toBe('group.agentid.pub/10005');
@@ -436,7 +436,7 @@ describe('AUNClient.startGroupTransfer 高层编排', () => {
     const groupStore = new AIDStore({ aunPath: 'browser-aun-start-no-key', encryptionSeed: 'test-seed' });
     const client = new AUNClient(ownerAid);
     const callSpy = vi.fn(async (method: string) => {
-      if (method === 'group.get') return { group: { group_id: 'group.agentid.pub/10007', group_aid: groupAid } };
+      if (method === 'group.get_info') return { group_id: 'group.agentid.pub/10007', group_aid: groupAid };
       return { ok: true };
     });
     (client as any)._rpcPipeline.call = callSpy;
@@ -447,7 +447,10 @@ describe('AUNClient.startGroupTransfer 高层编排', () => {
     )).rejects.toThrow(/private key not found/);
 
     expect(callSpy).toHaveBeenCalledTimes(1);
-    expect(callSpy).toHaveBeenCalledWith('group.get', { group_id: 'group.agentid.pub/10007' });
+    expect(callSpy).toHaveBeenCalledWith('group.get_info', {
+      group_id: 'group.agentid.pub/10007',
+      required: ['member'],
+    });
     groupStore.close();
   });
 });

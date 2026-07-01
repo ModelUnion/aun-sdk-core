@@ -314,6 +314,9 @@ func (c *AUNClient) logMessageDebugWithPayload(stage, source, event string, mess
 	if c == nil || c.log == nil {
 		return
 	}
+	if c.logger != nil && !c.logger.IsDebugEnabled() {
+		return
+	}
 	record := map[string]any{
 		"stage":    stage,
 		"source":   source,
@@ -361,6 +364,10 @@ const (
 	ConnStateConnectionFailed ConnectionState = "connection_failed" // 不可恢复失败
 	ConnStateClosed           ConnectionState = "closed"            // 已关闭
 )
+
+func clientStateIsReady(state ClientState) bool {
+	return state == StateConnected || state == ClientState(ConnStateReady)
+}
 
 // ConnectOptions 连接选项（供 Authenticate 使用）
 type ConnectOptions struct {
@@ -443,11 +450,9 @@ var nonIdempotentMethods = map[string]bool{
 	"group.remove_member":              true,
 	"group.leave":                      true,
 	"group.dissolve":                   true,
-	"group.update_name":                true,
-	"group.update_avatar":              true,
+	"group.set_settings":               true,
 	"group.update_announcement":        true,
-	"group.update_settings":            true,
-	"group.rotate_epoch":               true,
+	"group.update_rules":               true,
 	"storage.put_object":               true,
 	"storage.delete_object":            true,
 	"storage.create_share_link":        true,
@@ -1362,7 +1367,10 @@ func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (an
 	defer store.Close()
 
 	payload := copyRpcParams(params)
-	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+	groupID := strings.TrimSpace(firstNonEmpty(authGetStr(payload, "group_id"), authGetStr(payload, "group_aid")))
+	if groupID != "" {
+		payload["group_id"] = groupID
+	}
 
 	// 优先复用 pending 槽位中已暂存的待绑定密钥（崩溃/重试幂等）
 	keystore := store.keyStore
@@ -1370,6 +1378,9 @@ func (c *AUNClient) BindGroupAID(ctx context.Context, params map[string]any) (an
 	var publicKey, privateKey, curve string
 
 	pending, loadErr := keystore.LoadPendingGroupBind(groupID)
+	if loadErr != nil && c.log != nil {
+		c.log.Warn("BindGroupAID: 加载 pending group bind 失败 group_id=%s: %v", groupID, loadErr)
+	}
 	if loadErr == nil && pending != nil {
 		publicKey = strings.TrimSpace(authGetStr(pending, "public_key_der_b64"))
 		privateKey = strings.TrimSpace(authGetStr(pending, "private_key_pem"))
@@ -1445,23 +1456,20 @@ func (c *AUNClient) RenewGroupAID(ctx context.Context, params map[string]any) (a
 	defer store.Close()
 
 	payload := copyRpcParams(params)
-	groupID := strings.TrimSpace(authGetStr(payload, "group_id"))
+	groupID := strings.TrimSpace(firstNonEmpty(authGetStr(payload, "group_id"), authGetStr(payload, "group_aid")))
 	if groupID == "" {
-		return nil, NewValidationError("RenewGroupAID requires group_id")
+		return nil, NewValidationError("RenewGroupAID requires group_id or group_aid")
 	}
+	payload["group_id"] = groupID
 
 	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
 	if groupAID == "" {
-		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		info, infoErr := c.Call(ctx, "group.get_info", map[string]any{"group_id": groupID, "required": []string{"member"}})
 		if infoErr != nil {
 			return nil, infoErr
 		}
 		if infoMap, ok := info.(map[string]any); ok {
-			grp := infoMap
-			if inner, ok := infoMap["group"].(map[string]any); ok {
-				grp = inner
-			}
-			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+			groupAID = strings.TrimSpace(authGetStr(infoMap, "group_aid"))
 		}
 	}
 	if groupAID == "" {
@@ -1578,16 +1586,12 @@ func (c *AUNClient) StartGroupTransfer(ctx context.Context, params map[string]an
 	}
 	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
 	if groupAID == "" {
-		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		info, infoErr := c.Call(ctx, "group.get_info", map[string]any{"group_id": groupID, "required": []string{"member"}})
 		if infoErr != nil {
 			return nil, infoErr
 		}
 		if infoMap, ok := info.(map[string]any); ok {
-			grp := infoMap
-			if inner, ok := infoMap["group"].(map[string]any); ok {
-				grp = inner
-			}
-			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+			groupAID = strings.TrimSpace(authGetStr(infoMap, "group_aid"))
 		}
 	}
 	if groupAID == "" {
@@ -1654,16 +1658,12 @@ func (c *AUNClient) CompleteGroupTransfer(ctx context.Context, params map[string
 	}
 	groupAID := strings.TrimSpace(authGetStr(payload, "group_aid"))
 	if groupAID == "" {
-		info, infoErr := c.Call(ctx, "group.get", map[string]any{"group_id": groupID})
+		info, infoErr := c.Call(ctx, "group.get_info", map[string]any{"group_id": groupID, "required": []string{"member"}})
 		if infoErr != nil {
 			return nil, infoErr
 		}
 		if infoMap, ok := info.(map[string]any); ok {
-			grp := infoMap
-			if inner, ok := infoMap["group"].(map[string]any); ok {
-				grp = inner
-			}
-			groupAID = strings.TrimSpace(authGetStr(grp, "group_aid"))
+			groupAID = strings.TrimSpace(authGetStr(infoMap, "group_aid"))
 		}
 	}
 	if groupAID == "" {
@@ -2672,7 +2672,7 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 			if isClosing {
 				return
 			}
-			if state != StateConnected {
+			if !clientStateIsReady(state) {
 				consecutiveFailures = 0
 				timer.Reset(time.Duration(currentInterval * float64(time.Second)))
 				continue
@@ -2782,7 +2782,7 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 		if isClosing {
 			return
 		}
-		if state != StateConnected || gateway == "" {
+		if !clientStateIsReady(state) || gateway == "" {
 			sleepWithCancel(ctx, checkInterval)
 			continue
 		}
@@ -2854,7 +2854,7 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 
 		c.mu.Lock()
 		// 刷新期间可能已断线，复检状态，避免写回 stale identity
-		if c.state != StateConnected {
+		if !clientStateIsReady(c.state) {
 			c.mu.Unlock()
 			sleepWithCancel(ctx, checkInterval)
 			continue
@@ -3526,7 +3526,7 @@ func (c *AUNClient) CanConnect() bool {
 func (c *AUNClient) CanSend() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.state == StateConnected
+	return clientStateIsReady(c.state)
 }
 
 // IsReady 是否已就绪（等同 CanSend）
@@ -3536,7 +3536,7 @@ func (c *AUNClient) IsReady() bool { return c.CanSend() }
 func (c *AUNClient) IsOnline() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.state == StateConnected || c.state == StateReconnecting
+	return clientStateIsReady(c.state) || c.state == StateReconnecting
 }
 
 // IsClosed 是否已关闭

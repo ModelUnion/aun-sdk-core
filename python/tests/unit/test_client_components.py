@@ -229,7 +229,10 @@ async def test_group_state_membership_change_updates_cache_and_spk_path():
     class FakeClient:
         _aid = "alice.agentid.pub"
         _v2_session = object()
-        _v2_bootstrap_cache = {"group:group.agentid.pub/g1": ("cached",)}
+        _v2_bootstrap_cache = {
+            "group:group.agentid.pub/g1": ("legacy",),
+            "group:g1.agentid.pub": ("standard",),
+        }
         _v2_auto_state_management_enabled = True
         _public_state = "ready"
         _closing = False
@@ -261,6 +264,6 @@ async def test_group_state_membership_change_updates_cache_and_spk_path():
     })
     await asyncio.sleep(0)
 
-    assert "group:group.agentid.pub/g1" not in client._v2_bootstrap_cache
-    assert ("register", "group.agentid.pub/g1", "group.changed:member_added") in events
-    assert ("propose", "group.agentid.pub/g1", True) in events
+    assert client._v2_bootstrap_cache == {}
+    assert ("register", "g1.agentid.pub", "group.changed:member_added") in events
+    assert ("propose", "g1.agentid.pub", True) in events

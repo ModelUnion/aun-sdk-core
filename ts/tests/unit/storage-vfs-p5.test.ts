@@ -254,7 +254,7 @@ describe('P5 StorageVFS TypeScript 契约', () => {
 
     await storage.symlink('/target.txt', '/link.txt');
     await storage.renameSymlink('/link.txt', '/latest.txt', { overwrite: true, expectedVersion: 1 });
-    await storage.setAcl('/docs', { granteeAid: 'bob.agentid.pub', perms: 'r', maxUses: 2 });
+    await storage.setAcl('/docs', { granteeAid: 'bob1.agentid.pub', perms: 'r', maxUses: 2 });
     await storage.setVisibility('/docs/a.txt', { visibility: 'private', allowRoles: ['admin'] });
     const access = await storage.checkAccess('/docs/a.txt', { operation: 'read' });
     await storage.issueToken('/docs/a.txt', { maxReads: 1 });
@@ -274,7 +274,7 @@ describe('P5 StorageVFS TypeScript 契约', () => {
       'storage.get_quota',
     ]);
     expect(client.calls[1].params).toMatchObject({ path: 'link.txt', new_path: 'latest.txt', overwrite: true, expected_version: 1 });
-    expect(client.calls[2].params).toMatchObject({ grantee_aid: 'bob.agentid.pub', perms: 'r', max_uses: 2 });
+    expect(client.calls[2].params).toMatchObject({ grantee_aid: 'bob1.agentid.pub', perms: 'r', max_uses: 2 });
     expect(client.calls[3].params).toMatchObject({ path: 'docs/a.txt', visibility: 'private', allow_roles: ['admin'] });
     expect(client.calls[4].params).toMatchObject({ path: 'docs/a.txt', operation: 'read', follow_symlinks: true });
     expect(client.calls[5].params).toMatchObject({ max_reads: 1 });
@@ -335,15 +335,15 @@ describe('P5 StorageVFS TypeScript 契约', () => {
     const client = new FakeClient();
     const storage = new StorageVFS(client);
 
-    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob.agentid.pub', recursive: true });
+    const copied = await storage.copy('/docs/a.txt', '/inbox/a.txt', { owner: 'alice.agentid.pub', dstOwner: 'bob1.agentid.pub', recursive: true });
 
-    expect(copied.owner).toBe('bob.agentid.pub');
+    expect(copied.owner).toBe('bob1.agentid.pub');
     expect(client.calls).toHaveLength(1);
     expect(client.calls[0]).toMatchObject({
       method: 'storage.fs.copy',
       params: {
         owner_aid: 'alice.agentid.pub',
-        dst_owner_aid: 'bob.agentid.pub',
+        dst_owner_aid: 'bob1.agentid.pub',
         src: 'docs/a.txt',
         dst: 'inbox/a.txt',
         recursive: true,
@@ -363,7 +363,7 @@ describe('P5 StorageLowLevel TypeScript 契约', () => {
     const client = new FakeClient();
     const low = new StorageLowLevel(client);
 
-    await low.removeAcl({ owner: 'alice.agentid.pub', path: 'docs', granteeAid: 'bob.agentid.pub' });
+    await low.removeAcl({ owner: 'alice.agentid.pub', path: 'docs', granteeAid: 'bob1.agentid.pub' });
     await low.listAcl({ owner: 'alice.agentid.pub', path: 'docs' });
     await low.revokeToken({ owner: 'alice.agentid.pub', path: 'docs/a.txt', token: 'tok' });
 

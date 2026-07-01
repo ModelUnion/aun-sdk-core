@@ -4,7 +4,7 @@
  * 覆盖：
  *   1. set_settings: name+description / rules+announcement / 非管理员拒绝 / 未知 key 拒绝
  *   2. get_settings: 全量读取 / keys 过滤 / 值匹配验证
- *   3. info 视角: owner / include stats / 非成员看公开群 / 非成员看私有群被拒
+ *   3. get_info 视角: owner / 非成员看公开群 / 非成员看私有群被拒
  *   4. 设置同步: owner 修改 → member 读取验证 / member 离开后无法查看
  *
  * 运行方法：
@@ -577,15 +577,16 @@ describe('Group: info 视角', () => {
       groupId = ((createResult.group as any)?.group_id ?? '') as string;
       expect(groupId).toBeTruthy();
 
-      // ---- owner 查看 info ----
+      // ---- owner 查看 get_info ----
       let infoResult: Record<string, unknown>;
       try {
-        infoResult = await owner.call('group.info', {
+        infoResult = await owner.call('group.get_info', {
           group_id: groupId,
+          required: ['member'],
         }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.info 未实现，跳过');
+          console.log('group.get_info 未实现，跳过');
           return;
         }
         throw e;
@@ -594,63 +595,6 @@ describe('Group: info 视角', () => {
       expect(infoResult.group_id).toBe(groupId);
       expect(infoResult.name).toBe(`info-${rid}`);
       expect(infoResult.owner_aid).toBe(ownerAid);
-    } finally {
-      if (groupId) {
-        try { await owner.call('group.dissolve', { group_id: groupId }); } catch { /* 忽略 */ }
-      }
-      await owner.close();
-    }
-  }, 60_000);
-
-  it('info with include=["stats"] → stats present', async () => {
-    const rid = runId();
-    const ownerAid = `gs-stats-o-${rid}.${ISSUER}`;
-
-    const owner = makeClient();
-
-    let groupId = '';
-
-    try {
-      await ensureConnected(owner, ownerAid);
-
-      let createResult: Record<string, unknown>;
-      try {
-        createResult = await owner.call('group.create', {
-          name: `stats-${rid}`,
-          visibility: 'public',
-        }) as Record<string, unknown>;
-      } catch (e) {
-        if (isNotImplemented(e)) {
-          console.log('group.create 未实现，跳过 info stats 测试');
-          return;
-        }
-        throw e;
-      }
-
-      groupId = ((createResult.group as any)?.group_id ?? '') as string;
-      expect(groupId).toBeTruthy();
-
-      // ---- include=["stats"] ----
-      let infoResult: Record<string, unknown>;
-      try {
-        infoResult = await owner.call('group.info', {
-          group_id: groupId,
-          include: ['stats'],
-        }) as Record<string, unknown>;
-      } catch (e) {
-        if (isNotImplemented(e)) {
-          console.log('group.info include stats 未实现，跳过');
-          return;
-        }
-        throw e;
-      }
-
-      const stats = infoResult.stats as Record<string, unknown> | undefined;
-      expect(stats).toBeDefined();
-      expect(typeof stats).toBe('object');
-      // stats 中应包含基本统计字段
-      expect((stats as Record<string, unknown>).human_count).toBeGreaterThanOrEqual(0);
-      expect((stats as Record<string, unknown>).admin_count).toBeGreaterThanOrEqual(0);
     } finally {
       if (groupId) {
         try { await owner.call('group.dissolve', { group_id: groupId }); } catch { /* 忽略 */ }
@@ -690,15 +634,15 @@ describe('Group: info 视角', () => {
       groupId = ((createResult.group as any)?.group_id ?? '') as string;
       expect(groupId).toBeTruthy();
 
-      // ---- 非成员查看公开群 info ----
+      // ---- 非成员查看公开群 get_info ----
       let infoResult: Record<string, unknown>;
       try {
-        infoResult = await outsider.call('group.info', {
+        infoResult = await outsider.call('group.get_info', {
           group_id: groupId,
         }) as Record<string, unknown>;
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.info 未实现，跳过');
+          console.log('group.get_info 未实现，跳过');
           return;
         }
         throw e;
@@ -749,15 +693,15 @@ describe('Group: info 视角', () => {
       groupId = ((createResult.group as any)?.group_id ?? '') as string;
       expect(groupId).toBeTruthy();
 
-      // ---- 非成员查看私有群 info → 应被拒绝 ----
+      // ---- 非成员查看私有群 get_info → 应被拒绝 ----
       try {
-        await outsider.call('group.info', {
+        await outsider.call('group.get_info', {
           group_id: groupId,
         });
         expect.unreachable('非成员看私有群应被拒绝');
       } catch (e) {
         if (isNotImplemented(e)) {
-          console.log('group.info 未实现，跳过');
+          console.log('group.get_info 未实现，跳过');
           return;
         }
         // 被拒绝 — 符合预期

@@ -173,6 +173,14 @@ function normalizedGroupId(raw: unknown): string {
   return normalizeGroupId(groupId) || groupId;
 }
 
+function groupCacheIds(raw: unknown, groupId: string): string[] {
+  const ids: string[] = [];
+  for (const value of [groupId, String(raw ?? '').trim()]) {
+    if (value && !ids.includes(value)) ids.push(value);
+  }
+  return ids;
+}
+
 export class GroupStateCoordinator {
   private readonly runtime: ClientRuntime;
 
@@ -210,13 +218,16 @@ export class GroupStateCoordinator {
 
   handleGroupChangedV2Membership(data: JsonObject): void {
     const client = this.client;
-    const groupId = normalizedGroupId(data.group_id);
+    const rawGroupId = data.group_aid ?? data.group_id;
+    const groupId = normalizedGroupId(rawGroupId);
     const action = String(data.action ?? '').trim();
     if (!groupId) {
       return;
     }
 
-    client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${groupId}`);
+    for (const cacheGroupId of groupCacheIds(rawGroupId, groupId)) {
+      client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${cacheGroupId}`);
+    }
     const membershipAction = MEMBERSHIP_ACTIONS.has(action);
     if (client._v2Session && (action === 'upsert' || membershipAction)) {
       client._safeAsync(client._v2AutoProposeState(groupId, { leaderDelay: true }));
@@ -227,7 +238,7 @@ export class GroupStateCoordinator {
   async onV2StateProposed(data: EventPayload): Promise<void> {
     const client = this.client;
     if (!isJsonObject(data) || !client._v2Session) return;
-    const groupId = normalizedGroupId(data.group_id);
+    const groupId = normalizedGroupId(data.group_aid ?? data.group_id);
     if (!groupId) return;
     await client._dispatcher.publish('group.v2.state_proposed', data);
     try {
@@ -240,7 +251,7 @@ export class GroupStateCoordinator {
   async onV2StateRetryNeeded(data: EventPayload): Promise<void> {
     const client = this.client;
     if (!isJsonObject(data) || !client._v2Session) return;
-    const groupId = normalizedGroupId(data.group_id);
+    const groupId = normalizedGroupId(data.group_aid ?? data.group_id);
     if (!groupId) return;
     await client._dispatcher.publish('group.v2.state_retry_needed', data);
     try {
@@ -253,9 +264,12 @@ export class GroupStateCoordinator {
   async onV2StateConfirmed(data: EventPayload): Promise<void> {
     const client = this.client;
     if (!isJsonObject(data)) return;
-    const groupId = normalizedGroupId(data.group_id);
+    const rawGroupId = data.group_aid ?? data.group_id;
+    const groupId = normalizedGroupId(rawGroupId);
     if (groupId) {
-      client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${groupId}`);
+      for (const cacheGroupId of groupCacheIds(rawGroupId, groupId)) {
+        client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${cacheGroupId}`);
+      }
       client._v2AutoProposeLastSnapshot?.delete?.(groupId);
     }
     await client._dispatcher.publish('group.v2.state_confirmed', data);
@@ -398,14 +412,18 @@ export class GroupStateCoordinator {
   async onGroupStateCommitted(data: EventPayload): Promise<void> {
     const client = this.client;
     const tStart = Date.now();
-    const groupIdInit = String((data as Record<string, unknown> | null | undefined)?.group_id ?? '');
+    const groupIdInit = String(
+      (data as Record<string, unknown> | null | undefined)?.group_aid
+      ?? (data as Record<string, unknown> | null | undefined)?.group_id
+      ?? '',
+    );
     client._clientLog.debug(`_onGroupStateCommitted enter: group_id=${groupIdInit} state_version=${String((data as Record<string, unknown> | null | undefined)?.state_version ?? '-')}`);
     try {
       if (!isJsonObject(data)) {
         client._clientLog.debug(`_onGroupStateCommitted exit: elapsed=${Date.now() - tStart}ms reason=non_object`);
         return;
       }
-      const groupId = String(data.group_id ?? '').trim();
+      const groupId = normalizedGroupId(data.group_aid ?? data.group_id);
       if (!groupId) {
         client._clientLog.debug(`_onGroupStateCommitted exit: elapsed=${Date.now() - tStart}ms reason=no_group_id`);
         return;
@@ -858,7 +876,7 @@ export class GroupStateCoordinator {
       const groups = (Array.isArray(groupsResp?.groups) ? groupsResp.groups
         : Array.isArray(groupsResp?.items) ? groupsResp.items : []) as Array<Record<string, unknown>>;
       for (const g of groups) {
-        const gid = String(g.group_id ?? '').trim();
+        const gid = normalizedGroupId(g.group_aid ?? g.group_id);
         const myRole = String(g.role ?? g.my_role ?? '').trim();
         if (!gid || (myRole !== 'owner' && myRole !== 'admin')) continue;
         try {
@@ -880,7 +898,7 @@ export class GroupStateCoordinator {
     const extracted = typeof client._extractGroupIdFromResult === 'function'
       ? client._extractGroupIdFromResult(result)
       : '';
-    return normalizedGroupId(extracted || params.group_id || '');
+    return normalizedGroupId(extracted || params.group_aid || params.group_id || '');
   }
 
   private pruneSigCache(now: number): void {
@@ -921,10 +939,16 @@ export class GroupStateCoordinator {
 
       let mode = '';
       try {
-        const reqResp = await client.call('group.get_join_requirements', { group_id: groupId }) as Record<string, unknown> | null;
-        mode = isJsonObject(reqResp)
-          ? String((reqResp as JsonObject).mode ?? '').trim()
-          : '';
+        const reqResp = await client.call('group.get_settings', { group_id: groupId, keys: ['join.mode'] }) as Record<string, unknown> | null;
+        const settings: Record<string, unknown> = {};
+        if (isJsonObject(reqResp) && Array.isArray(reqResp.settings)) {
+          for (const s of reqResp.settings as unknown[]) {
+            if (isJsonObject(s) && typeof s.key === 'string') {
+              settings[s.key] = s.value;
+            }
+          }
+        }
+        mode = String(settings['join.mode'] ?? '').trim();
       } catch {
         mode = '';
       }

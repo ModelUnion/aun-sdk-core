@@ -63,6 +63,7 @@ function safeAid(aid: string): string {
 }
 
 export class LocalIdentityStore implements KeyStore {
+  private static _aidLocks = new Map<string, { count: number; lockDir: string }>();
   private _root: string;
   private _aidsRoot: string;
   private _secretStore: SecretStore;
@@ -140,9 +141,86 @@ export class LocalIdentityStore implements KeyStore {
     return db;
   }
 
+  private _withAidLock<T>(aid: string, fn: () => T): T {
+    const key = safeAid(aid);
+    const held = LocalIdentityStore._aidLocks.get(key);
+    if (held) {
+      held.count++;
+      try {
+        return fn();
+      } finally {
+        held.count--;
+      }
+    }
+    const lockDir = this._acquireAidLock(key);
+    LocalIdentityStore._aidLocks.set(key, { count: 1, lockDir });
+    try {
+      return fn();
+    } finally {
+      const current = LocalIdentityStore._aidLocks.get(key);
+      if (current) {
+        current.count--;
+        if (current.count <= 0) {
+          LocalIdentityStore._aidLocks.delete(key);
+          this._releaseAidLock(current.lockDir);
+        }
+      }
+    }
+  }
+
+  private _acquireAidLock(key: string): string {
+    const root = join(this._root, 'locks', 'identity');
+    mkdirSync(root, { recursive: true });
+    const lockDir = join(root, `${key}.lock`);
+    const deadline = Date.now() + 2000;
+    while (true) {
+      try {
+        mkdirSync(lockDir);
+        writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        return lockDir;
+      } catch (exc) {
+        const code = (exc as { code?: string }).code;
+        if (code !== 'EEXIST') throw exc;
+        try {
+          if (Date.now() - statSync(lockDir).mtimeMs > 30_000) {
+            fsRmSync(lockDir, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`identity store lock timeout: ${key}`);
+        }
+        LocalIdentityStore._sleepSync(10);
+      }
+    }
+  }
+
+  private _releaseAidLock(lockDir: string): void {
+    try {
+      fsRmSync(lockDir, { recursive: true, force: true });
+    } catch (exc) {
+      this._logger.warn(`identity lock release failed: ${exc instanceof Error ? exc.message : String(exc)}`);
+    }
+  }
+
+  private static _sleepSync(ms: number): void {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch {
+      const end = Date.now() + ms;
+      while (Date.now() < end) { /* sync fallback */ }
+    }
+  }
+
   // ── KeyPair ──────────────────────────────────────────────
 
   loadKeyPair(aid: string): KeyPairRecord | null {
+    return this._withAidLock(aid, () => this._loadKeyPairUnlocked(aid));
+  }
+
+  private _loadKeyPairUnlocked(aid: string): KeyPairRecord | null {
     const path = this._keyPairPath(aid);
     if (!existsSync(path)) return null;
     let raw: JsonObject;
@@ -156,7 +234,9 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   saveKeyPair(aid: string, keyPair: KeyPairRecord): void {
-    this._saveKeyPairAtPath(aid, this._keyPairPath(aid), keyPair);
+    this._withAidLock(aid, () => {
+      this._saveKeyPairAtPath(aid, this._keyPairPath(aid), keyPair);
+    });
   }
 
   private _saveKeyPairAtPath(aid: string, path: string, keyPair: KeyPairRecord): void {
@@ -225,6 +305,10 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   saveCert(aid: string, certPem: string, certFingerprint?: string, opts?: { makeActive?: boolean }): void {
+    this._withAidLock(aid, () => this._saveCertUnlocked(aid, certPem, certFingerprint, opts));
+  }
+
+  private _saveCertUnlocked(aid: string, certPem: string, certFingerprint?: string, opts?: { makeActive?: boolean }): void {
     const norm = this._normalizeCertFingerprint(certFingerprint);
     if (norm) {
       const vp = this._certVersionPath(aid, norm);
@@ -247,10 +331,14 @@ export class LocalIdentityStore implements KeyStore {
   // ── Identity ─────────────────────────────────────────────
 
   loadIdentity(aid: string): IdentityRecord | null {
+    return this._withAidLock(aid, () => this._loadIdentityUnlocked(aid));
+  }
+
+  private _loadIdentityUnlocked(aid: string): IdentityRecord | null {
     const identityDir = join(this._aidsRoot, safeAid(aid));
     if (!existsSync(identityDir)) return null;
 
-    const kp = this.loadKeyPair(aid);
+    const kp = this._loadKeyPairUnlocked(aid);
     const cert = this.loadCert(aid);
     const db = this._getDB(aid);
     const kv = db.getAllMetadata();
@@ -283,18 +371,20 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   saveIdentity(aid: string, identity: IdentityRecord): void {
-    const kp: KeyPairRecord = {};
-    for (const k of ['private_key_pem', 'public_key_der_b64', 'curve'] as const) {
-      if (k in identity) kp[k] = identity[k] as string;
-    }
-    if (Object.keys(kp).length > 0) this.saveKeyPair(aid, kp);
-    if (typeof identity.cert === 'string' && identity.cert) this.saveCert(aid, identity.cert);
-    const db = this._getDB(aid);
-    const skip = new Set(['private_key_pem', 'public_key_der_b64', 'curve', 'cert']);
-    for (const [k, v] of Object.entries(identity)) {
-      if (skip.has(k)) continue;
-      db.setMetadata(k, JSON.stringify(v));
-    }
+    this._withAidLock(aid, () => {
+      const kp: KeyPairRecord = {};
+      for (const k of ['private_key_pem', 'public_key_der_b64', 'curve'] as const) {
+        if (k in identity) kp[k] = identity[k] as string;
+      }
+      if (Object.keys(kp).length > 0) this._saveKeyPairAtPath(aid, this._keyPairPath(aid), kp);
+      if (typeof identity.cert === 'string' && identity.cert) this._saveCertUnlocked(aid, identity.cert);
+      const db = this._getDB(aid);
+      const skip = new Set(['private_key_pem', 'public_key_der_b64', 'curve', 'cert']);
+      for (const [k, v] of Object.entries(identity)) {
+        if (skip.has(k)) continue;
+        db.setMetadata(k, JSON.stringify(v));
+      }
+    });
   }
 
   loadAnyIdentity(): IdentityRecord | null {
@@ -521,6 +611,10 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   savePendingGroupBind(groupId: string, keyPair: KeyPairRecord): void {
+    this._withAidLock(`group-bind:${groupId}`, () => this._savePendingGroupBindUnlocked(groupId, keyPair));
+  }
+
+  private _savePendingGroupBindUnlocked(groupId: string, keyPair: KeyPairRecord): void {
     const gid = groupId.trim();
     if (!gid) throw new Error('savePendingGroupBind requires non-empty group_id');
 
@@ -553,6 +647,10 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   loadPendingGroupBind(groupId: string): KeyPairRecord | null {
+    return this._withAidLock(`group-bind:${groupId}`, () => this._loadPendingGroupBindUnlocked(groupId));
+  }
+
+  private _loadPendingGroupBindUnlocked(groupId: string): KeyPairRecord | null {
     const gid = groupId.trim();
     if (!gid) return null;
 
@@ -586,6 +684,10 @@ export class LocalIdentityStore implements KeyStore {
   }
 
   clearPendingGroupBind(groupId: string): void {
+    this._withAidLock(`group-bind:${groupId}`, () => this._clearPendingGroupBindUnlocked(groupId));
+  }
+
+  private _clearPendingGroupBindUnlocked(groupId: string): void {
     const gid = groupId.trim();
     if (!gid) return;
     const path = this._pendingBindPath(gid);

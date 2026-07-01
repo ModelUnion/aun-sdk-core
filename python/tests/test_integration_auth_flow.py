@@ -240,8 +240,6 @@ async def local_gateway(tmp_path, monkeypatch) -> LocalGateway:
                     result = {"status": status}
                 elif method == "meta.ping":
                     result = {"pong": True}
-                elif method == "message.e2ee.put_prekey":
-                    result = {"ok": True}
                 else:
                     await ws.send_json({
                         "jsonrpc": "2.0",

@@ -138,13 +138,16 @@ type GroupFSRmOptions struct {
 }
 
 type GroupFSMvOptions struct {
-	Force      bool
-	GroupID    string
-	SrcGroupID string
-	DstGroupID string
-	SignAs     string
-	AidStore   *AIDStore
-	Extra      map[string]any
+	Force       bool
+	GroupAID    string
+	GroupID     string
+	SrcGroupAID string
+	SrcGroupID  string
+	DstGroupAID string
+	DstGroupID  string
+	SignAs      string
+	AidStore    *AIDStore
+	Extra       map[string]any
 }
 
 type GroupFSDfOptions struct {
@@ -182,8 +185,11 @@ type GroupFSCpOptions struct {
 	Metadata        map[string]any
 	ExpectedVersion *int
 	VerifyHash      *bool
+	GroupAID        string
 	GroupID         string
+	SrcGroupAID     string
 	SrcGroupID      string
+	DstGroupAID     string
 	DstGroupID      string
 	SignAs          string
 	AidStore        *AIDStore
@@ -415,8 +421,8 @@ func (v *GroupFSVFS) Cp(ctx context.Context, src, dst string, opts *GroupFSCpOpt
 	if opts == nil {
 		opts = &GroupFSCpOptions{}
 	}
-	srcRemote := groupFSIsRemoteCopyPath(src, opts.SrcGroupID, opts.GroupID)
-	dstRemote := groupFSIsRemoteCopyPath(dst, opts.DstGroupID, opts.GroupID)
+	srcRemote := groupFSIsRemoteCopyPath(src, firstNonEmpty(opts.SrcGroupAID, opts.SrcGroupID), firstNonEmpty(opts.GroupAID, opts.GroupID))
+	dstRemote := groupFSIsRemoteCopyPath(dst, firstNonEmpty(opts.DstGroupAID, opts.DstGroupID), firstNonEmpty(opts.GroupAID, opts.GroupID))
 	switch {
 	case srcRemote && dstRemote:
 		raw, err := v.copyGroupToGroup(ctx, src, dst, opts)
@@ -445,15 +451,15 @@ func (v *GroupFSVFS) Mv(ctx context.Context, src, dst string, opts *GroupFSMvOpt
 	if opts == nil {
 		opts = &GroupFSMvOptions{}
 	}
-	if !groupFSIsRemoteCopyPath(src, opts.SrcGroupID, opts.GroupID) ||
-		!groupFSIsRemoteCopyPath(dst, opts.DstGroupID, opts.GroupID) {
+	if !groupFSIsRemoteCopyPath(src, firstNonEmpty(opts.SrcGroupAID, opts.SrcGroupID), firstNonEmpty(opts.GroupAID, opts.GroupID)) ||
+		!groupFSIsRemoteCopyPath(dst, firstNonEmpty(opts.DstGroupAID, opts.DstGroupID), firstNonEmpty(opts.GroupAID, opts.GroupID)) {
 		return GroupFSNodeView{}, &StorageError{Message: "group.fs.mv only supports group remote paths", Code: "EINVAL", Path: src}
 	}
 	params := map[string]any{"src": src, "dst": dst}
 	if opts.Force {
 		params["force"] = true
 	}
-	groupFSAddGroupParams(params, opts.GroupID, opts.SrcGroupID, opts.DstGroupID)
+	groupFSAddGroupParams(params, opts.GroupID, opts.SrcGroupID, opts.DstGroupID, opts.GroupAID, opts.SrcGroupAID, opts.DstGroupAID)
 	params = groupFSParams(params, opts.Extra)
 	groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
 	raw, err := v.call(ctx, "group.fs.mv", params, src)
@@ -555,7 +561,7 @@ func (v *GroupFSVFS) copyGroupToGroup(ctx context.Context, src, dst string, opts
 	if opts.FollowSymlinks != nil {
 		params["follow_symlinks"] = *opts.FollowSymlinks
 	}
-	groupFSAddGroupParams(params, opts.GroupID, opts.SrcGroupID, opts.DstGroupID)
+	groupFSAddGroupParams(params, opts.GroupID, opts.SrcGroupID, opts.DstGroupID, opts.GroupAID, opts.SrcGroupAID, opts.DstGroupAID)
 	params = groupFSParams(params, opts.Extra)
 	groupFSAddSigningParams(params, opts.SignAs, opts.AidStore)
 	return v.call(ctx, "group.fs.cp", params, src)
@@ -595,8 +601,8 @@ func (v *GroupFSVFS) uploadLocalFile(ctx context.Context, localPath, groupPath s
 	if opts.ExpectedVersion != nil {
 		baseParams["expected_version"] = *opts.ExpectedVersion
 	}
-	if opts.GroupID != "" || opts.DstGroupID != "" {
-		groupFSAddGroupParams(baseParams, opts.GroupID, "", opts.DstGroupID)
+	if opts.GroupID != "" || opts.DstGroupID != "" || opts.GroupAID != "" || opts.DstGroupAID != "" {
+		groupFSAddGroupParams(baseParams, opts.GroupID, "", opts.DstGroupID, opts.GroupAID, "", opts.DstGroupAID)
 	}
 	baseParams = groupFSParams(baseParams, opts.Extra)
 	delete(baseParams, "parentsSet")
@@ -655,8 +661,8 @@ func (v *GroupFSVFS) downloadRemoteFile(ctx context.Context, groupPath, localPat
 	}
 
 	ticketParams := map[string]any{"path": groupPath}
-	if opts.GroupID != "" || opts.SrcGroupID != "" {
-		groupFSAddGroupParams(ticketParams, opts.GroupID, opts.SrcGroupID, "")
+	if opts.GroupID != "" || opts.SrcGroupID != "" || opts.GroupAID != "" || opts.SrcGroupAID != "" {
+		groupFSAddGroupParams(ticketParams, opts.GroupID, opts.SrcGroupID, "", opts.GroupAID, opts.SrcGroupAID, "")
 	}
 	ticketParams = groupFSParams(ticketParams, opts.Extra)
 	groupFSAddSigningParams(ticketParams, opts.SignAs, opts.AidStore)
@@ -862,14 +868,32 @@ func groupFSStorageRefFromAny(value any) GroupFSStorageRef {
 	}
 }
 
-func groupFSAddGroupParams(params map[string]any, groupID, srcGroupID, dstGroupID string) {
-	if groupID != "" {
+func groupFSAddGroupParams(params map[string]any, groupID, srcGroupID, dstGroupID string, groupAID ...string) {
+	sharedGroupAID := ""
+	srcGroupAID := ""
+	dstGroupAID := ""
+	if len(groupAID) > 0 {
+		sharedGroupAID = strings.TrimSpace(groupAID[0])
+	}
+	if len(groupAID) > 1 {
+		srcGroupAID = strings.TrimSpace(groupAID[1])
+	}
+	if len(groupAID) > 2 {
+		dstGroupAID = strings.TrimSpace(groupAID[2])
+	}
+	if sharedGroupAID != "" {
+		params["group_aid"] = sharedGroupAID
+	} else if groupID != "" {
 		params["group_id"] = groupID
 	}
-	if srcGroupID != "" {
+	if srcGroupAID != "" {
+		params["src_group_aid"] = srcGroupAID
+	} else if srcGroupID != "" {
 		params["src_group_id"] = srcGroupID
 	}
-	if dstGroupID != "" {
+	if dstGroupAID != "" {
+		params["dst_group_aid"] = dstGroupAID
+	} else if dstGroupID != "" {
 		params["dst_group_id"] = dstGroupID
 	}
 }

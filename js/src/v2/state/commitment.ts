@@ -4,7 +4,7 @@
  * 规范引用: §6.2
  *
  * state_commitment = SHA256(
- *   "AUN-V2-SC-v1" || group_id || uint32(epoch) || canonical_json(sorted_payload)
+ *   "AUN-V2-SC-v1" || group_aid || uint32(epoch) || canonical_json(sorted_payload)
  * )
  *
  * sorted_payload 规则：
@@ -16,6 +16,7 @@
  * 浏览器实现：使用 WebCrypto subtle.digest('SHA-256')，async。
  */
 import { canonicalJson } from '../crypto/canonical';
+import { normalizeGroupId } from '../../group-id';
 
 export const STATE_PREFIX = new TextEncoder().encode('AUN-V2-SC-v1');
 
@@ -78,7 +79,7 @@ function sortPayload(payload: StatePayload): void {
 /**
  * 计算 state_commitment（64 hex）。
  *
- * @param groupId      群 ID
+ * @param groupId      群 ID 或 group_aid
  * @param epoch        当前 epoch（uint32 big-endian 编入）
  * @param statePayload 状态负载（members / audit_aids / admin_set / ...）
  */
@@ -93,7 +94,8 @@ export async function computeStateCommitment(
   const sorted = deepClone(statePayload as StatePayload);
   sortPayload(sorted);
 
-  const groupBytes = new TextEncoder().encode(groupId);
+  const groupKey = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+  const groupBytes = new TextEncoder().encode(groupKey);
   const epochBytes = new Uint8Array(4);
   // big-endian uint32
   new DataView(epochBytes.buffer).setUint32(0, epoch, false);

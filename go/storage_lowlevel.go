@@ -403,15 +403,36 @@ func (l *StorageLowLevel) FSUnmount(ctx context.Context, owner, bucket, mountPat
 	}), mountPath)
 }
 
-func (l *StorageLowLevel) FSInvalidateMembership(ctx context.Context, groupID, groupOwnerAID, memberAID, reason, status string) (map[string]any, error) {
+type FSInvalidateMembershipOptions struct {
+	GroupID       string
+	GroupAID      string
+	GroupOwnerAID string
+	MemberAID     string
+	Reason        string
+	Status        string
+}
+
+func (l *StorageLowLevel) FSInvalidateMembershipWithOptions(ctx context.Context, opts FSInvalidateMembershipOptions) (map[string]any, error) {
+	groupID := firstNonEmpty(opts.GroupID, opts.GroupAID)
 	extra := map[string]any{
 		"group_id":        groupID,
-		"group_owner_aid": groupOwnerAID,
-		"member_aid":      emptyToNil(memberAID),
-		"reason":          reason,
-		"status":          emptyToNil(status),
+		"group_aid":       emptyToNil(opts.GroupAID),
+		"group_owner_aid": opts.GroupOwnerAID,
+		"member_aid":      emptyToNil(opts.MemberAID),
+		"reason":          firstNonEmpty(opts.Reason, "membership_changed"),
+		"status":          emptyToNil(opts.Status),
 	}
 	return l.call(ctx, "storage.fs.invalidate_membership", extra, "")
+}
+
+func (l *StorageLowLevel) FSInvalidateMembership(ctx context.Context, groupID, groupOwnerAID, memberAID, reason, status string) (map[string]any, error) {
+	return l.FSInvalidateMembershipWithOptions(ctx, FSInvalidateMembershipOptions{
+		GroupID:       groupID,
+		GroupOwnerAID: groupOwnerAID,
+		MemberAID:     memberAID,
+		Reason:        reason,
+		Status:        status,
+	})
 }
 
 func (l *StorageLowLevel) VolumeCreate(ctx context.Context, owner, bucket, volumeID string, sizeBytes int64, mountPoint string, expiresAt *int64, usedBytes *int64, status string) (map[string]any, error) {

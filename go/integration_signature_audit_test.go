@@ -439,7 +439,7 @@ func TestIntegration_SignatureAudit_SetRole(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TestIntegration_SignatureAudit_UnsignedOperationSafe
-// 只读操作（group.list_my、group.info）不需要签名，不应崩溃
+// 只读操作（group.list_my、group.get_info）不需要签名，不应崩溃
 // ---------------------------------------------------------------------------
 
 func TestIntegration_SignatureAudit_UnsignedOperationSafe(t *testing.T) {
@@ -476,18 +476,19 @@ func TestIntegration_SignatureAudit_UnsignedOperationSafe(t *testing.T) {
 	}
 	t.Logf("group.list_my 正常执行")
 
-	// ---- group.info 应正常执行 ----
-	infoResult, err := alice.Call(ctx, "group.info", map[string]any{
+	// ---- group.get_info 应正常执行 ----
+	infoResult, err := alice.Call(ctx, "group.get_info", map[string]any{
 		"group_id": groupID,
+		"required": []string{"member"},
 	})
-	skipIfNotImplemented(t, err, "group.info")
+	skipIfNotImplemented(t, err, "group.get_info")
 	if err != nil {
-		t.Fatalf("group.info 失败: %v", err)
+		t.Fatalf("group.get_info 失败: %v", err)
 	}
 	if infoResult == nil {
-		t.Fatalf("group.info 返回 nil")
+		t.Fatalf("group.get_info 返回 nil")
 	}
-	t.Logf("group.info 正常执行")
+	t.Logf("group.get_info 正常执行")
 
 	t.Logf("只读操作无签名要求，执行正常，无崩溃")
 }

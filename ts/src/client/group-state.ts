@@ -125,6 +125,14 @@ function normalizedGroupId(raw: unknown): string {
   return normalizeGroupId(groupId) || groupId;
 }
 
+function groupCacheIds(raw: unknown, groupId: string): string[] {
+  const ids: string[] = [];
+  for (const value of [groupId, String(raw ?? '').trim()]) {
+    if (value && !ids.includes(value)) ids.push(value);
+  }
+  return ids;
+}
+
 export class GroupStateCoordinator {
   private readonly runtime: ClientRuntime;
 
@@ -163,13 +171,16 @@ export class GroupStateCoordinator {
 
   handleGroupChangedV2Membership(data: JsonObject): void {
     const client = this.client;
-    const groupId = normalizedGroupId(data.group_id);
+    const rawGroupId = data.group_aid ?? data.group_id;
+    const groupId = normalizedGroupId(rawGroupId);
     const action = String(data.action ?? '').trim();
     if (!groupId) {
       return;
     }
 
-    client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${groupId}`);
+    for (const cacheGroupId of groupCacheIds(rawGroupId, groupId)) {
+      client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${cacheGroupId}`);
+    }
     const membershipAction = MEMBERSHIP_ACTIONS.has(action);
     if (client._v2Session && (action === 'upsert' || membershipAction)) {
       client._safeAsync(client._v2AutoProposeState(groupId, { leaderDelay: true }));
@@ -181,7 +192,7 @@ export class GroupStateCoordinator {
     const client = this.client;
     const d = isJsonObject(data as JsonValue | object | null | undefined) ? data as JsonObject : null;
     if (!d || !client._v2Session) return;
-    const groupId = normalizedGroupId(d.group_id);
+    const groupId = normalizedGroupId(d.group_aid ?? d.group_id);
     if (!groupId) return;
     await client._dispatcher.publish('group.v2.state_proposed', d);
     try {
@@ -195,7 +206,7 @@ export class GroupStateCoordinator {
     const client = this.client;
     const d = isJsonObject(data as JsonValue | object | null | undefined) ? data as JsonObject : null;
     if (!d || !client._v2Session) return;
-    const groupId = normalizedGroupId(d.group_id);
+    const groupId = normalizedGroupId(d.group_aid ?? d.group_id);
     if (!groupId) return;
     await client._dispatcher.publish('group.v2.state_retry_needed', d);
     try {
@@ -209,9 +220,12 @@ export class GroupStateCoordinator {
     const client = this.client;
     const d = isJsonObject(data as JsonValue | object | null | undefined) ? data as JsonObject : null;
     if (!d) return;
-    const groupId = normalizedGroupId(d.group_id);
+    const rawGroupId = d.group_aid ?? d.group_id;
+    const groupId = normalizedGroupId(rawGroupId);
     if (groupId) {
-      client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${groupId}`);
+      for (const cacheGroupId of groupCacheIds(rawGroupId, groupId)) {
+        client._v2E2EE?.deleteBootstrapCacheEntry?.(`group:${cacheGroupId}`);
+      }
       client._v2AutoProposeLastSnapshot?.delete?.(groupId);
     }
     await client._dispatcher.publish('group.v2.state_confirmed', d);
@@ -344,7 +358,7 @@ export class GroupStateCoordinator {
       return;
     }
     const d = data as JsonObject;
-    const groupId = String(d.group_id ?? '').trim();
+    const groupId = normalizedGroupId(d.group_aid ?? d.group_id);
     if (!groupId) {
       client._clientLog.debug(`_onGroupStateCommitted exit: elapsed=${Date.now() - tStart}ms (no group_id)`);
       return;
@@ -787,7 +801,7 @@ export class GroupStateCoordinator {
       if (!Array.isArray(groups)) return;
       for (const group of groups) {
         if (!isJsonObject(group as JsonValue | object | null | undefined)) continue;
-        const groupId = String((group as JsonObject).group_id ?? '').trim();
+        const groupId = normalizedGroupId((group as JsonObject).group_aid ?? (group as JsonObject).group_id);
         const myRole = String((group as JsonObject).role ?? (group as JsonObject).my_role ?? '').trim();
         if (!groupId || (myRole !== 'owner' && myRole !== 'admin')) continue;
         try {
@@ -809,7 +823,7 @@ export class GroupStateCoordinator {
     const extracted = typeof client._extractGroupIdFromResult === 'function'
       ? client._extractGroupIdFromResult(result)
       : '';
-    return normalizedGroupId(extracted || params.group_id || '');
+    return normalizedGroupId(extracted || params.group_aid || params.group_id || '');
   }
 
   private pruneSigCache(now: number): void {
@@ -845,8 +859,16 @@ export class GroupStateCoordinator {
 
       let mode = '';
       try {
-        const req = await client.call('group.get_join_requirements', { group_id: groupId });
-        mode = isJsonObject(req as JsonValue | object | null | undefined) ? String((req as JsonObject).mode ?? '') : '';
+        const resp = await client.call('group.get_settings', { group_id: groupId, keys: ['join.mode'] });
+        const settings: Record<string, unknown> = {};
+        if (isJsonObject(resp as JsonValue | object | null | undefined) && Array.isArray((resp as JsonObject).settings)) {
+          for (const s of (resp as JsonObject).settings as unknown[]) {
+            if (isJsonObject(s as JsonValue | object | null | undefined) && typeof (s as JsonObject).key === 'string') {
+              settings[(s as JsonObject).key as string] = (s as JsonObject).value;
+            }
+          }
+        }
+        mode = String(settings['join.mode'] ?? '');
       } catch {
         mode = '';
       }

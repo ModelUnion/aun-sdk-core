@@ -547,6 +547,25 @@ describe('LocalIdentityStore', () => {
     }
   });
 
+
+  it('group_aid 应读取旧格式 group_state 记录', async () => {
+    const ks = new LocalTokenStore(tmpDir);
+    const legacyGroupId = 'group.agentid.pub/room-123';
+    const groupAid = 'room-123.agentid.pub';
+
+    const db = (ks as any)._getDB('group-aid.agentid.pub');
+    db.saveGroupState(legacyGroupId, 7, 'state-hash-legacy', 3, '[]', '{}');
+
+    const state = db.loadGroupState(groupAid);
+    expect(state).toMatchObject({
+      group_id: legacyGroupId,
+      group_aid: groupAid,
+      state_hash: 'state-hash-legacy',
+    });
+
+    ks.close();
+  });
+
   it('loadKeyPair 不存在的 AID 返回 null', () => {
     const ks = new LocalIdentityStore(tmpDir);
     expect(ks.loadKeyPair('nonexistent')).toBeNull();

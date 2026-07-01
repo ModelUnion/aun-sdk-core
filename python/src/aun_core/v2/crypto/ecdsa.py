@@ -19,8 +19,30 @@ from cryptography.exceptions import InvalidSignature
 
 
 _PUBLIC_KEY_CACHE_MAX = 512
+_PRIVATE_KEY_CACHE_MAX = 128
+_PRIVATE_KEY_CACHE: OrderedDict[bytes, ec.EllipticCurvePrivateKey] = OrderedDict()
 _PUBLIC_KEY_CACHE: OrderedDict[bytes, ec.EllipticCurvePublicKey] = OrderedDict()
 _PUBLIC_KEY_CACHE_LOCK = RLock()
+_PRIVATE_KEY_CACHE_LOCK = RLock()
+
+
+def _private_key_from_scalar(private_key_scalar: bytes) -> ec.EllipticCurvePrivateKey:
+    with _PRIVATE_KEY_CACHE_LOCK:
+        cached = _PRIVATE_KEY_CACHE.get(private_key_scalar)
+        if cached is not None:
+            _PRIVATE_KEY_CACHE.move_to_end(private_key_scalar)
+            return cached
+    private_key = ec.derive_private_key(
+        int.from_bytes(private_key_scalar, "big"),
+        ec.SECP256R1(),
+        default_backend(),
+    )
+    with _PRIVATE_KEY_CACHE_LOCK:
+        _PRIVATE_KEY_CACHE[private_key_scalar] = private_key
+        _PRIVATE_KEY_CACHE.move_to_end(private_key_scalar)
+        while len(_PRIVATE_KEY_CACHE) > _PRIVATE_KEY_CACHE_MAX:
+            _PRIVATE_KEY_CACHE.popitem(last=False)
+    return private_key
 
 
 def _public_key_from_der(public_key_der: bytes) -> ec.EllipticCurvePublicKey | None:
@@ -52,11 +74,7 @@ def ecdsa_sign_raw(private_key_scalar: bytes, message: bytes) -> bytes:
     Returns:
         64 字节签名（r 32B || s 32B）
     """
-    private_key = ec.derive_private_key(
-        int.from_bytes(private_key_scalar, "big"),
-        ec.SECP256R1(),
-        default_backend(),
-    )
+    private_key = _private_key_from_scalar(private_key_scalar)
 
     # cryptography 库 >= 41.0 支持 deterministic_signing=True (RFC 6979)
     der_sig = private_key.sign(message, ec.ECDSA(hashes.SHA256(), deterministic_signing=True))

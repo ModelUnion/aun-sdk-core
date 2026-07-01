@@ -305,12 +305,14 @@ async def test_join_requirements_and_batch_review():
         )
         _ok("创建带问题的审批群")
 
-        req = (await alice.call("group.get_join_requirements", {
+        result = await alice.call("group.get_settings", {
             "group_id": group_question,
-        })).get("join_requirements") or {}
-        if req.get("mode") != "approval" or req.get("question") != "用途是什么？":
-            raise AssertionError(f"入群要求初始化异常: {req}")
-        _ok("get_join_requirements 返回初始化配置")
+            "keys": ["join.mode", "join.question"],
+        })
+        settings = {s["key"]: s["value"] for s in result.get("settings", [])}
+        if settings.get("join.mode") != "approval" or settings.get("join.question") != "用途是什么？":
+            raise AssertionError(f"入群要求初始化异常: {settings}")
+        _ok("get_settings 返回初始化配置")
 
         question = await bobb.call("group.request_join", {"group_id": group_question})
         if question.get("status") != "question_required":
@@ -361,9 +363,9 @@ async def test_join_requirements_and_batch_review():
             raise AssertionError(f"拒绝审批返回异常: {rejected}")
         _ok("单个审批拒绝路径")
 
-        await alice.call("group.update_join_requirements", {
+        await alice.call("group.set_settings", {
             "group_id": group_question,
-            "mode": "open",
+            "settings": {"join.mode": "open"},
         })
         joined = await bobb.call("group.request_join", {
             "group_id": group_question,
@@ -556,12 +558,14 @@ async def test_query_stats_and_dissolve_guards():
     rid = uuid.uuid4().hex[:10]
     alice = _make_client()
     bobb = _make_client()
+    charlie = _make_client()
     public_gid = ""
     private_gid = ""
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bobb, _BOBB_AID)
+        await _ensure_connected(charlie, _CHARLIE_AID)
 
         public_gid = await _create_group(
             alice,
@@ -576,44 +580,30 @@ async def test_query_stats_and_dissolve_guards():
         await alice.call("group.add_member", {"group_id": private_gid, "aid": _BOBB_AID})
         _ok("创建查询/统计测试群")
 
-        got = await alice.call("group.get", {"group_id": public_gid})
-        if not got.get("found") or (got.get("group") or {}).get("group_id") != public_gid:
-            raise AssertionError(f"group.get 返回异常: {got}")
-        _ok("group.get 返回群详情")
+        info = await alice.call("group.get_info", {
+            "group_id": public_gid,
+            "required": ["member"],
+        })
+        if info.get("group_id") != public_gid or "name" not in info or "owner_aid" not in info:
+            raise AssertionError(f"group.get_info 返回异常: {info}")
+        _ok("group.get_info 返回平铺群详情")
 
-        info = await alice.call("group.get_info", {"group_id": public_gid})
-        if info.get("group_id") != public_gid or "name" not in info:
-            raise AssertionError(f"group.get_info 兼容返回异常: {info}")
-        _ok("group.get_info 顶层兼容字段存在")
-
-        public_info = await bobb.call("group.get_public_info", {"group_id": public_gid})
-        if (public_info.get("group") or {}).get("group_id") != public_gid:
+        public_info = await bobb.call("group.get_info", {"group_id": public_gid})
+        if public_info.get("group_id") != public_gid or "owner_aid" in public_info:
             raise AssertionError(f"非成员读取 public info 失败: {public_info}")
-        _ok("非成员可读取 public info")
+        _ok("非成员可通过 get_info 默认读取公开信息")
 
         await _expect_failure(
-            lambda: bobb.call("group.get_public_info", {"group_id": private_gid}),
-            "private 群 get_public_info 被拒绝",
-            contains="not public",
+            lambda: charlie.call("group.get_info", {"group_id": private_gid}),
+            "private 群 get_info 默认公开信息被拒绝",
+            contains="not a member",
         )
-        _ok("private 群 public_info 被拒绝")
+        _ok("private 群 get_info 默认公开信息被拒绝")
 
         mine = await alice.call("group.list_my", {})
         if not any(item.get("group_id") in {public_gid, private_gid} for item in mine.get("items", [])):
             raise AssertionError(f"group.list_my 未包含新建群: {mine}")
         _ok("group.list_my 包含成员索引")
-
-        stats = await alice.call("group.get_stats", {"group_id": private_gid})
-        if stats.get("group_id") != private_gid or "member_count" not in stats:
-            raise AssertionError(f"owner get_stats 返回异常: {stats}")
-        _ok("owner 可读取 get_stats")
-
-        await _expect_failure(
-            lambda: bobb.call("group.get_stats", {"group_id": private_gid}),
-            "普通成员 get_stats 被拒绝",
-            contains="admin",
-        )
-        _ok("普通成员 get_stats 权限生效")
 
         await _expect_failure(
             lambda: bobb.call("group.dissolve", {"group_id": private_gid}),
@@ -633,7 +623,7 @@ async def test_query_stats_and_dissolve_guards():
     finally:
         await _cleanup_group(alice, public_gid)
         await _cleanup_group(alice, private_gid)
-        await _close_all(alice, bobb)
+        await _close_all(alice, bobb, charlie)
 
 
 async def _run_test(name: str, func):

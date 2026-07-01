@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelunion/aun-sdk-core/go/v2/e2ee"
@@ -53,15 +54,18 @@ func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID str
 	if state == nil || state.session == nil {
 		return nil, errors.New("V2 session not initialized (not connected?)")
 	}
+	groupID = groupAIDOrRaw(groupID)
 	if groupID == "" {
 		return nil, errors.New("send_group_v2: group_id 不能为空")
 	}
 	c.logMessageDebugWithPayload("send-plaintext", "group.send.v2", "group.send", map[string]any{
-		"group_id": groupID,
-		"payload":  payload,
+		"group_id":  groupID,
+		"group_aid": groupID,
+		"payload":   payload,
 	}, payload, nil)
 	resultParams := map[string]any{
 		"group_id":          groupID,
+		"group_aid":         groupID,
 		"payload":           payload,
 		"protected_headers": opts.ProtectedHeaders,
 		"context":           opts.Context,
@@ -98,33 +102,13 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 		return nil, fmt.Errorf("V2 group bootstrap: no devices found for group %s", groupID)
 	}
 
-	c.mu.RLock()
-	myAID := c.aid
-	myDeviceID := c.deviceID
-	c.mu.RUnlock()
-
-	// 构建 targets：排除自己当前设备，同 AID 其它设备 role="self_sync"
-	targets := make([]e2ee.Target, 0, len(allDevices))
-	for _, dev := range allDevices {
-		devAID := v2AsString(dev["aid"])
-		devID, hasDeviceID := v2DeviceIDFromDevice(dev)
-		if devAID == myAID && hasDeviceID && devID == myDeviceID {
-			continue
-		}
-		role := "member"
-		if devAID == myAID {
-			role = "self_sync"
-		}
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, devAID, devID, role, "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
+	targetSet, err := v.v2GroupTargetSet(ctx, state, groupID, allDevices, auditRaw, wrapPolicy, useCache)
+	if err != nil {
+		return nil, err
 	}
+	sendTargets := targetSet.Targets
 
-	if len(targets) == 0 {
+	if len(sendTargets) == 0 {
 		if usedCachedBootstrap {
 			return nil, NewAUNError(
 				fmt.Sprintf("V2 group: no target devices for group %s; bootstrap may be stale", groupID),
@@ -134,23 +118,12 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 		}
 		return nil, fmt.Errorf("V2 group: no target devices for group %s", groupID)
 	}
-	// 监管 AID：audit_recipients 加入 targets（role="audit"）
-	for _, dev := range auditRaw {
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
-	}
 
 	sender, err := state.session.GetSenderIdentity()
 	if err != nil {
 		return nil, fmt.Errorf("send_group_v2: 获取 sender identity 失败: %w", err)
 	}
 
-	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptGroupMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -182,8 +155,9 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 	})
 
 	raw, err := c.Call(ctx, "group.v2.send", map[string]any{
-		"group_id": groupID,
-		"envelope": envelope,
+		"group_id":  groupID,
+		"group_aid": groupID,
+		"envelope":  envelope,
 	})
 	if err != nil {
 		return nil, err
@@ -210,6 +184,7 @@ func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *
 
 	raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{
 		"group_id":               groupID,
+		"group_aid":              groupID,
 		"e2ee_wrap_capabilities": v2WrapCapabilities(),
 	})
 	if err != nil {
@@ -259,6 +234,7 @@ func (v *v2E2EECoordinator) v2ResolveGroupBootstrap(ctx context.Context, state *
 type groupV2PullOptions struct {
 	explicitAfterSeq bool
 	cursorParams     map[string]any
+	wireGroupID      string
 }
 
 // PullGroupV2 拉取并解密 V2 Group 消息。
@@ -277,8 +253,17 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 	if state == nil || state.session == nil {
 		return nil, meta, errors.New("V2 session not initialized (not connected?)")
 	}
+	rawGroupID := strings.TrimSpace(groupID)
+	groupID = groupAIDOrRaw(rawGroupID)
 	if groupID == "" {
 		return nil, meta, errors.New("pull_group_v2: group_id 不能为空")
+	}
+	wireGroupID := strings.TrimSpace(opts.wireGroupID)
+	if wireGroupID == "" {
+		wireGroupID = rawGroupID
+	}
+	if wireGroupID == "" {
+		wireGroupID = groupID
 	}
 	if limit <= 0 {
 		limit = 50
@@ -291,7 +276,7 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 	}
 
 	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ns=%s", groupID, effectiveAfterSeq, limit, ns)
-	raw, err := v.rawGroupV2Pull(ctx, groupID, effectiveAfterSeq, limit, opts.cursorParams)
+	raw, err := v.rawGroupV2Pull(ctx, wireGroupID, groupID, effectiveAfterSeq, limit, opts.cursorParams)
 	if err != nil {
 		return nil, meta, err
 	}
@@ -387,10 +372,16 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 	return decrypted, meta, nil
 }
 
-func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, wireGroupID string, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
 	c := v.runtime.client
+	wireGroupID = strings.TrimSpace(wireGroupID)
+	groupID = groupAIDOrRaw(groupID)
+	if wireGroupID == "" {
+		wireGroupID = groupID
+	}
 	params := map[string]any{
-		"group_id":  groupID,
+		"group_id":  wireGroupID,
+		"group_aid": groupID,
 		"after_seq": afterSeq,
 		"limit":     limit,
 	}
@@ -418,6 +409,7 @@ func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, groupID string, 
 // Group 不触发 PFS SPK 销毁。
 func (v *v2E2EECoordinator) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
 	c := v.runtime.client
+	groupID = groupAIDOrRaw(groupID)
 	if groupID == "" {
 		return nil, errors.New("ack_group_v2: group_id 不能为空")
 	}
@@ -439,6 +431,7 @@ func (v *v2E2EECoordinator) ackGroupV2(ctx context.Context, groupID string, upTo
 	c.logE2.Debug("group.v2.ack send: group=%s ns=%s up_to_seq=%d", groupID, ns, seq)
 	ackParams := map[string]any{
 		"group_id":  groupID,
+		"group_aid": groupID,
 		"up_to_seq": seq,
 	}
 	if rpcBackgroundFromContext(ctx) {
@@ -479,7 +472,7 @@ func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, 
 }
 
 func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
-	return c.getV2E2EECoordinator().rawGroupV2Pull(ctx, groupID, afterSeq, limit, cursorParams)
+	return c.getV2E2EECoordinator().rawGroupV2Pull(ctx, groupID, groupAIDOrRaw(groupID), afterSeq, limit, cursorParams)
 }
 
 func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {

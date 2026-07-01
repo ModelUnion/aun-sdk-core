@@ -452,6 +452,7 @@ func TestP0Integration_03_LoginExpiredChallenge(t *testing.T) {
 	// 首次认证 — 获取第一次 token
 	auth1, err := c.Authenticate(ctx)
 	if err != nil {
+		skipIfGatewayRateLimited(t, "首次认证", err)
 		t.Fatalf("首次认证失败: %v", err)
 	}
 	if auth1["access_token"] == nil {

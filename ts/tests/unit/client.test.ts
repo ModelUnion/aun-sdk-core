@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { AUNClient } from '../../src/client.js';
 import { AID } from '../../src/aid.js';
 import { RPCTransport } from '../../src/transport.js';
-import { AuthError, ConnectionError, PermissionError, StateError, ValidationError } from '../../src/errors.js';
+import { AuthError, ConnectionError, StateError, TimeoutError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 import { computeStateCommitment } from '../../src/v2/state/index.js';
 import { encryptP2PMessage } from '../../src/v2/e2ee/encrypt-p2p.js';
@@ -47,6 +47,13 @@ describe('AUNClient peer 证书缓存', () => {
   it('TTL 应为 3600 秒', () => {
     const source = readFileSync(new URL('../../src/client.ts', import.meta.url), 'utf8');
     expect(source).toContain('const PEER_CERT_CACHE_TTL = 3600;');
+  });
+
+  it('不再订阅 V1 epoch rotation 残留事件', () => {
+    const source = readFileSync(new URL('../../src/client.ts', import.meta.url), 'utf8')
+      + readFileSync(new URL('../../src/client/v2-e2ee.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain('group.v2.epoch_rotated');
+    expect(source).not.toContain('_onV2EpochRotated');
   });
 });
 
@@ -143,30 +150,31 @@ describe('AUNClient.call 状态检查', () => {
     await expect(client.call('meta.ping')).rejects.toThrow(ConnectionError);
   });
 
+  it('ready 状态下 RPC 超时应触发半开连接重连', async () => {
+    const client = new AUNClient();
+    const err = new TimeoutError('rpc timeout: message.query_online', { retryable: true });
+    (client as any)._state = 'ready';
+    (client as any)._sessionOptions = {
+      auto_reconnect: true,
+      retry: { initial_delay: 0.01, max_delay: 0.05, max_attempts: 0 },
+      timeouts: { connect: 5, call: 10, http: 30 },
+      heartbeat_interval: 0,
+      token_refresh_before: 60,
+    };
+    vi.spyOn((client as any)._rpcPipeline, 'call').mockRejectedValue(err);
+    const closeSpy = vi.spyOn((client as any)._transport, 'close').mockResolvedValue(undefined);
+    const reconnectSpy = vi.spyOn(client as any, '_startReconnect').mockImplementation(() => undefined);
+
+    await expect(client.call('message.query_online', { aids: ['alice.agentid.pub'] })).rejects.toBe(err);
+    expect(closeSpy).toHaveBeenCalled();
+    expect(reconnectSpy).toHaveBeenCalled();
+  });
+
   it('内部方法被阻止', async () => {
     const client = new AUNClient();
     // 即使未连接，内部方法检查也应在连接检查之前
     // 但实际上连接检查先执行，所以这里测试的是连接检查
     await expect(client.call('auth.login1')).rejects.toThrow();
-  });
-
-  it('已移除的 V1 E2EE RPC 应在签名和传输前被拒绝', async () => {
-    const client = new AUNClient();
-    (client as any)._state = 'connected';
-    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
-
-    const removedMethods = [
-      'message.e2ee.upload_prekey',
-      'group.e2ee.begin_rotation',
-      'group.e2ee.commit_rotation',
-      'group.e2ee.abort_rotation',
-      'group.rotate_epoch',
-    ];
-
-    for (const method of removedMethods) {
-      await expect(client.call(method, { group_id: 'group.agentid.pub/grp01' })).rejects.toThrow(PermissionError);
-    }
-    expect((client as any)._transport.call).not.toHaveBeenCalled();
   });
 
   it('非幂等 RPC 应按毫秒传入 35 秒超时', async () => {
@@ -264,7 +272,7 @@ describe('AUNClient.notify', () => {
     await client.notify(
       'event/app.typing',
       { thread_id: 't1' },
-      { to: 'bob.agentid.pub', device_id: 'dev-1', slot_id: 'slot-1', ttl_ms: 5000 },
+      { to: 'bob1.agentid.pub', device_id: 'dev-1', slot_id: 'slot-1', ttl_ms: 5000 },
     );
 
     expect((client as any)._transport.notify).toHaveBeenCalledWith(
@@ -272,7 +280,7 @@ describe('AUNClient.notify', () => {
       {
         target: {
           type: 'aid',
-          aid: 'bob.agentid.pub',
+          aid: 'bob1.agentid.pub',
           device_id: 'dev-1',
           slot_id: 'slot-1',
         },
@@ -294,7 +302,30 @@ describe('AUNClient.notify', () => {
     expect((client as any)._transport.notify).toHaveBeenCalledWith(
       'notification/group.route',
       {
-        group_id: 'group.agentid.pub/g-room',
+        group_aid: 'g-room.agentid.pub',
+        group_id: 'g-room.agentid.pub',
+        deliver: {
+          method: 'event/app.presence',
+          params: { state: 'active' },
+        },
+      },
+    );
+  });
+
+  it('group_aid 目标应优先包装为 notification/group.route', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.notify = vi.fn().mockResolvedValue(undefined);
+
+    await client.notify('event/app.presence', { state: 'active' }, {
+      group_aid: 'group.agentid.pub/room-123',
+      group_id: 'legacy-ignored.agentid.pub',
+    });
+
+    expect((client as any)._transport.notify).toHaveBeenCalledWith(
+      'notification/group.route',
+      {
+        group_aid: 'room-123.agentid.pub',
+        group_id: 'room-123.agentid.pub',
         deliver: {
           method: 'event/app.presence',
           params: { state: 'active' },
@@ -420,7 +451,7 @@ describe('AUNClient message.send 接收者校验', () => {
     (client as any)._state = 'connected';
 
     await expect(client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       persist: true,
@@ -432,7 +463,7 @@ describe('AUNClient message.send 接收者校验', () => {
     (client as any)._state = 'connected';
 
     await expect(client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       delivery_mode: { mode: 'queue' },
@@ -451,7 +482,7 @@ describe('AUNClient message.send 接收者校验', () => {
     const protectedHeaders = new ProtectedHeaders({ Device_ID: 'dev-a', slot_id: 'slot-a' });
 
     await client.call('message.send', {
-      to: 'bob.example.com',
+      to: 'bob1.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
       protected_headers: protectedHeaders as unknown as Record<string, string>,
@@ -526,9 +557,9 @@ describe('AUNClient 证书 URL 编排', () => {
   it('构建证书 URL 时应透传 cert_fingerprint', () => {
     expect((AUNClient as any)._buildCertUrl(
       'wss://gateway.example.com/aun',
-      'bob.example.com',
+      'bob1.example.com',
       'sha256:abc',
-    )).toBe('https://gateway.example.com/pki/cert/bob.example.com?cert_fingerprint=sha256%3Aabc');
+    )).toBe('https://gateway.example.com/pki/cert/bob1.example.com?cert_fingerprint=sha256%3Aabc');
   });
 });
 
@@ -940,8 +971,8 @@ describe('AUNClient V2 群状态自动编排', () => {
     await (client as any)._onRawGroupChanged({
       group_id: 'test-group-123',
       action: 'invite_code_used',
-      member_aid: 'bob.aid.com',
-      actor_aid: 'bob.aid.com',
+      member_aid: 'bob1.aid.com',
+      actor_aid: 'bob1.aid.com',
     });
 
     expect(proposeSpy).toHaveBeenCalledWith('test-group-123', { leaderDelay: true });
@@ -1146,10 +1177,10 @@ describe('group.add_member 成员变更 V2 state 处理', () => {
 
     expect((client as any)._transport.call).toHaveBeenCalledWith(
       'group.add_member',
-      expect.objectContaining({ group_id: 'group.agentid.pub/g-abc' }),
+      expect.objectContaining({ group_id: 'g-abc.agentid.pub' }),
       35_000,
     );
-    expect(proposeSpy).toHaveBeenCalledWith('group.agentid.pub/g-abc');
+    expect(proposeSpy).toHaveBeenCalledWith('g-abc.agentid.pub');
   });
 });
 
@@ -1347,7 +1378,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
               version: 'v1',
               seq: 1,
               message_id: 'gm-sync-1',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               payload: { type: 'text', text: 'sync-1' },
             },
           ],
@@ -1373,6 +1404,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
       ['group.v2.pull', {
         group_id: 'grp01',
+        group_aid: 'grp01',
         after_seq: 0,
         limit: 2,
         device_id: 'sync-dev-a',
@@ -1443,7 +1475,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       version: 'v2',
       suite: 'P256_HKDF_SHA256_AES_256_GCM',
       payload_type: 'text',
-      aad: { from: 'bob.aid.com', from_device: 'bob-dev' },
+      aad: { from: 'bob1.aid.com', from_device: 'bob-dev' },
       recipients: [['alice.aid.com', 'device-001', 'peer', 'peer_device_prekey', 'fp', 'missing-spk', 'n', 'w']],
       protected_headers: { payload_type: 'text', trace_id: 'trace-1', _auth: 'secret' },
     };
@@ -1451,7 +1483,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._decryptV2Message({
       seq: 1,
       message_id: 'm1',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: JSON.stringify(envelope),
       t_server: 123,
     });
@@ -1468,7 +1500,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const [senderIkPriv, senderIkPubDer] = generateP256Keypair();
     const [recipientIkPriv, recipientIkPubDer] = generateP256Keypair();
     const sender = {
-      aid: 'bob.aid.com',
+      aid: 'bob1.aid.com',
       deviceId: 'bob-dev',
       ikPriv: senderIkPriv,
       ikPubDer: senderIkPubDer,
@@ -1490,7 +1522,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._decryptV2Message({
       seq: 1,
       message_id: 'm1',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: JSON.stringify(envelope),
       t_server: 123,
       device_id: 'device-001',
@@ -1510,7 +1542,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const [senderIkPriv, senderIkPubDer] = generateP256Keypair();
     const [recipientIkPriv, recipientIkPubDer] = generateP256Keypair();
     const sender = {
-      aid: 'bob.aid.com',
+      aid: 'bob1.aid.com',
       deviceId: 'bob-dev',
       ikPriv: senderIkPriv,
       ikPubDer: senderIkPubDer,
@@ -1532,7 +1564,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._decryptV2Message({
       seq: 1,
       message_id: 'gm1',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       group_id: 'grp01',
       envelope_json: JSON.stringify(envelope),
       t_server: 123,
@@ -1558,7 +1590,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `m-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -1610,7 +1642,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `gap-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -1628,7 +1660,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
     const v2AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     const v1AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.ack');
-    // 第一次 pull 拿到 [1,2,3]，第二次 pull 因 contiguous 推进到 3 触发递归补洞确认 has_more=false
+    // _pullV2 内部已持续拉到空页，外层 gap-fill 不再额外递归确认。
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 50 }, undefined, undefined, true],
       ['message.v2.pull', { after_seq: 3, limit: 50 }, undefined, undefined, true],
@@ -1652,7 +1684,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
           await (client as any)._onV2PushNotification({
             seq: 5,
             message_id: 'm-push-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
           });
           return { has_more: false, messages: [] };
         }
@@ -1662,7 +1694,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq: 5,
             message_id: 'm-push-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: 5,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -1698,7 +1730,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `gm-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             type: 'message',
             payload: { type: 'text', text: `gm-${seq}` },
@@ -1714,7 +1746,54 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+  });
+
+  it('group.v2.pull 应使用 group_aid 作为本地 namespace，并保留旧 group_id 查询字段', async () => {
+    const client = makeV2Client();
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'group.v2.pull') {
+        return {
+          has_more: false,
+          messages: [{
+            version: 'v1',
+            seq: 1,
+            message_id: 'gm-legacy-1',
+            from_aid: 'bob1.aid.com',
+            t_server: 1,
+            type: 'message',
+            payload: { type: 'text', text: 'gm-legacy-1' },
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await client.call('group.pull', { group_id: 'group.example.com/g1', after_seq: 0, limit: 10 });
+
+    expect((result.messages as Array<Record<string, unknown>>).map((msg) => msg.seq)).toEqual([1]);
+    expect((client as any)._seqTracker.getContiguousSeq('group:g1.example.com')).toBe(1);
+    expect((client as any)._seqTracker.getContiguousSeq('group:group.example.com/g1')).toBe(0);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
+      ['group.v2.pull', {
+        group_id: 'group.example.com/g1',
+        group_aid: 'g1.example.com',
+        after_seq: 0,
+        limit: 10,
+        device_id: 'device-001',
+        slot_id: 'slot-a',
+      }, undefined, undefined, true],
+    ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
+      ['group.v2.ack', {
+        group_id: 'g1.example.com',
+        group_aid: 'g1.example.com',
+        up_to_seq: 1,
+        device_id: 'device-001',
+        slot_id: 'slot-a',
+      }, undefined, undefined, true],
+    ]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -1729,7 +1808,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `m-page-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -1751,6 +1830,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 2 }, undefined, undefined, true],
       ['message.v2.pull', { after_seq: 2, limit: 2 }, undefined, undefined, true],
+      ['message.v2.pull', { after_seq: 3, limit: 2 }, undefined, undefined, true],
     ]);
     expect(ackCalls).toEqual([
       ['message.v2.ack', { up_to_seq: 2 }, undefined, undefined, true],
@@ -1770,7 +1850,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `gm-page-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             type: 'message',
             payload: { type: 'text', text: `gm-page-${seq}` },
@@ -1788,12 +1868,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
-      ['group.v2.pull', { group_id: 'grp01', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.pull', { group_id: 'grp01', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
     expect(ackCalls).toEqual([
-      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
   });
 
@@ -1828,7 +1908,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq: 5,
             message_id: 'm-stale-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             legacy_v1: {
               to: 'alice.aid.com',
               payload: { type: 'text', text: 'old' },
@@ -1843,7 +1923,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
-    expect(result.map((msg) => msg.seq)).toEqual([5]);
+    expect(result.map((msg) => msg.seq)).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
@@ -1862,7 +1942,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v2',
             seq: 5,
             message_id: 'm-lag-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             envelope_json: '{}',
           }],
         };
@@ -1871,7 +1951,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullV2(5, 10);
+    const result = await (client as any)._pullV2(4, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -1896,7 +1976,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `m-event-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             legacy_v1: {
               to: 'alice.aid.com',
@@ -1948,7 +2028,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq: 5,
             message_id: 'gm-stale-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             payload: { type: 'text', text: 'old' },
           }],
         };
@@ -1979,7 +2059,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v2',
             seq: 5,
             message_id: 'gm-lag-5',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             envelope_json: '{}',
           }],
         };
@@ -1994,7 +2074,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 5, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 5, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
   });
 
@@ -2013,7 +2093,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             version: 'v1',
             seq,
             message_id: `gm-event-${seq}`,
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             t_server: seq,
             type: 'message',
             payload: { type: 'text', text: `gm-event-${seq}` },
@@ -2029,7 +2109,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
   });
 
   it('V2 target 构建应接受显式空 device_id', async () => {
@@ -2040,7 +2120,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const target = await (client as any)._v2BuildTargetFromDevice({
       dev: { device_id: '', ik_pk: 'AQID' },
-      aid: 'bob.aid.com',
+      aid: 'bob1.aid.com',
       deviceId: '',
       hasDeviceId: true,
       role: 'peer',
@@ -2048,11 +2128,11 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
 
     expect(target).toEqual(expect.objectContaining({
-      aid: 'bob.aid.com',
+      aid: 'bob1.aid.com',
       deviceId: '',
       role: 'peer',
     }));
-    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
+    expect(cachePeerIK).toHaveBeenCalledWith('bob1.aid.com', '', expect.any(Uint8Array));
   });
 
   it('V2 target 构建应接受 bootstrap 中 SPK 字段实际为 IK', async () => {
@@ -2067,15 +2147,15 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const target = await (client as any)._v2BuildTargetFromDevice({
       dev: { device_id: '', ik_pk: ikB64, spk_pk: ikB64, spk_id: ikId, key_source: 'peer_device_prekey' },
-      aid: 'bob.aid.com',
+      aid: 'bob1.aid.com',
       deviceId: '',
       role: 'peer',
       defaultKeySource: 'peer_device_prekey',
     });
 
-    expect(target).toEqual(expect.objectContaining({ aid: 'bob.aid.com', deviceId: '', spkId: ikId }));
-    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
-    expect(markPeerSPKVerified).toHaveBeenCalledWith('bob.aid.com', '', ikId);
+    expect(target).toEqual(expect.objectContaining({ aid: 'bob1.aid.com', deviceId: '', spkId: ikId }));
+    expect(cachePeerIK).toHaveBeenCalledWith('bob1.aid.com', '', expect.any(Uint8Array));
+    expect(markPeerSPKVerified).toHaveBeenCalledWith('bob1.aid.com', '', ikId);
   });
   it('V2 sender IK pending resolver 应通过 bootstrap 缓存显式空 device_id 的 IK', async () => {
     const client = makeV2Client();
@@ -2093,12 +2173,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     vi.spyOn(client as any, '_fetchPeerCert').mockRejectedValue(new Error('no cert'));
 
-    await (client as any)._v2E2EE.resolveSenderIKPending('bob.aid.com', '', '', 'bob.aid.com||');
-    const pub = (client as any)._v2Session.getPeerIK('bob.aid.com', '');
+    await (client as any)._v2E2EE.resolveSenderIKPending('bob1.aid.com', '', '', 'bob1.aid.com||');
+    const pub = (client as any)._v2Session.getPeerIK('bob1.aid.com', '');
 
     expect(Array.from(pub ?? [])).toEqual([1, 2, 3]);
-    expect((client as any).call).toHaveBeenCalledWith('message.v2.bootstrap', expect.objectContaining({ peer_aid: 'bob.aid.com' }));
-    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
+    expect((client as any).call).toHaveBeenCalledWith('message.v2.bootstrap', expect.objectContaining({ peer_aid: 'bob1.aid.com' }));
+    expect(cachePeerIK).toHaveBeenCalledWith('bob1.aid.com', '', expect.any(Uint8Array));
     expect((client as any)._fetchPeerCert).not.toHaveBeenCalled();
   });
   it('message.v2.pull 跳过非 V2 行', async () => {
@@ -2111,7 +2191,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'legacy',
               message_id: 'm-legacy',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               type: 'message',
               payload: { type: 'text', text: 'legacy plain' },
@@ -2133,7 +2213,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const statePayload = {
       members: [
         { aid: 'alice.aid.com', devices: [{ device_id: 'device-001', ik_fp: 'ik-a' }] },
-        { aid: 'bob.aid.com', devices: [{ device_id: 'device-002', ik_fp: 'ik-b' }] },
+        { aid: 'bob1.aid.com', devices: [{ device_id: 'device-002', ik_fp: 'ik-b' }] },
       ],
       audit_aids: [],
       admin_set: { admin_aids: ['alice.aid.com'], threshold: 1 },
@@ -2151,7 +2231,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
         return {
           members: [
             { aid: 'alice.aid.com', role: 'owner' },
-            { aid: 'bob.aid.com', role: 'member' },
+            { aid: 'bob1.aid.com', role: 'member' },
           ],
         };
       }
@@ -2159,7 +2239,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
         return {
           devices: [
             { aid: 'alice.aid.com', device_id: 'device-001', ik_fp: 'ik-a' },
-            { aid: 'bob.aid.com', device_id: 'device-002', ik_fp: 'ik-b' },
+            { aid: 'bob1.aid.com', device_id: 'device-002', ik_fp: 'ik-b' },
           ],
           audit_recipients: [],
         };
@@ -2206,7 +2286,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any).call = vi.fn().mockImplementation(async (method: string) => {
       calls.push(method);
       if (method === 'group.get_members') {
-        return { members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'member' }] };
+        return { members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob1.aid.com', role: 'member' }] };
       }
       if (method === 'group.v2.bootstrap') {
         return { devices: [], audit_recipients: [] };
@@ -2254,7 +2334,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       ...basePayload,
       members: [
         { aid: 'alice.aid.com', devices: [] },
-        { aid: 'bob.aid.com', devices: [] },
+        { aid: 'bob1.aid.com', devices: [] },
       ],
     };
     const baseHash = computeStateCommitment(groupId, 1, basePayload);
@@ -2293,9 +2373,9 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const client = makeV2Client();
     const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
 
-    await (client as any)._onV2StateRetryNeeded({ group_id: 'group.agentid.pub/12345' });
+    await (client as any)._onV2StateRetryNeeded({ group_id: '12345.agentid.pub' });
 
-    expect(proposeSpy).toHaveBeenCalledWith('group.agentid.pub/12345', { leaderDelay: true });
+    expect(proposeSpy).toHaveBeenCalledWith('12345.agentid.pub', { leaderDelay: true });
   });
 
   it('message.v2.pull 应透传服务端合并的 V1 明文行，但跳过 V1 E2EE envelope', async () => {
@@ -2308,7 +2388,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v1',
               message_id: 'm-plain',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               type: 'message',
               t_server: 123,
@@ -2320,7 +2400,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v1',
               message_id: 'm-e2ee',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 2,
               type: 'message',
               legacy_v1: {
@@ -2337,7 +2417,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     expect(result).toEqual([expect.objectContaining({
       message_id: 'm-plain',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'legacy plain' },
@@ -2358,7 +2438,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
           messages: [{
             version: 'v1',
             message_id: 'm-v2-pure-push',
-            from_aid: 'bob.aid.com',
+            from_aid: 'bob1.aid.com',
             seq: 1,
             t_server: 123,
             legacy_v1: {
@@ -2374,7 +2454,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await (client as any)._onV2PushNotification({
       seq: 1,
       message_id: 'm-v2-pure-push',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
     });
     await Promise.resolve();
     await Promise.resolve();
@@ -2389,7 +2469,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(published).toHaveLength(1);
     expect(published[0]).toMatchObject({
       message_id: 'm-v2-pure-push',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'pulled by v2 pure push' },
@@ -2402,7 +2482,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._seqTracker.onMessageSeq(ns, 1);
     vi.spyOn(client as any, '_decryptV2PushMessage').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -2417,7 +2497,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -2441,7 +2521,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._seqTracker.forceContiguousSeq(ns, 99999);
     vi.spyOn(client as any, '_decryptV2PushMessage').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -2453,7 +2533,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -2469,7 +2549,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const repairSpy = vi.spyOn((client as any)._seqTracker, 'repairContiguousSeq');
     const decryptSpy = vi.spyOn(client as any, '_decryptV2PushMessage').mockResolvedValue({
       message_id: 'm-push-3',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 3,
       payload: { type: 'text', text: 'push-3' },
@@ -2481,7 +2561,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
       envelope_json: '{}',
     });
 
@@ -2506,7 +2586,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await (client as any)._onV2PushNotification({
       seq: 3,
       message_id: 'm-push-3',
-      from_aid: 'bob.aid.com',
+      from_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
@@ -2530,7 +2610,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       group_id: groupId,
       seq: 3,
       message_id: 'gm-push-3',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(2);
@@ -2557,7 +2637,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
       kind: 'group.online_unread_hint',
     });
 
@@ -2585,7 +2665,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       group_id: 'grp01',
       seq: 7,
       message_id: 'gm-hint-7',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
       kind: 'group.online_unread_hint',
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2605,7 +2685,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       group_id: groupId,
       seq: 3,
       message_id: 'gm-push-3',
-      sender_aid: 'bob.aid.com',
+      sender_aid: 'bob1.aid.com',
     });
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
@@ -2629,7 +2709,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._pushedSeqs.set(ns, new Set([1]));
     const decrypted = {
       message_id: 'm-v2',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'already pushed' },
@@ -2645,7 +2725,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v2',
               message_id: 'm-v2',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               envelope_json: '{}',
             },
@@ -2665,18 +2745,18 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const sendSpy = vi.spyOn(encrypted as any, '_sendV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       content: { text: 'hello' },
     } as any);
 
-    expect(sendSpy).toHaveBeenCalledWith('bob.aid.com', { type: 'text', text: 'hello' }, expect.any(Object));
+    expect(sendSpy).toHaveBeenCalledWith('bob1.aid.com', { type: 'text', text: 'hello' }, expect.any(Object));
 
     const plaintext = makeV2Client();
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (plaintext as any)._transport.call = transportCall;
 
     await plaintext.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       content: { text: 'plain' },
       encrypt: false,
     } as any);
@@ -2717,7 +2797,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await expect(client.call('message.send', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       payload: 'bad-payload' as any,
     })).rejects.toThrow(ValidationError);
 
@@ -2734,7 +2814,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'legacy',
               message_id: 'gm-legacy',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               payload: { type: 'text', text: 'group plain' },
             },
@@ -2759,7 +2839,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v1',
               message_id: 'gm-plain',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               type: 'group.message',
               t_server: 456,
@@ -2768,7 +2848,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v1',
               message_id: 'gm-e2ee',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 2,
               payload: { type: 'e2ee.group_encrypted', ciphertext: 'x' },
             },
@@ -2782,7 +2862,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     expect(result).toEqual([expect.objectContaining({
       message_id: 'gm-plain',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       group_id: 'grp01',
       seq: 1,
       payload: { type: 'text', text: 'group legacy plain' },
@@ -2809,7 +2889,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._pushedSeqs.set(ns, new Set([1]));
     const decrypted = {
       message_id: 'gm-v2',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload: { type: 'text', text: 'already pushed group' },
@@ -2825,7 +2905,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'v2',
               message_id: 'gm-v2',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 1,
               envelope_json: '{}',
             },
@@ -2851,7 +2931,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'legacy',
               message_id: 'm-gap',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               seq: 3,
               type: 'message',
               payload: { type: 'text', text: 'gap trigger' },
@@ -2880,7 +2960,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
             {
               version: 'legacy',
               message_id: 'gm-gap',
-              from_aid: 'bob.aid.com',
+              from_aid: 'bob1.aid.com',
               group_id: 'grp01',
               seq: 3,
               payload: { type: 'text', text: 'gap trigger group' },
@@ -2955,13 +3035,13 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = transportCall;
 
     await client.call('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: '推理片段' },
     });
 
     expect(transportCall).toHaveBeenCalledWith('message.thought.put', expect.objectContaining({
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run', id: 'run-root' },
       encrypted: true,
       payload: envelope,
@@ -2980,7 +3060,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
 
     await client.call('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run', id: 'run-root' },
       protected_headers: { device_id: 'dev-a', slot_id: 'slot-a' },
       payload: { type: 'thought', text: 'p2p-thought' },
@@ -3073,12 +3153,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       found: true,
       sender_aid: 'alice.aid.com',
-      peer_aid: 'bob.aid.com',
+      peer_aid: 'bob1.aid.com',
       thoughts: [
         {
           thought_id: 'mt-1',
           from: 'alice.aid.com',
-          to: 'bob.aid.com',
+          to: 'bob1.aid.com',
           context: { type: 'run', id: 'run-root' },
           payload: { type: 'e2ee.p2p_encrypted', version: 'v2', suite: 'AUN-X25519-MLKEM768-v1', payload_type: 'thought', protected_headers: { payload_type: 'thought', trace_id: 'trace-p2p', _auth: 'secret' } },
           created_at: 1710504000000,
@@ -3095,7 +3175,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       thought_id: 'mt-1',
       message_id: 'mt-1',
       from: 'alice.aid.com',
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: '只给接收方看' },
       payload_type: 'thought',
@@ -3116,7 +3196,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       found: true,
       sender_aid: 'alice.aid.com',
-      peer_aid: 'bob.aid.com',
+      peer_aid: 'bob1.aid.com',
       thoughts: [{
         thought_id: 'mt-fail',
         payload: {
@@ -3150,12 +3230,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const client = new AUNClient();
 
     expect(() => (client as any)._rpcPipeline.validateOutboundCall('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       payload: { type: 'thought' },
     })).toThrow('context.type');
 
     expect(() => (client as any)._rpcPipeline.validateOutboundCall('message.thought.put', {
-      to: 'bob.aid.com',
+      to: 'bob1.aid.com',
       context: { type: 'run' },
       payload: { type: 'thought' },
     })).toThrow('context.type');
@@ -3280,7 +3360,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-other-slot',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       slot_id: 'slot-b',
       payload: { type: 'text', text: 'wrong slot' },
@@ -3304,7 +3384,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-raw-encrypted-ok',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       timestamp: 123,
@@ -3314,7 +3394,7 @@ describe('有序消息发布', () => {
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'text',
         protected_headers: { payload_type: 'text', trace_id: 'trace-1', _auth: 'secret' },
-        aad: { from: 'bob.aid.com', from_device: 'bob-dev' },
+        aad: { from: 'bob1.aid.com', from_device: 'bob-dev' },
         recipients: [['alice.aid.com', 'dev-1', 'peer', 'peer_device_prekey', 'fp', 'spk-1']],
         ciphertext: 'ciphertext',
       },
@@ -3377,7 +3457,7 @@ describe('有序消息发布', () => {
 
     await (client as any)._delivery.processAndPublishMessage({
       message_id: 'm-raw-encrypted',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       timestamp: 123,
@@ -3397,7 +3477,7 @@ describe('有序消息发布', () => {
     expect(undecryptable[0]).not.toHaveProperty('payload');
     expect(undecryptable[0]).toEqual(expect.objectContaining({
       message_id: 'm-raw-encrypted',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       to: 'alice.aid.com',
       seq: 1,
       payload_type: 'text',
@@ -3421,7 +3501,7 @@ describe('有序消息发布', () => {
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted-ok',
       group_id: 'grp01',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       seq: 1,
       timestamp: 123,
       payload: {
@@ -3430,7 +3510,7 @@ describe('有序消息发布', () => {
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'group-text',
         protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1', _auth: 'secret' },
-        aad: { from: 'bob.aid.com', from_device: 'bob-dev', group_id: 'grp01' },
+        aad: { from: 'bob1.aid.com', from_device: 'bob-dev', group_id: 'grp01' },
         recipients: [['alice.aid.com', 'dev-1', 'peer', 'group_device_prekey', 'fp', 'spk-1']],
         ciphertext: 'ciphertext',
       },
@@ -3491,7 +3571,7 @@ describe('有序消息发布', () => {
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-other-slot',
       group_id: 'grp01',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       device_id: 'dev-2',
       slot_id: 'slot-b',
       payload: { type: 'text', text: 'group' },
@@ -3516,7 +3596,7 @@ describe('有序消息发布', () => {
     await (client as any)._delivery.processAndPublishGroupMessage({
       message_id: 'gm-raw-encrypted',
       group_id: 'grp01',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       seq: 1,
       timestamp: 123,
       payload: {
@@ -3535,7 +3615,7 @@ describe('有序消息发布', () => {
     expect(undecryptable[0]).toEqual(expect.objectContaining({
       message_id: 'gm-raw-encrypted',
       group_id: 'grp01',
-      from: 'bob.aid.com',
+      from: 'bob1.aid.com',
       seq: 1,
       payload_type: 'group-text',
       protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1' },
@@ -3581,14 +3661,14 @@ describe('AUNClient agent.md ETag 缓存', () => {
     (client as any)._observeRpcMeta({
       agent_md_etag: '"alice-cloud"',
       agent_md_etags: {
-        to: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
+        to: { aid: 'bob1.agentid.pub', etag: '"bob-cloud"' },
         target: { aid: 'carol.agentid.pub', etag: '"carol-cloud"' },
         sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
       },
     });
 
     expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
-    expect(readAgentRecord(client, 'bob.agentid.pub').remote_etag).toBe('"bob-cloud"');
+    expect(readAgentRecord(client, 'bob1.agentid.pub').remote_etag).toBe('"bob-cloud"');
     expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
     expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
     (client as any)._tokenStore?.close?.();
@@ -3618,7 +3698,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
   it('V2 信封 agent_md.sender 应透传到应用层并落到 list.json', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-envelope-'));
     const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
-    (client as any)._aid = 'bob.agentid.pub';
+    (client as any)._aid = 'bob1.agentid.pub';
     const event: Record<string, unknown> = {};
 
     (client as any)._attachV2EnvelopeMetadataFromSource(event, {

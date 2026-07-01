@@ -8,6 +8,25 @@ class MockWebSocket {
   send(data: string): void { this.sent.push(data); }
 }
 
+class SilentOpenMockWebSocket {
+  static instances: SilentOpenMockWebSocket[] = [];
+  onopen: (() => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onclose: ((event: { code: number; reason: string }) => void) | null = null;
+  closed = false;
+
+  constructor(_url: string) {
+    SilentOpenMockWebSocket.instances.push(this);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  send(_data: string): void { /* noop */ }
+}
+
 class ClosingMockWebSocket {
   readyState = 2;
   onclose: ((event: { code: number; reason: string }) => void) | null = null;
@@ -55,6 +74,32 @@ function flushSend(): Promise<void> {
 describe('RPCTransport 后台 RPC 调度', () => {
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('WebSocket open 后未收到 challenge 应按 connect timeout 回滚', async () => {
+    vi.useFakeTimers();
+    SilentOpenMockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', SilentOpenMockWebSocket);
+
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({
+      eventDispatcher: dispatcher,
+      timeout: 0.05,
+    });
+
+    const pending = transport.connect('wss://gateway.agentid.pub/aun').catch((err: unknown) => err);
+    const ws = SilentOpenMockWebSocket.instances[0];
+    expect(ws).toBeTruthy();
+    ws.onopen?.();
+
+    await vi.advanceTimersByTimeAsync(60);
+    const err = await pending;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/connect timeout/);
+    expect(ws.closed).toBe(true);
+    expect((transport as any)._ws).toBeNull();
+    expect((transport as any)._closed).toBe(true);
   });
 
   it('transport 已关闭时应在错误中保留最近 WebSocket close code', async () => {

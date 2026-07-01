@@ -123,7 +123,7 @@ def test_auto_migration_falls_back_to_legacy_seed_when_strict_verification_fails
     assert (tmp_path / ".seed").exists()
 
 
-def test_seed_migration_db_columns_only_rewrite_records_decryptable_by_old_seed(tmp_path):
+def test_seed_migration_v2_spk_only_rewrites_records_decryptable_by_old_seed(tmp_path):
     old_seed = b"old-db-seed"
     new_seed = b""
     other_seed = b"other-db-seed"
@@ -141,22 +141,21 @@ def test_seed_migration_db_columns_only_rewrite_records_decryptable_by_old_seed(
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
-            "CREATE TABLE prekeys ("
-            "prekey_id TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', "
-            "private_key_enc TEXT NOT NULL DEFAULT '', data TEXT NOT NULL DEFAULT '{}', "
-            "created_at INTEGER, updated_at INTEGER NOT NULL, expires_at INTEGER, "
-            "PRIMARY KEY (prekey_id, device_id))"
+            "CREATE TABLE v2_spk ("
+            "spk_id TEXT PRIMARY KEY, "
+            "private_key_enc TEXT NOT NULL DEFAULT '', "
+            "created_at INTEGER, updated_at INTEGER NOT NULL)"
         )
         rows = [
-            ("p1", json.dumps(encrypt_record(old_seed, aid, "prekey/p1", b"GOOD_PREKEY"))),
-            ("p2", json.dumps(encrypt_record(old_seed, aid, "prekey/not-p2", b"WRONG_NAME_PREKEY"))),
-            ("p3", json.dumps(encrypt_record(other_seed, aid, "prekey/p3", b"WRONG_SEED_PREKEY"))),
-            ("p4", "PLAINTEXT_PREKEY"),
+            ("s1", json.dumps(encrypt_record(old_seed, aid, "v2/spk/s1", b"GOOD_SPK"))),
+            ("s2", json.dumps(encrypt_record(old_seed, aid, "v2/spk/not-s2", b"WRONG_NAME_SPK"))),
+            ("s3", json.dumps(encrypt_record(other_seed, aid, "v2/spk/s3", b"WRONG_SEED_SPK"))),
+            ("s4", "PLAINTEXT_SPK"),
         ]
-        for prekey_id, stored in rows:
+        for spk_id, stored in rows:
             conn.execute(
-                "INSERT INTO prekeys (prekey_id, device_id, private_key_enc, updated_at) VALUES (?, '', ?, 1)",
-                (prekey_id, stored),
+                "INSERT INTO v2_spk (spk_id, private_key_enc, updated_at) VALUES (?, ?, 1)",
+                (spk_id, stored),
             )
         conn.commit()
     finally:
@@ -170,19 +169,19 @@ def test_seed_migration_db_columns_only_rewrite_records_decryptable_by_old_seed(
     other_master = derive_master_key(other_seed)
     conn = sqlite3.connect(str(db_path))
     try:
-        stored = dict(conn.execute("SELECT prekey_id, private_key_enc FROM prekeys").fetchall())
+        stored = dict(conn.execute("SELECT spk_id, private_key_enc FROM v2_spk").fetchall())
     finally:
         conn.close()
 
-    p1 = json.loads(stored["p1"])
-    assert decrypt_record(new_master, aid, "prekey/p1", p1) == b"GOOD_PREKEY"
+    s1 = json.loads(stored["s1"])
+    assert decrypt_record(new_master, aid, "v2/spk/s1", s1) == b"GOOD_SPK"
 
-    p2 = json.loads(stored["p2"])
-    assert decrypt_record(new_master, aid, "prekey/p2", p2) is None
-    assert decrypt_record(old_master, aid, "prekey/not-p2", p2) == b"WRONG_NAME_PREKEY"
+    s2 = json.loads(stored["s2"])
+    assert decrypt_record(new_master, aid, "v2/spk/s2", s2) is None
+    assert decrypt_record(old_master, aid, "v2/spk/not-s2", s2) == b"WRONG_NAME_SPK"
 
-    p3 = json.loads(stored["p3"])
-    assert decrypt_record(new_master, aid, "prekey/p3", p3) is None
-    assert decrypt_record(other_master, aid, "prekey/p3", p3) == b"WRONG_SEED_PREKEY"
+    s3 = json.loads(stored["s3"])
+    assert decrypt_record(new_master, aid, "v2/spk/s3", s3) is None
+    assert decrypt_record(other_master, aid, "v2/spk/s3", s3) == b"WRONG_SEED_SPK"
 
-    assert stored["p4"] == "PLAINTEXT_PREKEY"
+    assert stored["s4"] == "PLAINTEXT_SPK"

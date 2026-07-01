@@ -672,7 +672,10 @@ func (a *CrossSdkGoAgent) callCollabAction(ctx context.Context, action string, p
 	case "unregister":
 		return collab.Unregister(ctx, firstNonEmpty(stringValue(params["group_aid"]), stringValue(params["groupAid"])), root)
 	case "set_acl":
-		return collab.SetACL(ctx, root, firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"])), firstNonEmpty(stringValue(params["perms"]), "w"))
+		return collab.SetACL(ctx, root, firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"])), firstNonEmpty(stringValue(params["perms"]), "w"), aun.CollabSetACLOptions{
+			ExpiresAt: optionalInt64(firstNonNil(params["expires_at"], params["expiresAt"])),
+			MaxUses:   optionalInt(firstNonNil(params["max_uses"], params["maxUses"])),
+		})
 	case "remove_acl":
 		return collab.RemoveACL(ctx, root, firstNonEmpty(stringValue(params["grantee_aid"]), stringValue(params["granteeAID"])))
 	case "tag.create":

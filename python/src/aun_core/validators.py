@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from .errors import ValidationError
+from .group_id import convert_to_group_aid
 
 
 # AID name 规范：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
@@ -18,8 +19,8 @@ _AID_NAME_RE = re.compile(r'^[a-z0-9_][a-z0-9_-]{3,63}$')
 # Group ID 格式（基于服务端实际实现）
 # Legacy 格式：g- 后接 4-32 位小写字母数字
 _GROUP_ID_LEGACY_PATTERN = re.compile(r'^g-[a-z0-9]{4,32}$')
-# 新格式 base：5 位或更多小写字母数字
-_GROUP_ID_NEW_BASE_PATTERN = re.compile(r'^[a-z0-9]{5,}$')
+# 新格式 base：5 到 64 位小写字母数字
+_GROUP_ID_NEW_BASE_PATTERN = re.compile(r'^[a-z0-9]{5,64}$')
 # Group name 格式：4-64 字符，首字符 [a-z0-9]，可包含 _-
 _GROUP_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9_-]{3,63}$')
 
@@ -92,13 +93,80 @@ def validate_aid_format(aid: Any, *, param_name: str = "aid") -> str:
     return aid_str
 
 
-def validate_group_id_format(group_id: Any, *, param_name: str = "group_id") -> str:
+def _validate_group_aid_parts(raw: Any, group_aid: str, *, param_name: str) -> None:
+    """校验转换后的 group_aid 中的 base 和 issuer。"""
+    base = ""
+    domain = ""
+
+    if "." in group_aid:
+        base, _, domain = group_aid.partition(".")
+        base = base.strip(".")
+        domain = domain.strip(".")
+    else:
+        base = group_aid
+
+    if not base:
+        raise ValidationError(f"Invalid {param_name} '{raw}': base part cannot be empty")
+
+    is_valid_base = (
+        _GROUP_ID_LEGACY_PATTERN.fullmatch(base) or
+        _GROUP_ID_NEW_BASE_PATTERN.fullmatch(base) or
+        _GROUP_NAME_PATTERN.fullmatch(base)
+    )
+
+    if not is_valid_base:
+        raise ValidationError(
+            f"Invalid {param_name} '{raw}': base '{base}' must be one of: "
+            f"legacy format 'g-[a-z0-9]{{4,32}}', new format '[a-z0-9]{{5,64}}', "
+            f"or group name format '[a-z0-9][a-z0-9_-]{{3,63}}'"
+        )
+
+    if domain and not _DOMAIN_RE.match(domain):
+        raise ValidationError(
+            f"Invalid {param_name} '{raw}': domain '{domain}' is not a valid domain"
+        )
+
+
+def validate_group_aid_format(
+    group_aid: Any,
+    *,
+    param_name: str = "group_aid",
+    local_issuer: str = "",
+) -> str:
+    """
+    校验群组标识并返回目标态 group_aid。
+
+    兼容历史输入格式：``group.{issuer}/{base}``、``{base}@{issuer}``、
+    ``{base}.{issuer}`` 和本域短格式。短格式只有在传入 ``local_issuer``
+    时才会补齐 issuer。
+    """
+    if group_aid is None or (isinstance(group_aid, str) and not group_aid.strip()):
+        raise ValidationError(f"{param_name} cannot be empty")
+
+    raw_text = str(group_aid).strip()
+    if "//" in raw_text:
+        raise ValidationError(f"Invalid {param_name} '{group_aid}': empty path segment is not allowed")
+
+    group_aid_str = convert_to_group_aid(raw_text, local_issuer=local_issuer)
+    if not group_aid_str:
+        raise ValidationError(f"{param_name} cannot be empty")
+
+    _validate_group_aid_parts(group_aid, group_aid_str, param_name=param_name)
+    return group_aid_str
+
+
+def validate_group_id_format(
+    group_id: Any,
+    *,
+    param_name: str = "group_id",
+    local_issuer: str = "",
+) -> str:
     """
     校验 Group ID 格式是否合法。
 
     接受的 base 格式（不含域名部分）：
     1. Legacy 格式：g-[a-z0-9]{4,32} — 以 g- 开头，后接 4 到 32 位小写字母或数字
-    2. 新格式：[a-z0-9]{5,} — 5 位或更多小写字母或数字
+    2. 新格式：[a-z0-9]{5,64} — 5 到 64 位小写字母或数字
     3. Group name 格式：[a-z0-9][a-z0-9_-]{3,63} — 4 到 64 个字符，可包含 _-
 
     完整格式：
@@ -117,83 +185,15 @@ def validate_group_id_format(group_id: Any, *, param_name: str = "group_id") -> 
     Raises:
         ValidationError: Group ID 格式不合法
     """
-    if group_id is None or (isinstance(group_id, str) and not group_id.strip()):
-        raise ValidationError(f"{param_name} cannot be empty")
-
-    gid_str = str(group_id).strip().lower()
-
-    # 解析 base 和 domain
-    base = ""
-    domain = ""
-
-    # 情况1: group.{issuer}/{base} (canonical)
-    if gid_str.startswith("group.") and "/" in gid_str:
-        issuer_and_base = gid_str[6:]  # 去掉 "group."
-        parts = issuer_and_base.split("/", 1)
-        if len(parts) == 2:
-            domain, base = parts[0].strip("."), parts[1].strip(".")
-            # 处理污染格式 group.{A}/{base}@{B}
-            if "@" in base:
-                base_part, _, b_domain = base.partition("@")
-                base = base_part.strip(".")
-                domain = f"{b_domain.strip('.')}.{domain}" if domain else b_domain.strip(".")
-    # 情况2: {base}@{issuer}
-    elif "@" in gid_str:
-        base, _, domain = gid_str.partition("@")
-        base = base.strip(".")
-        domain = domain.strip(".")
-    # 情况3: {base}.{issuer} 或 {base} (需要区分)
-    elif "." in gid_str:
-        # 如果是 g- 开头，点号后是域名
-        if gid_str.startswith("g-"):
-            rest = gid_str[2:]
-            if "." in rest:
-                slug, _, domain = rest.partition(".")
-                base = f"g-{slug}"
-                domain = domain.strip(".")
-            else:
-                base = gid_str
-        else:
-            # 尝试判断是 {base}.{domain} 还是单个 base
-            # 这里简化处理：如果有点号就认为后面是域名
-            parts = gid_str.split(".", 1)
-            if len(parts) == 2:
-                base, domain = parts[0], parts[1].strip(".")
-            else:
-                base = gid_str
-    else:
-        # 情况4: 纯 {base}（本域简写）
-        base = gid_str
-
-    # 校验 base 部分
-    if not base:
-        raise ValidationError(f"Invalid {param_name} '{group_id}': base part cannot be empty")
-
-    # 检查 base 是否符合任一格式
-    is_valid_base = (
-        _GROUP_ID_LEGACY_PATTERN.fullmatch(base) or
-        _GROUP_ID_NEW_BASE_PATTERN.fullmatch(base) or
-        _GROUP_NAME_PATTERN.fullmatch(base)
+    return validate_group_aid_format(
+        group_id,
+        param_name=param_name,
+        local_issuer=local_issuer,
     )
-
-    if not is_valid_base:
-        raise ValidationError(
-            f"Invalid {param_name} '{group_id}': base '{base}' must be one of: "
-            f"legacy format 'g-[a-z0-9]{{4,32}}', new format '[a-z0-9]{{5,}}', "
-            f"or group name format '[a-z0-9][a-z0-9_-]{{3,63}}'"
-        )
-
-    # 如果有 domain，校验 domain 部分
-    if domain:
-        if not _DOMAIN_RE.match(domain):
-            raise ValidationError(
-                f"Invalid {param_name} '{group_id}': domain '{domain}' is not a valid domain"
-            )
-
-    return gid_str
 
 
 __all__ = [
     "validate_aid_format",
+    "validate_group_aid_format",
     "validate_group_id_format",
 ]

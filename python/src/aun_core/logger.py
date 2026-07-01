@@ -96,6 +96,9 @@ class AUNLogger:
         self._console(line)
         self._file(line)
 
+    def is_debug_enabled(self) -> bool:
+        return self._debug and self._min_level <= _LEVEL_ORDER["debug"]
+
     def bind_device_id(self, device_id: str | None) -> None:
         self._device_id = str(device_id or "-")
 
@@ -170,3 +173,6 @@ class NullLogger:
 
     def debug(self, module: str, msg: str, *args: object) -> None:
         pass
+
+    def is_debug_enabled(self) -> bool:
+        return False

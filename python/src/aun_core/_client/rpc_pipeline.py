@@ -5,6 +5,8 @@ import base64
 import hashlib
 import json
 import time
+from collections import OrderedDict
+from threading import RLock
 from typing import Any
 
 from ..config import normalize_slot_id, slot_isolation_key
@@ -19,6 +21,29 @@ from ..group_id import normalize_group_id as _normalize_group_id
 from ..types import ConnectionState
 from ..validators import validate_aid_format, validate_group_id_format
 from .runtime import ClientRuntime
+
+
+_SIGNING_KEY_CACHE_MAX = 32
+_SIGNING_KEY_CACHE: OrderedDict[str, Any] = OrderedDict()
+_CERT_FINGERPRINT_CACHE: OrderedDict[str, str] = OrderedDict()
+_SIGNING_CACHE_LOCK = RLock()
+
+
+def _cache_get(cache: OrderedDict[str, Any], key: str) -> Any | None:
+    with _SIGNING_CACHE_LOCK:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+
+def _cache_put(cache: OrderedDict[str, Any], key: str, value: Any) -> Any:
+    with _SIGNING_CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > _SIGNING_KEY_CACHE_MAX:
+            cache.popitem(last=False)
+        return value
 
 
 class RpcPipeline:
@@ -45,18 +70,9 @@ class RpcPipeline:
         client._log.debug("client", "call enter: method=%s", method)
         if method in {"message.send", "group.send"}:
             client._normalize_outbound_message_payload(prepared, method=method)
+        self.normalize_group_call_identifier(method, prepared)
         client._validate_outbound_call(method, prepared)
         client._inject_message_cursor_context(method, prepared)
-
-        # group.* 方法的 group_id 归一化为 canonical 格式（兼容老/污染数据）
-        # 不对无域输入补本域——保持与历史行为兼容，交给服务端归一化
-        if method.startswith("group.") and "group_id" in prepared:
-            raw_gid = prepared.get("group_id")
-            if raw_gid:
-                normalized_gid = _normalize_group_id(str(raw_gid))
-                if normalized_gid != str(raw_gid):
-                    client._log.debug("client", "call group_id normalized: %s -> %s method=%s", raw_gid, normalized_gid, method)
-                prepared["group_id"] = normalized_gid
 
         # group.* 方法注入 device_id（服务端用于多设备消息路由）
         if method.startswith("group.") and "device_id" not in prepared:
@@ -369,17 +385,33 @@ class RpcPipeline:
             params_json = json.dumps(params_for_hash, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             params_hash = hashlib.sha256(params_json.encode("utf-8")).hexdigest()
             sign_data = f"{method}|{aid}|{ts}|{params_hash}".encode("utf-8")
-            pk = _ser.load_pem_private_key(
-                current_aid.private_key_pem.encode("utf-8"), password=None,
-            )
+            private_key_pem = str(current_aid.private_key_pem)
+            private_key_cache_key = hashlib.sha256(private_key_pem.encode("utf-8")).hexdigest()
+            pk = _cache_get(_SIGNING_KEY_CACHE, private_key_cache_key)
+            if pk is None:
+                pk = _cache_put(
+                    _SIGNING_KEY_CACHE,
+                    private_key_cache_key,
+                    _ser.load_pem_private_key(private_key_pem.encode("utf-8"), password=None),
+                )
             sig = pk.sign(sign_data, _ec.ECDSA(_hashes.SHA256()))
             # 证书指纹：用于锁定签名时使用的证书版本
-            cert_fingerprint = ""
-            cert_pem = current_aid.cert_pem
+            cert_pem = str(getattr(current_aid, "cert_pem", "") or "")
+            cert_fingerprint = str(getattr(current_aid, "cert_fingerprint", "") or "") if cert_pem else ""
             if cert_pem:
-                from cryptography import x509 as _x509
-                cert_obj = _x509.load_pem_x509_certificate(cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem)
-                cert_fingerprint = "sha256:" + cert_obj.fingerprint(_hashes.SHA256()).hex()
+                cached_fp = _cache_get(_CERT_FINGERPRINT_CACHE, cert_pem)
+                if cached_fp is not None:
+                    cert_fingerprint = cached_fp
+                elif cert_fingerprint:
+                    _cache_put(_CERT_FINGERPRINT_CACHE, cert_pem, cert_fingerprint)
+                else:
+                    from cryptography import x509 as _x509
+                    cert_obj = _x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+                    cert_fingerprint = _cache_put(
+                        _CERT_FINGERPRINT_CACHE,
+                        cert_pem,
+                        "sha256:" + cert_obj.fingerprint(_hashes.SHA256()).hex(),
+                    )
             params["client_signature"] = {
                 "aid": aid,
                 "cert_fingerprint": cert_fingerprint,
@@ -414,10 +446,10 @@ class RpcPipeline:
         if method in ("message.pull", "message.v2.pull"):
             return f"p2p:{client._aid}" if client._aid else ""
         if method in ("group.pull", "group.v2.pull"):
-            gid = str(params.get("group_id") or "").strip()
+            gid = str(params.get("group_aid") or params.get("group_id") or "").strip()
             return f"group:{gid}" if gid else ""
         if method == "group.pull_events":
-            gid = str(params.get("group_id") or "").strip()
+            gid = str(params.get("group_aid") or params.get("group_id") or "").strip()
             return f"group_event:{gid}" if gid else ""
         return ""
 
@@ -508,5 +540,39 @@ class RpcPipeline:
                 call_kwargs.pop("timeout", None)
                 call_kwargs.pop("trace", None)
                 call_kwargs.pop("background", None)
-                return await client._transport.call(method, payload, **call_kwargs) if call_kwargs else await client._transport.call(method, payload)
+            return await client._transport.call(method, payload, **call_kwargs) if call_kwargs else await client._transport.call(method, payload)
             raise
+
+    def normalize_group_call_identifier(self, method: str, params: dict[str, Any]) -> None:
+        if not method.startswith("group."):
+            return
+        raw_gid = None
+        raw_key = ""
+        for key in ("group_aid", "groupAid", "group_id", "groupId"):
+            if key in params and str(params.get(key) or "").strip():
+                raw_gid = params.get(key)
+                raw_key = key
+                break
+        if raw_gid is not None:
+            raw_gid_text = str(raw_gid).strip()
+            normalized_gid = _normalize_group_id(raw_gid_text)
+            if normalized_gid:
+                if normalized_gid != raw_gid_text:
+                    self.client._log.debug(
+                        "client",
+                        "call group identifier normalized: %s=%s -> %s method=%s",
+                        raw_key,
+                        raw_gid,
+                        normalized_gid,
+                        method,
+                    )
+                existing_group_id = str(params.get("group_id") or params.get("groupId") or "").strip()
+                if raw_key in ("group_id", "groupId"):
+                    params["group_id"] = raw_gid_text
+                elif existing_group_id:
+                    params["group_id"] = existing_group_id
+                else:
+                    params["group_id"] = normalized_gid
+                params["group_aid"] = normalized_gid
+        params.pop("groupAid", None)
+        params.pop("groupId", None)

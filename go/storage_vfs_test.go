@@ -39,7 +39,7 @@ func (f *fakeStorageClient) Call(ctx context.Context, method string, params map[
 		}
 	}
 	switch method {
-	case "group.get":
+	case "group.get_info":
 		return map[string]any{"group": map[string]any{"group_id": params["group_id"], "group_aid": "team.agentid.pub"}}, nil
 	case "storage.check_upload":
 		if f.checkUpload != nil {

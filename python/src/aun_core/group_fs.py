@@ -180,20 +180,32 @@ class GroupFSVFS:
         on_progress: Callable[[int, int], None] | None = None,
         **options: Any,
     ) -> Any:
+        src_group_aid = options.pop("src_group_aid", None)
+        dst_group_aid = options.pop("dst_group_aid", None)
+        shared_group_aid = options.pop("group_aid", None)
         src_group_id = options.pop("src_group_id", None)
         dst_group_id = options.pop("dst_group_id", None)
         shared_group_id = options.pop("group_id", None)
-        src_remote = _is_group_remote_copy_path(src, src_group_id, shared_group_id)
-        dst_remote = _is_group_remote_copy_path(dst, dst_group_id, shared_group_id)
+        src_group_ref = src_group_aid or src_group_id
+        dst_group_ref = dst_group_aid or dst_group_id
+        shared_group_ref = shared_group_aid or shared_group_id
+        src_remote = _is_group_remote_copy_path(src, src_group_ref, shared_group_ref)
+        dst_remote = _is_group_remote_copy_path(dst, dst_group_ref, shared_group_ref)
         callback = progress or on_progress
 
         if src_remote and dst_remote:
             params = self._params(src=src, dst=dst, **options)
-            if shared_group_id is not None:
+            if shared_group_aid is not None:
+                params["group_aid"] = shared_group_aid
+            elif shared_group_id is not None:
                 params["group_id"] = shared_group_id
-            if src_group_id is not None:
+            if src_group_aid is not None:
+                params["src_group_aid"] = src_group_aid
+            elif src_group_id is not None:
                 params["src_group_id"] = src_group_id
-            if dst_group_id is not None:
+            if dst_group_aid is not None:
+                params["dst_group_aid"] = dst_group_aid
+            elif dst_group_id is not None:
                 params["dst_group_id"] = dst_group_id
             if force:
                 params["force"] = True
@@ -212,7 +224,8 @@ class GroupFSVFS:
                 metadata=metadata,
                 expected_version=expected_version,
                 on_progress=callback,
-                group_id=dst_group_id or shared_group_id,
+                group_aid=dst_group_aid or shared_group_aid,
+                group_id=None if (dst_group_aid or shared_group_aid) else (dst_group_id or shared_group_id),
                 **options,
             )
         if src_remote and not dst_remote:
@@ -222,27 +235,40 @@ class GroupFSVFS:
                 force=force,
                 verify_hash=verify_hash,
                 on_progress=callback,
-                group_id=src_group_id or shared_group_id,
+                group_aid=src_group_aid or shared_group_aid,
+                group_id=None if (src_group_aid or shared_group_aid) else (src_group_id or shared_group_id),
                 **options,
             )
         raise StorageError("local-to-local copy is not handled by group.fs", code="EINVAL", path=src)
 
     async def mv(self, src: str, dst: str, *, force: bool = False, **options: Any) -> Any:
+        src_group_aid = options.pop("src_group_aid", None)
+        dst_group_aid = options.pop("dst_group_aid", None)
+        shared_group_aid = options.pop("group_aid", None)
         src_group_id = options.pop("src_group_id", None)
         dst_group_id = options.pop("dst_group_id", None)
         shared_group_id = options.pop("group_id", None)
-        if not _is_group_remote_copy_path(src, src_group_id, shared_group_id) or not _is_group_remote_copy_path(
+        src_group_ref = src_group_aid or src_group_id
+        dst_group_ref = dst_group_aid or dst_group_id
+        shared_group_ref = shared_group_aid or shared_group_id
+        if not _is_group_remote_copy_path(src, src_group_ref, shared_group_ref) or not _is_group_remote_copy_path(
             dst,
-            dst_group_id,
-            shared_group_id,
+            dst_group_ref,
+            shared_group_ref,
         ):
             raise StorageError("group.fs.mv only supports group remote paths", code="EINVAL", path=src)
         params = self._params(src=src, dst=dst, **options)
-        if shared_group_id is not None:
+        if shared_group_aid is not None:
+            params["group_aid"] = shared_group_aid
+        elif shared_group_id is not None:
             params["group_id"] = shared_group_id
-        if src_group_id is not None:
+        if src_group_aid is not None:
+            params["src_group_aid"] = src_group_aid
+        elif src_group_id is not None:
             params["src_group_id"] = src_group_id
-        if dst_group_id is not None:
+        if dst_group_aid is not None:
+            params["dst_group_aid"] = dst_group_aid
+        elif dst_group_id is not None:
             params["dst_group_id"] = dst_group_id
         if force:
             params["force"] = True

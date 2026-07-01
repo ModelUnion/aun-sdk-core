@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { GroupStateCoordinator } from '../../src/client/group-state.js';
 import { ClientRuntime } from '../../src/client/runtime.js';
+import { normalizeGroupId } from '../../src/group-id.js';
 import { computeStateCommitment } from '../../src/v2/state/index.js';
 
 const encoder = new TextEncoder();
@@ -34,8 +35,9 @@ async function cacheStateSignature(client: Record<string, any>, args: {
   membershipSnapshot: string;
   signatureB64: string;
 }): Promise<void> {
+  const normalizedGroupId = normalizeGroupId(args.groupId) || args.groupId;
   const signPayload = stableStringifyForTest({
-    group_id: args.groupId,
+    group_id: normalizedGroupId,
     membership_snapshot: args.membershipSnapshot,
     state_hash: args.stateHash,
     state_version: args.stateVersion,
@@ -102,12 +104,12 @@ describe('GroupStateCoordinator 组件边界', () => {
   it('postprocessResult 在 membership mutation 成功后触发 state propose 和建群 SPK 注册', async () => {
     const { coordinator, client } = createCoordinator();
 
-    const result = { group: { group_id: 'group.agentid.pub/12345' } };
+    const result = { group: { group_id: '12345.agentid.pub' } };
 
     await expect(coordinator.postprocessResult('group.create', {}, result)).resolves.toBe(result);
 
-    expect(client._v2AutoProposeState).toHaveBeenCalledWith('group.agentid.pub/12345');
-    expect(client._v2E2EE.scheduleGroupSpkRegistration).toHaveBeenCalledWith('group.agentid.pub/12345', {
+    expect(client._v2AutoProposeState).toHaveBeenCalledWith('12345.agentid.pub');
+    expect(client._v2E2EE.scheduleGroupSpkRegistration).toHaveBeenCalledWith('12345.agentid.pub', {
       reason: 'group.create',
     });
   });
@@ -131,17 +133,17 @@ describe('GroupStateCoordinator 组件边界', () => {
     const { coordinator, client } = createCoordinator();
 
     coordinator.handleGroupChangedV2Membership({
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
       action: 'member_added',
       aid: 'bob.aid.com',
     });
 
-    expect(client._v2E2EE.deleteBootstrapCacheEntry).toHaveBeenCalledWith('group:group.agentid.pub/12345');
+    expect(client._v2E2EE.deleteBootstrapCacheEntry).toHaveBeenCalledWith('group:12345.agentid.pub');
     expect(client._safeAsync).toHaveBeenCalled();
-    expect(client._v2AutoProposeState).toHaveBeenCalledWith('group.agentid.pub/12345', { leaderDelay: true });
+    expect(client._v2AutoProposeState).toHaveBeenCalledWith('12345.agentid.pub', { leaderDelay: true });
     expect(client._v2E2EE.handleGroupChangedSpk).toHaveBeenCalledWith(
-      expect.objectContaining({ group_id: 'group.agentid.pub/12345', action: 'member_added' }),
-      'group.agentid.pub/12345',
+      expect.objectContaining({ group_id: '12345.agentid.pub', action: 'member_added' }),
+      '12345.agentid.pub',
       'member_added',
     );
   });
@@ -149,24 +151,24 @@ describe('GroupStateCoordinator 组件边界', () => {
   it('state proposed/retry/confirmed 事件走组件发布和副作用', async () => {
     const { coordinator, client } = createCoordinator();
 
-    await coordinator.onV2StateProposed({ group_id: 'group.agentid.pub/12345', proposal_id: 'sp-1' });
-    await coordinator.onV2StateRetryNeeded({ group_id: 'group.agentid.pub/12345' });
-    client._v2AutoProposeLastSnapshot.set('group.agentid.pub/12345', 'snapshot');
-    await coordinator.onV2StateConfirmed({ group_id: 'group.agentid.pub/12345' });
+    await coordinator.onV2StateProposed({ group_id: '12345.agentid.pub', proposal_id: 'sp-1' });
+    await coordinator.onV2StateRetryNeeded({ group_id: '12345.agentid.pub' });
+    client._v2AutoProposeLastSnapshot.set('12345.agentid.pub', 'snapshot');
+    await coordinator.onV2StateConfirmed({ group_id: '12345.agentid.pub' });
 
     expect(client._dispatcher.publish).toHaveBeenCalledWith('group.v2.state_proposed', {
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
       proposal_id: 'sp-1',
     });
-    expect(client._v2ConfirmPendingProposal).toHaveBeenCalledWith('group.agentid.pub/12345');
+    expect(client._v2ConfirmPendingProposal).toHaveBeenCalledWith('12345.agentid.pub');
     expect(client._dispatcher.publish).toHaveBeenCalledWith('group.v2.state_retry_needed', {
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
     });
-    expect(client._v2AutoProposeState).toHaveBeenCalledWith('group.agentid.pub/12345', { leaderDelay: true });
-    expect(client._v2E2EE.deleteBootstrapCacheEntry).toHaveBeenCalledWith('group:group.agentid.pub/12345');
-    expect(client._v2AutoProposeLastSnapshot.has('group.agentid.pub/12345')).toBe(false);
+    expect(client._v2AutoProposeState).toHaveBeenCalledWith('12345.agentid.pub', { leaderDelay: true });
+    expect(client._v2E2EE.deleteBootstrapCacheEntry).toHaveBeenCalledWith('group:12345.agentid.pub');
+    expect(client._v2AutoProposeLastSnapshot.has('12345.agentid.pub')).toBe(false);
     expect(client._dispatcher.publish).toHaveBeenCalledWith('group.v2.state_confirmed', {
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
     });
   });
 
@@ -175,27 +177,27 @@ describe('GroupStateCoordinator 组件边界', () => {
       _v2GroupSecurityLevels: new Map<string, string>(),
     });
 
-    await coordinator.publishV2GroupSecurityLevel('group.agentid.pub/12345', {
+    await coordinator.publishV2GroupSecurityLevel('12345.agentid.pub', {
       e2ee_security_level: 'degraded',
       e2ee_security_warning: 'missing devices',
     });
-    await coordinator.publishV2GroupSecurityLevel('group.agentid.pub/12345', {
+    await coordinator.publishV2GroupSecurityLevel('12345.agentid.pub', {
       e2ee_security_level: 'degraded',
       e2ee_security_warning: 'same',
     });
-    await coordinator.publishV2GroupSecurityLevel('group.agentid.pub/12345', {
+    await coordinator.publishV2GroupSecurityLevel('12345.agentid.pub', {
       e2ee_security_level: 'end_to_end',
     });
 
     expect(client._dispatcher.publish).toHaveBeenCalledTimes(2);
     expect(client._dispatcher.publish).toHaveBeenNthCalledWith(1, 'group.v2.security_level', {
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
       level: 'degraded',
       warning: 'missing devices',
       previous_level: null,
     });
     expect(client._dispatcher.publish).toHaveBeenNthCalledWith(2, 'group.v2.security_level', {
-      group_id: 'group.agentid.pub/12345',
+      group_id: '12345.agentid.pub',
       level: 'end_to_end',
       warning: '',
       previous_level: 'degraded',
@@ -204,7 +206,7 @@ describe('GroupStateCoordinator 组件边界', () => {
 
   it('verifyStateSignature 命中签名缓存时不重复拉证书，并继续检查成员篡改', async () => {
     const { coordinator, client } = createCoordinator();
-    const groupId = 'group.agentid.pub/12345';
+    const groupId = '12345.agentid.pub';
     const actorAid = 'owner.aid.com';
     const membershipSnapshot = JSON.stringify(['alice.aid.com']);
     const signatureB64 = btoa('cached-signature');
@@ -216,7 +218,7 @@ describe('GroupStateCoordinator 组件边界', () => {
       membershipSnapshot,
       signatureB64,
     });
-    client.call = vi.fn(async () => ({ mode: 'closed' }));
+    client.call = vi.fn(async () => ({ settings: [{ key: 'join.mode', value: 'closed' }] }));
 
     await coordinator.verifyStateSignature(groupId, {
       state_version: 3,
@@ -228,7 +230,7 @@ describe('GroupStateCoordinator 组件边界', () => {
     });
 
     expect(client._fetchPeerCert).not.toHaveBeenCalled();
-    expect(client.call).toHaveBeenCalledWith('group.get_join_requirements', { group_id: groupId });
+    expect(client.call).toHaveBeenCalledWith('group.get_settings', { group_id: groupId, keys: ['join.mode'] });
     expect(client._dispatcher.publish).toHaveBeenCalledWith('group.v2.state_tampered', {
       group_id: groupId,
       pending_extra: ['bob.aid.com'],

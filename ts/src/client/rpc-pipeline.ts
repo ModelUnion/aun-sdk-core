@@ -24,13 +24,6 @@ const INTERNAL_ONLY_METHODS = new Set([
   'initialize',
 ]);
 
-const REMOVED_E2EE_METHODS = new Set([
-  'group.rotate_epoch',
-  'group.e2ee.begin_rotation',
-  'group.e2ee.commit_rotation',
-  'group.e2ee.abort_rotation',
-]);
-
 const PROTECTED_HEADERS_METHODS = new Set([
   'message.send',
   'group.send',
@@ -49,9 +42,9 @@ const SIGNED_METHODS = new Set([
   'group.v2.propose_state', 'group.v2.confirm_state',
   'group.v2.get_proposal',
   'group.kick', 'group.add_member',
-  'group.leave', 'group.remove_member', 'group.update_rules',
-  'group.update', 'group.update_announcement',
-  'group.update_join_requirements', 'group.set_role',
+  'group.leave', 'group.remove_member',
+  'group.update',
+  'group.set_role',
   'group.transfer_owner', 'group.bind_group_aid', 'group.complete_transfer',
   'group.review_join_request',
   'group.batch_review_join_request',
@@ -59,6 +52,8 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.create_upload_session', 'storage.complete_upload',
@@ -88,14 +83,54 @@ const SIGNED_METHODS = new Set([
   'group.dissolve', 'group.suspend', 'group.resume',
 ]);
 
+const SIGNING_KEY_CACHE_MAX = 32;
+const signingKeyCache = new Map<string, crypto.KeyObject>();
+const certFingerprintCache = new Map<string, string>();
+
+function cacheGet<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function cachePut<K, V>(cache: Map<K, V>, key: K, value: V): V {
+  cache.set(key, value);
+  while (cache.size > SIGNING_KEY_CACHE_MAX) {
+    const first = cache.keys().next().value as K | undefined;
+    if (first === undefined) break;
+    cache.delete(first);
+  }
+  return value;
+}
+
+function sha256Hex(text: string): string {
+  return crypto.createHash('sha256').update(text, 'utf-8').digest('hex');
+}
+
+function getSigningPrivateKey(privateKeyPem: string): crypto.KeyObject {
+  const key = sha256Hex(privateKeyPem);
+  return cacheGet(signingKeyCache, key) ?? cachePut(signingKeyCache, key, crypto.createPrivateKey(privateKeyPem));
+}
+
+function getCertFingerprint(certPem: string): string {
+  const key = sha256Hex(certPem);
+  const cached = cacheGet(certFingerprintCache, key);
+  if (cached !== undefined) return cached;
+  const certObj = new crypto.X509Certificate(certPem);
+  return cachePut(certFingerprintCache, key, 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase());
+}
+
 /** pull-gate 防并发窗口，与 client.ts PULL_GATE_STALE_MS 保持一致 */
 const PULL_GATE_STALE_MS = 30000;
 const NON_IDEMPOTENT_TIMEOUT_MS = 35_000;
 const NON_IDEMPOTENT_METHODS = new Set([
   'message.send', 'group.send', 'group.create', 'group.invite',
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
-  'group.update_name', 'group.update_avatar', 'group.update_announcement',
-  'group.update_settings',
+  'group.set_settings',
+  'group.update_announcement', 'group.update_rules',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.create_upload_session', 'storage.complete_upload',
@@ -183,7 +218,7 @@ export class RpcPipeline {
         const encrypt = p.encrypt ?? true;
         delete p.encrypt;
         if (encrypt) {
-          return await runWithRpcPriority(() => client._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
+          return await runWithRpcPriority(() => client._sendGroupV2(String(p.group_aid ?? p.group_id ?? ''), p.payload as Record<string, unknown>, {
             messageId: String(p.message_id ?? '') || undefined,
             timestamp: p.timestamp as number | undefined,
             protectedHeaders: client._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
@@ -245,12 +280,13 @@ export class RpcPipeline {
         const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
         const cursorParams = client._explicitGroupCursorParams(p);
         const ownsCursor = Object.keys(cursorParams).length === 0 || client._groupCursorTargetsCurrentInstance(cursorParams);
-        const pullOpts: { gateLocked: boolean; explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = { gateLocked: true };
+        const pullOpts: { gateLocked: boolean; explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean; wireGroupId?: string } = { gateLocked: true };
         if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
         if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
         if (!ownsCursor) pullOpts.ownsCursor = false;
+        if (String(p.group_id ?? '').trim()) pullOpts.wireGroupId = String(p.group_id).trim();
         const messages = await runWithRpcPriority(() => client._pullGroupV2(
-          String(p.group_id),
+          String(p.group_aid ?? p.group_id),
           Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
           Number(p.limit ?? 50) || 50,
           pullOpts,
@@ -269,7 +305,7 @@ export class RpcPipeline {
           return await runWithRpcPriority(() => client._rawGroupAckMessages(p)) as RpcResult;
         }
         return await runWithRpcPriority(() => client._ackGroupV2(
-          String(p.group_id),
+          String(p.group_aid ?? p.group_id),
           Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
         )) as RpcResult;
       }
@@ -323,10 +359,6 @@ export class RpcPipeline {
     if (INTERNAL_ONLY_METHODS.has(method)) {
       throw new PermissionError(`method is internal_only: ${method}`);
     }
-    if (method.startsWith('message.e2ee.') || method.startsWith('group.e2ee.') || REMOVED_E2EE_METHODS.has(method)) {
-      throw new PermissionError(`legacy E2EE method is removed in this SDK: ${method}`);
-    }
-
     const p: RpcParams = { ...(params ?? {}) };
     this.mergeInstanceProtectedHeaders(method, p);
     const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || client._backgroundRpcDepth > 0;
@@ -335,6 +367,7 @@ export class RpcPipeline {
     if (method === 'message.send' || method === 'group.send') {
       this.normalizeOutboundMessagePayload(p, method);
     }
+    this.normalizeGroupCallIdentifier(method, p);
     this.validateOutboundCall(method, p);
     this.injectMessageCursorContext(method, p);
     this.captureGroupCursorParams(method, p);
@@ -491,14 +524,13 @@ export class RpcPipeline {
       const paramsHash = crypto.createHash('sha256').update(paramsJson, 'utf-8').digest('hex');
 
       const signData = Buffer.from(`${method}|${aid}|${ts}|${paramsHash}`, 'utf-8');
-      const privateKey = crypto.createPrivateKey(currentAid.privateKeyPem);
+      const privateKey = getSigningPrivateKey(currentAid.privateKeyPem);
       const signature = crypto.sign('SHA256', signData, privateKey);
 
       let certFingerprint = '';
       const certPem = currentAid.certPem;
       if (certPem) {
-        const certObj = new crypto.X509Certificate(certPem);
-        certFingerprint = 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase();
+        certFingerprint = getCertFingerprint(certPem);
       }
 
       params.client_signature = {
@@ -520,11 +552,11 @@ export class RpcPipeline {
     if (method === 'message.pull' || method === 'message.v2.pull') {
       return client._aid ? `p2p:${client._aid}` : '';
     }
-    if ((method === 'group.pull' || method === 'group.v2.pull') && String(params.group_id ?? '').trim()) {
-      return `group:${String(params.group_id ?? '').trim()}`;
+    if ((method === 'group.pull' || method === 'group.v2.pull') && String(params.group_aid ?? params.group_id ?? '').trim()) {
+      return `group:${String(params.group_aid ?? params.group_id ?? '').trim()}`;
     }
-    if (method === 'group.pull_events' && String(params.group_id ?? '').trim()) {
-      return `group_event:${String(params.group_id ?? '').trim()}`;
+    if (method === 'group.pull_events' && String(params.group_aid ?? params.group_id ?? '').trim()) {
+      return `group_event:${String(params.group_aid ?? params.group_id ?? '').trim()}`;
     }
     return '';
   }
@@ -669,7 +701,7 @@ export class RpcPipeline {
 
   private postprocessGroupPull(params: RpcParams, result: JsonObject): void {
     const client = this.runtime.client;
-    const gid = String(params.group_id ?? '').trim();
+    const gid = String(params.group_aid ?? params.group_id ?? '').trim();
     if (!gid || !client._seqTracker) {
       return;
     }
@@ -712,20 +744,48 @@ export class RpcPipeline {
       return;
     }
     const client = this.runtime.client;
-    if (params.group_id !== undefined && params.group_id !== null) {
-      const rawGroupId = String(params.group_id);
-      const normalizedGroupId = normalizeGroupId(rawGroupId);
-      if (normalizedGroupId && normalizedGroupId !== rawGroupId) {
-        client._clientLog?.debug?.(`call group_id normalized: ${rawGroupId} -> ${normalizedGroupId} method=${method}`);
-      }
-      params.group_id = normalizedGroupId;
-    }
+    this.normalizeGroupCallIdentifier(method, params);
     if (params.device_id === undefined) {
       params.device_id = client._deviceId;
     }
     if (params.slot_id === undefined) {
       params.slot_id = client._slotId;
     }
+  }
+
+  private normalizeGroupCallIdentifier(method: string, params: RpcParams): void {
+    if (!method.startsWith('group.')) {
+      return;
+    }
+    const record = params as Record<string, unknown>;
+    const rawEntries: Array<[string, unknown]> = [
+      ['group_aid', record.group_aid],
+      ['groupAid', record.groupAid],
+      ['group_id', record.group_id],
+      ['groupId', record.groupId],
+    ];
+    const found = rawEntries.find(([, value]) => String(value ?? '').trim());
+    if (found) {
+      const [key, raw] = found;
+      const rawGroupId = String(raw).trim();
+      const normalizedGroupId = normalizeGroupId(rawGroupId);
+      if (normalizedGroupId) {
+        if (normalizedGroupId !== rawGroupId) {
+          this.runtime.client._clientLog?.debug?.(`call group identifier normalized: ${key}=${rawGroupId} -> ${normalizedGroupId} method=${method}`);
+        }
+        const existingGroupId = String(record.group_id ?? record.groupId ?? '').trim();
+        if (key === 'group_id' || key === 'groupId') {
+          params.group_id = rawGroupId;
+        } else if (existingGroupId) {
+          params.group_id = existingGroupId;
+        } else {
+          params.group_id = normalizedGroupId;
+        }
+        params.group_aid = normalizedGroupId;
+      }
+    }
+    delete record.groupAid;
+    delete record.groupId;
   }
 
   private groupCursorParams(params: RpcParams): RpcParams {

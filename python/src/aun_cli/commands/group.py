@@ -752,11 +752,13 @@ def group_bind(
 
     async def _run():
         async with CLISession(ctx) as client:
-            info = await client.call("group.info", {"group_id": resolved_group_id})
-            group = info.get("group") if isinstance(info, dict) else None
-            if not isinstance(group, dict):
+            info = await client.call("group.get_info", {
+                "group_id": resolved_group_id,
+                "required": ["member"],
+            })
+            if not isinstance(info, dict) or info.get("found") is False:
                 raise ValueError(f"group not found or unavailable: {resolved_group_id}")
-            existing_group_aid = str(group.get("group_aid") or "").strip()
+            existing_group_aid = str(info.get("group_aid") or "").strip()
             if _is_named_group_aid(existing_group_aid):
                 raise ValueError(f"group already has group_aid: {existing_group_aid}")
             params: dict[str, Any] = {"group_id": resolved_group_id}
@@ -1197,7 +1199,10 @@ def group_info(
 
     async def _run():
         async with CLISession(ctx) as client:
-            return await client.call("group.info", {"group_id": resolved_group_id})
+            return await client.call("group.get_info", {
+                "group_id": resolved_group_id,
+                "required": ["member", "state", "e2ee"],
+            })
 
     try:
         result = run_async(_run())

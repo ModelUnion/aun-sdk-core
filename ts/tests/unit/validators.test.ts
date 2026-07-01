@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { validateAIDFormat, validateGroupIDFormat, ValidationError } from '../../src/index.js';
+import { validateAIDFormat, validateGroupAIDFormat, validateGroupIDFormat, ValidationError } from '../../src/index.js';
 
 describe('validators', () => {
   describe('validateAIDFormat', () => {
@@ -11,7 +11,7 @@ describe('validators', () => {
 
     it('should normalize to lowercase', () => {
       expect(validateAIDFormat('Alice.AID.COM')).toBe('alice.aid.com');
-      expect(validateAIDFormat('BOB.Example.Org')).toBe('bob.example.org');
+      expect(validateAIDFormat('BOB1.Example.Org')).toBe('bob1.example.org');
     });
 
     it('should reject empty AID', () => {
@@ -36,11 +36,16 @@ describe('validators', () => {
 
     it('should reject AID name too short', () => {
       expect(() => validateAIDFormat('ab.aid.com')).toThrow(ValidationError);
+      expect(() => validateAIDFormat('bob.aid.com')).toThrow(ValidationError);
+    });
+
+    it('should accept AID name at the 4-character minimum', () => {
+      expect(validateAIDFormat('bob1.aid.com')).toBe('bob1.aid.com');
     });
 
     it('should reject invalid characters in name', () => {
-      expect(() => validateAIDFormat('alice@bob.aid.com')).toThrow(ValidationError);
-      expect(() => validateAIDFormat('alice bob.aid.com')).toThrow(ValidationError);
+      expect(() => validateAIDFormat('alice@bob1.aid.com')).toThrow(ValidationError);
+      expect(() => validateAIDFormat('alice bob1.aid.com')).toThrow(ValidationError);
     });
 
     it('should reject invalid domain', () => {
@@ -66,13 +71,13 @@ describe('validators', () => {
     });
 
     it('should accept canonical format', () => {
-      expect(validateGroupIDFormat('group.aid.com/g-test')).toBe('group.aid.com/g-test');
-      expect(validateGroupIDFormat('group.example.org/mygroup')).toBe('group.example.org/mygroup');
+      expect(validateGroupIDFormat('group.aid.com/g-test')).toBe('g-test.aid.com');
+      expect(validateGroupIDFormat('group.example.org/mygroup')).toBe('mygroup.example.org');
     });
 
     it('should accept @ format', () => {
-      expect(validateGroupIDFormat('g-test@aid.com')).toBe('g-test@aid.com');
-      expect(validateGroupIDFormat('mygroup@example.org')).toBe('mygroup@example.org');
+      expect(validateGroupIDFormat('g-test@aid.com')).toBe('g-test.aid.com');
+      expect(validateGroupIDFormat('mygroup@example.org')).toBe('mygroup.example.org');
     });
 
     it('should accept dot format', () => {
@@ -83,6 +88,14 @@ describe('validators', () => {
     it('should normalize to lowercase', () => {
       expect(validateGroupIDFormat('G-TEST')).toBe('g-test');
       expect(validateGroupIDFormat('MyGroup.EXAMPLE.ORG')).toBe('mygroup.example.org');
+    });
+
+    it('should return target group_aid format for legacy inputs', () => {
+      expect(validateGroupAIDFormat('room-123.agentid.pub')).toBe('room-123.agentid.pub');
+      expect(validateGroupAIDFormat('group.agentid.pub/room-123')).toBe('room-123.agentid.pub');
+      expect(validateGroupAIDFormat('room-123@agentid.pub')).toBe('room-123.agentid.pub');
+      expect(validateGroupAIDFormat('g-abc123', { localIssuer: 'agentid.pub' })).toBe('g-abc123.agentid.pub');
+      expect(validateGroupAIDFormat('group.pub/room-123@agentid')).toBe('room-123.agentid.pub');
     });
 
     it('should reject empty group_id', () => {

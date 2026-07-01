@@ -316,7 +316,9 @@ headers = client.get_protected_headers()
 
 ## 业务门面
 
-除 `client.call(method, params)` 外，四语言 SDK 对 storage、collab 和 group.fs 群文件系统提供高层门面。普通应用优先用门面，只有需要精确控制底层参数时再直调 RPC。
+除 `client.call(method, params)` 外，四语言 SDK 提供高层门面（Facade），封装常用操作并简化参数。普通应用优先用门面，只有需要精确控制底层参数时再直调 RPC。
+
+### 文件与存储门面
 
 | 能力 | Python | TS/JS | Go | 说明 |
 |------|--------|-------|----|------|
@@ -325,6 +327,30 @@ headers = client.get_protected_headers()
 | Group FS | `client.group.fs` | `client.group.fs` | `client.Group().FS()` | POSIX 风格群文件系统；`ls/find/stat/lstat/mkdir/rm/cp/mv/df/mount/umount`，以及 `set_acl/remove_acl/get_acl/list_acl` 角色 ACL 门面，上传下载数据面由 SDK 编排 |
 
 群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `group_data/{group_aid}` 的映射只在服务端完成。群自有区写入允许当前 `group_aid` 证书签名、默认 `role:owner`、以及 owner 通过 `group.fs.set_acl` 显式授权后的 `role:admin`；撤销使用 `group.fs.remove_acl`，查询使用 `group.fs.get_acl/list_acl`，这些角色 ACL 操作都要求当前 group owner 调用且对外权限位显示为 `rwx`。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
+
+### 消息与群组门面
+
+| 能力 | Python | TS/JS | Go | 说明 |
+|------|--------|-------|----|------|
+| Message | `client.message` | `client.message` | `client.Message()` | 消息便利方法：`send()`、`pull()`、`ack()`、`recall()`、`queryOnline()` |
+| Message Thought | `client.message.thought` | `client.message.thought` | `client.Message().Thought()` | P2P 思考内容：`put()`、`get()`（不持久化、不分配 seq、强制 E2EE） |
+| Group | `client.group` | `client.group` | `client.Group()` | 群组便利方法：`create()`、`send()`、`pull()`、`ack()`、群管理方法、群查询方法、群设置便利方法 |
+| Group Thought | `client.group.thought` | `client.group.thought` | `client.Group().Thought()` | 群思考内容：`put()`、`get()`（不持久化、不分配 seq、强制 E2EE） |
+| Stream | `client.stream` | `client.stream` | — | 流式数据：`createStream()`、`sendChunk()`、`endStream()`、`subscribeStream()` |
+
+**群查询方法**：`GroupFacade` 提供三个查询方法，适用不同场景：
+
+- `getBasic()` — 查询群组基础信息（嵌套格式 `{found, group_id, group: {...}}`），**SDK 内部逻辑使用**
+- `getInfo()` — 查询群组信息（扁平化格式，提升常用字段到顶层），**推荐外部使用**
+- `info()` — 查询群组详细信息（带权限控制，非成员只能看公开群，成员能看 seq/epoch 等运行时状态）
+
+**群设置便利方法**：`GroupFacade` 提供向后兼容的便利方法，基于 `group.set_settings` / `group.get_settings` 实现：
+
+- `getAnnouncement()` / `updateAnnouncement()` — 群公告
+- `getRules()` / `updateRules()` — 群规则
+- `getJoinRequirements()` / `updateJoinRequirements()` — 入群要求
+
+便利方法返回旧格式（嵌套对象 `{announcement: {content, attachments}}`），屏蔽 `settings` 数组的繁琐。新代码建议直接使用 `group.set_settings` / `group.get_settings` 以获得更灵活的批量操作能力（一次调用可设置多个键）。
 
 ---
 

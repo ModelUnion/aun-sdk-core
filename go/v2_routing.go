@@ -87,12 +87,38 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if nsBefore != "" {
 		contigBefore = c.seqTracker.GetContiguousSeq(nsBefore)
 	}
-	msgs, pullMeta, err := c.pullV2WithForce(ctx, afterSeq, limit, force)
-	if err != nil {
-		return nil, err
+	allMsgs := make([]map[string]any, 0)
+	pullMeta := v2PullPageMeta{}
+	nextAfterSeq := afterSeq
+	if !force && nextAfterSeq == 0 && nsBefore != "" {
+		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(nsBefore))
 	}
-	out := make([]any, 0, len(msgs))
-	for _, m := range msgs {
+	for pageCount := 0; pageCount < 100; pageCount++ {
+		msgs, pageMeta, err := c.pullV2WithForce(ctx, nextAfterSeq, limit, force)
+		if err != nil {
+			return nil, err
+		}
+		if pageMeta.hasServerAck {
+			pullMeta.hasServerAck = true
+			if pageMeta.serverAckSeq > pullMeta.serverAckSeq {
+				pullMeta.serverAckSeq = pageMeta.serverAckSeq
+			}
+		}
+		nextAfter := nextAfterSeq
+		if pageMeta.latestSeq > nextAfter {
+			nextAfter = pageMeta.latestSeq
+		}
+		if nextAfter > nextAfterSeq {
+			allMsgs = append(allMsgs, msgs...)
+			pullMeta.rawCount += pageMeta.rawCount
+		}
+		if pageMeta.rawCount <= 0 || nextAfter <= nextAfterSeq {
+			break
+		}
+		nextAfterSeq = nextAfter
+	}
+	out := make([]any, 0, len(allMsgs))
+	for _, m := range allMsgs {
 		out = append(out, m)
 	}
 	// 与 V1 路径一致：发布到应用层 + auto-ack；这里 PullV2 已自行更新 SeqTracker，
@@ -104,7 +130,7 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if myAID != "" {
 		ns = "p2p:" + myAID
 	}
-	for _, m := range msgs {
+	for _, m := range allMsgs {
 		seq := toInt64(m["seq"])
 		event, payload := p2pAppEventForMessage(m)
 		if seq <= 0 || ns == "" {
@@ -151,8 +177,8 @@ func (c *AUNClient) ackV2Internal(ctx context.Context, params map[string]any) (a
 
 // sendGroupV2Internal 适配 client.Call("group.send", params) → SendGroupV2。
 func (c *AUNClient) sendGroupV2Internal(ctx context.Context, params map[string]any) (any, error) {
-	groupID := strings.TrimSpace(getStr(params, "group_id", ""))
-	if groupID == "" {
+	_, groupAID := groupIdentifierPairFromParams(params)
+	if groupAID == "" {
 		return nil, NewValidationError("group.send requires 'group_id'")
 	}
 	payload, _ := params["payload"].(map[string]any)
@@ -172,14 +198,14 @@ func (c *AUNClient) sendGroupV2Internal(ctx context.Context, params map[string]a
 	if ctxMeta, ok := params["context"].(map[string]any); ok && len(ctxMeta) > 0 {
 		opts.Context = ctxMeta
 	}
-	resp, err := c.SendGroupV2WithOpts(ctx, groupID, payload, opts)
+	resp, err := c.SendGroupV2WithOpts(ctx, groupAID, payload, opts)
 	if err != nil {
 		return nil, err
 	}
 	// 发送成功后记录自己发的群消息 seq，保证 SeqTracker 连续；与 Python 对齐。
 	if resp != nil {
 		if seq := toInt64(resp["seq"]); seq > 0 {
-			ns := "group:" + groupID
+			ns := "group:" + groupAID
 			c.seqTracker.OnMessageSeq(ns, int(seq))
 			c.markPushedSeq(ns, int(seq))
 			c.saveSeqTrackerState()
@@ -194,8 +220,8 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	if truthyBool(params["_rpc_background"]) {
 		ctx = contextWithRPCBackground(ctx)
 	}
-	groupID := strings.TrimSpace(getStr(params, "group_id", ""))
-	if groupID == "" {
+	wireGroupID, groupAID := groupIdentifierPairFromParams(params)
+	if groupAID == "" {
 		return nil, NewValidationError("group.pull requires 'group_id'")
 	}
 	afterSeq := int64(0)
@@ -211,12 +237,13 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	if limit <= 0 {
 		limit = 50
 	}
-	ns := "group:" + groupID
+	ns := "group:" + groupAID
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
 	ownsCursor := c.groupCursorTargetsCurrentInstance(params)
-	msgs, pullMeta, err := c.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{
+	msgs, pullMeta, err := c.pullGroupV2WithOptions(ctx, groupAID, afterSeq, limit, groupV2PullOptions{
 		explicitAfterSeq: explicitAfterSeq,
 		cursorParams:     groupCursorParams(params),
+		wireGroupID:      wireGroupID,
 	})
 	if err != nil {
 		return nil, err
@@ -228,7 +255,7 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 		// 命中则归一化为 group.message_recalled 事件并占 seq，但绝不 append 进返回的 messages
 		// 列表（否则撤回 tombstone 会作为"普通消息"泄漏给应用层）。对齐 Python/TS：识别后直接 continue。
 		if _, isRecall := recallEventFromGroupMessage(m); isRecall {
-			c.delivery().publishGroupRecallTombstone(groupID, int(seq), m)
+			c.delivery().publishGroupRecallTombstone(groupAID, int(seq), m)
 			if seq > 0 {
 				c.markPushedSeq(ns, int(seq))
 			}
@@ -247,7 +274,8 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	if ackNeeded {
 		ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
 		ackParams := map[string]any{
-			"group_id":  groupID,
+			"group_id":  groupAID,
+			"group_aid": groupAID,
 			"up_to_seq": ackSeq,
 		}
 		go func() {
@@ -256,7 +284,7 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 			c.signClientOperation("group.v2.ack", ackParams)
 			ackParams["_rpc_background"] = true
 			if _, ackErr := c.transport.Call(ackCtx, "group.v2.ack", ackParams); ackErr != nil {
-				c.logEG.Debug("V2 group auto-ack failed: group=%s %v", groupID, ackErr)
+				c.logEG.Debug("V2 group auto-ack failed: group=%s %v", groupAID, ackErr)
 			}
 		}()
 	}
@@ -289,15 +317,15 @@ func (c *AUNClient) ackGroupV2Internal(ctx context.Context, params map[string]an
 	if truthyBool(params["_rpc_background"]) {
 		ctx = contextWithRPCBackground(ctx)
 	}
-	groupID := strings.TrimSpace(getStr(params, "group_id", ""))
-	if groupID == "" {
+	_, groupAID := groupIdentifierPairFromParams(params)
+	if groupAID == "" {
 		return nil, errors.New("group.ack_messages requires 'group_id'")
 	}
 	upTo := toInt64(params["msg_seq"])
 	if upTo == 0 {
 		upTo = toInt64(params["up_to_seq"])
 	}
-	return c.ackGroupV2(ctx, groupID, upTo)
+	return c.ackGroupV2(ctx, groupAID, upTo)
 }
 
 // 占位 import 防止 fmt 被去掉；实际使用见错误格式化扩展

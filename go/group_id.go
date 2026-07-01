@@ -1,118 +1,107 @@
-// group_id 归一化工具。
+// group_id/group_aid 兼容转换工具。
 //
-// AUN 协议规定的 canonical 格式为 `group.{domain}/{base}`。
-//
-// 历史上出现过四种老/脏格式：
-//   1. {base}.{domain}            例如 g-xxx.agentid.pub / 10086.agentid.pub
-//   2. g-{slug}.{domain}          （属于 1 的一种）
-//   3. {base}@{domain}            例如 g-xxx@agentid.pub
-//   4. group.{A}/{base}@{B}       旧版服务端迁移脚本未识别 @ 导致的污染数据
-//                                 真实语义：group.{B}.{A}/{base}
-//
-// 与 Python/TS/JS SDK 保持等价，零代码共享。
+// 目标态群组主标识是 group_aid，格式为 {base}.{issuer}。
+// 历史 group_id 字段名继续保留，但旧函数名也返回 group_aid。
 
 package aun
 
-import (
-	"strings"
-)
+import "strings"
 
 func trimDots(s string) string {
 	return strings.Trim(s, ".")
 }
 
-// NormalizeGroupID 将任意历史格式的 group_id 归一化为 canonical。
-// localIssuer 不为空时，对无域前缀的本域简写补全为 group.{localIssuer}/{base}；
-// 为空时原样返回。
-func NormalizeGroupID(raw string, localIssuer string) string {
-	value := strings.ToLower(strings.TrimSpace(raw))
+// ConvertToGroupAID 将任意历史群标识转换为标准 group_aid。
+func ConvertToGroupAID(raw string, localIssuer string) string {
+	value := strings.ToLower(strings.Trim(strings.TrimSpace(raw), "/"))
 	if value == "" {
 		return ""
 	}
 
-	// 情况 4：已迁移但 base 位置残留 @issuer 尾巴
 	if strings.HasPrefix(value, "group.") && strings.Contains(value, "/") {
 		issuerAndBase := value[6:]
 		if slash := strings.Index(issuerAndBase, "/"); slash > 0 && slash < len(issuerAndBase)-1 {
-			aDomain := trimDots(issuerAndBase[:slash])
-			baseTail := issuerAndBase[slash+1:]
+			domain := trimDots(issuerAndBase[:slash])
+			baseTail := strings.Trim(issuerAndBase[slash+1:], "/")
 			if at := strings.Index(baseTail, "@"); at > 0 {
 				base := trimDots(baseTail[:at])
-				bDomain := trimDots(baseTail[at+1:])
-				if base != "" && bDomain != "" {
-					merged := bDomain
-					if aDomain != "" {
-						merged = bDomain + "." + aDomain
+				suffixDomain := trimDots(baseTail[at+1:])
+				if base != "" && suffixDomain != "" {
+					merged := suffixDomain
+					if domain != "" {
+						merged = suffixDomain + "." + domain
 					}
-					return "group." + merged + "/" + base
+					return base + "." + merged
 				}
 			}
-			if aDomain != "" {
-				return "group." + aDomain + "/" + trimDots(baseTail)
+			base := trimDots(baseTail)
+			if base != "" && domain != "" {
+				return base + "." + domain
 			}
 			return value
 		}
 		return value
 	}
 
-	// 情况 3：base@domain / g-{slug}@domain
 	if at := strings.Index(value, "@"); at > 0 {
 		base := trimDots(value[:at])
 		domain := trimDots(value[at+1:])
 		if base != "" && domain != "" {
-			return "group." + domain + "/" + base
+			return base + "." + domain
 		}
 		return value
 	}
 
+	if strings.Contains(value, ".") {
+		return value
+	}
 	issuer := strings.ToLower(trimDots(strings.TrimSpace(localIssuer)))
-
-	// 情况 1/2：base.domain / g-{slug}.domain
-	if strings.HasPrefix(value, "g-") {
-		rest := value[2:]
-		if dot := strings.Index(rest, "."); dot > 0 {
-			slug := rest[:dot]
-			domain := trimDots(rest[dot+1:])
-			if slug != "" && domain != "" {
-				return "group." + domain + "/g-" + slug
-			}
-		}
-		if issuer != "" {
-			return "group." + issuer + "/g-" + rest
-		}
-		return value
-	}
-	if dot := strings.Index(value, "."); dot > 0 {
-		base := value[:dot]
-		domain := trimDots(value[dot+1:])
-		if base != "" && domain != "" {
-			return "group." + domain + "/" + base
-		}
-	}
 	if issuer != "" {
-		return "group." + issuer + "/" + value
+		return value + "." + issuer
 	}
 	return value
 }
 
-// SplitGroupID 返回 (base, domain)。对污染格式也能还原出正确的 (base, domain)。
-func SplitGroupID(raw string) (string, string) {
-	canonical := NormalizeGroupID(raw, "")
-	if strings.HasPrefix(canonical, "group.") && strings.Contains(canonical, "/") {
-		issuerAndBase := canonical[6:]
-		slash := strings.Index(issuerAndBase, "/")
-		domain := trimDots(issuerAndBase[:slash])
-		base := trimDots(issuerAndBase[slash+1:])
-		return base, domain
-	}
-	return trimDots(canonical), ""
+// NormalizeGroupID 是旧函数名兼容包装；目标态返回 group_aid。
+func NormalizeGroupID(raw string, localIssuer string) string {
+	return ConvertToGroupAID(raw, localIssuer)
 }
 
-// BuildDiscoveryHost 构造 federation 发现 host：{base}.{domain}。
-func BuildDiscoveryHost(raw string) string {
-	base, domain := SplitGroupID(raw)
-	if base == "" || domain == "" {
-		return ""
+func groupAIDOrRaw(raw string) string {
+	value := strings.TrimSpace(raw)
+	normalized := ConvertToGroupAID(value, "")
+	if normalized != "" {
+		return normalized
 	}
-	return base + "." + domain
+	return value
+}
+
+func groupIdentifierPairFromParams(params map[string]any) (string, string) {
+	if params == nil {
+		return "", ""
+	}
+	wireGroupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+	groupAID := strings.TrimSpace(stringFromAny(params["group_aid"]))
+	if groupAID == "" {
+		groupAID = groupAIDOrRaw(wireGroupID)
+	}
+	if wireGroupID == "" {
+		wireGroupID = groupAID
+	}
+	return wireGroupID, groupAID
+}
+
+// SplitGroupID 返回 (base, issuer)。对旧格式输入也先转换为 group_aid。
+func SplitGroupID(raw string) (string, string) {
+	groupAID := ConvertToGroupAID(raw, "")
+	if dot := strings.Index(groupAID, "."); dot > 0 {
+		return trimDots(groupAID[:dot]), trimDots(groupAID[dot+1:])
+	}
+	return trimDots(groupAID), ""
+}
+
+// BuildDiscoveryHost 构造 federation 发现 host。群服务发现走 issuer 域。
+func BuildDiscoveryHost(raw string) string {
+	_, domain := SplitGroupID(raw)
+	return domain
 }

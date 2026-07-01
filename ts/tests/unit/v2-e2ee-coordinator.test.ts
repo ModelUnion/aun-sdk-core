@@ -5,7 +5,7 @@ import { ClientRuntime } from '../../src/client/runtime.js';
 
 function createCoordinator(): { coordinator: V2E2EECoordinator; client: Record<string, any> } {
   const client: Record<string, any> = {
-    _aid: 'bob.agentid.pub',
+    _aid: 'bob1.agentid.pub',
     _deviceId: 'device-b',
     _v2BootstrapCache: new Map(),
     _clientLog: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
@@ -50,12 +50,12 @@ describe('V2E2EECoordinator 组件边界', () => {
   it('bootstrap cache 支持 set/get/delete/clear 和 TTL prune', () => {
     const { coordinator } = createCoordinator();
 
-    coordinator.setBootstrapCacheEntry('bob.agentid.pub', { cachedAt: 100, devices: [{ device_id: 'old' }] });
+    coordinator.setBootstrapCacheEntry('bob1.agentid.pub', { cachedAt: 100, devices: [{ device_id: 'old' }] });
     coordinator.setBootstrapCacheEntry('alice.agentid.pub', { cachedAt: 900, devices: [{ device_id: 'fresh' }] });
 
     coordinator.pruneExpiredBootstrapCache(500, 1000);
 
-    expect(coordinator.getBootstrapCacheEntry('bob.agentid.pub')).toBeUndefined();
+    expect(coordinator.getBootstrapCacheEntry('bob1.agentid.pub')).toBeUndefined();
     expect(coordinator.getBootstrapCacheEntry('alice.agentid.pub')?.devices).toEqual([{ device_id: 'fresh' }]);
 
     coordinator.deleteBootstrapCacheEntry('alice.agentid.pub');
@@ -125,7 +125,7 @@ describe('V2E2EECoordinator 组件边界', () => {
     const msg = {
       message_id: 'm-1',
       from: 'alice.agentid.pub',
-      to: 'bob.agentid.pub',
+      to: 'bob1.agentid.pub',
       seq: 7,
       timestamp: 123,
       device_id: 'device-a',
@@ -144,7 +144,7 @@ describe('V2E2EECoordinator 组件边界', () => {
     await expect(coordinator.publishEncryptedPushMessage(
       'message.received',
       'message.undecryptable',
-      'p2p:bob.agentid.pub',
+      'p2p:bob1.agentid.pub',
       7,
       msg,
       false,
@@ -156,12 +156,12 @@ describe('V2E2EECoordinator 组件边界', () => {
     });
     expect(client._publishOrderedMessage).toHaveBeenCalledWith(
       'message.undecryptable',
-      'p2p:bob.agentid.pub',
+      'p2p:bob1.agentid.pub',
       7,
       expect.objectContaining({
         message_id: 'm-1',
         from: 'alice.agentid.pub',
-        to: 'bob.agentid.pub',
+        to: 'bob1.agentid.pub',
         _decrypt_stage: 'push_envelope',
         _envelope_type: 'e2ee.p2p_encrypted',
         payload_type: 'text',

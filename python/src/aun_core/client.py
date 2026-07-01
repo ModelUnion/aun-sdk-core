@@ -46,6 +46,7 @@ from .errors import (
     NotFoundError,
     PermissionError as AUNPermissionError,
     StateError,
+    TimeoutError,
     ValidationError,
 )
 from .events import EventDispatcher, Subscription
@@ -207,8 +208,7 @@ _NON_IDEMPOTENT_TIMEOUT = 35.0
 _NON_IDEMPOTENT_METHODS = frozenset({
     "message.send", "group.send", "group.create", "group.invite",
     "group.kick", "group.remove_member", "group.leave", "group.dissolve",
-    "group.update_name", "group.update_avatar", "group.update_announcement",
-    "group.update_settings", "group.rotate_epoch",
+    "group.set_settings",
     "storage.put_object", "storage.delete_object", "storage.get_by_share",
     "storage.create_share_link", "storage.revoke_share_link",
     "storage.create_upload_session", "storage.complete_upload",
@@ -257,6 +257,7 @@ _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
 _PUBLIC_CONNECTION_OPTION_KEYS = frozenset({
     "auto_reconnect",
     "connect_timeout",
+    "retry",
     "retry_initial_delay",
     "retry_max_delay",
     "retry_max_attempts",
@@ -555,6 +556,7 @@ class AUNClient:
         # 但 epoch rotation 等路径会无条件访问，需先以空值占位避免 AttributeError。
         self._v2_session = None
         self._v2_bootstrap_cache: dict[str, tuple] = {}
+        self._v2_target_set_cache: dict[str, tuple[float, Any]] = {}
         self._v2_sender_ik_pending: dict[str, dict[str, Any]] = {}
         self._v2_sender_ik_fetching: set[str] = set()
         self._prekey_replenish_inflight: bool = False
@@ -621,6 +623,8 @@ class AUNClient:
         self._ordered_gap_block_stats: dict[str, dict[str, Any]] = {}
         # 诊断：push 从 raw 到应用层发布的关键分支计数。
         self._push_processing_stats: dict[str, dict[str, int]] = {}
+        # 诊断：P2P gap-fill / push auto-pull 的触发与拉取结果。
+        self._p2p_gap_fill_stats: dict[str, int] = {}
         # 诊断：SDK auto-ack 后台任务计数。
         self._auto_ack_stats: dict[str, int] = {}
         # P2P pull 进行中到达的纯通知 push 上界。当前 pull 结束后需要再补拉一次。
@@ -666,10 +670,8 @@ class AUNClient:
         self._dispatcher.subscribe("_raw.group.v2.message_created", self._on_raw_group_v2_message_created)
         # 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
         self._dispatcher.subscribe("_raw.group.message_recalled", self._on_raw_group_message_recalled)
-        # 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
+        # 群组变更事件：透传并触发 V2 state/SPK 维护
         self._dispatcher.subscribe("_raw.group.changed", self._on_raw_group_changed)
-        # V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation
-        self._dispatcher.subscribe("_raw.group.v2.epoch_rotated", self._on_v2_epoch_rotated)
         # V2 state proposal 服务平面事件：owner/admin 负责确认或重新提案
         self._dispatcher.subscribe("_raw.group.v2.state_proposed", self._on_v2_state_proposed)
         self._dispatcher.subscribe("_raw.group.v2.state_retry_needed", self._on_v2_state_retry_needed)
@@ -1010,9 +1012,8 @@ class AUNClient:
         "group.v2.propose_state", "group.v2.confirm_state",
         "group.v2.get_proposal",
         "group.kick", "group.add_member",
-        "group.leave", "group.remove_member", "group.update_rules",
-        "group.update", "group.update_announcement",
-        "group.update_join_requirements", "group.set_role",
+        "group.leave", "group.remove_member",
+        "group.update", "group.set_role",
         "group.transfer_owner", "group.bind_group_aid", "group.renew_group_aid", "group.complete_transfer",
         "group.review_join_request",
         "group.batch_review_join_request",
@@ -1020,9 +1021,9 @@ class AUNClient:
         "group.thought.put",
         "message.thought.put",
         "group.set_settings",
+        "group.update_announcement",
+        "group.update_rules",
         "group.commit_state",
-        "group.e2ee.begin_rotation", "group.e2ee.commit_rotation",
-        "group.e2ee.abort_rotation",
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
         "storage.put_object", "storage.delete_object", "storage.get_by_share",
@@ -1063,7 +1064,23 @@ class AUNClient:
         self._rpc().release_pull_gate(key, token)
 
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
-        return await self._rpc().call(method, params, trace=trace)
+        try:
+            return await self._rpc().call(method, params, trace=trace)
+        except Exception as exc:
+            await self._maybe_handle_half_open_rpc_failure(exc)
+            raise
+
+    async def _maybe_handle_half_open_rpc_failure(self, error: Exception) -> None:
+        if not isinstance(error, (ConnectionError, TimeoutError)):
+            return
+        if bool(getattr(self, "_closing", False)) or self._public_state != ConnectionState.READY:
+            return
+        if not bool((getattr(self, "_session_options", None) or {}).get("auto_reconnect")):
+            return
+        reconnect_task = getattr(self, "_reconnect_task", None)
+        if reconnect_task is not None and not reconnect_task.done():
+            return
+        await self._handle_transport_disconnect(error)
 
     async def create_group(
         self,
@@ -1147,9 +1164,13 @@ class AUNClient:
         if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity"):
             raise ValueError("bind_group_aid requires aid_store with import_group_identity")
 
-        group_id = str(merged.get("group_id") or "").strip()
+        group_id = str(merged.get("group_id") or merged.get("group_aid") or "").strip()
         if not group_id:
-            raise ValueError("bind_group_aid requires group_id")
+            raise ValueError("bind_group_aid requires group_id or group_aid")
+        if not str(merged.get("group_id") or "").strip():
+            merged["group_id"] = group_id
+        if "group_aid" in merged and str(merged.get("group_aid") or "").strip():
+            merged["group_aid"] = str(merged.get("group_aid") or "").strip()
 
         keystore = getattr(store, "_keystore", None)
         pseudo_aid = f"group:{group_id}"
@@ -1280,14 +1301,15 @@ class AUNClient:
         if store is None or not hasattr(store, "_register_flow") or not hasattr(store, "import_group_identity") or not hasattr(store, "load"):
             raise ValueError("renew_group_aid requires aid_store with load/import_group_identity")
 
-        group_id = str(merged.get("group_id") or "").strip()
+        group_id = str(merged.get("group_id") or merged.get("group_aid") or "").strip()
         if not group_id:
-            raise ValueError("renew_group_aid requires group_id")
+            raise ValueError("renew_group_aid requires group_id or group_aid")
+        if not str(merged.get("group_id") or "").strip():
+            merged["group_id"] = group_id
         group_aid = str(merged.get("group_aid") or "").strip()
         if not group_aid:
-            info = await self.call("group.get", {"group_id": group_id})
-            group_info = info.get("group") if isinstance(info, dict) else {}
-            group_aid = str(group_info.get("group_aid") or "").strip() if isinstance(group_info, dict) else ""
+            info = await self.call("group.get_info", {"group_id": group_id, "required": ["member"]})
+            group_aid = str(info.get("group_aid") or "").strip() if isinstance(info, dict) else ""
         if not group_aid:
             raise ValueError("renew_group_aid: unable to determine group_aid")
 
@@ -1406,8 +1428,8 @@ class AUNClient:
 
         group_aid = str(merged.get("group_aid") or "").strip()
         if not group_aid:
-            info = await self.call("group.get", {"group_id": group_id})
-            group_aid = str((info.get("group") or info or {}).get("group_aid") or "").strip()
+            info = await self.call("group.get_info", {"group_id": group_id, "required": ["member"]})
+            group_aid = str(info.get("group_aid") or "").strip() if isinstance(info, dict) else ""
         if not group_aid:
             raise ValueError("start_group_transfer: unable to determine group_aid")
 
@@ -1468,9 +1490,8 @@ class AUNClient:
             raise ValueError("complete_group_transfer requires group_id")
         group_aid = str(merged.get("group_aid") or "").strip()
         if not group_aid:
-            info = await self.call("group.get", {"group_id": group_id})
-            group_info = info.get("group") if isinstance(info, dict) else {}
-            group_aid = str(group_info.get("group_aid") or "").strip() if isinstance(group_info, dict) else ""
+            info = await self.call("group.get_info", {"group_id": group_id, "required": ["member"]})
+            group_aid = str(info.get("group_aid") or "").strip() if isinstance(info, dict) else ""
         if not group_aid:
             raise ValueError("complete_group_transfer: unable to determine group_aid")
         current = self.current_aid
@@ -1746,7 +1767,7 @@ class AUNClient:
         _t_start = time.time()
         if isinstance(data, dict):
             action = data.get("action", "")
-            group_id = data.get("group_id", "")
+            group_id = data.get("group_aid") or data.get("group_id", "")
             self._log.debug("client", "_on_raw_group_changed enter: group=%s action=%s event_seq=%s", group_id, action, data.get("event_seq", "-"))
             # 验签：有签名就验证操作者身份
             cs = data.get("client_signature")
@@ -1764,10 +1785,13 @@ class AUNClient:
 
     def _cleanup_dissolved_group(self, group_id: str) -> None:
         """群组解散后清理本地 V2 缓存、seq_tracker 和有序队列运行态。"""
-        group_id = str(group_id or "").strip()
+        from .group_id import normalize_group_id
+
+        group_id = normalize_group_id(str(group_id or "").strip()) if group_id else ""
         if not group_id:
             return
         self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+        self._v2_target_set_cache.pop(f"group:{group_id}", None)
         self._v2_group_security_levels.pop(group_id, None)
         group_ns = f"group:{group_id}"
         group_event_ns = f"group_event:{group_id}"
@@ -1786,25 +1810,6 @@ class AUNClient:
         self._pending_ordered().pop(group_ns, None)
         self._pending_ordered().pop(group_event_ns, None)
         self._log.info("client", "cleaned up dissolved group local state: group=%s", group_id)
-
-    async def _on_v2_epoch_rotated(self, data: Any) -> None:
-        """处理 V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation。"""
-        if not isinstance(data, dict):
-            return
-        group_id = str(data.get("group_id") or "").strip()
-        if not group_id:
-            return
-        new_epoch = data.get("epoch", 0)
-        self._log.debug("client", "_on_v2_epoch_rotated: group=%s epoch=%s", group_id, new_epoch)
-        # 清除 bootstrap 缓存
-        self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
-        # 触发 SPK rotation
-        if self._v2_session:
-            try:
-                await self._v2_session.rotate_spk(self.call)
-                self._log.info("client", "SPK rotated after epoch change: group=%s epoch=%s", group_id, new_epoch)
-            except Exception as exc:
-                self._log.debug("client", "SPK rotation after epoch change failed (non-fatal): %s", exc)
 
     async def _on_group_state_committed(self, data: Any) -> None:
         """处理 event/group.state_committed：验签 → 验证 state_hash 链 → 更新本地存储"""

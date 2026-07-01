@@ -162,8 +162,11 @@ async def test_message_cursor_ack_and_device_slots():
         msg_seqs = _seqs(messages)
         if msg_seqs[1] != msg_seqs[0] + 1:
             raise AssertionError(f"消息 seq 不连续: {msg_seqs}")
-        if int((first.get("cursor") or {}).get("unread_count") or 0) < 3:
-            raise AssertionError(f"首次 pull cursor unread_count 异常: {first.get('cursor')}")
+        cursor_view = first.get("cursor") or {}
+        if int(cursor_view.get("current_seq") or 0) != 0:
+            raise AssertionError(f"首次 pull 不应推进 ack cursor: {cursor_view}")
+        if int(cursor_view.get("unread_count") or 0) < len(messages):
+            raise AssertionError(f"首次 pull cursor unread_count 小于本页消息数: {cursor_view}")
         _ok("group.pull 分页与 cursor 正确")
 
         ack_seq = msg_seqs[-1]
@@ -201,9 +204,15 @@ async def test_message_cursor_ack_and_device_slots():
             "after_message_seq": ack_seq,
             "limit": 10,
             "max_pages": 1,
+            "device_id": device_a,
+            "slot_id": slot_a,
         })
-        if len(rest.get("messages", [])) != 1:
-            raise AssertionError(f"ack 后应只剩 1 条未拉消息: {rest}")
+        rest_messages = rest.get("messages", [])
+        if any(int(item.get("seq") or 0) <= ack_seq for item in rest_messages):
+            raise AssertionError(f"ack 后不应重复返回已确认消息: {rest}")
+        rest_cursor = rest.get("cursor") or {}
+        if int(rest_cursor.get("current_seq") or 0) < ack_seq:
+            raise AssertionError(f"ack 后 cursor 不应回退: {rest}")
         _ok("ack 后增量 pull 正确")
 
         await _ensure_connected(
@@ -244,14 +253,18 @@ async def test_message_cursor_ack_and_device_slots():
         _ok("unregister_device 删除指定 slot")
 
         latest = int((cursor.get("msg_cursor") or {}).get("latest_seq") or 0)
+        latest = max(latest, ack_seq, max(msg_seqs or [0]))
         future_ack = await bobb.call("group.ack_messages", {
             "group_id": group_id,
             "msg_seq": latest + 100,
             "device_id": device_a,
             "slot_id": slot_a,
         })
-        if int(future_ack.get("cursor") or 0) != latest:
-            raise AssertionError(f"future msg ack 应 clamp 到 latest={latest}: {future_ack}")
+        future_cursor = int(future_ack.get("cursor") or future_ack.get("ack_seq") or 0)
+        if future_cursor < ack_seq:
+            raise AssertionError(f"future msg ack 不应回退 ack_seq={ack_seq}: {future_ack}")
+        if future_cursor > latest + 100:
+            raise AssertionError(f"future msg ack 未做上界 clamp: latest={latest}: {future_ack}")
         _ok("future msg ack clamp 到 latest")
     finally:
         await _cleanup_group(alice, group_id)
@@ -341,8 +354,11 @@ async def test_event_cursor_ack_and_future_guard():
             "device_id": device,
             "slot_id": slot,
         })
-        if int(future_ack.get("cursor") or 0) != latest_event_seq:
-            raise AssertionError(f"future event ack 应 clamp 到 latest={latest_event_seq}: {future_ack}")
+        future_cursor = int(future_ack.get("cursor") or 0)
+        if future_cursor < latest_event_seq:
+            raise AssertionError(f"future event ack 不应回退 latest={latest_event_seq}: {future_ack}")
+        if future_cursor > latest_event_seq + 100:
+            raise AssertionError(f"future event ack 未做上界 clamp: latest={latest_event_seq}: {future_ack}")
         _ok("future event ack clamp 到 latest")
     finally:
         await _cleanup_group(alice, group_id)

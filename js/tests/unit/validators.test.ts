@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { ValidationError } from '../../src/errors.js';
-import { validateAIDFormat, validateGroupIDFormat } from '../../src/validators.js';
+import { validateAIDFormat, validateGroupAIDFormat, validateGroupIDFormat } from '../../src/validators.js';
 
 describe('validateAIDFormat', () => {
   it('接受合法 AID', () => {
@@ -79,14 +79,14 @@ describe('validateGroupIDFormat', () => {
 
   it('接受带域名的 legacy 格式', () => {
     expect(validateGroupIDFormat('g-abc123.aid.pub')).toBe('g-abc123.aid.pub');
-    expect(validateGroupIDFormat('g-test@example.com')).toBe('g-test@example.com');
+    expect(validateGroupIDFormat('g-test@example.com')).toBe('g-test.example.com');
   });
 
   it('接受新格式 base', () => {
     expect(validateGroupIDFormat('12345')).toBe('12345');
     expect(validateGroupIDFormat('abcde')).toBe('abcde');
     expect(validateGroupIDFormat('a1b2c3')).toBe('a1b2c3');
-    const longBase = 'a'.repeat(100);
+    const longBase = 'a'.repeat(64);
     expect(validateGroupIDFormat(longBase)).toBe(longBase);
   });
 
@@ -97,15 +97,23 @@ describe('validateGroupIDFormat', () => {
   });
 
   it('接受 canonical 格式', () => {
-    expect(validateGroupIDFormat('group.aid.pub/g-abc123')).toBe('group.aid.pub/g-abc123');
-    expect(validateGroupIDFormat('group.example.com/12345')).toBe('group.example.com/12345');
-    expect(validateGroupIDFormat('group.aid.pub/my_team')).toBe('group.aid.pub/my_team');
+    expect(validateGroupIDFormat('group.aid.pub/g-abc123')).toBe('g-abc123.aid.pub');
+    expect(validateGroupIDFormat('group.example.com/12345')).toBe('12345.example.com');
+    expect(validateGroupIDFormat('group.aid.pub/my_team')).toBe('my_team.aid.pub');
   });
 
   it('大小写规范化', () => {
     expect(validateGroupIDFormat('G-ABC123')).toBe('g-abc123');
-    expect(validateGroupIDFormat('  G-TEST@EXAMPLE.COM  ')).toBe('g-test@example.com');
+    expect(validateGroupIDFormat('  G-TEST@EXAMPLE.COM  ')).toBe('g-test.example.com');
     expect(validateGroupIDFormat('MyTeam')).toBe('myteam');
+  });
+
+  it('旧函数名也返回目标态 group_aid', () => {
+    expect(validateGroupAIDFormat('room-123.agentid.pub')).toBe('room-123.agentid.pub');
+    expect(validateGroupAIDFormat('group.agentid.pub/room-123')).toBe('room-123.agentid.pub');
+    expect(validateGroupAIDFormat('room-123@agentid.pub')).toBe('room-123.agentid.pub');
+    expect(validateGroupAIDFormat('g-abc123', { localIssuer: 'agentid.pub' })).toBe('g-abc123.agentid.pub');
+    expect(validateGroupAIDFormat('group.pub/room-123@agentid')).toBe('room-123.agentid.pub');
   });
 
   it('拒绝空值', () => {
@@ -123,6 +131,7 @@ describe('validateGroupIDFormat', () => {
   it('拒绝 base 太长', () => {
     const longSlug = 'a'.repeat(63); // g- + 63 = 65 字符，超过 group name 上限
     expect(() => validateGroupIDFormat(`g-${longSlug}`)).toThrow(/must be one of/);
+    expect(() => validateGroupIDFormat('a'.repeat(65))).toThrow(/must be one of/);
   });
 
   it('拒绝非法字符', () => {

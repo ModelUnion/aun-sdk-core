@@ -1,7 +1,7 @@
 import { slotIsolationKey } from '../config.js';
 import type { EventPayload } from '../events.js';
 import { normalizeGroupId } from '../group-id.js';
-import { isJsonObject, type JsonObject, type JsonValue, type Message, type RpcParams } from '../types.js';
+import { ConnectionState, isJsonObject, type JsonObject, type JsonValue, type Message, type RpcParams } from '../types.js';
 import type { ClientRuntime } from './runtime.js';
 
 const PUSHED_SEQS_LIMIT = 50_000;
@@ -104,7 +104,8 @@ export class MessageDeliveryEngine {
       const eventPayload = payload as JsonObject;
       client._groupState?.handleGroupChangedV2Membership?.(eventPayload);
       if (eventPayload.action === 'dissolved') {
-        const groupId = normalizeGroupId(String(eventPayload.group_id ?? '')) || String(eventPayload.group_id ?? '').trim();
+        const rawGroupId = eventPayload.group_aid ?? eventPayload.group_id ?? '';
+        const groupId = normalizeGroupId(String(rawGroupId)) || String(rawGroupId).trim();
         if (groupId) client._cleanupDissolvedGroup?.(groupId);
       }
     }
@@ -547,6 +548,7 @@ export class MessageDeliveryEngine {
     opts: { payloadOverride?: unknown; extra?: Record<string, unknown> } = {},
   ): void {
     const client = this.runtime.client;
+    if (client._isMessageDebugEnabled?.() === false) return;
     const record: Record<string, unknown> = {
       stage,
       source,
@@ -813,9 +815,6 @@ export class MessageDeliveryEngine {
     } finally {
       client._gapFillDone.delete(dedupKey);
       client._releasePullGate(ns, token);
-      if (filled > 0 && client._seqTracker.getContiguousSeq(ns) > afterSeq) {
-        void this.fillP2pGap();
-      }
     }
   }
 
@@ -968,6 +967,7 @@ export class MessageDeliveryEngine {
 
   async handleGroupChangedEventSeq(data: JsonObject, groupId: string): Promise<void> {
     const client = this.runtime.client;
+    groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     let needPull = false;
     const rawEventSeq = data.event_seq;
     const eventSeq = Number(rawEventSeq);
@@ -1189,7 +1189,7 @@ export class MessageDeliveryEngine {
     this.runtime.delivery.setOnlineUnreadHintDrainActive(true);
     try {
       while (client._onlineUnreadHintQueue.size > 0) {
-        if (client.state !== 'ready') return;
+        if (client.state !== ConnectionState.READY) return;
         if (client._sessionOptions?.background_sync === false) return;
         const groupId = client._onlineUnreadHintQueue.keys().next().value as string | undefined;
         if (!groupId) return;

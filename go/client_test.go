@@ -31,6 +31,18 @@ func TestPeerCertCacheTTLIsOneHour(t *testing.T) {
 	}
 }
 
+func TestReadyStateHelperAcceptsPublicReadyAndLegacyConnected(t *testing.T) {
+	if !clientStateIsReady(StateConnected) {
+		t.Fatal("历史内部 connected 状态应被视为 ready")
+	}
+	if !clientStateIsReady(ClientState(ConnStateReady)) {
+		t.Fatal("公开 ready 状态应被视为 ready")
+	}
+	if clientStateIsReady(StateDisconnected) {
+		t.Fatal("disconnected 不应被视为 ready")
+	}
+}
+
 func TestPublicConnectionOptionsDoNotExposeGatewayOrToken(t *testing.T) {
 	forbidden := []string{
 		"Gateway",
@@ -71,6 +83,36 @@ func cloneRPCParamsForTest(t *testing.T, params map[string]any) map[string]any {
 		t.Fatalf("反序列化测试 RPC 参数失败: %v", err)
 	}
 	return cloned
+}
+
+func TestNormalizeGroupCallContextAcceptsGroupAIDAliases(t *testing.T) {
+	c := &AUNClient{deviceID: "device-a", slotID: "slot-a"}
+	cases := []map[string]any{
+		{"group_aid": "group.agentid.pub/room-123"},
+		{"groupAid": "room-123@agentid.pub"},
+		{"groupId": "group.agentid.pub/room-123"},
+	}
+	for _, params := range cases {
+		_, inputWasGroupIDAlias := params["groupId"]
+		params["payload"] = map[string]any{"type": "text", "text": "hi"}
+		normalizeGroupCallContext(c, "group.send", params)
+		wantGroupID := "room-123.agentid.pub"
+		if inputWasGroupIDAlias {
+			wantGroupID = "group.agentid.pub/room-123"
+		}
+		if got := stringFromAny(params["group_id"]); got != wantGroupID {
+			t.Fatalf("group_id = %q, want %s; params=%#v", got, wantGroupID, params)
+		}
+		if got := stringFromAny(params["group_aid"]); got != "room-123.agentid.pub" {
+			t.Fatalf("group_aid = %q, want room-123.agentid.pub; params=%#v", got, params)
+		}
+		if _, exists := params["groupAid"]; exists {
+			t.Fatalf("groupAid camel alias should be removed: %#v", params)
+		}
+		if _, exists := params["groupId"]; exists {
+			t.Fatalf("groupId camel alias should be removed: %#v", params)
+		}
+	}
 }
 
 func TestOrderedP2PPublishWaitsForGapFill(t *testing.T) {
@@ -131,7 +173,8 @@ func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
 	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	groupID := "group.example.com/g-events"
+	legacyGroupID := "group.example.com/g-events"
+	groupID := "g-events.example.com"
 	ns := "group_event:" + groupID
 	c.seqTracker.OnMessageSeq(ns, 1)
 	c.mu.Lock()
@@ -149,7 +192,7 @@ func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
 	})
 
 	c.enqueueOrderedMessage(ns, "group.changed", 3, map[string]any{
-		"group_id":   groupID,
+		"group_id":   legacyGroupID,
 		"event_seq":  3,
 		"event_type": "group.member_removed",
 		"action":     "member_removed",
@@ -163,7 +206,7 @@ func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
 	}
 
 	c.enqueueOrderedMessage(ns, "group.changed", 2, map[string]any{
-		"group_id":   groupID,
+		"group_id":   legacyGroupID,
 		"event_seq":  2,
 		"event_type": "group.member_added",
 		"action":     "member_added",
@@ -186,7 +229,7 @@ func TestOrderedGroupEventPublishWaitsForGapFillAndDedups(t *testing.T) {
 	}
 
 	c.delivery().handleGroupChangedEventSeq(map[string]any{
-		"group_id":   groupID,
+		"group_id":   legacyGroupID,
 		"event_seq":  3,
 		"event_type": "group.member_removed",
 		"action":     "member_removed",
@@ -627,6 +670,43 @@ func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
 
 	if atomic.LoadInt32(&received) != 0 {
 		t.Fatal("P2P push 明确指向其它 slot 时不应发布 message.received")
+	}
+}
+
+func TestP2PPlainPushAutoAckUsesV2CursorWhenSessionActive(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "message.v2.ack":
+			return map[string]any{"success": true, "ack_seq": params["up_to_seq"]}
+		case "message.ack":
+			t.Fatalf("V2 会话下 P2P push 自动 ack 不应走 raw message.ack: %#v", params)
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+
+	c.processAndPublishMessage(map[string]any{
+		"message_id": "m-v2-ack",
+		"from":       "bob1.example.com",
+		"to":         "alice.example.com",
+		"seq":        int64(1),
+		"payload":    map[string]any{"type": "text", "text": "ack"},
+		"device_id":  "dev-1",
+		"slot_id":    "slot-1",
+	})
+
+	if !waitForParityCondition(time.Second, func() bool {
+		for _, call := range getCalls() {
+			if call.Method == "message.v2.ack" && toInt64(call.Params["up_to_seq"]) == 1 {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("P2P push 自动 ack 应走 message.v2.ack: %#v", getCalls())
 	}
 }
 
@@ -1082,8 +1162,8 @@ func TestCompleteGroupTransferImportsServerReturnedGroupIdentity(t *testing.T) {
 	groupAID := "team-transferred.aid.com"
 	aunPath := t.TempDir()
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
-		if method == "group.get" {
-			return map[string]any{"group": map[string]any{"group_id": "transferred-group", "group_aid": groupAID}}
+		if method == "group.get_info" {
+			return map[string]any{"group_id": "transferred-group", "group_aid": groupAID}
 		}
 		if method != "group.complete_transfer" {
 			return map[string]any{"ok": false, "error": "unexpected method"}
@@ -1140,10 +1220,10 @@ func TestCompleteGroupTransferImportsServerReturnedGroupIdentity(t *testing.T) {
 
 	calls := getCalls()
 	if len(calls) != 2 {
-		t.Fatalf("应调用 group.get + group.complete_transfer，实际调用数: %d", len(calls))
+		t.Fatalf("应调用 group.get_info + group.complete_transfer，实际调用数: %d", len(calls))
 	}
-	if calls[0].Method != "group.get" {
-		t.Fatalf("第一调用应为 group.get，实际: %s", calls[0].Method)
+	if calls[0].Method != "group.get_info" {
+		t.Fatalf("第一调用应为 group.get_info，实际: %s", calls[0].Method)
 	}
 	call := calls[1]
 	if call.Method != "group.complete_transfer" {
@@ -1209,7 +1289,7 @@ func TestConstructWithAunPath(t *testing.T) {
 	}
 }
 
-func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
+func TestConstructDefaultStoreUsesAUNPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	c := newClient(map[string]any{
 		"aun_path": tmpDir,
@@ -2181,6 +2261,7 @@ func TestOnRawGroupChangedSelfJoinStartsVisibleEventBaseline(t *testing.T) {
 
 func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
 	groupID := "group.example.com/g-invite"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "auth.connect":
@@ -2213,7 +2294,7 @@ func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, call := range getCalls() {
-			if call.Method == "group.get_online_members" && call.Params["group_id"] == groupID {
+			if call.Method == "group.get_online_members" && call.Params["group_id"] == groupAID {
 				return
 			}
 		}

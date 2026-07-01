@@ -128,6 +128,7 @@ function createEngine(): {
     _verifyEventSignature: vi.fn(async () => true),
     _isEventSignatureVerified: vi.fn((value: unknown) => value === true),
     _transport: { call: vi.fn(async () => ({ ok: true })) },
+    _rpcPipeline: { postprocessResult: vi.fn(async (_method: string, _params: unknown, result: unknown) => result) },
     call: vi.fn(async () => ({ ok: true })),
   };
   const engine = new MessageDeliveryEngine(new ClientRuntime(client));
@@ -198,6 +199,69 @@ describe('MessageDeliveryEngine 组件边界', () => {
     for (const key of ['message_id', 'seq', 'device_id', 'slot_id', 'headers', 'from_aid', 'to_aid', 'created_at']) {
       expect(envelope).not.toHaveProperty(key);
     }
+  });
+
+  it('ready 状态允许 P2P gap-fill，connected 作为兼容别名也允许', async () => {
+    for (const rawState of ['ready', 'connected']) {
+      const { engine, client } = createEngine();
+      client._state = rawState;
+      client.state = 'ready';
+      await engine.fillP2pGap();
+
+      expect(client._pullV2).toHaveBeenCalledWith(1, 50);
+    }
+  });
+
+  it('P2P gap-fill 遇到 V2 service plane 暂不可用时应退回普通 message.pull', async () => {
+    const { engine, client, seqTracker, published } = createEngine();
+    const ns = 'p2p:alice.agentid.pub';
+    seqTracker.setContiguousSeq(ns, 1);
+    client._pullV2 = vi.fn(async () => {
+      throw new Error('Service plane unavailable for message.v2.pull: no_service');
+    });
+    client._transport.call = vi.fn(async (method: string, params: Record<string, unknown>, _timeout: unknown, _unused: unknown, background: boolean) => {
+      expect(method).toBe('message.pull');
+      expect(params).toEqual({
+        after_seq: 1,
+        limit: 50,
+        device_id: 'device-a',
+        slot_id: 'slot-a',
+        _rpc_background: true,
+      });
+      expect(background).toBe(true);
+      return {
+        messages: [
+          {
+            message_id: 'plain-2',
+            from: 'bob.agentid.pub',
+            to: 'alice.agentid.pub',
+            seq: 2,
+            payload: { type: 'text', text: 'fallback' },
+          },
+        ],
+      };
+    });
+
+    await engine.fillP2pGap();
+
+    expect(client._transport.call).toHaveBeenCalledTimes(1);
+    expect(client._rpcPipeline.postprocessResult).toHaveBeenCalledWith('message.pull', {
+      after_seq: 1,
+      limit: 50,
+      device_id: 'device-a',
+      slot_id: 'slot-a',
+      _rpc_background: true,
+    }, expect.any(Object));
+    expect(published).toEqual([
+      {
+        event: 'message.received',
+        payload: expect.objectContaining({
+          seq: 2,
+          payload: { type: 'text', text: 'fallback' },
+        }),
+      },
+    ]);
+    expect(client._gapFillDone.has(`p2p_pull:${ns}`)).toBe(false);
   });
 
   it('publishAppEvent 为群事件注入 envelope 并保留顶层兼容字段', async () => {
@@ -354,7 +418,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
   it('clampAckParams 按 max_seen 修正过大的 P2P 和群 ack', () => {
     const { engine, seqTracker } = createEngine();
     seqTracker.setMaxSeenSeq('p2p:alice.agentid.pub', 5);
-    seqTracker.setMaxSeenSeq('group:group.agentid.pub/g1', 7);
+    seqTracker.setMaxSeenSeq('group:g1.agentid.pub', 7);
 
     expect(engine.clampAckParams('message.ack', { seq: 9 })).toEqual({ seq: 5 });
     expect(engine.clampAckParams('message.v2.ack', { up_to_seq: -2 })).toEqual({ up_to_seq: 0 });
@@ -379,21 +443,21 @@ describe('MessageDeliveryEngine 组件边界', () => {
     });
 
     expect(migrated).toEqual({
-      'group_msg:group.agentid.pub/g1': 5,
-      'group_event:group.agentid.pub/g2': 6,
+      'group_msg:g1.agentid.pub': 5,
+      'group_event:g2.agentid.pub': 6,
       'p2p:alice.agentid.pub': 9,
     });
     expect(client._tokenStore.deleteSeq).toHaveBeenCalledWith(
       'alice.agentid.pub',
       'device-a',
       'slot-a',
-      'group_msg:g1.agentid.pub',
+      'group_msg:group.agentid.pub/g1',
     );
     expect(client._tokenStore.saveSeq).toHaveBeenCalledWith(
       'alice.agentid.pub',
       'device-a',
       'slot-a',
-      'group_event:group.agentid.pub/g2',
+      'group_event:g2.agentid.pub',
       6,
     );
   });
@@ -427,7 +491,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     await engine.restoreSeqTrackerState();
 
     expect(seqTracker.restoreState).toHaveBeenCalledWith({
-      'group_msg:group.agentid.pub/g1': 3,
+      'group_msg:g1.agentid.pub': 3,
       'p2p:alice.agentid.pub': 8,
     });
   });

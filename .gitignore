@@ -78,3 +78,22 @@ js/_packed_docs/
 # 内部脚本和跨 SDK 测试（不发布到 GitHub）
 scripts/
 tests/cross-sdk/
+
+# 性能测试临时数据
+autoscale-*.json
+autoscale-*.txt
+autoscale-*.stderr.txt
+pyspy-*.raw
+*-cpu.tsv
+bench-results/
+hotspot*.tsv
+msgopt*.tsv
+msgprofile*.tsv
+
+# CLI 临时目录
+cli-fs-p4-*/
+
+# 临时报告和错误日志
+full_report.md
+.codex-*.err
+.codex-*.txt

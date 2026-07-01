@@ -29,6 +29,13 @@ def _existing(paths: list[Path]) -> list[Path]:
     return [path for path in paths if path.exists()]
 
 
+def test_client_does_not_subscribe_removed_v1_epoch_rotated_event():
+    source = (Path(__file__).resolve().parents[2] / "src" / "aun_core" / "client.py").read_text(encoding="utf-8")
+
+    assert "group.v2.epoch_rotated" not in source
+    assert "_on_v2_epoch_rotated" not in source
+
+
 def test_client_rejects_legacy_config_constructor():
     with pytest.raises(TypeError, match="AID"):
         AUNClient({"aun_path": "/tmp/aun"})
@@ -210,7 +217,6 @@ def test_client_does_not_expose_test_or_diagnostic_helpers():
         "set_v2_auto_state_management_enabled",
         "rotate_v2_spk",
         "get_v2_sender_identity",
-        "get_group_secret_epochs",
         "handle_group_key_distribution",
         "has_v2_session",
         "v2_session_info",
@@ -278,7 +284,6 @@ def test_migrated_integration_tests_do_not_call_removed_client_methods():
         "set_v2_auto_state_management_enabled",
         "rotate_v2_spk",
         "get_v2_sender_identity",
-        "get_group_secret_epochs",
         "handle_group_key_distribution",
         "has_v2_session",
         "v2_session_info",

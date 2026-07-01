@@ -151,7 +151,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     const payload = {
       message_id: 'm-1',
       seq: 7,
-      from: 'bob.agentid.pub',
+      from: 'bob1.agentid.pub',
       to: 'alice.agentid.pub',
       payload: { type: 'text', text: 'hello' },
       e2ee: { payload_type: 'text' },
@@ -164,7 +164,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       payload: {
         message_id: 'm-1',
         seq: 7,
-        from: 'bob.agentid.pub',
+        from: 'bob1.agentid.pub',
         to: 'alice.agentid.pub',
         payload: { type: 'text', text: 'hello' },
         e2ee: { payload_type: 'text' },
@@ -172,7 +172,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
         device_id: 'device-a',
         slot_id: 'slot-a',
         envelope: {
-          from: 'bob.agentid.pub',
+          from: 'bob1.agentid.pub',
           to: 'alice.agentid.pub',
           type: 'text',
         },
@@ -186,7 +186,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     const envelope = engine.appMessageEnvelope({
       message_id: 'm-1',
       seq: 7,
-      from_aid: 'bob.agentid.pub',
+      from_aid: 'bob1.agentid.pub',
       to_aid: 'alice.agentid.pub',
       created_at: 1234567890000,
       payload: { type: 'text', text: 'hello' },
@@ -197,7 +197,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     });
 
     expect(envelope).toEqual({
-      from: 'bob.agentid.pub',
+      from: 'bob1.agentid.pub',
       to: 'alice.agentid.pub',
       type: 'text',
       timestamp: 1234567890000,
@@ -219,7 +219,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       event_type: 'group.member_added',
       action: 'member_added',
       actor_aid: 'alice.agentid.pub',
-      member_aid: 'bob.agentid.pub',
+      member_aid: 'bob1.agentid.pub',
     }));
 
     expect(published).toEqual([{
@@ -231,7 +231,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
         event_type: 'group.member_added',
         action: 'member_added',
         actor_aid: 'alice.agentid.pub',
-        member_aid: 'bob.agentid.pub',
+        member_aid: 'bob1.agentid.pub',
         _agent_md: { local_etag: 'local-1', remote_etag: 'remote-1' },
         device_id: 'device-a',
         slot_id: 'slot-a',
@@ -242,7 +242,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
           event_type: 'group.member_added',
           action: 'member_added',
           actor_aid: 'alice.agentid.pub',
-          member_aid: 'bob.agentid.pub',
+          member_aid: 'bob1.agentid.pub',
           device_id: 'device-a',
           slot_id: 'slot-a',
         },
@@ -256,7 +256,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     const p2pRecall = engine.p2pAppEventForMessage({
       message_id: 'recall-1',
       from: 'alice.agentid.pub',
-      to: 'bob.agentid.pub',
+      to: 'bob1.agentid.pub',
       seq: 9,
       type: 'message.recalled',
       payload: {
@@ -289,7 +289,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       message_ids: ['m-1'],
       envelope: expect.objectContaining({
         from: 'alice.agentid.pub',
-        to: 'bob.agentid.pub',
+        to: 'bob1.agentid.pub',
         type: 'message.recalled',
         kind: 'message.recalled',
         timestamp: 123,
@@ -362,7 +362,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
   it('clampAckParams 按 max_seen 修正过大的 P2P 和群 ack', () => {
     const { engine, seqTracker } = createEngine();
     seqTracker.setMaxSeenSeq('p2p:alice.agentid.pub', 5);
-    seqTracker.setMaxSeenSeq('group:group.agentid.pub/g1', 7);
+    seqTracker.setMaxSeenSeq('group:g1.agentid.pub', 7);
 
     expect(engine.clampAckParams('message.ack', { seq: 9 })).toEqual({ seq: 5 });
     expect(engine.clampAckParams('message.v2.ack', { up_to_seq: -2 })).toEqual({ up_to_seq: 0 });
@@ -387,21 +387,21 @@ describe('MessageDeliveryEngine 组件边界', () => {
     });
 
     expect(migrated).toEqual({
-      'group_msg:group.agentid.pub/g1': 5,
-      'group_event:group.agentid.pub/g2': 6,
+      'group_msg:g1.agentid.pub': 5,
+      'group_event:g2.agentid.pub': 6,
       'p2p:alice.agentid.pub': 9,
     });
     expect(client._tokenStore.deleteSeq).toHaveBeenCalledWith(
       'alice.agentid.pub',
       'device-a',
       'slot-a',
-      'group_msg:g1.agentid.pub',
+      'group_msg:group.agentid.pub/g1',
     );
     expect(client._tokenStore.saveSeq).toHaveBeenCalledWith(
       'alice.agentid.pub',
       'device-a',
       'slot-a',
-      'group_event:group.agentid.pub/g2',
+      'group_event:g2.agentid.pub',
       6,
     );
   });
@@ -434,7 +434,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     engine.restoreSeqTrackerState();
 
     expect(seqTracker.restoreState).toHaveBeenCalledWith({
-      'group_msg:group.agentid.pub/g1': 3,
+      'group_msg:g1.agentid.pub': 3,
       'p2p:alice.agentid.pub': 8,
     });
   });
@@ -445,7 +445,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     seqTracker.setContiguousSeq(ns, 1);
     client._decryptV2PushMessage.mockResolvedValue({
       message_id: 'm3',
-      from: 'bob.agentid.pub',
+      from: 'bob1.agentid.pub',
       to: 'alice.agentid.pub',
       seq: 3,
       payload: { type: 'text' },
@@ -454,7 +454,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     await engine.onV2PushNotification({
       seq: 3,
       message_id: 'm3',
-      from_aid: 'bob.agentid.pub',
+      from_aid: 'bob1.agentid.pub',
       envelope_json: '{}',
     });
 
@@ -472,7 +472,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
     await engine.onV2PushNotification({
       seq: 3,
       message_id: 'm3',
-      from_aid: 'bob.agentid.pub',
+      from_aid: 'bob1.agentid.pub',
     });
 
     expect(client._decryptV2PushMessage).not.toHaveBeenCalled();
@@ -513,7 +513,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
       group_id: 'g1',
       seq: 3,
       message_id: 'gm3',
-      sender_aid: 'bob.agentid.pub',
+      sender_aid: 'bob1.agentid.pub',
     });
 
     expect(seqTracker.getContiguousSeq(ns)).toBe(2);
@@ -568,7 +568,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
   it('fillGroupEventGap 拉取群事件后标记 gap-fill、跳过消息事件并 ack 最终 contiguous_seq', async () => {
     const { engine, client, seqTracker, published } = createEngine();
-    const groupId = 'group.agentid.pub/g1';
+    const groupId = 'g1.agentid.pub';
     const ns = `group_event:${groupId}`;
     seqTracker.setContiguousSeq(ns, 1);
     let acquired = false;
@@ -624,7 +624,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
   it('fillGroupEventGap 空页只按 retention floor 推进 tracker，不发送 ack_events', async () => {
     const { engine, client, seqTracker } = createEngine();
-    const groupId = 'group.agentid.pub/g1';
+    const groupId = 'g1.agentid.pub';
     const ns = `group_event:${groupId}`;
     seqTracker.setContiguousSeq(ns, 5);
     client.call = vi.fn(async () => ({
@@ -646,7 +646,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
   it('fillGroupEventGap 在 has_more=true 时按最大 event_seq 翻页', async () => {
     const { engine, client, seqTracker } = createEngine();
-    const groupId = 'group.agentid.pub/g1';
+    const groupId = 'g1.agentid.pub';
     const ns = `group_event:${groupId}`;
     seqTracker.setContiguousSeq(ns, 0);
     let acquired = false;
@@ -675,7 +675,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
   it('handleGroupChangedEventSeq 遇到 _from_gap_fill 事件不递归触发补洞', async () => {
     const { engine, client, seqTracker } = createEngine();
-    const groupId = 'group.agentid.pub/g1';
+    const groupId = 'g1.agentid.pub';
     seqTracker.setContiguousSeq(`group_event:${groupId}`, 1);
 
     await engine.handleGroupChangedEventSeq({
@@ -690,7 +690,7 @@ describe('MessageDeliveryEngine 组件边界', () => {
 
   it('handleGroupChangedEventSeq 连续 push 后持久化并 ack 事件 cursor', async () => {
     const { engine, client, seqTracker } = createEngine();
-    const groupId = 'group.agentid.pub/g1';
+    const groupId = 'g1.agentid.pub';
     const ns = `group_event:${groupId}`;
     seqTracker.setContiguousSeq(ns, 5);
 

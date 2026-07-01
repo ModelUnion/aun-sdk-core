@@ -5,16 +5,17 @@
  */
 
 import { ValidationError } from './errors.js';
+import { convertToGroupAid } from './group-id.js';
 
 // AID name 规范：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
 // 注意：{3,63} 表示后续3-63个字符，加上首字符共4-64个
-const AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{2,62}$/;
+const AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
 
 // Group ID 格式（基于服务端实际实现）
 // Legacy 格式：g- 后接 4-32 位小写字母数字
 const GROUP_ID_LEGACY_PATTERN = /^g-[a-z0-9]{4,32}$/;
-// 新格式 base：5 位或更多小写字母数字
-const GROUP_ID_NEW_BASE_PATTERN = /^[a-z0-9]{5,}$/;
+// 新格式 base：5 到 64 位小写字母数字
+const GROUP_ID_NEW_BASE_PATTERN = /^[a-z0-9]{5,64}$/;
 // Group name 格式：4-64 字符，首字符 [a-z0-9]，可包含 _-
 const GROUP_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{3,63}$/;
 
@@ -91,90 +92,38 @@ export function validateAIDFormat(aid: unknown, paramName = 'aid'): string {
   return aidStr;
 }
 
-/**
- * 校验 Group ID 格式是否合法。
- *
- * 接受的 base 格式（不含域名部分）：
- * 1. Legacy 格式：g-[a-z0-9]{4,32} — 以 g- 开头，后接 4 到 32 位小写字母或数字
- * 2. 新格式：[a-z0-9]{5,} — 5 位或更多小写字母或数字
- * 3. Group name 格式：[a-z0-9][a-z0-9_-]{3,63} — 4 到 64 个字符，可包含 _-
- *
- * 完整格式：
- * - group.{issuer}/{base} (canonical)
- * - {base}.{issuer} (旧格式)
- * - {base}@{issuer} (兼容格式)
- * - {base} (本域简写)
- *
- * @param groupId 待校验的 Group ID
- * @param paramName 参数名称（用于错误消息）
- * @returns 规范化后的 Group ID（转小写、去空格）
- * @throws ValidationError Group ID 格式不合法
- */
-export function validateGroupIDFormat(groupId: unknown, paramName = 'group_id'): string {
-  if (groupId === null || groupId === undefined || (typeof groupId === 'string' && !groupId.trim())) {
-    throw new ValidationError(`${paramName} cannot be empty`);
+export interface GroupAIDValidationOptions {
+  localIssuer?: string;
+  paramName?: string;
+}
+
+function resolveGroupValidationArgs(
+  defaultParamName: string,
+  paramNameOrOptions?: string | GroupAIDValidationOptions,
+  maybeOptions?: GroupAIDValidationOptions,
+): { paramName: string; localIssuer: string } {
+  if (typeof paramNameOrOptions === 'string') {
+    return {
+      paramName: paramNameOrOptions || defaultParamName,
+      localIssuer: maybeOptions?.localIssuer ?? '',
+    };
   }
 
-  const gidStr = String(groupId).trim().toLowerCase();
+  return {
+    paramName: paramNameOrOptions?.paramName ?? defaultParamName,
+    localIssuer: paramNameOrOptions?.localIssuer ?? '',
+  };
+}
 
-  // 解析 base 和 domain
-  let base = '';
-  let domain = '';
+function validateGroupAidParts(raw: unknown, groupAid: string, paramName: string): void {
+  const dotIndex = groupAid.indexOf('.');
+  const base = dotIndex >= 0 ? groupAid.substring(0, dotIndex).replace(/^\.+|\.+$/g, '') : groupAid;
+  const domain = dotIndex >= 0 ? groupAid.substring(dotIndex + 1).replace(/^\.+|\.+$/g, '') : '';
 
-  // 情况1: group.{issuer}/{base} (canonical)
-  if (gidStr.startsWith('group.') && gidStr.includes('/')) {
-    const issuerAndBase = gidStr.substring(6); // 去掉 "group."
-    const slashIndex = issuerAndBase.indexOf('/');
-    if (slashIndex !== -1) {
-      domain = issuerAndBase.substring(0, slashIndex).replace(/^\.+|\.+$/g, '');
-      base = issuerAndBase.substring(slashIndex + 1).replace(/^\.+|\.+$/g, '');
-      // 处理污染格式 group.{A}/{base}@{B}
-      if (base.includes('@')) {
-        const atIndex = base.indexOf('@');
-        const basePart = base.substring(0, atIndex).replace(/^\.+|\.+$/g, '');
-        const bDomain = base.substring(atIndex + 1).replace(/^\.+|\.+$/g, '');
-        base = basePart;
-        domain = domain ? `${bDomain}.${domain}` : bDomain;
-      }
-    }
-  }
-  // 情况2: {base}@{issuer}
-  else if (gidStr.includes('@')) {
-    const atIndex = gidStr.indexOf('@');
-    base = gidStr.substring(0, atIndex).replace(/^\.+|\.+$/g, '');
-    domain = gidStr.substring(atIndex + 1).replace(/^\.+|\.+$/g, '');
-  }
-  // 情况3: {base}.{issuer} 或 {base} (需要区分)
-  else if (gidStr.includes('.')) {
-    // 如果是 g- 开头，点号后是域名
-    if (gidStr.startsWith('g-')) {
-      const rest = gidStr.substring(2);
-      if (rest.includes('.')) {
-        const dotIndex = rest.indexOf('.');
-        const slug = rest.substring(0, dotIndex);
-        base = `g-${slug}`;
-        domain = rest.substring(dotIndex + 1).replace(/^\.+|\.+$/g, '');
-      } else {
-        base = gidStr;
-      }
-    } else {
-      // 尝试判断是 {base}.{domain} 还是单个 base
-      // 这里简化处理：如果有点号就认为后面是域名
-      const dotIndex = gidStr.indexOf('.');
-      base = gidStr.substring(0, dotIndex);
-      domain = gidStr.substring(dotIndex + 1).replace(/^\.+|\.+$/g, '');
-    }
-  } else {
-    // 情况4: 纯 {base}（本域简写）
-    base = gidStr;
-  }
-
-  // 校验 base 部分
   if (!base) {
-    throw new ValidationError(`Invalid ${paramName} '${groupId}': base part cannot be empty`);
+    throw new ValidationError(`Invalid ${paramName} '${groupAid}': base part cannot be empty`);
   }
 
-  // 检查 base 是否符合任一格式
   const isValidBase =
     GROUP_ID_LEGACY_PATTERN.test(base) ||
     GROUP_ID_NEW_BASE_PATTERN.test(base) ||
@@ -182,20 +131,65 @@ export function validateGroupIDFormat(groupId: unknown, paramName = 'group_id'):
 
   if (!isValidBase) {
     throw new ValidationError(
-      `Invalid ${paramName} '${groupId}': base '${base}' must be one of: ` +
-      `legacy format 'g-[a-z0-9]{4,32}', new format '[a-z0-9]{5,}', ` +
+      `Invalid ${paramName} '${raw}': base '${base}' must be one of: ` +
+      `legacy format 'g-[a-z0-9]{4,32}', new format '[a-z0-9]{5,64}', ` +
       `or group name format '[a-z0-9][a-z0-9_-]{3,63}'`
     );
   }
 
-  // 如果有 domain，校验 domain 部分
-  if (domain) {
-    if (!DOMAIN_RE.test(domain)) {
-      throw new ValidationError(
-        `Invalid ${paramName} '${groupId}': domain '${domain}' is not a valid domain`
-      );
-    }
+  if (domain && !DOMAIN_RE.test(domain)) {
+    throw new ValidationError(
+      `Invalid ${paramName} '${raw}': domain '${domain}' is not a valid domain`
+    );
+  }
+}
+
+/**
+ * 校验群组标识并返回目标态 group_aid。
+ */
+export function validateGroupAIDFormat(
+  groupId: unknown,
+  paramNameOrOptions: string | GroupAIDValidationOptions = 'group_aid',
+  maybeOptions?: GroupAIDValidationOptions,
+): string {
+  const { paramName, localIssuer } = resolveGroupValidationArgs(
+    'group_aid',
+    paramNameOrOptions,
+    maybeOptions,
+  );
+
+  if (groupId === null || groupId === undefined || (typeof groupId === 'string' && !groupId.trim())) {
+    throw new ValidationError(`${paramName} cannot be empty`);
   }
 
-  return gidStr;
+  const rawText = String(groupId).trim();
+  if (rawText.includes('//')) {
+    throw new ValidationError(`Invalid ${paramName} '${String(groupId)}': empty path segment is not allowed`);
+  }
+
+  const groupAid = convertToGroupAid(rawText, { localIssuer });
+  if (!groupAid) {
+    throw new ValidationError(`${paramName} cannot be empty`);
+  }
+
+  validateGroupAidParts(groupId, groupAid, paramName);
+  return groupAid;
+}
+
+/**
+ * 校验 Group ID 格式是否合法。
+ *
+ * 旧函数名保留兼容，但返回目标态 group_aid。
+ */
+export function validateGroupIDFormat(
+  groupId: unknown,
+  paramNameOrOptions: string | GroupAIDValidationOptions = 'group_id',
+  maybeOptions?: GroupAIDValidationOptions,
+): string {
+  const { paramName, localIssuer } = resolveGroupValidationArgs(
+    'group_id',
+    paramNameOrOptions,
+    maybeOptions,
+  );
+  return validateGroupAIDFormat(groupId, paramName, { localIssuer });
 }

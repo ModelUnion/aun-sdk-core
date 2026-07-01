@@ -1,8 +1,11 @@
 // ── JS SDK V2-only 与 Python/TS 编排语义对齐测试 ──────────────
 import 'fake-indexeddb/auto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
-import { E2EEError, PermissionError, ValidationError } from '../../src/errors.js';
+import { E2EEError, ValidationError } from '../../src/errors.js';
+import { normalizeGroupId } from '../../src/group-id.js';
 import { computeStateCommitment } from '../../src/v2/state/index.js';
 
 const encoder = new TextEncoder();
@@ -25,8 +28,9 @@ async function cacheStateSignature(client: AUNClient, args: {
   membershipSnapshot: string;
   signatureB64: string;
 }): Promise<void> {
+  const groupId = normalizeGroupId(args.groupId);
   const signPayload = stableStringifyForTest({
-    group_id: args.groupId,
+    group_id: groupId,
     membership_snapshot: args.membershipSnapshot,
     state_hash: args.stateHash,
     state_version: args.stateVersion,
@@ -71,17 +75,11 @@ function connectedV2Client(): AUNClient {
 }
 
 describe('AUNClient V2-only parity', () => {
-  it('legacy E2EE RPC 不应透传到底层 transport', async () => {
-    const client = connectedClient();
-
-    await expect(client.call('message.e2ee.get_prekey', { aid: 'bob1.aid.com' }))
-      .rejects.toThrow(PermissionError);
-    await expect(client.call('group.e2ee.get_epoch', { group_id: 'grp01' }))
-      .rejects.toThrow(PermissionError);
-    await expect(client.call('group.rotate_epoch', { group_id: 'grp01' }))
-      .rejects.toThrow(PermissionError);
-
-    expect((client as any)._transport.call).not.toHaveBeenCalled();
+  it('不再订阅 V1 epoch rotation 残留事件', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'client.ts'), 'utf8')
+      + readFileSync(join(process.cwd(), 'src', 'client', 'v2-e2ee.ts'), 'utf8');
+    expect(source).not.toContain('group.v2.epoch_rotated');
+    expect(source).not.toContain('_onV2EpochRotated');
   });
 
   it('V1 E2EE manager 与旧编排内部方法应从 JS client 清理', () => {
@@ -317,7 +315,7 @@ describe('AUNClient V2-only parity', () => {
 
     await (client as any)._onV2StateRetryNeeded({ group_id: 'group.agentid.pub/12345' });
 
-    expect(proposeSpy).toHaveBeenCalledWith('group.agentid.pub/12345', { leaderDelay: true });
+    expect(proposeSpy).toHaveBeenCalledWith('12345.agentid.pub', { leaderDelay: true });
   });
 
   it('V2 state 签名校验应通过 PKI 拉证书，失败时阻断 bootstrap 信任', async () => {
@@ -358,8 +356,8 @@ describe('AUNClient V2-only parity', () => {
 
     const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish');
     const callSpy = vi.spyOn(client, 'call')
-      .mockResolvedValueOnce({ mode: 'open' } as any)
-      .mockResolvedValueOnce({ mode: 'closed' } as any);
+      .mockResolvedValueOnce({ settings: [{ key: 'join.mode', value: 'open' }] } as any)
+      .mockResolvedValueOnce({ settings: [{ key: 'join.mode', value: 'closed' }] } as any);
     const bootstrap = {
       state_version: stateVersion,
       state_signature: signatureB64,
@@ -373,9 +371,9 @@ describe('AUNClient V2-only parity', () => {
     expect(publishSpy).not.toHaveBeenCalledWith('group.v2.state_tampered', expect.anything());
 
     await (client as any)._v2VerifyStateSignature(groupId, bootstrap);
-    expect(callSpy).toHaveBeenCalledWith('group.get_join_requirements', { group_id: groupId });
+    expect(callSpy).toHaveBeenCalledWith('group.get_settings', { group_id: '12345.agentid.pub', keys: ['join.mode'] });
     expect(publishSpy).toHaveBeenCalledWith('group.v2.state_tampered', {
-      group_id: groupId,
+      group_id: '12345.agentid.pub',
       pending_extra: ['bob1.aid.com'],
       mode: 'closed',
     });
@@ -526,7 +524,54 @@ describe('AUNClient V2-only parity', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', up_to_seq: 3, device_id: 'dev-alice', slot_id: 'slot-a' }]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'dev-alice', slot_id: 'slot-a' }]]);
+  });
+
+  it('group.v2.pull 应使用 group_aid 作为本地 namespace，并保留旧 group_id 查询字段', async () => {
+    const client = connectedV2Client();
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'group.v2.pull') {
+        return {
+          has_more: false,
+          messages: [{
+            version: 'v1',
+            seq: 1,
+            message_id: 'gm-legacy-1',
+            from_aid: 'bob1.aid.com',
+            t_server: 1,
+            type: 'message',
+            payload: { type: 'text', text: 'gm-legacy-1' },
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await client.call('group.pull', { group_id: 'group.example.com/g1', after_seq: 0, limit: 10 });
+
+    expect((result.messages as Array<Record<string, unknown>>).map((msg) => msg.seq)).toEqual([1]);
+    expect((client as any)._seqTracker.getContiguousSeq('group:g1.example.com')).toBe(1);
+    expect((client as any)._seqTracker.getContiguousSeq('group:group.example.com/g1')).toBe(0);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
+      ['group.v2.pull', expect.objectContaining({
+        group_id: 'group.example.com/g1',
+        group_aid: 'g1.example.com',
+        after_seq: 0,
+        limit: 10,
+        device_id: 'dev-alice',
+        slot_id: 'slot-a',
+      })],
+    ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
+      ['group.v2.ack', expect.objectContaining({
+        group_id: 'g1.example.com',
+        group_aid: 'g1.example.com',
+        up_to_seq: 1,
+        device_id: 'dev-alice',
+        slot_id: 'slot-a',
+      })],
+    ]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -564,6 +609,7 @@ describe('AUNClient V2-only parity', () => {
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 2 }],
       ['message.v2.pull', { after_seq: 2, limit: 2 }],
+      ['message.v2.pull', { after_seq: 3, limit: 2 }],
     ]);
     expect(ackCalls).toEqual([
       ['message.v2.ack', { up_to_seq: 2 }],
@@ -655,7 +701,7 @@ describe('AUNClient V2-only parity', () => {
     const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
-    expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
+    expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
@@ -684,7 +730,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await (client as any)._pullV2(5, 10);
+    const result = await (client as any)._pullV2(4, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     expect(result).toEqual([]);
@@ -802,7 +848,7 @@ describe('AUNClient V2-only parity', () => {
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', { group_id: 'grp01', up_to_seq: 5, device_id: 'dev-alice', slot_id: 'slot-a' }],
+      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 5, device_id: 'dev-alice', slot_id: 'slot-a' }],
     ]);
   });
 
@@ -1099,6 +1145,7 @@ describe('AUNClient V2-only parity', () => {
     expect(ackCalls).toEqual([
       ['group.v2.ack', {
         group_id: groupId,
+        group_aid: groupId,
         up_to_seq: 3,
         device_id: 'dev-alice',
         slot_id: 'slot-a',

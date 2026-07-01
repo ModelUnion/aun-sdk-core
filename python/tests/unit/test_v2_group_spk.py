@@ -56,7 +56,10 @@ def test_group_decrypt_keys_accept_legacy_composite_group_spk_id(tmp_path):
         _ik_priv, spk_priv = session.get_group_decrypt_keys(group_id, f"{group_id}\0{spk_id}")
 
         assert spk_priv == group_spk_priv
-        session._last_uploaded_group_spk_ids[group_id] = spk_id
+        # 字典键必须使用 normalized group_id
+        from aun_core.v2.session import V2Session
+        normalized_group_id = V2Session._group_key(group_id)
+        session._last_uploaded_group_spk_ids[normalized_group_id] = spk_id
         assert session.is_last_uploaded_group_spk(group_id, f"{group_id}\0{spk_id}") is True
     finally:
         db.close()
@@ -103,10 +106,14 @@ def test_group_last_uploaded_spk_is_isolated_by_group(tmp_path):
         return {"ok": True}
 
     try:
+        from aun_core.v2.session import V2Session
         asyncio.run(session.ensure_group_registered("group.agentid.pub/1", call_fn))
-        group1_spk = session._last_uploaded_group_spk_ids["group.agentid.pub/1"]
+        # 字典键使用 normalized group_id
+        group1_normalized = V2Session._group_key("group.agentid.pub/1")
+        group1_spk = session._last_uploaded_group_spk_ids[group1_normalized]
         asyncio.run(session.ensure_group_registered("group.agentid.pub/2", call_fn))
-        group2_spk = session._last_uploaded_group_spk_ids["group.agentid.pub/2"]
+        group2_normalized = V2Session._group_key("group.agentid.pub/2")
+        group2_spk = session._last_uploaded_group_spk_ids[group2_normalized]
 
         assert group1_spk
         assert group2_spk
@@ -189,9 +196,12 @@ def test_group_uploaded_marker_restores_without_rpc(tmp_path):
         raise AssertionError(f"unexpected RPC: {method} {params}")
 
     try:
+        from aun_core.v2.session import V2Session
         group_id = "group.agentid.pub/marker"
         asyncio.run(session.ensure_group_registered(group_id, call_fn))
-        uploaded_spk = session._last_uploaded_group_spk_ids[group_id]
+        # 字典键使用 normalized group_id
+        group_normalized = V2Session._group_key(group_id)
+        uploaded_spk = session._last_uploaded_group_spk_ids[group_normalized]
         assert uploaded_spk
         assert [method for method, _params in calls] == ["group.v2.put_group_pk"]
 
@@ -238,6 +248,7 @@ def test_legacy_v2_device_keys_migration_accepts_null_uploaded_markers(tmp_path)
 
     db = AIDDatabase(db_path)
     try:
+        from aun_core.v2.session import V2Session
         store = V2KeyStore(db)
         assert store.load_latest_uploaded_spk_id("dev-1") == "spk-1"
         assert store.load_latest_uploaded_group_spk_id("dev-1", "group.agentid.pub/legacy") == "sha256:legacy_group"
@@ -245,7 +256,9 @@ def test_legacy_v2_device_keys_migration_accepts_null_uploaded_markers(tmp_path)
             "SELECT group_id, key_id FROM v2_device_keys WHERE key_type IN ('group_spk', 'group_spk_uploaded')"
         ).fetchall()
         assert rows
-        assert all(row[0] == "group.agentid.pub/legacy" for row in rows)
+        # 迁移后 group_id 已被 normalize
+        normalized_group_id = V2Session._group_key("group.agentid.pub/legacy")
+        assert all(row[0] == normalized_group_id for row in rows)
         assert all("\0" not in str(row[1]) for row in rows)
     finally:
         db.close()
@@ -254,6 +267,7 @@ def test_legacy_v2_device_keys_migration_accepts_null_uploaded_markers(tmp_path)
 def test_group_spk_new_records_do_not_use_legacy_nul_composite_key(tmp_path):
     db = AIDDatabase(tmp_path / "aun.db")
     try:
+        from aun_core.v2.session import V2Session
         store = V2KeyStore(db)
         store.save_group_spk("dev-1", "group.agentid.pub/new", "sha256:new_group", b"gpriv", b"gpub")
         store.mark_group_spk_uploaded("dev-1", "group.agentid.pub/new", "sha256:new_group")
@@ -261,7 +275,9 @@ def test_group_spk_new_records_do_not_use_legacy_nul_composite_key(tmp_path):
             "SELECT group_id, key_id FROM v2_device_keys WHERE key_type IN ('group_spk', 'group_spk_uploaded')"
         ).fetchall()
         assert len(rows) == 2
-        assert all(row[0] == "group.agentid.pub/new" for row in rows)
+        # group_id 会被 normalize
+        normalized_group_id = V2Session._group_key("group.agentid.pub/new")
+        assert all(row[0] == normalized_group_id for row in rows)
         assert all(row[1] == "sha256:new_group" for row in rows)
         assert all("\0" not in str(row[1]) for row in rows)
     finally:

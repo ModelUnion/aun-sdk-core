@@ -22,6 +22,16 @@ _ONLINE_UNREAD_HINT_INTERVAL = 0.05
 _SEQ_TRACKER_PERSIST_FLUSH_DELAY = 0.2
 
 
+def _coerce_positive_seq(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        seq = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return seq if seq > 0 else 0
+
+
 _APP_MESSAGE_ENVELOPE_KEYS = (
     "module_id", "message_type", "type", "kind", "version",
     "from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
@@ -89,7 +99,7 @@ class MessageDeliveryEngine:
         if isinstance(messages, list):
             for msg in messages:
                 client._log_message_debug("pull-raw", method, "group.message_created", msg)
-        gid = (params or {}).get("group_id", "")
+        gid = (params or {}).get("group_aid") or (params or {}).get("group_id", "")
         ns = f"group:{gid}" if gid else ""
         contig_before = client._seq_tracker.get_contiguous_seq(ns) if gid and getattr(client, "_seq_tracker", None) is not None else 0
         if isinstance(messages, list) and messages and gid and getattr(client, "_seq_tracker", None) is not None:
@@ -160,7 +170,7 @@ class MessageDeliveryEngine:
         if isinstance(payload, dict):
             client._group_state().handle_group_changed_v2_membership(payload)
             if payload.get("action") == "dissolved":
-                group_id = str(payload.get("group_id") or "").strip()
+                group_id = str(payload.get("group_aid") or payload.get("group_id") or "").strip()
                 if group_id:
                     client._cleanup_dissolved_group(group_id)
         await client._publish_app_event("group.changed", payload, source=source)
@@ -168,6 +178,7 @@ class MessageDeliveryEngine:
     async def handle_group_changed_event(self, data: dict[str, Any], group_id: str) -> None:
         """按 group_event:{group_id} 对 group.changed 做 SDK 内部消费和应用发布保序。"""
         client = self.client
+        group_id = _normalize_group_id(group_id) or str(group_id or "").strip()
         raw_event_seq = data.get("event_seq")
         try:
             event_seq = int(raw_event_seq)
@@ -185,6 +196,24 @@ class MessageDeliveryEngine:
             return
 
         ns = f"group_event:{group_id}"
+        if str(data.get("kind") or "").strip() == "group.online_unread_hint":
+            session_options = getattr(client, "_session_options", {}) or {}
+            if not session_options.get("background_sync", True):
+                client._log.debug(
+                    "client",
+                    "group.changed online unread hint skipped: group=%s background_sync=false",
+                    group_id,
+                )
+                return
+            client._log.debug(
+                "client",
+                "group.changed online unread hint triggering gap fill: group=%s event_seq=%d",
+                group_id, event_seq,
+            )
+            loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
+            loop.create_task(client._fill_group_event_gap(group_id))
+            return
+
         if self.is_self_join_group_changed(data):
             contig = client._seq_tracker.get_contiguous_seq(ns)
             max_seen = client._seq_tracker.get_max_seen_seq(ns)
@@ -649,7 +678,14 @@ class MessageDeliveryEngine:
         payload_override: Any = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        if getattr(self.client._log, "is_null_logger", False):
+        logger = self.client._log
+        debug_enabled = getattr(logger, "is_debug_enabled", None)
+        if callable(debug_enabled):
+            if not debug_enabled():
+                return
+        elif getattr(logger, "is_null_logger", False):
+            return
+        elif hasattr(logger, "_debug") and not getattr(logger, "_debug", False):
             return
         record: dict[str, Any] = {
             "stage": stage,
@@ -660,7 +696,7 @@ class MessageDeliveryEngine:
         }
         if extra:
             record["extra"] = extra
-        self.client._log.debug("client", "message.debug %s", self.client._debug_json(record))
+        logger.debug("client", "message.debug %s", self.client._debug_json(record))
 
     def record_push_processing(self, scope: str, key: str, amount: int = 1) -> None:
         stats = getattr(self.client, "_push_processing_stats", None)
@@ -669,6 +705,13 @@ class MessageDeliveryEngine:
             self.client._push_processing_stats = stats
         section = stats.setdefault(scope, {})
         section[key] = int(section.get(key) or 0) + amount
+
+    def record_p2p_gap_fill(self, key: str, amount: int = 1) -> None:
+        stats = getattr(self.client, "_p2p_gap_fill_stats", None)
+        if stats is None:
+            stats = {}
+            self.client._p2p_gap_fill_stats = stats
+        stats[key] = int(stats.get(key) or 0) + int(amount or 0)
 
     def record_auto_ack(self, key: str, amount: int = 1) -> None:
         stats = getattr(self.client, "_auto_ack_stats", None)
@@ -923,9 +966,9 @@ class MessageDeliveryEngine:
         if method == "message.ack":
             ns = f"p2p:{client._aid}" if client._aid else ""
             return _clamp_field(params, "seq", ns)
-        # Group ack: ns 来自 group_id
+        # Group ack: ns 来自标准 group_aid；group_id 只保留为历史 wire 字段名。
         if method in ("group.v2.ack", "group.ack_messages", "group.ack_events"):
-            group_id = str(params.get("group_id") or "").strip()
+            group_id = str(params.get("group_aid") or params.get("group_id") or "").strip()
             if method == "group.v2.ack":
                 ns = f"group:{group_id}" if group_id else ""
                 return _clamp_field(params, "up_to_seq", ns)
@@ -1034,7 +1077,7 @@ class MessageDeliveryEngine:
             if seq is not None and client._aid:
                 ns = f"p2p:{client._aid}"
                 # Push 修上界：先更新 max_seen_seq，让上界反映服务端状态（即使后续被去重/旁路）
-                seq_int = int(seq) if isinstance(seq, (int, float)) else 0
+                seq_int = _coerce_positive_seq(seq)
                 if seq_int > 0:
                     client._seq_tracker.update_max_seen(ns, seq_int)
                 old_contig = client._seq_tracker.get_contiguous_seq(ns)
@@ -1449,7 +1492,7 @@ class MessageDeliveryEngine:
     async def fill_p2p_gap(self) -> None:
         """后台补齐 P2P 消息空洞。"""
         client = self.client
-        if client._state != "connected" or client._closing:
+        if client._public_state != ConnectionState.READY or client._closing:
             return
         if not client._aid:
             return
@@ -1461,7 +1504,7 @@ class MessageDeliveryEngine:
     async def fill_p2p_gap_inner(self, ns: str) -> None:
         """P2P gap fill 内部实现（在 ns lock 保护下调用）。"""
         client = self.client
-        if client._state != "connected" or client._closing:
+        if client._public_state != ConnectionState.READY or client._closing:
             return
         after_seq = client._seq_tracker.get_contiguous_seq(ns)
         dedup_key = f"p2p_pull:{ns}"
@@ -1470,6 +1513,7 @@ class MessageDeliveryEngine:
         client._gap_fill_done[dedup_key] = time.time()
         # S1: try/finally 保证 dedup 键在所有出口清理
         try:
+            self.record_p2p_gap_fill("gap_fill_started")
             client._log.info("client", "P2P message gap fill start: after_seq=%d device_id=%s", after_seq, client._device_id)
             self.runtime.delivery.set_gap_fill_active(True)
             try:
@@ -1483,6 +1527,12 @@ class MessageDeliveryEngine:
             if isinstance(result, dict):
                 messages = result.get("messages", [])
                 if isinstance(messages, list):
+                    raw_count = int(result.get("raw_count") or len(messages) or 0)
+                    self.record_p2p_gap_fill("gap_fill_pages")
+                    self.record_p2p_gap_fill("gap_fill_raw_messages", raw_count)
+                    self.record_p2p_gap_fill("gap_fill_published_messages", len(messages))
+                    if raw_count <= 0:
+                        self.record_p2p_gap_fill("gap_fill_empty_pages")
                     # 统计解密成功/失败
                     ok_count = sum(1 for m in messages if isinstance(m, dict) and m.get("encrypted"))
                     fail_count = len(messages) - ok_count
@@ -1518,6 +1568,7 @@ class MessageDeliveryEngine:
                         except Exception as ack_exc:
                             client._log.debug("client", "P2P gap fill auto-ack failed: %s", ack_exc)
         except Exception as exc:
+            self.record_p2p_gap_fill("gap_fill_failed")
             client._log.warn("client", "P2P message gap fill failed: after_seq=%d error=%s", after_seq, exc)
         finally:
             client._gap_fill_done.pop(dedup_key, None)
@@ -1526,7 +1577,10 @@ class MessageDeliveryEngine:
     async def fill_group_event_gap(self, group_id: str) -> None:
         """后台补齐群事件空洞。"""
         client = self.client
-        if client._state != "connected" or client._closing:
+        if client._public_state != ConnectionState.READY or client._closing:
+            return
+        group_id = _normalize_group_id(group_id) or str(group_id or "").strip()
+        if not group_id:
             return
         ns = f"group_event:{group_id}"
         async with client._get_ns_lock(ns):
@@ -1535,7 +1589,7 @@ class MessageDeliveryEngine:
     async def fill_group_event_gap_inner(self, group_id: str, ns: str) -> None:
         """群事件 gap fill 内部实现（在 ns lock 保护下调用）。"""
         client = self.client
-        if client._state != "connected" or client._closing:
+        if client._public_state != ConnectionState.READY or client._closing:
             return
         after_seq = client._seq_tracker.get_contiguous_seq(ns)
         dedup_key = f"group_event_pull:{ns}"
@@ -1648,6 +1702,7 @@ class MessageDeliveryEngine:
         previous = int(pending.get(ns, 0) or 0)
         if seq > previous:
             pending[ns] = seq
+            self.record_p2p_gap_fill("pending_upper_recorded")
         client._log.debug(
             "client",
             "P2P pending pull upper recorded: ns=%s seq=%d previous=%d contiguous=%d",
@@ -1674,7 +1729,7 @@ class MessageDeliveryEngine:
                 ns, upper_seq, contig, reason,
             )
             return False
-        if client._state != "connected" or client._closing:
+        if client._public_state != ConnectionState.READY or client._closing:
             client._log.debug(
                 "client",
                 "P2P pending pull postponed: ns=%s upper_seq=%d contiguous=%d state=%s closing=%s reason=%s",
@@ -1691,6 +1746,7 @@ class MessageDeliveryEngine:
             "P2P pending push follow-up pull scheduled: ns=%s upper_seq=%d contiguous=%d reason=%s",
             ns, upper_seq, contig, reason,
         )
+        self.record_p2p_gap_fill("followup_scheduled")
         loop.create_task(client._fill_p2p_gap())
         return True
 
@@ -1732,7 +1788,7 @@ class MessageDeliveryEngine:
         for ns in list(state.keys()):
             if not isinstance(ns, str):
                 continue
-            for prefix in ("group_event:", "group_msg:"):
+            for prefix in ("group:", "group_event:", "group_msg:"):
                 if ns.startswith(prefix):
                     old_gid = ns[len(prefix):]
                     # 迁移不对无域输入强行补域，避免误伤
@@ -2045,7 +2101,7 @@ class MessageDeliveryEngine:
             push_seq, push_from, push_msg_id, bool(envelope_json), contig_before, pull_in_flight,
         )
 
-        push_seq_int = int(push_seq) if push_seq and isinstance(push_seq, (int, float)) and push_seq > 0 else 0
+        push_seq_int = _coerce_positive_seq(push_seq)
 
         # Push 修上界：只更新 max_seen_seq，不动 contiguous_seq。
         if push_seq_int > 0 and ns:
@@ -2126,7 +2182,17 @@ class MessageDeliveryEngine:
         client._gap_fill_done[dedup_key] = time.time()
 
         try:
-            await self.run_background_rpc(lambda: client._pull_v2_internal({}))
+            self.record_p2p_gap_fill("push_auto_pull_started")
+            result = await self.run_background_rpc(lambda: client._pull_v2_internal({}))
+            if isinstance(result, dict):
+                messages = result.get("messages", [])
+                published_count = len(messages) if isinstance(messages, list) else 0
+                raw_count = int(result.get("raw_count") or 0)
+                self.record_p2p_gap_fill("push_auto_pull_pages")
+                self.record_p2p_gap_fill("push_auto_pull_raw_messages", raw_count)
+                self.record_p2p_gap_fill("push_auto_pull_published_messages", published_count)
+                if raw_count <= 0:
+                    self.record_p2p_gap_fill("push_auto_pull_empty_pages")
             new_contig = client._seq_tracker.get_contiguous_seq(ns) if ns else -1
             client._log.debug(
                 "client",
@@ -2134,6 +2200,7 @@ class MessageDeliveryEngine:
                 contig_before, new_contig, push_seq,
             )
         except Exception as exc:
+            self.record_p2p_gap_fill("push_auto_pull_failed")
             client._log.warn("client", "V2 push auto-pull failed: %s", exc)
         finally:
             client._gap_fill_done.pop(dedup_key, None)

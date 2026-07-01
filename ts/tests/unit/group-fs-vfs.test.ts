@@ -52,12 +52,31 @@ class FakeClient {
   _identity?: Record<string, unknown>;
   _sessionParams?: Record<string, unknown>;
   calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  createGroupCalls: Record<string, unknown>[] = [];
+  startTransferCalls: Array<{ params: Record<string, unknown>; options: Record<string, unknown> }> = [];
+  completeTransferCalls: Array<{ params: Record<string, unknown>; options: Record<string, unknown> }> = [];
   responses: Record<string, Record<string, unknown>> = {};
 
   async call(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
     const callParams = params ?? {};
     this.calls.push({ method, params: callParams });
     return this.responses[method] ?? { method, params: callParams };
+  }
+
+  async createGroup(params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const callParams = params ?? {};
+    this.createGroupCalls.push(callParams);
+    return { group: { group_id: 'group.agentid.pub/10001', group_aid: 'named.agentid.pub' }, params: callParams };
+  }
+
+  async startGroupTransfer(params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.startTransferCalls.push({ params: params ?? {}, options: options ?? {} });
+    return { status: 'pending_rekey', group_id: params?.group_id, new_owner: params?.new_owner };
+  }
+
+  async completeGroupTransfer(params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.completeTransferCalls.push({ params: params ?? {}, options: options ?? {} });
+    return { status: 'transferred', group_id: params?.group_id };
   }
 }
 
@@ -86,6 +105,48 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
 
     expect(() => group.send({ payload: { text: 'hi' } })).toThrow(/group_id cannot be empty/);
     expect(() => group.pull({ group_id: '   ', limit: 10 })).toThrow(/group_id cannot be empty/);
+    expect(client.calls).toEqual([]);
+  });
+
+  it('命名群 create 走 createGroup 以保存 group_aid 私钥', async () => {
+    const client = new FakeClient();
+    const group = new GroupFacade(client);
+
+    await group.create({ name: 'Named Team', group_name: 'named-team', visibility: 'private' });
+
+    expect(client.createGroupCalls).toEqual([{ name: 'Named Team', group_name: 'named-team', visibility: 'private' }]);
+    expect(client.calls).toEqual([]);
+  });
+
+  it('transferOwner 带 aidStore 时走 startGroupTransfer 且不透传 aidStore', async () => {
+    const client = new FakeClient();
+    const group = new GroupFacade(client);
+    const aidStore = { tag: 'group-store' };
+
+    await group.transferOwner({ group_id: 'group.agentid.pub/10001', new_owner: 'bob.agentid.pub', aidStore } as any);
+
+    expect(client.startTransferCalls).toEqual([
+      {
+        params: { group_id: 'group.agentid.pub/10001', new_owner: 'bob.agentid.pub' },
+        options: { aidStore },
+      },
+    ]);
+    expect(client.calls).toEqual([]);
+  });
+
+  it('completeTransfer 带 aidStore 时走 completeGroupTransfer 且不透传 aidStore', async () => {
+    const client = new FakeClient();
+    const group = new GroupFacade(client);
+    const aidStore = { tag: 'new-owner-store' };
+
+    await group.completeTransfer({ group_id: 'group.agentid.pub/10001', aidStore } as any);
+
+    expect(client.completeTransferCalls).toEqual([
+      {
+        params: { group_id: 'group.agentid.pub/10001' },
+        options: { aidStore },
+      },
+    ]);
     expect(client.calls).toEqual([]);
   });
 
@@ -326,6 +387,44 @@ describe('Phase 6 GroupFSVFS TypeScript 契约', () => {
       ]);
       expect(client.calls[0].params.group_id).toBe('group.example.test/team');
       expect(client.calls[3].params.group_id).toBe('group.example.test/team');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('cp 裸路径支持共享 group_aid 参数', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'aun-group-fs-'));
+    try {
+      const local = join(dir, 'aid-active.md');
+      const target = join(dir, 'aid-out.md');
+      await writeFile(local, 'active group aid');
+      const digest = sha256Hex('active group aid');
+      const client = new FakeClient();
+      client.responses = {
+        'group.fs.check_upload': { target_exists: false },
+        'group.fs.create_upload_session': {
+          upload_url: 'https://upload.example.test/active-aid',
+          session_id: 's-active-aid',
+        },
+        'group.fs.complete_upload': { type: 'file', path: '/docs/active-aid.md' },
+        'group.fs.create_download_ticket': {
+          download_url: 'https://download.example.test/active-aid',
+          sha256: digest,
+          file_name: 'active-aid.md',
+        },
+      };
+      const lowlevel = new FakeLowLevel(new TextEncoder().encode('active group aid'));
+      const fs = new GroupFacade(client).fs;
+      fs.lowlevel = lowlevel;
+
+      await fs.cp(`local:${local}`, '/docs/active-aid.md', { group_aid: 'team.agentid.pub' });
+      const result = await fs.cp('/docs/active-aid.md', `local:${target}`, { group_aid: 'team.agentid.pub' });
+
+      expect(result).toMatchObject({ localPath: target, verified: true });
+      expect(client.calls[0].params.group_aid).toBe('team.agentid.pub');
+      expect(client.calls[0].params.group_id).toBeUndefined();
+      expect(client.calls[3].params.group_aid).toBe('team.agentid.pub');
+      expect(client.calls[3].params.group_id).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

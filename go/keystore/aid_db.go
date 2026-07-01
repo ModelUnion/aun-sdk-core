@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +31,95 @@ func slotIsolationKey(slotID string) string {
 	return slotID
 }
 
+func groupTrimDots(value string) string {
+	return strings.Trim(value, ".")
+}
+
+func issuerFromAID(aid string) string {
+	value := strings.ToLower(strings.TrimSpace(aid))
+	if dot := strings.Index(value, "."); dot > 0 && dot < len(value)-1 {
+		return strings.Trim(value[dot+1:], ".")
+	}
+	return ""
+}
+
+func convertToGroupAIDLocal(raw string, localIssuer string) string {
+	value := strings.ToLower(strings.Trim(strings.TrimSpace(raw), "/"))
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "group.") && strings.Contains(value, "/") {
+		issuerAndBase := value[6:]
+		if slash := strings.Index(issuerAndBase, "/"); slash > 0 && slash < len(issuerAndBase)-1 {
+			domain := groupTrimDots(issuerAndBase[:slash])
+			baseTail := strings.Trim(issuerAndBase[slash+1:], "/")
+			if at := strings.Index(baseTail, "@"); at > 0 {
+				base := groupTrimDots(baseTail[:at])
+				suffixDomain := groupTrimDots(baseTail[at+1:])
+				if base != "" && suffixDomain != "" {
+					merged := suffixDomain
+					if domain != "" {
+						merged = suffixDomain + "." + domain
+					}
+					return base + "." + merged
+				}
+			}
+			base := groupTrimDots(baseTail)
+			if base != "" && domain != "" {
+				return base + "." + domain
+			}
+			return value
+		}
+		return value
+	}
+	if at := strings.Index(value, "@"); at > 0 {
+		base := groupTrimDots(value[:at])
+		domain := groupTrimDots(value[at+1:])
+		if base != "" && domain != "" {
+			return base + "." + domain
+		}
+		return value
+	}
+	if strings.Contains(value, ".") {
+		return value
+	}
+	issuer := strings.ToLower(groupTrimDots(strings.TrimSpace(localIssuer)))
+	if issuer != "" {
+		return value + "." + issuer
+	}
+	return value
+}
+
+func groupLookupCandidates(groupID string, localIssuer string) []string {
+	raw := strings.TrimSpace(groupID)
+	if raw == "" {
+		return nil
+	}
+	normalized := convertToGroupAIDLocal(raw, localIssuer)
+	candidates := make([]string, 0, 5)
+	seen := map[string]bool{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		candidates = append(candidates, value)
+	}
+	add(raw)
+	add(normalized)
+	if dot := strings.Index(normalized, "."); dot > 0 && dot < len(normalized)-1 {
+		base := normalized[:dot]
+		issuer := normalized[dot+1:]
+		add("group." + issuer + "/" + base)
+		add(base + "@" + issuer)
+		if localIssuer != "" && issuer == strings.ToLower(groupTrimDots(strings.TrimSpace(localIssuer))) {
+			add(base)
+		}
+	}
+	return candidates
+}
+
 var aidDBDDL = []string{
 	`CREATE TABLE IF NOT EXISTS _schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -40,39 +128,6 @@ var aidDBDDL = []string{
 	`CREATE TABLE IF NOT EXISTS tokens (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL,
-		updated_at INTEGER NOT NULL
-	)`,
-	`CREATE TABLE IF NOT EXISTS prekeys (
-		prekey_id TEXT NOT NULL,
-		device_id TEXT NOT NULL DEFAULT '',
-		private_key_enc TEXT NOT NULL DEFAULT '',
-		data TEXT NOT NULL DEFAULT '{}',
-		created_at INTEGER,
-		updated_at INTEGER NOT NULL,
-		expires_at INTEGER,
-		PRIMARY KEY (prekey_id, device_id)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_prekeys_device ON prekeys (device_id, created_at)`,
-	`CREATE TABLE IF NOT EXISTS group_current (
-		group_id TEXT PRIMARY KEY,
-		epoch INTEGER NOT NULL,
-		secret_enc TEXT NOT NULL DEFAULT '',
-		data TEXT NOT NULL DEFAULT '{}',
-		updated_at INTEGER NOT NULL
-	)`,
-	`CREATE TABLE IF NOT EXISTS group_old_epochs (
-		group_id TEXT NOT NULL,
-		epoch INTEGER NOT NULL,
-		secret_enc TEXT NOT NULL DEFAULT '',
-		data TEXT NOT NULL DEFAULT '{}',
-		updated_at INTEGER NOT NULL,
-		expires_at INTEGER,
-		PRIMARY KEY (group_id, epoch)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_group_old_expires ON group_old_epochs (group_id, expires_at)`,
-	`CREATE TABLE IF NOT EXISTS e2ee_sessions (
-		session_id TEXT PRIMARY KEY,
-		data_enc TEXT NOT NULL DEFAULT '{}',
 		updated_at INTEGER NOT NULL
 	)`,
 	`CREATE TABLE IF NOT EXISTS instance_state (
@@ -110,10 +165,10 @@ var aidDBDDL = []string{
 
 // AIDDatabase 单个 AID 的 SQLite 数据库。
 type AIDDatabase struct {
-	mu          sync.Mutex
-	db          *sql.DB
-	dbPath      string
-	aid         string                  // 当前 AID 标识，用于 SecretStore scope
+	mu     sync.Mutex
+	db     *sql.DB
+	dbPath string
+	aid    string // 当前 AID 标识，用于 SecretStore scope
 }
 
 // newAIDDatabase 创建或打开 AID 数据库。
@@ -304,1022 +359,6 @@ func (a *AIDDatabase) GetAllTokens() map[string]string {
 	return result
 }
 
-// ── Prekeys ──────────────────────────────────────────────────
-
-func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, createdAt, expiresAt *int64, extraData map[string]any) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := nowMs()
-
-	// 阶段6：prekey 私钥明文写入（IK 私钥仍由 file.go 加密保护）
-	storedKey := privateKeyPEM
-
-	dataJSON, err := json.Marshal(extraData)
-	if err != nil {
-		pkgLogKeystore().Warn("SavePrekey json.Marshal failed: %v", err)
-		dataJSON = []byte("{}")
-	}
-	if _, err := a.db.Exec(
-		`INSERT INTO prekeys (prekey_id, device_id, private_key_enc, data, created_at, updated_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(prekey_id, device_id) DO UPDATE SET
-		   private_key_enc=excluded.private_key_enc, data=excluded.data,
-		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
-		prekeyID, deviceID, storedKey, string(dataJSON),
-		nullInt64Ptr(createdAt, now), now, nullInt64PtrSQL(expiresAt),
-	); err != nil {
-		pkgLogKeystore().Warn("SavePrekey failed (id=%s): %v", prekeyID, err)
-	}
-}
-
-func (a *AIDDatabase) LoadPrekeys(deviceID string) map[string]map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query(
-		`SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at
-		 FROM prekeys WHERE device_id = ?`, deviceID,
-	)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	result := make(map[string]map[string]any)
-	for rows.Next() {
-		var id, enc, dataStr string
-		var createdAt, updatedAt sql.NullInt64
-		var expiresAt sql.NullInt64
-		if err := rows.Scan(&id, &enc, &dataStr, &createdAt, &updatedAt, &expiresAt); err != nil {
-			continue
-		}
-
-		// 字段级解密：明文存储，直接使用
-		privateKeyPEM := enc
-
-		entry := map[string]any{
-			"private_key_pem": privateKeyPEM,
-		}
-		if createdAt.Valid {
-			entry["created_at"] = createdAt.Int64
-		}
-		if updatedAt.Valid {
-			entry["updated_at"] = updatedAt.Int64
-		}
-		if expiresAt.Valid {
-			entry["expires_at"] = expiresAt.Int64
-		}
-		var extra map[string]any
-		if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-			for k, v := range extra {
-				entry[k] = v
-			}
-		}
-		result[id] = entry
-	}
-	return result
-}
-
-// LoadPrekeyByID 按 prekey_id 单点查询（WHERE prekey_id = ? LIMIT 1）。
-// 解密入站消息时信封里都带 prekey_id，应优先走这条路径，避免 LoadPrekeys 的全量扫描。
-// 不限 device_id，与 Python 实现保持一致（兼容旧数据）。未命中返回 nil。
-func (a *AIDDatabase) LoadPrekeyByID(prekeyID string) map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	row := a.db.QueryRow(
-		`SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at
-		 FROM prekeys WHERE prekey_id = ? LIMIT 1`, prekeyID,
-	)
-	var id, enc, dataStr string
-	var createdAt, updatedAt sql.NullInt64
-	var expiresAt sql.NullInt64
-	if err := row.Scan(&id, &enc, &dataStr, &createdAt, &updatedAt, &expiresAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil
-		}
-		pkgLogKeystore().Warn("LoadPrekeyByID scan failed (id=%s): %v", prekeyID, err)
-		return nil
-	}
-
-	// 字段级解密：与 LoadPrekeys 保持一致
-	privateKeyPEM := enc
-	entry := map[string]any{
-		"private_key_pem": privateKeyPEM,
-	}
-	if createdAt.Valid {
-		entry["created_at"] = createdAt.Int64
-	}
-	if updatedAt.Valid {
-		entry["updated_at"] = updatedAt.Int64
-	}
-	if expiresAt.Valid {
-		entry["expires_at"] = expiresAt.Int64
-	}
-	var extra map[string]any
-	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-		for k, v := range extra {
-			entry[k] = v
-		}
-	}
-	return entry
-}
-
-func (a *AIDDatabase) DeletePrekey(prekeyID, deviceID string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, err := a.db.Exec("DELETE FROM prekeys WHERE prekey_id = ? AND device_id = ?", prekeyID, deviceID); err != nil {
-		pkgLogKeystore().Warn("DeletePrekey failed (id=%s, device=%s): %v", prekeyID, deviceID, err)
-	}
-}
-
-func (a *AIDDatabase) CleanupPrekeys(deviceID string, cutoffMs int64, keepLatest int) []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query(
-		"SELECT prekey_id, created_at FROM prekeys WHERE device_id = ? ORDER BY created_at DESC",
-		deviceID,
-	)
-	if err != nil {
-		return nil
-	}
-	type row struct {
-		id        string
-		createdAt sql.NullInt64
-	}
-	var all []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.createdAt); err == nil {
-			all = append(all, r)
-		}
-	}
-	rows.Close()
-
-	latestIDs := make(map[string]bool)
-	for i, r := range all {
-		if i < keepLatest {
-			latestIDs[r.id] = true
-		}
-	}
-	var toDelete []string
-	for _, r := range all {
-		if latestIDs[r.id] {
-			continue
-		}
-		if r.createdAt.Valid && r.createdAt.Int64 < cutoffMs {
-			toDelete = append(toDelete, r.id)
-		}
-	}
-	for _, id := range toDelete {
-		if _, err := a.db.Exec("DELETE FROM prekeys WHERE device_id = ? AND prekey_id = ?", deviceID, id); err != nil {
-			pkgLogKeystore().Warn("CleanupPrekeys deletefailed (device=%s, id=%s): %v", deviceID, id, err)
-		}
-	}
-	return toDelete
-}
-
-// ── Group Current ────────────────────────────────────────────
-
-func (a *AIDDatabase) SaveGroupCurrent(groupID string, epoch int64, secret string, data map[string]any) {
-	tStart := time.Now()
-	pkgLogKeystore().Debug("SaveGroupCurrent enter: group=%s epoch=%d", groupID, epoch)
-	defer func() {
-		pkgLogKeystore().Debug("SaveGroupCurrent exit: group=%s epoch=%d elapsed=%dms", groupID, epoch, time.Since(tStart).Milliseconds())
-	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		pkgLogKeystore().Warn("SaveGroupCurrent json.Marshal failed: %v", err)
-		dataJSON = []byte("{}")
-	}
-	storedSecret := secret
-	if _, err := a.db.Exec(
-		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(group_id) DO UPDATE SET
-		   epoch=excluded.epoch, secret_enc=excluded.secret_enc,
-		   data=excluded.data, updated_at=excluded.updated_at`,
-		groupID, epoch, storedSecret, string(dataJSON), nowMs(),
-	); err != nil {
-		pkgLogKeystore().Warn("SaveGroupCurrent failed (group=%s): %v", groupID, err)
-	}
-}
-
-func (a *AIDDatabase) LoadGroupCurrent(groupID string) map[string]any {
-	tStart := time.Now()
-	pkgLogKeystore().Debug("LoadGroupCurrent enter: group=%s", groupID)
-	defer func() {
-		pkgLogKeystore().Debug("LoadGroupCurrent exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
-	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var epoch int64
-	var enc, dataStr string
-	var updatedAt int64
-	row := a.db.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?", groupID,
-	)
-	if err := row.Scan(&epoch, &enc, &dataStr, &updatedAt); err != nil {
-		return nil
-	}
-	result := map[string]any{
-		"group_id":   groupID,
-		"epoch":      epoch,
-		"secret":     enc,
-		"updated_at": updatedAt,
-	}
-	var extra map[string]any
-	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-		for k, v := range extra {
-			result[k] = v
-		}
-	}
-	return result
-}
-
-func (a *AIDDatabase) LoadGroupSecretEpoch(groupID string, epoch *int) (map[string]any, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	current, err := a.loadGroupCurrentLocked(groupID)
-	if err != nil {
-		return nil, err
-	}
-	if epoch == nil {
-		return current, nil
-	}
-	if current != nil && int(toInt64Local(current["epoch"])) == *epoch {
-		return current, nil
-	}
-	var oldEpoch, updatedAt int64
-	var enc, dataStr string
-	var expiresAt sql.NullInt64
-	row := a.db.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
-		groupID, *epoch,
-	)
-	if err := row.Scan(&oldEpoch, &enc, &dataStr, &updatedAt, &expiresAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	entry := map[string]any{
-		"epoch":      oldEpoch,
-		"secret":     enc,
-		"updated_at": updatedAt,
-	}
-	var extra map[string]any
-	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-		for k, v := range extra {
-			entry[k] = v
-		}
-	}
-	if expiresAt.Valid {
-		entry["expires_at"] = expiresAt.Int64
-	}
-	return entry, nil
-}
-
-func (a *AIDDatabase) LoadGroupSecretEpochs(groupID string) ([]map[string]any, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	current, err := a.loadGroupCurrentLocked(groupID)
-	if err != nil {
-		return nil, err
-	}
-	var result []map[string]any
-	if current != nil {
-		result = append(result, current)
-	}
-	rows, err := a.db.Query(
-		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC",
-		groupID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var oldEpoch, updatedAt int64
-		var enc, dataStr string
-		var expiresAt sql.NullInt64
-		if err := rows.Scan(&oldEpoch, &enc, &dataStr, &updatedAt, &expiresAt); err != nil {
-			return nil, err
-		}
-		entry := map[string]any{
-			"epoch":      oldEpoch,
-			"secret":     enc,
-			"updated_at": updatedAt,
-		}
-		var extra map[string]any
-		if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-			for k, v := range extra {
-				entry[k] = v
-			}
-		}
-		if expiresAt.Valid {
-			entry["expires_at"] = expiresAt.Int64
-		}
-		result = append(result, entry)
-	}
-	return result, rows.Err()
-}
-
-func (a *AIDDatabase) loadGroupCurrentLocked(groupID string) (map[string]any, error) {
-	var epoch int64
-	var enc, dataStr string
-	var updatedAt int64
-	row := a.db.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?", groupID,
-	)
-	if err := row.Scan(&epoch, &enc, &dataStr, &updatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	result := map[string]any{
-		"group_id":   groupID,
-		"epoch":      epoch,
-		"secret":     enc,
-		"updated_at": updatedAt,
-	}
-	var extra map[string]any
-	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-		for k, v := range extra {
-			result[k] = v
-		}
-	}
-	return result, nil
-}
-
-func (a *AIDDatabase) LoadAllGroupCurrent() map[string]map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query("SELECT group_id, epoch, secret_enc, data, updated_at FROM group_current")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	result := make(map[string]map[string]any)
-	for rows.Next() {
-		var gid string
-		var epoch, updatedAt int64
-		var enc, dataStr string
-		if err := rows.Scan(&gid, &epoch, &enc, &dataStr, &updatedAt); err != nil {
-			continue
-		}
-		entry := map[string]any{
-			"group_id":   gid,
-			"epoch":      epoch,
-			"secret":     enc,
-			"updated_at": updatedAt,
-		}
-		var extra map[string]any
-		if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-			for k, v := range extra {
-				entry[k] = v
-			}
-		}
-		result[gid] = entry
-	}
-	return result
-}
-
-func (a *AIDDatabase) DeleteGroupCurrent(groupID string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, err := a.db.Exec("DELETE FROM group_current WHERE group_id = ?", groupID); err != nil {
-		pkgLogKeystore().Warn("DeleteGroupCurrent failed (group=%s): %v", groupID, err)
-	}
-}
-
-// ── Group Old Epochs ─────────────────────────────────────────
-
-func (a *AIDDatabase) SaveGroupOldEpoch(groupID string, epoch int64, secret string, data map[string]any, updatedAt *int64, expiresAt *int64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := nowMs()
-	if updatedAt != nil {
-		now = *updatedAt
-	}
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		pkgLogKeystore().Warn("SaveGroupOldEpoch json.Marshal failed: %v", err)
-		dataJSON = []byte("{}")
-	}
-	storedSecret := secret
-	if _, err := a.db.Exec(
-		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(group_id, epoch) DO UPDATE SET
-		   secret_enc=excluded.secret_enc, data=excluded.data,
-		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
-		groupID, epoch, storedSecret, string(dataJSON), now, nullInt64PtrSQL(expiresAt),
-	); err != nil {
-		pkgLogKeystore().Warn("SaveGroupOldEpoch failed (group=%s, epoch=%d): %v", groupID, epoch, err)
-	}
-}
-
-func (a *AIDDatabase) LoadGroupOldEpochs(groupID string) []map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query(
-		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC",
-		groupID,
-	)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var result []map[string]any
-	for rows.Next() {
-		var epoch, updatedAt int64
-		var enc, dataStr string
-		var expiresAt sql.NullInt64
-		if err := rows.Scan(&epoch, &enc, &dataStr, &updatedAt, &expiresAt); err != nil {
-			continue
-		}
-		entry := map[string]any{
-			"epoch":      epoch,
-			"secret":     enc,
-			"updated_at": updatedAt,
-		}
-		if expiresAt.Valid {
-			entry["expires_at"] = expiresAt.Int64
-		}
-		var extra map[string]any
-		if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
-			for k, v := range extra {
-				entry[k] = v
-			}
-		}
-		result = append(result, entry)
-	}
-	return result
-}
-
-func (a *AIDDatabase) DeleteAllGroupOldEpochs(groupID string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, err := a.db.Exec("DELETE FROM group_old_epochs WHERE group_id = ?", groupID); err != nil {
-		pkgLogKeystore().Warn("DeleteAllGroupOldEpochs failed (group=%s): %v", groupID, err)
-	}
-}
-
-func (a *AIDDatabase) LoadAllGroupIDsWithOldEpochs() []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query("SELECT DISTINCT group_id FROM group_old_epochs")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var result []string
-	for rows.Next() {
-		var groupID string
-		if err := rows.Scan(&groupID); err == nil {
-			result = append(result, groupID)
-		}
-	}
-	return result
-}
-
-func (a *AIDDatabase) CleanupGroupOldEpochs(groupID string, cutoffMs int64) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	res, err := a.db.Exec(
-		`DELETE FROM group_old_epochs WHERE group_id = ? AND updated_at <= ?`,
-		groupID, cutoffMs,
-	)
-	if err != nil {
-		pkgLogKeystore().Warn("CleanupGroupOldEpochs failed (group=%s): %v", groupID, err)
-		return 0
-	}
-	n, _ := res.RowsAffected()
-	return int(n)
-}
-
-func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecretTransitionOptions) (ok bool, err error) {
-	tStart := time.Now()
-	pkgLogKeystore().Debug("StoreGroupSecretTransition enter: group=%s", groupID)
-	defer func() {
-		if err != nil {
-			pkgLogKeystore().Debug("StoreGroupSecretTransition exit (error): group=%s ok=%v elapsed=%dms err=%v", groupID, ok, time.Since(tStart).Milliseconds(), err)
-		} else {
-			pkgLogKeystore().Debug("StoreGroupSecretTransition exit: group=%s ok=%v elapsed=%dms", groupID, ok, time.Since(tStart).Milliseconds())
-		}
-	}()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	tx, err := a.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	now := nowMs()
-	epoch := int64(opts.Epoch)
-	members := normalizeStringSlice(opts.MemberAIDs)
-	pendingID := strings.TrimSpace(opts.PendingRotationID)
-
-	var currentEpoch, currentUpdatedAt int64
-	var currentEnc, currentDataStr string
-	row := tx.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
-		groupID,
-	)
-	hasCurrent := true
-	if err := row.Scan(&currentEpoch, &currentEnc, &currentDataStr, &currentUpdatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			hasCurrent = false
-		} else {
-			return false, err
-		}
-	}
-
-	if hasCurrent {
-		currentSecret := currentEnc
-		currentData := jsonObjectLocal(currentDataStr)
-		if epoch < currentEpoch {
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			committed = true
-			return false, nil
-		}
-		if epoch == currentEpoch && currentSecret != "" {
-			if currentSecret != opts.Secret {
-				if strings.TrimSpace(fmt.Sprint(currentData["pending_rotation_id"])) != "" {
-					if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
-						return false, err
-					}
-					if err := tx.Commit(); err != nil {
-						return false, err
-					}
-					committed = true
-					return true, nil
-				}
-				if err := tx.Commit(); err != nil {
-					return false, err
-				}
-				committed = true
-				return false, nil
-			}
-
-			updated := copyMapLocal(currentData)
-			changed := false
-			oldMembers := normalizeStringSliceFromAny(updated["member_aids"])
-			if len(members) > 0 && !stringSliceEqualLocal(oldMembers, members) {
-				updated["member_aids"] = members
-				updated["commitment"] = opts.Commitment
-				changed = true
-			}
-			if opts.EpochChain != "" && updated["epoch_chain"] != opts.EpochChain {
-				updated["epoch_chain"] = opts.EpochChain
-				changed = true
-			}
-			if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
-				if updated["epoch_chain_unverified"] != true {
-					updated["epoch_chain_unverified"] = true
-					changed = true
-				}
-				if opts.EpochChainUnverifiedReason != "" && updated["epoch_chain_unverified_reason"] != opts.EpochChainUnverifiedReason {
-					updated["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
-					changed = true
-				}
-			} else if opts.EpochChainUnverifiedSet && (updated["epoch_chain_unverified"] != nil || updated["epoch_chain_unverified_reason"] != nil) {
-				delete(updated, "epoch_chain_unverified")
-				delete(updated, "epoch_chain_unverified_reason")
-				changed = true
-			}
-			if pendingID != "" && updated["pending_rotation_id"] != pendingID {
-				updated["pending_rotation_id"] = pendingID
-				updated["pending_created_at"] = now
-				changed = true
-			}
-			if pendingID == "" && updated["pending_rotation_id"] != nil {
-				delete(updated, "pending_rotation_id")
-				delete(updated, "pending_created_at")
-				changed = true
-			}
-			if changed {
-				if err := a.upsertGroupCurrentTx(tx, groupID, epoch, currentSecret, updated, now); err != nil {
-					return false, err
-				}
-			}
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			committed = true
-			return true, nil
-		}
-		if currentEpoch != epoch {
-			expiresAt := currentUpdatedAt + opts.OldEpochRetentionMillis
-			if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, currentSecret, currentData, currentUpdatedAt, &expiresAt); err != nil {
-				return false, err
-			}
-		} else {
-			// epoch == currentEpoch 但 currentSecret 为空：合并 data，保留已有字段
-			newData := buildGroupCurrentData(opts, members, now)
-			if opts.EpochChain == "" {
-				if ec, ok := currentData["epoch_chain"].(string); ok && ec != "" {
-					newData["epoch_chain"] = ec
-				}
-			}
-			if pendingID == "" {
-				if pid, ok := currentData["pending_rotation_id"].(string); ok && pid != "" {
-					newData["pending_rotation_id"] = pid
-					if pca, ok := currentData["pending_created_at"]; ok {
-						newData["pending_created_at"] = pca
-					}
-				}
-			}
-			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, newData, now); err != nil {
-				return false, err
-			}
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			committed = true
-			return true, nil
-		}
-	}
-
-	if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	committed = true
-	return true, nil
-}
-
-func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTransitionOptions) (bool, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	tx, err := a.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	now := nowMs()
-	epoch := int64(opts.Epoch)
-	members := normalizeStringSlice(opts.MemberAIDs)
-	pendingID := strings.TrimSpace(opts.PendingRotationID)
-
-	var currentEpoch int64
-	var currentEnc, currentDataStr string
-	var currentUpdatedAt int64
-	row := tx.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
-		groupID,
-	)
-	hasCurrent := true
-	if err := row.Scan(&currentEpoch, &currentEnc, &currentDataStr, &currentUpdatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			hasCurrent = false
-		} else {
-			return false, err
-		}
-	}
-
-	if !hasCurrent {
-		if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
-			return false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		committed = true
-		return true, nil
-	}
-
-	if epoch > currentEpoch {
-		// 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
-		oldSecret := currentEnc
-		oldData := jsonObjectLocal(currentDataStr)
-		expiresAt := now + opts.OldEpochRetentionMillis
-		if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, oldSecret, oldData, currentUpdatedAt, &expiresAt); err != nil {
-			return false, err
-		}
-		if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
-			return false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		committed = true
-		return true, nil
-	}
-
-	if epoch == currentEpoch {
-		currentSecret := currentEnc
-		currentData := jsonObjectLocal(currentDataStr)
-		if currentSecret != "" && currentSecret != opts.Secret {
-			if strings.TrimSpace(fmt.Sprint(currentData["pending_rotation_id"])) == "" {
-				if err := tx.Commit(); err != nil {
-					return false, err
-				}
-				committed = true
-				return false, nil
-			}
-			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
-				return false, err
-			}
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			committed = true
-			return true, nil
-		}
-
-		updated := copyMapLocal(currentData)
-		changed := false
-		oldMembers := normalizeStringSliceFromAny(updated["member_aids"])
-		if len(members) > 0 && !stringSliceEqualLocal(oldMembers, members) {
-			updated["member_aids"] = members
-			updated["commitment"] = opts.Commitment
-			changed = true
-		}
-		if opts.EpochChain != "" && updated["epoch_chain"] != opts.EpochChain {
-			updated["epoch_chain"] = opts.EpochChain
-			changed = true
-		}
-		if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
-			if updated["epoch_chain_unverified"] != true {
-				updated["epoch_chain_unverified"] = true
-				changed = true
-			}
-			if opts.EpochChainUnverifiedReason != "" && updated["epoch_chain_unverified_reason"] != opts.EpochChainUnverifiedReason {
-				updated["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
-				changed = true
-			}
-		} else if opts.EpochChainUnverifiedSet && (updated["epoch_chain_unverified"] != nil || updated["epoch_chain_unverified_reason"] != nil) {
-			delete(updated, "epoch_chain_unverified")
-			delete(updated, "epoch_chain_unverified_reason")
-			changed = true
-		}
-		if pendingID != "" && updated["pending_rotation_id"] != pendingID {
-			updated["pending_rotation_id"] = pendingID
-			updated["pending_created_at"] = now
-			changed = true
-		}
-		if pendingID == "" && updated["pending_rotation_id"] != nil {
-			delete(updated, "pending_rotation_id")
-			delete(updated, "pending_created_at")
-			changed = true
-		}
-		if changed {
-			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, currentSecret, updated, now); err != nil {
-				return false, err
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		committed = true
-		return true, nil
-	}
-
-	var oldEnc string
-	oldRow := tx.QueryRow(
-		"SELECT secret_enc FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
-		groupID, epoch,
-	)
-	if err := oldRow.Scan(&oldEnc); err != nil && err != sql.ErrNoRows {
-		return false, err
-	} else if err == nil {
-		oldSecret := oldEnc
-		if oldSecret != "" && oldSecret != opts.Secret {
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			committed = true
-			return false, nil
-		}
-	}
-
-	expiresAt := now + opts.OldEpochRetentionMillis
-	if err := a.upsertGroupOldEpochTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now, &expiresAt); err != nil {
-		return false, err
-	}
-	_ = currentUpdatedAt
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	committed = true
-	return true, nil
-}
-
-func (a *AIDDatabase) DiscardPendingGroupSecretState(groupID string, epoch int, rotationID string) (bool, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rid := strings.TrimSpace(rotationID)
-	if rid == "" {
-		return false, nil
-	}
-	tx, err := a.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	var currentEpoch int64
-	var dataStr string
-	row := tx.QueryRow("SELECT epoch, data FROM group_current WHERE group_id = ?", groupID)
-	if err := row.Scan(&currentEpoch, &dataStr); err != nil {
-		if err == sql.ErrNoRows {
-			_ = tx.Commit()
-			committed = true
-			return false, nil
-		}
-		return false, err
-	}
-	if int(currentEpoch) != epoch {
-		_ = tx.Commit()
-		committed = true
-		return false, nil
-	}
-	data := jsonObjectLocal(dataStr)
-	if strings.TrimSpace(fmt.Sprint(data["pending_rotation_id"])) != rid {
-		_ = tx.Commit()
-		committed = true
-		return false, nil
-	}
-
-	var oldEpoch, oldUpdatedAt int64
-	var oldEnc, oldData string
-	var oldExpires sql.NullInt64
-	oldRow := tx.QueryRow(
-		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch < ? ORDER BY epoch DESC LIMIT 1",
-		groupID, epoch,
-	)
-	if err := oldRow.Scan(&oldEpoch, &oldEnc, &oldData, &oldUpdatedAt, &oldExpires); err != nil {
-		if err != sql.ErrNoRows {
-			return false, err
-		}
-		if _, err := tx.Exec("DELETE FROM group_current WHERE group_id = ?", groupID); err != nil {
-			return false, err
-		}
-		if _, err := tx.Exec("DELETE FROM group_old_epochs WHERE group_id = ?", groupID); err != nil {
-			return false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		committed = true
-		return true, nil
-	}
-	secret := oldEnc
-	if err := a.upsertGroupCurrentTx(tx, groupID, oldEpoch, secret, jsonObjectLocal(oldData), nowMs()); err != nil {
-		return false, err
-	}
-	if _, err := tx.Exec("DELETE FROM group_old_epochs WHERE group_id = ? AND epoch = ?", groupID, oldEpoch); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	committed = true
-	return true, nil
-}
-
-func (a *AIDDatabase) upsertGroupCurrentTx(tx *sql.Tx, groupID string, epoch int64, secret string, data map[string]any, updatedAt int64) error {
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		dataJSON = []byte("{}")
-	}
-	storedSecret := secret
-	_, err = tx.Exec(
-		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(group_id) DO UPDATE SET
-		   epoch=excluded.epoch, secret_enc=excluded.secret_enc,
-		   data=excluded.data, updated_at=excluded.updated_at`,
-		groupID, epoch, storedSecret, string(dataJSON), updatedAt,
-	)
-	return err
-}
-
-func (a *AIDDatabase) upsertGroupOldEpochTx(tx *sql.Tx, groupID string, epoch int64, secret string, data map[string]any, updatedAt int64, expiresAt *int64) error {
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		dataJSON = []byte("{}")
-	}
-	storedSecret := secret
-	_, err = tx.Exec(
-		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(group_id, epoch) DO UPDATE SET
-		   secret_enc=excluded.secret_enc, data=excluded.data,
-		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
-		groupID, epoch, storedSecret, string(dataJSON), updatedAt, nullInt64PtrSQL(expiresAt),
-	)
-	return err
-}
-
-// ── E2EE Sessions ────────────────────────────────────────────
-
-func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		pkgLogKeystore().Warn("SaveSession json.Marshal failed: %v", err)
-		dataJSON = []byte("{}")
-	}
-
-	// 阶段6：session 数据明文写入
-	stored := string(dataJSON)
-
-	if _, err := a.db.Exec(
-		`INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at`,
-		sessionID, stored, nowMs(),
-	); err != nil {
-		pkgLogKeystore().Warn("SaveSession failed (id=%s): %v", sessionID, err)
-	}
-}
-
-func (a *AIDDatabase) LoadSession(sessionID string) map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var enc string
-	var updatedAt int64
-	row := a.db.QueryRow("SELECT data_enc, updated_at FROM e2ee_sessions WHERE session_id = ?", sessionID)
-	if err := row.Scan(&enc, &updatedAt); err != nil {
-		return nil
-	}
-	plain := a.decryptSessionData(sessionID, enc)
-	var result map[string]any
-	if err := json.Unmarshal([]byte(plain), &result); err != nil {
-		return nil
-	}
-	result["session_id"] = sessionID
-	result["updated_at"] = updatedAt
-	return result
-}
-
-func (a *AIDDatabase) LoadAllSessions() []map[string]any {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	rows, err := a.db.Query("SELECT session_id, data_enc, updated_at FROM e2ee_sessions")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var result []map[string]any
-	for rows.Next() {
-		var sid, enc string
-		var updatedAt int64
-		if err := rows.Scan(&sid, &enc, &updatedAt); err != nil {
-			continue
-		}
-		plain := a.decryptSessionData(sid, enc)
-		var entry map[string]any
-		if err := json.Unmarshal([]byte(plain), &entry); err != nil {
-			continue
-		}
-		entry["session_id"] = sid
-		entry["updated_at"] = updatedAt
-		result = append(result, entry)
-	}
-	return result
-}
-
-func (a *AIDDatabase) DeleteSession(sessionID string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, err := a.db.Exec("DELETE FROM e2ee_sessions WHERE session_id = ?", sessionID); err != nil {
-		pkgLogKeystore().Warn("DeleteSession failed (id=%s): %v", sessionID, err)
-	}
-}
-
-// decryptSessionData 尝试解密 session 数据，兼容旧明文格式
-func (a *AIDDatabase) decryptSessionData(sessionID, enc string) string {
-	return enc
-}
-
-
 // ── Instance State ───────────────────────────────────────────
 
 func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[string]any) {
@@ -1491,122 +530,6 @@ func (a *AIDDatabase) GetAllMetadata() map[string]string {
 	return result
 }
 
-// ── 工具函数 ─────────────────────────────────────────────────
-
-func nullInt64Ptr(p *int64, fallback int64) any {
-	if p != nil {
-		return *p
-	}
-	return fallback
-}
-
-func nullInt64PtrSQL(p *int64) sql.NullInt64 {
-	if p != nil {
-		return sql.NullInt64{Int64: *p, Valid: true}
-	}
-	return sql.NullInt64{}
-}
-
-func buildGroupCurrentData(opts GroupSecretTransitionOptions, members []string, now int64) map[string]any {
-	data := map[string]any{
-		"commitment":  opts.Commitment,
-		"member_aids": members,
-	}
-	if opts.EpochChain != "" {
-		data["epoch_chain"] = opts.EpochChain
-	}
-	if strings.TrimSpace(opts.PendingRotationID) != "" {
-		data["pending_rotation_id"] = strings.TrimSpace(opts.PendingRotationID)
-		data["pending_created_at"] = now
-	}
-	if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
-		data["epoch_chain_unverified"] = true
-		if opts.EpochChainUnverifiedReason != "" {
-			data["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
-		}
-	}
-	return data
-}
-
-func jsonObjectLocal(data string) map[string]any {
-	var result map[string]any
-	if err := json.Unmarshal([]byte(data), &result); err != nil || result == nil {
-		return map[string]any{}
-	}
-	return result
-}
-
-func copyMapLocal(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func normalizeStringSlice(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		s := strings.TrimSpace(v)
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func normalizeStringSliceFromAny(raw any) []string {
-	switch v := raw.(type) {
-	case []string:
-		return normalizeStringSlice(v)
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			s := strings.TrimSpace(fmt.Sprint(item))
-			if s != "" {
-				out = append(out, s)
-			}
-		}
-		sort.Strings(out)
-		return out
-	default:
-		return nil
-	}
-}
-
-func stringSliceEqualLocal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func toInt64Local(v any) int64 {
-	switch x := v.(type) {
-	case int:
-		return int64(x)
-	case int64:
-		return x
-	case int32:
-		return int64(x)
-	case float64:
-		return int64(x)
-	case float32:
-		return int64(x)
-	case json.Number:
-		n, _ := x.Int64()
-		return n
-	default:
-		return 0
-	}
-}
-
 // ── Group State ──────────────────────────────────────────────
 
 // SaveGroupState 保存群组 state_hash 状态（UPSERT）
@@ -1635,14 +558,19 @@ func (a *AIDDatabase) SaveGroupState(groupID string, stateVersion int64, stateHa
 func (a *AIDDatabase) LoadGroupState(groupID string) (*GroupState, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	row := a.db.QueryRow(
-		`SELECT group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at
-		 FROM group_state WHERE group_id = ?`, groupID,
-	)
 	var gs GroupState
-	err := row.Scan(&gs.GroupID, &gs.StateVersion, &gs.StateHash, &gs.KeyEpoch, &gs.MembershipJSON, &gs.PolicyJSON, &gs.UpdatedAt)
-	if err != nil {
-		return nil, nil // 不存在时返回 nil
+	for _, candidate := range groupLookupCandidates(groupID, issuerFromAID(a.aid)) {
+		row := a.db.QueryRow(
+			`SELECT group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at
+			 FROM group_state WHERE group_id = ?`, candidate,
+		)
+		err := row.Scan(&gs.GroupID, &gs.StateVersion, &gs.StateHash, &gs.KeyEpoch, &gs.MembershipJSON, &gs.PolicyJSON, &gs.UpdatedAt)
+		if err == nil {
+			return &gs, nil
+		}
+		if err != sql.ErrNoRows {
+			return nil, err
+		}
 	}
-	return &gs, nil
+	return nil, nil
 }

@@ -150,7 +150,9 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
         or ""
     )
 
-    aun_path = os.environ.get("AUN_DATA_ROOT") or profile.get("aun_path", "")
+    # profile 是 CLI 的显式身份上下文；AUN_DATA_ROOT 只作为未配置 aun_path 时的默认根。
+    # Docker tester 会设置 AUN_DATA_ROOT=/data/aun，不能覆盖 --profile bench 等专用路径。
+    aun_path = profile.get("aun_path") or os.environ.get("AUN_DATA_ROOT") or ""
     if not aun_path:
         aun_path = str(Path.home() / ".aun" / "profiles" / profile_name)
 

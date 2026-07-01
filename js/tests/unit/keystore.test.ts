@@ -5,12 +5,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { IndexedDBIdentityStore } from '../../src/keystore/indexeddb-identity-store.js';
 import { IndexedDBTokenStore } from '../../src/keystore/indexeddb-token-store.js';
 import { IndexedDBSecretStore } from '../../src/secret-store/indexeddb-store.js';
-import type { JsonObject, PrekeyMap } from '../../src/types.js';
+import type { JsonObject } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 const KEYSTORE_DB_NAME = 'aun-keystore';
-const KEYSTORE_DB_VERSION = 7;
-const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions', 'group_state', 'agent_md_cache', 'pending_identities'];
+const KEYSTORE_DB_VERSION = 8;
+const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'group_state', 'agent_md_cache', 'pending_identities', 'pending_binds'];
 
 async function withStore<T>(
   storeName: string,
@@ -125,9 +125,6 @@ class TestIndexedDBStore {
     }
     for (const name of [
       'saveInstanceState', 'loadInstanceState',
-      'saveE2EEPrekey', 'loadE2EEPrekeys', 'loadE2EEPrekeyById', 'cleanupE2EEPrekeys',
-      'storeGroupSecretTransition', 'storeGroupSecretEpoch', 'loadGroupSecretEpoch',
-      'loadGroupSecretEpochs', 'listGroupSecretIds', 'deleteGroupSecretState',
     ]) {
       this[name] = (this.token as any)[name].bind(this.token);
     }
@@ -388,28 +385,6 @@ describe('IndexedDB split stores', () => {
     expect(await ks.loadCert('nonexistent')).toBeNull();
   });
 
-  // ── Prekey / Identity 交互 ──────────────────────────────────
-
-  it('saveIdentity 更新 token 时不应覆盖已有 prekey', async () => {
-    await ks.saveE2EEPrekey!('identity.aid', 'pk1', {
-      private_key_pem: 'KEEP_ME',
-      created_at: Date.now(),
-    });
-
-    await ks.saveIdentity('identity.aid', {
-      aid: 'identity.aid',
-      access_token: 'tok-new',
-      refresh_token: 'rt-new',
-    });
-
-    const prekeys = await ks.loadE2EEPrekeys!('identity.aid');
-    expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
-
-    const identity = await ks.loadIdentity('identity.aid');
-    expect(identity!.access_token).toBe('tok-new');
-    expect(identity!.refresh_token).toBe('rt-new');
-  });
-
   it('实例态应按 device_id/slot_id 隔离保存', async () => {
     await ks.saveInstanceState!('instance.aid', 'device-a', '', {
       access_token: 'tok-a',
@@ -425,88 +400,27 @@ describe('IndexedDB split stores', () => {
     expect(slot2!.access_token).toBe('tok-b');
   });
 
-  it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', async () => {
-    const now = Date.now();
-    const cutoffMs = now - (7 * 24 * 3600 * 1000);
 
-    for (let i = 0; i < 8; i += 1) {
-      await ks.saveE2EEPrekey('cleanup-aid', `old-${i}`, {
-        private_key_pem: `OLD-${i}`,
-        created_at: cutoffMs - 1000 - (8 - i),
-      });
-    }
-    await ks.saveE2EEPrekey('cleanup-aid', 'current', {
-      private_key_pem: 'CURRENT',
-      created_at: now,
+  it('group_aid 应读取旧格式 group_state 记录', async () => {
+    const legacyGroupId = 'group.agentid.pub/room-123';
+    const groupAid = 'room-123.agentid.pub';
+
+    await (ks as any).token.saveGroupState(legacyGroupId, {
+      group_id: legacyGroupId,
+      state_version: 7,
+      state_hash: 'state-hash-legacy',
+      key_epoch: 3,
+      membership_json: '[]',
+      policy_json: '{}',
+      updated_at: Date.now(),
     });
 
-    const removed = await ks.cleanupE2EEPrekeys('cleanup-aid', cutoffMs, 7);
-    expect(removed.sort()).toEqual(['old-0', 'old-1']);
-
-    const prekeys = await ks.loadE2EEPrekeys('cleanup-aid');
-    expect(Object.keys(prekeys)).toHaveLength(7);
-    expect(prekeys['old-0']).toBeUndefined();
-    expect(prekeys['old-1']).toBeUndefined();
-    expect(prekeys.current.private_key_pem).toBe('CURRENT');
-  });
-
-  it('device-scoped prekey 应允许同一 prekey_id 并存且 cleanup 只影响目标 device', async () => {
-    await deleteAndReopenDb();
-    ks = new TestIndexedDBStore();
-    const now = Date.now();
-    const cutoffMs = now - (7 * 24 * 3600 * 1000);
-
-    await ks.saveE2EEPrekey!('device-aid', 'pk-same', {
-      private_key_pem: 'PHONE',
-      created_at: cutoffMs - 1000,
-    }, 'phone');
-    await ks.saveE2EEPrekey!('device-aid', 'pk-same', {
-      private_key_pem: 'LAPTOP',
-      created_at: cutoffMs - 1000,
-    }, 'laptop');
-
-    expect(await ks.loadE2EEPrekeys!('device-aid', 'phone')).toEqual({
-      'pk-same': { private_key_pem: 'PHONE', created_at: cutoffMs - 1000 },
+    const state = await (ks as any).token.loadGroupState(groupAid);
+    expect(state).toMatchObject({
+      group_id: legacyGroupId,
+      group_aid: groupAid,
+      state_hash: 'state-hash-legacy',
     });
-    expect(await ks.loadE2EEPrekeys!('device-aid', 'laptop')).toEqual({
-      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
-    });
-    expect(await ks.loadE2EEPrekeys!('device-aid')).toEqual({});
-    expect(await readStoreItems('prekeys')).toHaveLength(2);
-
-    const removed = await ks.cleanupE2EEPrekeys!('device-aid', cutoffMs, 0, 'phone');
-    expect(removed).toEqual(['pk-same']);
-    expect(await ks.loadE2EEPrekeys!('device-aid', 'phone')).toEqual({});
-    expect(await ks.loadE2EEPrekeys!('device-aid', 'laptop')).toEqual({
-      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
-    });
-    expect(await readStoreItems('prekeys')).toHaveLength(1);
-  });
-
-  it('loadE2EEPrekeyById 应按 prekey_id 单点查询并匹配 device-scoped 记录', async () => {
-    const now = Date.now();
-    // 1) 无 device_id 的 canonical 路径
-    await ks.saveE2EEPrekey!('byid-aid', 'pk-direct', {
-      private_key_pem: 'PEM-DIRECT',
-      created_at: now,
-    });
-    const direct = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
-      .loadE2EEPrekeyById!('byid-aid', 'pk-direct');
-    expect(direct).toEqual({ private_key_pem: 'PEM-DIRECT', created_at: now });
-
-    // 2) 设备级 prekey（key 形如 aid|device|prekey_id）→ 单查回退到前缀扫描后命中
-    await ks.saveE2EEPrekey!('byid-aid', 'pk-device', {
-      private_key_pem: 'PEM-DEVICE',
-      created_at: now,
-    }, 'phone');
-    const deviceHit = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
-      .loadE2EEPrekeyById!('byid-aid', 'pk-device');
-    expect(deviceHit).toEqual({ private_key_pem: 'PEM-DEVICE', created_at: now });
-
-    // 3) 不存在的 prekey_id 应返回 null（未命中且不抛异常）
-    const miss = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
-      .loadE2EEPrekeyById!('byid-aid', 'pk-missing');
-    expect(miss).toBeNull();
   });
 
   // ── 身份组合操作 ──────────────────────────────────

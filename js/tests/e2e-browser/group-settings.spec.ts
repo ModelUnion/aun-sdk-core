@@ -476,14 +476,14 @@ test.describe('Group Settings: info 视角（浏览器）', () => {
 
         await sleep(500);
 
-        // owner 调用 info
+        // owner 调用 get_info
         let infoResult: any;
         try {
-          infoResult = await owner.call('group.info', { group_id: groupId });
+          infoResult = await owner.call('group.get_info', { group_id: groupId, required: ['member'] });
         } catch (e: any) {
           const msg = (e.message ?? '').toLowerCase();
           if (msg.includes('not implement') || msg.includes('method not found')) {
-            return { skip: true, reason: 'group.info 未实现' };
+            return { skip: true, reason: 'group.get_info 未实现' };
           }
           return { skip: false, error: `info failed: ${e.message}` };
         }
@@ -563,14 +563,14 @@ test.describe('Group Settings: info 视角（浏览器）', () => {
 
         await sleep(500);
 
-        // 非成员调用 info
+        // 非成员调用 get_info
         let infoResult: any;
         try {
-          infoResult = await outsider.call('group.info', { group_id: groupId });
+          infoResult = await outsider.call('group.get_info', { group_id: groupId });
         } catch (e: any) {
           const msg = (e.message ?? '').toLowerCase();
           if (msg.includes('not implement') || msg.includes('method not found')) {
-            return { skip: true, reason: 'group.info 未实现' };
+            return { skip: true, reason: 'group.get_info 未实现' };
           }
           return { skip: false, error: `info failed: ${e.message}` };
         }

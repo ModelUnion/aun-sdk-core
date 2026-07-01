@@ -41,58 +41,18 @@ func (v *v2E2EECoordinator) buildV2P2PEnvelope(
 		return nil, fmt.Errorf("V2 bootstrap: no devices found for %s", to)
 	}
 
-	targets := make([]e2ee.Target, 0, len(peerDevices))
-	for _, dev := range peerDevices {
-		devID := v2AsString(dev["device_id"])
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, to, devID, "peer", "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
+	targetSet, err := v.v2PeerTargetSet(ctx, state, to, peerDevices, auditRaw, wrapPolicy, useCache)
+	if err != nil {
+		return nil, err
 	}
-
-	// audit recipients 也按 target 处理（与 Python _build_v2_p2p_envelope 对齐：
-	// audit 直接进入 targets 列表，target_set.audit_recipients 留空）
-	for _, dev := range auditRaw {
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
-	}
-
-	// self-sync：自己其它设备
-	c.mu.RLock()
-	myAID := c.aid
-	myDeviceID := c.deviceID
-	c.mu.RUnlock()
-	if myAID != "" && myAID != to {
-		selfDevices := v.v2FetchSelfDevices(ctx, state, myAID)
-		for _, dev := range selfDevices {
-			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
-			if !hasDeviceID || devID == myDeviceID {
-				continue
-			}
-			target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, myAID, devID, "self_sync", "peer_device_prekey")
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				targets = append(targets, target)
-			}
-		}
-	}
+	sendTargets := targetSet.Targets
+	sendAuditTargets := targetSet.AuditRecipients
 
 	sender, err := state.session.GetSenderIdentity()
 	if err != nil {
 		return nil, fmt.Errorf("buildV2P2PEnvelope: sender identity 失败: %w", err)
 	}
 
-	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptP2PMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -100,7 +60,7 @@ func (v *v2E2EECoordinator) buildV2P2PEnvelope(
 			IKPriv:   sender.IKPriv,
 			IKPubDER: sender.IKPubDER,
 		},
-		e2ee.TargetSet{Targets: sendTargets},
+		e2ee.TargetSet{Targets: sendTargets, AuditRecipients: sendAuditTargets},
 		payload,
 		opts,
 	)
@@ -117,7 +77,7 @@ func (v *v2E2EECoordinator) buildV2P2PEnvelope(
 	}, envelope, map[string]any{
 		"plaintext_payload": payload,
 		"target_count":      len(sendTargets),
-		"audit_count":       len(auditRaw),
+		"audit_count":       len(sendAuditTargets),
 		"use_cache":         useCache,
 	})
 	return envelope, nil
@@ -133,7 +93,7 @@ func (v *v2E2EECoordinator) buildV2GroupEnvelope(
 	useCache bool,
 ) (map[string]any, error) {
 	c := v.runtime.client
-	allDevices, epoch, sc, auditRaw, wrapPolicy, _, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, usedCachedBootstrap, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -141,43 +101,19 @@ func (v *v2E2EECoordinator) buildV2GroupEnvelope(
 		return nil, fmt.Errorf("V2 group bootstrap: no devices for %s", groupID)
 	}
 
-	c.mu.RLock()
-	myAID := c.aid
-	myDeviceID := c.deviceID
-	c.mu.RUnlock()
-
-	targets := make([]e2ee.Target, 0, len(allDevices))
-	for _, dev := range allDevices {
-		devAID := v2AsString(dev["aid"])
-		devID, hasDeviceID := v2DeviceIDFromDevice(dev)
-		if devAID == myAID && hasDeviceID && devID == myDeviceID {
-			continue
-		}
-		role := "member"
-		if devAID == myAID {
-			role = "self_sync"
-		}
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, devAID, devID, role, "peer_device_prekey")
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			targets = append(targets, target)
-		}
+	targetSet, err := v.v2GroupTargetSet(ctx, state, groupID, allDevices, auditRaw, wrapPolicy, useCache)
+	if err != nil {
+		return nil, err
 	}
-
-	// audit recipients
-	for _, dev := range auditRaw {
-		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
-		if err != nil {
-			return nil, err
+	sendTargets := targetSet.Targets
+	if len(sendTargets) == 0 {
+		if usedCachedBootstrap {
+			return nil, NewAUNError(
+				fmt.Sprintf("V2 group: no target devices for group %s; bootstrap may be stale", groupID),
+				WithCode(-33054),
+				WithData(map[string]any{"expected_peer_aids": []string{}}),
+			)
 		}
-		if ok {
-			targets = append(targets, target)
-		}
-	}
-
-	if len(targets) == 0 {
 		return nil, fmt.Errorf("V2 group: no target devices for %s", groupID)
 	}
 
@@ -186,7 +122,6 @@ func (v *v2E2EECoordinator) buildV2GroupEnvelope(
 		return nil, fmt.Errorf("buildV2GroupEnvelope: sender identity 失败: %w", err)
 	}
 
-	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptGroupMessage(
 		e2ee.Sender{
 			AID:      sender.AID,

@@ -163,9 +163,11 @@ async def test_full_lifecycle_signature_audit():
 
         sub_ann = bob.on("group.changed", _on_ann)
 
-        await alice.call("group.update_announcement", {
+        await alice.call("group.set_settings", {
             "group_id": group_id,
-            "content": f"审计测试公告 {rid}",
+            "settings": {
+                "announcement.content": f"审计测试公告 {rid}",
+            }
         })
         await _wait_event(events, ready)
 
@@ -188,9 +190,11 @@ async def test_full_lifecycle_signature_audit():
 
         sub_rules = bob.on("group.changed", _on_rules)
 
-        await alice.call("group.update_rules", {
+        await alice.call("group.set_settings", {
             "group_id": group_id,
-            "max_members": 100,
+            "settings": {
+                "rules.content": "审计测试规则",
+            }
         })
         await _wait_event(events, ready)
 
@@ -213,9 +217,11 @@ async def test_full_lifecycle_signature_audit():
 
         sub_join = bob.on("group.changed", _on_join_req)
 
-        await alice.call("group.update_join_requirements", {
+        await alice.call("group.set_settings", {
             "group_id": group_id,
-            "mode": "approval",
+            "settings": {
+                "join.mode": "approval",
+            }
         })
         await _wait_event(events, ready)
 
@@ -305,7 +311,7 @@ async def test_signature_tamper_detection():
                 "timestamp": "1234567890",
                 "params_hash": "tampered_hash",
                 "signature": "dGFtcGVyZWQ=",  # base64 of "tampered"
-                "_method": "group.update_announcement",
+                "_method": "group.set_settings",
             }
         }
 

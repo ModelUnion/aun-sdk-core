@@ -58,11 +58,17 @@ export interface GroupFSCopyOptions {
   onProgress?: (loaded: number, total: number) => void;
   on_progress?: (loaded: number, total: number) => void;
   groupId?: string;
+  groupAid?: string;
   group_id?: string;
+  group_aid?: string;
   srcGroupId?: string;
+  srcGroupAid?: string;
   src_group_id?: string;
+  src_group_aid?: string;
   dstGroupId?: string;
+  dstGroupAid?: string;
   dst_group_id?: string;
+  dst_group_aid?: string;
   signAs?: string;
   sign_as?: string;
   aidStore?: GroupFSAIDStore;
@@ -228,11 +234,17 @@ function remainingCopyOptions(options: GroupFSCopyOptions): Record<string, unkno
     onProgress: _onProgress,
     on_progress: _on_progress,
     groupId: _groupId,
+    groupAid: _groupAid,
     group_id: _group_id,
+    group_aid: _group_aid,
     srcGroupId: _srcGroupId,
+    srcGroupAid: _srcGroupAid,
     src_group_id: _src_group_id,
+    src_group_aid: _src_group_aid,
     dstGroupId: _dstGroupId,
+    dstGroupAid: _dstGroupAid,
     dst_group_id: _dst_group_id,
+    dst_group_aid: _dst_group_aid,
     ...rest
   } = options;
   return rest;
@@ -325,19 +337,28 @@ export class GroupFSVFS {
   }
 
   async cp(src: GroupFSCopySource, dst: GroupFSCopyDestination, options: GroupFSCopyOptions = {}): Promise<RpcResult | GroupFSDownloadResult> {
+    const sharedGroupAid = stringValue(options.group_aid ?? options.groupAid);
     const sharedGroupId = stringValue(options.group_id ?? options.groupId);
+    const srcGroupAid = stringValue(options.src_group_aid ?? options.srcGroupAid);
     const srcGroupId = stringValue(options.src_group_id ?? options.srcGroupId);
+    const dstGroupAid = stringValue(options.dst_group_aid ?? options.dstGroupAid);
     const dstGroupId = stringValue(options.dst_group_id ?? options.dstGroupId);
+    const sharedGroupRef = sharedGroupAid || sharedGroupId;
+    const srcGroupRef = srcGroupAid || srcGroupId;
+    const dstGroupRef = dstGroupAid || dstGroupId;
     const force = Boolean(options.force ?? options.overwrite ?? false);
-    const srcRemote = isGroupRemoteCopyPath(src, srcGroupId, sharedGroupId);
-    const dstRemote = isGroupRemoteCopyPath(dst, dstGroupId, sharedGroupId);
+    const srcRemote = isGroupRemoteCopyPath(src, srcGroupRef, sharedGroupRef);
+    const dstRemote = isGroupRemoteCopyPath(dst, dstGroupRef, sharedGroupRef);
     const rest = remainingCopyOptions(options);
 
     if (srcRemote && dstRemote) {
       const params: RpcParams = { ...rest, src, dst };
-      if (sharedGroupId) params.group_id = sharedGroupId;
-      if (srcGroupId) params.src_group_id = srcGroupId;
-      if (dstGroupId) params.dst_group_id = dstGroupId;
+      if (sharedGroupAid) params.group_aid = sharedGroupAid;
+      else if (sharedGroupId) params.group_id = sharedGroupId;
+      if (srcGroupAid) params.src_group_aid = srcGroupAid;
+      else if (srcGroupId) params.src_group_id = srcGroupId;
+      if (dstGroupAid) params.dst_group_aid = dstGroupAid;
+      else if (dstGroupId) params.dst_group_id = dstGroupId;
       if (force) params.force = true;
       if (options.recursive) params.recursive = true;
       const follow = options.follow_symlinks ?? options.followSymlinks;
@@ -348,7 +369,8 @@ export class GroupFSVFS {
     if (!srcRemote && dstRemote) {
       return this.uploadSource(src, dst, {
         ...rest,
-        group_id: dstGroupId || sharedGroupId || undefined,
+        group_aid: dstGroupAid || sharedGroupAid || undefined,
+        group_id: (!dstGroupAid && !sharedGroupAid) ? (dstGroupId || sharedGroupId || undefined) : undefined,
         force,
         parents: options.parents ?? true,
         content_type: options.content_type ?? options.contentType,
@@ -361,7 +383,8 @@ export class GroupFSVFS {
     if (srcRemote && !dstRemote) {
       return this.downloadRemote(src, dst, {
         ...rest,
-        group_id: srcGroupId || sharedGroupId || undefined,
+        group_aid: srcGroupAid || sharedGroupAid || undefined,
+        group_id: (!srcGroupAid && !sharedGroupAid) ? (srcGroupId || sharedGroupId || undefined) : undefined,
         force,
         verify_hash: options.verify_hash ?? options.verifyHash ?? true,
         onProgress: callbackFromOptions(options),
@@ -375,26 +398,41 @@ export class GroupFSVFS {
     force?: boolean;
     overwrite?: boolean;
     groupId?: string;
+    groupAid?: string;
     group_id?: string;
+    group_aid?: string;
     srcGroupId?: string;
+    srcGroupAid?: string;
     src_group_id?: string;
+    src_group_aid?: string;
     dstGroupId?: string;
+    dstGroupAid?: string;
     dst_group_id?: string;
+    dst_group_aid?: string;
   } = {}): Promise<RpcResult> {
+    const sharedGroupAid = stringValue(options.group_aid ?? options.groupAid);
     const sharedGroupId = stringValue(options.group_id ?? options.groupId);
+    const srcGroupAid = stringValue(options.src_group_aid ?? options.srcGroupAid);
     const srcGroupId = stringValue(options.src_group_id ?? options.srcGroupId);
+    const dstGroupAid = stringValue(options.dst_group_aid ?? options.dstGroupAid);
     const dstGroupId = stringValue(options.dst_group_id ?? options.dstGroupId);
+    const sharedGroupRef = sharedGroupAid || sharedGroupId;
+    const srcGroupRef = srcGroupAid || srcGroupId;
+    const dstGroupRef = dstGroupAid || dstGroupId;
     const force = Boolean(options.force ?? options.overwrite ?? false);
-    const srcRemote = isGroupRemoteCopyPath(src, srcGroupId, sharedGroupId);
-    const dstRemote = isGroupRemoteCopyPath(dst, dstGroupId, sharedGroupId);
+    const srcRemote = isGroupRemoteCopyPath(src, srcGroupRef, sharedGroupRef);
+    const dstRemote = isGroupRemoteCopyPath(dst, dstGroupRef, sharedGroupRef);
     if (!srcRemote || !dstRemote) {
       throw new StorageError('group.fs.mv only supports group remote paths', 'EINVAL', src);
     }
     const rest = remainingCopyOptions(options as GroupFSCopyOptions);
     const params: RpcParams = { ...rest, src, dst };
-    if (sharedGroupId) params.group_id = sharedGroupId;
-    if (srcGroupId) params.src_group_id = srcGroupId;
-    if (dstGroupId) params.dst_group_id = dstGroupId;
+    if (sharedGroupAid) params.group_aid = sharedGroupAid;
+    else if (sharedGroupId) params.group_id = sharedGroupId;
+    if (srcGroupAid) params.src_group_aid = srcGroupAid;
+    else if (srcGroupId) params.src_group_id = srcGroupId;
+    if (dstGroupAid) params.dst_group_aid = dstGroupAid;
+    else if (dstGroupId) params.dst_group_id = dstGroupId;
     if (force) params.force = true;
     return this.call('group.fs.mv', params, src);
   }

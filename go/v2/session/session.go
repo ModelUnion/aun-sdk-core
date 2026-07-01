@@ -182,12 +182,74 @@ func (s *V2Session) ikSPKIDLocked() string {
 	return "sha256:" + hex.EncodeToString(h[:])[:16]
 }
 
+func normalizeGroupKey(groupID string) string {
+	value := strings.ToLower(strings.Trim(strings.TrimSpace(groupID), "/"))
+	if value == "" {
+		return ""
+	}
+	trimDots := func(s string) string {
+		return strings.Trim(s, ".")
+	}
+	if strings.HasPrefix(value, "group.") && strings.Contains(value, "/") {
+		issuerAndBase := value[6:]
+		if slash := strings.Index(issuerAndBase, "/"); slash > 0 && slash < len(issuerAndBase)-1 {
+			domain := trimDots(issuerAndBase[:slash])
+			baseTail := strings.Trim(issuerAndBase[slash+1:], "/")
+			if at := strings.Index(baseTail, "@"); at > 0 {
+				base := trimDots(baseTail[:at])
+				suffixDomain := trimDots(baseTail[at+1:])
+				if base != "" && suffixDomain != "" {
+					merged := suffixDomain
+					if domain != "" {
+						merged = suffixDomain + "." + domain
+					}
+					return base + "." + merged
+				}
+			}
+			base := trimDots(baseTail)
+			if base != "" && domain != "" {
+				return base + "." + domain
+			}
+		}
+		return value
+	}
+	if at := strings.Index(value, "@"); at > 0 {
+		base := trimDots(value[:at])
+		domain := trimDots(value[at+1:])
+		if base != "" && domain != "" {
+			return base + "." + domain
+		}
+	}
+	return value
+}
+
+func groupLookupCandidates(groupID string) []string {
+	raw := strings.TrimSpace(groupID)
+	normalized := normalizeGroupKey(raw)
+	out := make([]string, 0, 2)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == value {
+				return
+			}
+		}
+		out = append(out, value)
+	}
+	add(normalized)
+	add(raw)
+	return out
+}
+
 func normalizeGroupSPKLookup(groupID, spkID string) (string, string) {
 	parts := strings.SplitN(spkID, "\x00", 2)
 	if len(parts) != 2 {
-		return groupID, spkID
+		return strings.TrimSpace(groupID), spkID
 	}
-	return parts[0], parts[1]
+	return strings.TrimSpace(parts[0]), parts[1]
 }
 
 // putPeerPKParams 构造 message.v2.put_peer_pk 调用参数（已锁定状态下使用）。
@@ -442,12 +504,18 @@ func (s *V2Session) EnsureGroupSPK(groupID string) (string, []byte, []byte, erro
 	if err := s.ensureKeysLocked(); err != nil {
 		return "", nil, nil, err
 	}
-	spkID, priv, pub, err := s.store.LoadCurrentGroupSPK(s.deviceID, groupID)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	if spkID != "" {
-		return spkID, priv, pub, nil
+	groupKey := normalizeGroupKey(groupID)
+	var spkID string
+	var priv, pub []byte
+	var err error
+	for _, candidate := range groupLookupCandidates(groupID) {
+		spkID, priv, pub, err = s.store.LoadCurrentGroupSPK(s.deviceID, candidate)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		if spkID != "" {
+			return spkID, priv, pub, nil
+		}
 	}
 	priv, pub, err = crypto.GenerateP256Keypair()
 	if err != nil {
@@ -455,7 +523,7 @@ func (s *V2Session) EnsureGroupSPK(groupID string) (string, []byte, []byte, erro
 	}
 	h := sha256.Sum256(pub)
 	spkID = "sha256:" + hex.EncodeToString(h[:])[:16]
-	if err := s.store.SaveGroupSPK(s.deviceID, groupID, spkID, priv, pub); err != nil {
+	if err := s.store.SaveGroupSPK(s.deviceID, groupKey, spkID, priv, pub); err != nil {
 		return "", nil, nil, err
 	}
 	return spkID, priv, pub, nil
@@ -468,28 +536,41 @@ func (s *V2Session) EnsureGroupRegistered(ctx context.Context, groupID string, c
 	if err := s.ensureKeysLocked(); err != nil {
 		return err
 	}
-	uploadedSPKID, err := s.store.LoadLatestUploadedGroupSPKID(s.deviceID, groupID)
-	if err != nil {
-		return err
-	}
-	if uploadedSPKID != "" {
-		s.lastUploadedGroupSPKs[groupID] = uploadedSPKID
-		return nil
+	groupKey := normalizeGroupKey(groupID)
+	var uploadedSPKID string
+	var err error
+	for _, candidate := range groupLookupCandidates(groupID) {
+		uploadedSPKID, err = s.store.LoadLatestUploadedGroupSPKID(s.deviceID, candidate)
+		if err != nil {
+			return err
+		}
+		if uploadedSPKID != "" {
+			s.lastUploadedGroupSPKs[groupKey] = uploadedSPKID
+			if candidate != groupKey {
+				s.lastUploadedGroupSPKs[candidate] = uploadedSPKID
+			}
+			return nil
+		}
 	}
 	// 加载或生成 group SPK（需要先解锁再加锁，因为 EnsureGroupSPK 也加锁）
 	s.mu.Unlock()
-	spkID, _, pubDER, err := s.EnsureGroupSPK(groupID)
+	spkID, _, pubDER, err := s.EnsureGroupSPK(groupKey)
 	s.mu.Lock()
 	if err != nil {
 		return err
 	}
-	uploadedSPKID, err = s.store.LoadLatestUploadedGroupSPKID(s.deviceID, groupID)
-	if err != nil {
-		return err
-	}
-	if uploadedSPKID != "" {
-		s.lastUploadedGroupSPKs[groupID] = uploadedSPKID
-		return nil
+	for _, candidate := range groupLookupCandidates(groupID) {
+		uploadedSPKID, err = s.store.LoadLatestUploadedGroupSPKID(s.deviceID, candidate)
+		if err != nil {
+			return err
+		}
+		if uploadedSPKID != "" {
+			s.lastUploadedGroupSPKs[groupKey] = uploadedSPKID
+			if candidate != groupKey {
+				s.lastUploadedGroupSPKs[candidate] = uploadedSPKID
+			}
+			return nil
+		}
 	}
 	return s.publishGroupSPKLocked(ctx, groupID, spkID, pubDER, callFn)
 }
@@ -505,12 +586,13 @@ func (s *V2Session) RotateGroupSPK(ctx context.Context, groupID string, callFn C
 	if err != nil {
 		return fmt.Errorf("V2Session.RotateGroupSPK generate: %w", err)
 	}
+	groupKey := normalizeGroupKey(groupID)
 	h := sha256.Sum256(pub)
 	spkID := "sha256:" + hex.EncodeToString(h[:])[:16]
-	if err := s.store.SaveGroupSPK(s.deviceID, groupID, spkID, priv, pub); err != nil {
+	if err := s.store.SaveGroupSPK(s.deviceID, groupKey, spkID, priv, pub); err != nil {
 		return err
 	}
-	return s.publishGroupSPKLocked(ctx, groupID, spkID, pub, callFn)
+	return s.publishGroupSPKLocked(ctx, groupKey, spkID, pub, callFn)
 }
 
 // GetGroupDecryptKeys 群消息解密按 group SPK -> device SPK -> IK fallback 查找。
@@ -525,12 +607,14 @@ func (s *V2Session) GetGroupDecryptKeys(groupID, spkID string) (ikPriv, spkPriv 
 		return s.ikPriv, nil, nil
 	}
 	lookupGroupID, lookupSPKID := normalizeGroupSPKLookup(groupID, spkID)
-	groupSPK, err := s.store.LoadGroupSPK(s.deviceID, lookupGroupID, lookupSPKID)
-	if err != nil {
-		return nil, nil, err
-	}
-	if groupSPK != nil {
-		return s.ikPriv, groupSPK, nil
+	for _, candidate := range groupLookupCandidates(lookupGroupID) {
+		groupSPK, err := s.store.LoadGroupSPK(s.deviceID, candidate, lookupSPKID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if groupSPK != nil {
+			return s.ikPriv, groupSPK, nil
+		}
 	}
 	// fallback 到 device SPK，再 fallback 到 IK 特殊 fallback（兼容历史消息）
 	if lookupSPKID == s.spkID {
@@ -574,10 +658,16 @@ func (s *V2Session) IsLastUploadedGroupSPK(groupID, spkID string) bool {
 		return false
 	}
 	lookupGroupID, lookupSPKID := normalizeGroupSPKLookup(groupID, spkID)
-	return s.lastUploadedGroupSPKs[lookupGroupID] == lookupSPKID
+	for _, candidate := range groupLookupCandidates(lookupGroupID) {
+		if s.lastUploadedGroupSPKs[candidate] == lookupSPKID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *V2Session) publishGroupSPKLocked(ctx context.Context, groupID, spkID string, pubDER []byte, callFn CallFn) error {
+	groupKey := normalizeGroupKey(groupID)
 	spkTimestamp := strconv.FormatInt(s.nowFn().Unix(), 10)
 	signData := append(append(pubDER, []byte(spkID)...), []byte(spkTimestamp)...)
 	sig, err := crypto.ECDSASignRaw(s.ikPriv, signData)
@@ -585,7 +675,8 @@ func (s *V2Session) publishGroupSPKLocked(ctx context.Context, groupID, spkID st
 		return fmt.Errorf("V2Session.publishGroupSPK sign: %w", err)
 	}
 	params := map[string]any{
-		"group_id":      groupID,
+		"group_id":      groupKey,
+		"group_aid":     groupKey,
 		"key_source":    "group_device_prekey",
 		"spk_id":        spkID,
 		"spk_pk":        base64.StdEncoding.EncodeToString(pubDER),
@@ -595,10 +686,13 @@ func (s *V2Session) publishGroupSPKLocked(ctx context.Context, groupID, spkID st
 	if _, err := callFn(ctx, "group.v2.put_group_pk", params); err != nil {
 		return fmt.Errorf("V2Session.publishGroupSPK: %w", err)
 	}
-	if err := s.store.MarkGroupSPKUploaded(s.deviceID, groupID, spkID); err != nil {
+	if err := s.store.MarkGroupSPKUploaded(s.deviceID, groupKey, spkID); err != nil {
 		return err
 	}
-	s.lastUploadedGroupSPKs[groupID] = spkID
+	s.lastUploadedGroupSPKs[groupKey] = spkID
+	if strings.TrimSpace(groupID) != "" && strings.TrimSpace(groupID) != groupKey {
+		s.lastUploadedGroupSPKs[strings.TrimSpace(groupID)] = spkID
+	}
 	return nil
 }
 

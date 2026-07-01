@@ -17,6 +17,7 @@ _logger = logging.getLogger(__name__)
 from .crypto.ecdh import generate_p256_keypair
 from .crypto.ecdsa import ecdsa_sign_raw, ecdsa_verify_raw
 from .keystore import V2KeyStore
+from ..group_id import normalize_group_id
 
 if TYPE_CHECKING:
     from ..keystore.sqlite_db import AIDDatabase
@@ -73,7 +74,7 @@ class V2Session:
 
     @staticmethod
     def _group_key(group_id: str) -> str:
-        return str(group_id or "").strip()
+        return normalize_group_id(group_id) or str(group_id or "").strip()
 
     @staticmethod
     def _normalize_group_spk_lookup(group_id: str, spk_id: str) -> tuple[str, str]:
@@ -217,7 +218,9 @@ class V2Session:
             group_id = self._group_key(group_id)
             uploaded_spk_id = self._store.load_latest_uploaded_group_spk_id(self._device_id, group_id)
             if uploaded_spk_id:
-                self._last_uploaded_group_spk_ids[group_id] = uploaded_spk_id
+                # 处理 legacy composite key 格式，只保存纯 spk_id
+                _, pure_spk_id = self._normalize_group_spk_lookup(group_id, uploaded_spk_id)
+                self._last_uploaded_group_spk_ids[group_id] = pure_spk_id
                 return
             spk_id, _spk_priv, spk_pub_der = self.ensure_group_spk(group_id)
             await self._publish_group_spk(group_id, spk_id, spk_pub_der, call_fn)
@@ -235,11 +238,13 @@ class V2Session:
 
     def is_last_uploaded_group_spk(self, group_id: str, spk_id: str | None) -> bool:
         """判断 spk_id 是否为本进程在该群最后一次成功上传的 group SPK。"""
-        group_id = self._group_key(group_id)
+        normalized_group_id = self._group_key(group_id)
         if not spk_id:
             return False
-        lookup_group_id, lookup_spk_id = self._normalize_group_spk_lookup(group_id, str(spk_id))
-        return self._last_uploaded_group_spk_ids.get(lookup_group_id) == lookup_spk_id
+        # 处理 legacy composite key，提取纯 spk_id
+        _, lookup_spk_id = self._normalize_group_spk_lookup(normalized_group_id, str(spk_id))
+        # 字典键始终使用 normalized group_id
+        return self._last_uploaded_group_spk_ids.get(normalized_group_id) == lookup_spk_id
 
     async def _publish_group_spk(self, group_id: str, spk_id: str, spk_pub_der: bytes, call_fn) -> None:
         group_id = self._group_key(group_id)

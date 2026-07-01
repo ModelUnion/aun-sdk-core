@@ -182,13 +182,20 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 }
 ```
 
-### `group.get`
+### `group.get_info`
 
-查询群组信息。需要是群成员。
+查询群组信息。默认返回公开平铺字段；需要成员信息、状态或 E2EE 字段时，通过 `required` 声明所需字段并由服务端鉴权。
 
-**参数**：`group_id` (string, 必填)
+**参数**：
 
-**响应**：`{ "group": { ... } }`
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组 ID 或 group AID |
+| `required` | string[] | ❌ | 可选值：`member` / `state` / `e2ee` / `avatar` |
+
+**响应**：平铺对象。默认字段包含 `found`、`group_id`、`group_aid`、`name`、`visibility`、`status`、`description`、`member_count`、`created_at`。
+
+> `group.get` 和 `group.info` 已合并到 `group.get_info`；`group.get_info` 默认行为等价于原公开信息查询。
 
 ### `group.update`
 
@@ -214,21 +221,6 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 **响应**：`{ "query": "...", "items": [ ... ], "total": 3 }`
 
-### `group.get_public_info`
-
-查询公开群组信息，无需是成员。仅限 `visibility=public` 的群组。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group": { ... } }`
-
-### `group.get_stats`
-
-获取群组统计信息。需要 admin 及以上权限。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "stats": { ... } }`
 
 ### `group.suspend`
 
@@ -481,22 +473,6 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 **响应**：`{ "group_id": "g-abc123.agentid.pub", "results": [ ... ] }`
 
-### `group.get_join_requirements`
-
-获取入群要求配置。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "requirements": { "mode": "approval", "question": "...", ... } }`
-
-### `group.update_join_requirements`
-
-更新入群要求配置。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `mode` / `question` / `auto_approve_patterns` / `max_pending` (可选)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "requirements": { ... } }`
-
 ### `group.create_invite_code`
 
 创建邀请码。需要 owner/admin 权限，或群规则允许成员邀请。
@@ -538,45 +514,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ---
 
-## 10.8 公告与规则
-
-### `group.get_announcement`
-
-获取群公告。需要是群成员。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id": "g-abc123.agentid.pub", "announcement": { ... } }`
-
-### `group.update_announcement`
-
-更新群公告。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `content` (string, 必填，上限默认 4000 字符), `attachments` (array, 可选)
-
-### `group.get_rules`
-
-获取群规则（可见性设置、加入模式等）。
-
-**参数**：`group_id` (string, 必填)
-
-### `group.update_rules`
-
-更新入群要求。需要 admin 及以上权限。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
-| `mode` | string | ❌ | `"open"` / `"approval"` / `"invite_only"` / `"closed"` |
-| `question` | string | ❌ | 入群问题 |
-| `auto_approve_patterns` | array | ❌ | 自动批准正则列表 |
-| `max_pending` | integer | ❌ | 最大待审批数 |
-
----
-
-## 10.9 群文件系统
+## 10.8 群文件系统
 
 群文件系统统一使用 `group.fs.*`。群路径采用 `group_aid:/path` 或 `https://{group_aid}/path`，也可在 RPC 参数中同时传 `group_id` 与裸路径。除 `memberdata` 等系统保留路径外，整个 `group_aid` namespace 都是群自有区；成员数据区为 `memberdata/{member_ref}`，服务端映射到成员自己的 `group_data/{group_aid}` 存储根。
 

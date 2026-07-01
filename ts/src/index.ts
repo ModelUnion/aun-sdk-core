@@ -33,11 +33,6 @@ export {
   GroupStateError,
   E2EEError,
   E2EEDecryptFailedError,
-  E2EEGroupSecretMissingError,
-  E2EEGroupEpochMismatchError,
-  E2EEGroupCommitmentInvalidError,
-  E2EEGroupNotMemberError,
-  E2EEGroupDecryptFailedError,
   CertificateRevokedError,
   E2EEDegradedError,
   ClientSignatureError,
@@ -45,7 +40,14 @@ export {
 } from './errors.js';
 
 // ── 校验工具 ─────────────────────────────────────────────────
-export { validateAIDFormat, validateGroupIDFormat } from './validators.js';
+export { validateAIDFormat, validateGroupAIDFormat, validateGroupIDFormat } from './validators.js';
+export {
+  convertToGroupAid,
+  normalizeGroupAid,
+  normalizeGroupId,
+  splitGroupId,
+  buildDiscoveryHost,
+} from './group-id.js';
 
 // ── 事件 ─────────────────────────────────────────────────────
 export { EventDispatcher, Subscription, type EventHandler } from './events.js';
@@ -66,6 +68,9 @@ export {
   type IdentityRecord,
   type SecretRecord,
   type Message,
+  type GroupMessage,
+  type GroupInfo,
+  type GroupMemberInfo,
   type SendResult,
   type AckResult,
   type PullResult,

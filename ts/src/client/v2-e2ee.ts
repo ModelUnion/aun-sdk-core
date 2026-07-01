@@ -16,6 +16,8 @@ import type { EventPayload } from '../events.js';
 import type { ClientHost, ClientRuntime } from './runtime.js';
 
 type BootstrapEntry = Record<string, any> & { cachedAt?: number };
+type V2P2PTargetSet = { targets: Target[]; auditRecipients: Target[] };
+type V2GroupTargetSet = { targets: Target[] };
 
 interface V2WrapPolicy {
   explicit: boolean;
@@ -159,6 +161,7 @@ function applyV2WrapPolicyToTargets(targets: Target[], policy: V2WrapPolicy): Ta
 export class V2E2EECoordinator {
   private readonly runtime: ClientRuntime;
   private _initSessionPromise: Promise<void> | null = null;
+  private readonly targetSetCache = new Map<string, { cachedAt: number; value: V2P2PTargetSet | V2GroupTargetSet }>();
 
   constructor(runtime: ClientRuntime) {
     this.runtime = runtime;
@@ -186,18 +189,53 @@ export class V2E2EECoordinator {
 
   deleteBootstrapCacheEntry(key: string): void {
     this.bootstrapCache.delete(key);
+    this.targetSetCache.delete(key);
   }
 
   clearBootstrapCache(): void {
     this.bootstrapCache.clear();
+    this.targetSetCache.clear();
   }
 
   pruneExpiredBootstrapCache(ttlMs: number, now = Date.now()): void {
     for (const [key, entry] of this.bootstrapCache) {
       if (now - Number(entry.cachedAt ?? 0) >= ttlMs) {
         this.bootstrapCache.delete(key);
+        this.targetSetCache.delete(key);
       }
     }
+    for (const [key, entry] of this.targetSetCache) {
+      if (now - Number(entry.cachedAt ?? 0) >= ttlMs) {
+        this.targetSetCache.delete(key);
+      }
+    }
+  }
+
+  private getTargetSetCache<T extends V2P2PTargetSet | V2GroupTargetSet>(key: string): T | undefined {
+    const cached = this.targetSetCache.get(key);
+    if (!cached || Date.now() - cached.cachedAt >= V2_BOOTSTRAP_TTL_MS) {
+      if (cached) this.targetSetCache.delete(key);
+      return undefined;
+    }
+    return cached.value as T;
+  }
+
+  private setTargetSetCache<T extends V2P2PTargetSet | V2GroupTargetSet>(key: string, value: T): T {
+    this.targetSetCache.set(key, { cachedAt: Date.now(), value });
+    return value;
+  }
+
+  private cloneP2PTargetSet(value: V2P2PTargetSet): V2P2PTargetSet {
+    return {
+      targets: value.targets.map((target) => ({ ...target })),
+      auditRecipients: value.auditRecipients.map((target) => ({ ...target })),
+    };
+  }
+
+  private cloneGroupTargetSet(value: V2GroupTargetSet): V2GroupTargetSet {
+    return {
+      targets: value.targets.map((target) => ({ ...target })),
+    };
   }
 
   async onConnected(opts: { backgroundSync: boolean }): Promise<void> {
@@ -497,6 +535,7 @@ export class V2E2EECoordinator {
       wrapPolicy = cached.wrapPolicy ?? wrapPolicy;
       client._clientLog.debug(`message.v2.bootstrap cache hit: to=${to}, devices=${peerDevices.length}, audit=${auditRaw.length}`);
     } else {
+      this.targetSetCache.delete(to);
       const bs = await client.call('message.v2.bootstrap', {
         peer_aid: to,
         e2ee_wrap_capabilities: v2WrapCapabilities(),
@@ -508,7 +547,7 @@ export class V2E2EECoordinator {
       peerDevices = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
       auditRaw = (Array.isArray(bs?.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
       client._clientLog.debug(`message.v2.bootstrap fetched: to=${to}, devices=${peerDevices.length}, audit=${auditRaw.length}`);
-      if (peerDevices.length > 0 && !this.getBootstrapCacheEntry(to)) {
+      if (peerDevices.length > 0) {
         this.setBootstrapCacheEntry(to, {
           devices: peerDevices,
           auditRecipients: auditRaw,
@@ -521,82 +560,91 @@ export class V2E2EECoordinator {
       throw new E2EEError(`V2 bootstrap: no devices found for ${to}`);
     }
 
-    const targets: Target[] = [];
-    for (const dev of peerDevices) {
-      const devId = getV2DeviceId(dev);
-      const target = await client._v2BuildTargetFromDevice({
-        dev,
-        aid: to,
-        deviceId: devId.value,
-        role: 'peer',
-        defaultKeySource: 'peer_device_prekey',
-      });
-      if (target) targets.push(target);
-    }
-
-    const auditTargets: Target[] = [];
-    for (const dev of auditRaw) {
-      const target = await client._v2BuildTargetFromDevice({
-        dev,
-        aid: String(dev.aid ?? ''),
-        deviceId: String(dev.device_id ?? ''),
-        role: 'audit',
-        defaultKeySource: 'peer_device_prekey',
-      });
-      if (target) auditTargets.push(target);
-    }
-
-    if (client._aid && client._aid !== to) {
-      try {
-        const selfCached = this.getBootstrapCacheEntry(client._aid);
-        let selfDevices: Array<Record<string, unknown>> = [];
-        if (selfCached && Date.now() - Number(selfCached.cachedAt ?? 0) < V2_BOOTSTRAP_TTL_MS) {
-          selfDevices = (selfCached.devices ?? []) as Array<Record<string, unknown>>;
-        } else {
-          const selfBs = await client.call('message.v2.bootstrap', {
-            peer_aid: client._aid,
-            e2ee_wrap_capabilities: v2WrapCapabilities(),
-          }) as Record<string, unknown>;
-          if (typeof client._primeBootstrapPeerCerts === 'function') {
-            await client._primeBootstrapPeerCerts(selfBs, client._aid);
-          }
-          selfDevices = (Array.isArray(selfBs?.peer_devices) ? selfBs.peer_devices : []) as Array<Record<string, unknown>>;
-          const selfWrapPolicy = normalizeV2WrapPolicy(selfBs.e2ee_wrap_policy);
-          if (selfDevices.length > 0) {
-            this.setBootstrapCacheEntry(client._aid, {
-              devices: selfDevices,
-              auditRecipients: [],
-              cachedAt: Date.now(),
-              wrapPolicy: selfWrapPolicy,
-            });
-          }
-        }
-        for (const dev of selfDevices) {
-          const devId = getV2DeviceId(dev);
-          if (!devId.present || devId.value === client._deviceId) continue;
-          const target = await client._v2BuildTargetFromDevice({
-            dev,
-            aid: client._aid,
-            deviceId: devId.value,
-            role: 'self_sync',
-            defaultKeySource: 'peer_device_prekey',
-          });
-          if (target) targets.push(target);
-        }
-      } catch (exc) {
-        client._clientLog.debug(`V2 self-sync bootstrap failed (non-fatal): ${formatE2EEError(exc)}`);
+    let targetSet = useCache ? this.getTargetSetCache<V2P2PTargetSet>(to) : undefined;
+    if (targetSet) {
+      targetSet = this.cloneP2PTargetSet(targetSet);
+    } else {
+      const targets: Target[] = [];
+      for (const dev of peerDevices) {
+        const devId = getV2DeviceId(dev);
+        const target = await client._v2BuildTargetFromDevice({
+          dev,
+          aid: to,
+          deviceId: devId.value,
+          role: 'peer',
+          defaultKeySource: 'peer_device_prekey',
+        });
+        if (target) targets.push(target);
       }
+
+      const auditTargets: Target[] = [];
+      for (const dev of auditRaw) {
+        const target = await client._v2BuildTargetFromDevice({
+          dev,
+          aid: String(dev.aid ?? ''),
+          deviceId: String(dev.device_id ?? ''),
+          role: 'audit',
+          defaultKeySource: 'peer_device_prekey',
+        });
+        if (target) auditTargets.push(target);
+      }
+
+      if (client._aid && client._aid !== to) {
+        try {
+          const selfCached = this.getBootstrapCacheEntry(client._aid);
+          let selfDevices: Array<Record<string, unknown>> = [];
+          if (selfCached && Date.now() - Number(selfCached.cachedAt ?? 0) < V2_BOOTSTRAP_TTL_MS) {
+            selfDevices = (selfCached.devices ?? []) as Array<Record<string, unknown>>;
+          } else {
+            this.targetSetCache.delete(client._aid);
+            const selfBs = await client.call('message.v2.bootstrap', {
+              peer_aid: client._aid,
+              e2ee_wrap_capabilities: v2WrapCapabilities(),
+            }) as Record<string, unknown>;
+            if (typeof client._primeBootstrapPeerCerts === 'function') {
+              await client._primeBootstrapPeerCerts(selfBs, client._aid);
+            }
+            selfDevices = (Array.isArray(selfBs?.peer_devices) ? selfBs.peer_devices : []) as Array<Record<string, unknown>>;
+            const selfWrapPolicy = normalizeV2WrapPolicy(selfBs.e2ee_wrap_policy);
+            if (selfDevices.length > 0) {
+              this.setBootstrapCacheEntry(client._aid, {
+                devices: selfDevices,
+                auditRecipients: [],
+                cachedAt: Date.now(),
+                wrapPolicy: selfWrapPolicy,
+              });
+            }
+          }
+          for (const dev of selfDevices) {
+            const devId = getV2DeviceId(dev);
+            if (!devId.present || devId.value === client._deviceId) continue;
+            const target = await client._v2BuildTargetFromDevice({
+              dev,
+              aid: client._aid,
+              deviceId: devId.value,
+              role: 'self_sync',
+              defaultKeySource: 'peer_device_prekey',
+            });
+            if (target) targets.push(target);
+          }
+        } catch (exc) {
+          client._clientLog.debug(`V2 self-sync bootstrap failed (non-fatal): ${formatE2EEError(exc)}`);
+        }
+      }
+
+      targetSet = this.setTargetSetCache(to, {
+        targets: applyV2WrapPolicyToTargets(targets, wrapPolicy),
+        auditRecipients: applyV2WrapPolicyToTargets(auditTargets, wrapPolicy),
+      });
+      targetSet = this.cloneP2PTargetSet(targetSet);
     }
 
-    if (targets.length === 0) {
+    if (targetSet.targets.length === 0) {
       throw new E2EEError(`V2 bootstrap: no usable devices found for ${to}`);
     }
     const envelope = encryptP2PMessage(
       session.getSenderIdentity(),
-      {
-        targets: applyV2WrapPolicyToTargets(targets, wrapPolicy),
-        auditRecipients: applyV2WrapPolicyToTargets(auditTargets, wrapPolicy),
-      },
+      targetSet,
       opts.payload,
       {
         messageId: opts.messageId,
@@ -614,12 +662,12 @@ export class V2E2EECoordinator {
       context: envelope.context,
     }, {
       payloadOverride: envelope,
-      extra: {
-        plaintext_payload: opts.payload,
-        target_count: targets.length,
-        audit_count: auditTargets.length,
-        use_cache: useCache,
-      },
+        extra: {
+          plaintext_payload: opts.payload,
+          target_count: targetSet.targets.length,
+          audit_count: targetSet.auditRecipients.length,
+          use_cache: useCache,
+        },
     });
     return envelope;
   }
@@ -709,6 +757,7 @@ export class V2E2EECoordinator {
     const decrypted: Array<Record<string, unknown>> = [];
     let nextAfterSeq = opts?.force ? afterSeq : (afterSeq || (ns ? client._seqTracker.getContiguousSeq(ns) : 0));
     let pageCount = 0;
+    let lastAutoAckSeq = 0;
     const maxPages = 100;
 
     while (pageCount < maxPages) {
@@ -719,8 +768,12 @@ export class V2E2EECoordinator {
         limit,
         ...(opts?.force ? { force: true } : {}),
       }) as Record<string, unknown>;
-      const messages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
-      client._clientLog.debug(`message.v2.pull page response: page=${pageCount}, raw_count=${messages.length}, has_more=${String(result.has_more ?? '')}, server_ack_seq=${String(result.server_ack_seq ?? '')}`);
+      const pageMessages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
+      const messages = pageMessages.filter((msg) => {
+        const seq = Number(msg.seq ?? 0);
+        return Number.isFinite(seq) && seq > nextAfterSeq;
+      });
+      client._clientLog.debug(`message.v2.pull page response: page=${pageCount}, raw_count=${messages.length}, stale_count=${Math.max(0, pageMessages.length - messages.length)}, has_more=${String(result.has_more ?? '')}, server_ack_seq=${String(result.server_ack_seq ?? '')}`);
       for (const msg of messages) {
         client._logMessageDebug('pull-raw', 'message.v2.pull', 'message.received', msg);
       }
@@ -814,18 +867,20 @@ export class V2E2EECoordinator {
           await client._drainOrderedMessages(ns, undefined, true);
           client._persistSeq(ns);
         }
-        const ackNeeded = messages.length > 0
+        const ackNeeded = pageMessages.length > 0
           && ackSeq > 0
+          && ackSeq > lastAutoAckSeq
           && !opts?.skipAutoAck
           && (contigAdvanced || (hasServerAckSeq && ackSeq > serverAckSeq));
         if (ackNeeded) {
           client._clientLog.debug(`message.v2.pull sending auto-ack: ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
           await this.ackV2(ackSeq);
+          lastAutoAckSeq = ackSeq;
         }
       }
 
       const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
-      if (messages.length === 0 || nextAfter <= nextAfterSeq || result.has_more === false) break;
+      if (messages.length === 0 || nextAfter <= nextAfterSeq) break;
       nextAfterSeq = nextAfter;
     }
 
@@ -965,7 +1020,8 @@ export class V2E2EECoordinator {
     const client = this.client;
     if (!client._v2Session) throw new StateError('V2 session not initialized');
     const session = client._v2Session;
-    const groupId = normalizeGroupId(opts.groupId) || String(opts.groupId ?? '').trim();
+    const rawGroupId = String(opts.groupId ?? '').trim();
+    const groupId = normalizeGroupId(rawGroupId) || rawGroupId;
     if (!groupId) throw new ValidationError("group.send requires 'group_id'");
     const cacheKey = `group:${groupId}`;
     const useCache = opts.useCache !== false;
@@ -977,7 +1033,15 @@ export class V2E2EECoordinator {
     let wrapPolicy = normalizeV2WrapPolicy(undefined);
     let usedCachedBootstrap = false;
 
-    const cached = useCache ? this.getBootstrapCacheEntry(cacheKey) : undefined;
+    let cached = useCache ? this.getBootstrapCacheEntry(cacheKey) : undefined;
+    if (!cached && useCache && rawGroupId && rawGroupId !== groupId) {
+      const legacyCacheKey = `group:${rawGroupId}`;
+      cached = this.getBootstrapCacheEntry(legacyCacheKey);
+      if (cached) {
+        this.setBootstrapCacheEntry(cacheKey, cached);
+        this.deleteBootstrapCacheEntry(legacyCacheKey);
+      }
+    }
     if (cached && Date.now() - Number(cached.cachedAt ?? 0) < V2_BOOTSTRAP_TTL_MS) {
       allDevices = (cached.devices ?? []) as Array<Record<string, unknown>>;
       auditRecipientsRaw = (cached.auditRecipients ?? []) as Array<Record<string, unknown>>;
@@ -987,6 +1051,7 @@ export class V2E2EECoordinator {
       usedCachedBootstrap = true;
       client._clientLog.debug(`group.v2.bootstrap cache hit: group=${groupId}, devices=${allDevices.length}, audit=${auditRecipientsRaw.length}, epoch=${epoch}, state_version=${stateCommitment.state_version}`);
     } else {
+      this.targetSetCache.delete(cacheKey);
       const bs = await client.call('group.v2.bootstrap', {
         group_id: groupId,
         e2ee_wrap_capabilities: v2WrapCapabilities(),
@@ -1025,22 +1090,54 @@ export class V2E2EECoordinator {
       throw new E2EEError(`V2 group bootstrap: no devices found for group ${groupId}`);
     }
 
-    const targets: Target[] = [];
-    for (const dev of allDevices) {
-      const devAid = String(dev.aid ?? '').trim();
-      const devId = getV2DeviceId(dev);
-      if (devAid === client._aid && devId.present && devId.value === client._deviceId) continue;
-      const role = devAid === client._aid ? 'self_sync' : 'member';
-      const target = await client._v2BuildTargetFromDevice({
-        dev,
-        aid: devAid,
-        deviceId: devId.value,
-        role,
-        defaultKeySource: 'peer_device_prekey',
+    let targetSet = useCache ? this.getTargetSetCache<V2GroupTargetSet>(cacheKey) : undefined;
+    if (targetSet) {
+      targetSet = this.cloneGroupTargetSet(targetSet);
+    } else {
+      const targets: Target[] = [];
+      for (const dev of allDevices) {
+        const devAid = String(dev.aid ?? '').trim();
+        const devId = getV2DeviceId(dev);
+        if (devAid === client._aid && devId.present && devId.value === client._deviceId) continue;
+        const role = devAid === client._aid ? 'self_sync' : 'member';
+        const target = await client._v2BuildTargetFromDevice({
+          dev,
+          aid: devAid,
+          deviceId: devId.value,
+          role,
+          defaultKeySource: 'peer_device_prekey',
+        });
+        if (target) targets.push(target);
+      }
+
+      if (targets.length === 0) {
+        if (usedCachedBootstrap) {
+          throw new E2EEError(`V2 group: no target devices for group ${groupId}; bootstrap may be stale`, {
+            code: V2_GROUP_STALE_BOOTSTRAP_CODE,
+            data: { expected_peer_aids: [] },
+          });
+        }
+        throw new E2EEError(`V2 group: no target devices for group ${groupId}`);
+      }
+
+      for (const dev of auditRecipientsRaw) {
+        const target = await client._v2BuildTargetFromDevice({
+          dev,
+          aid: String(dev.aid ?? ''),
+          deviceId: String(dev.device_id ?? ''),
+          role: 'audit',
+          defaultKeySource: 'peer_device_prekey',
+        });
+        if (target) targets.push(target);
+      }
+
+      targetSet = this.setTargetSetCache(cacheKey, {
+        targets: applyV2WrapPolicyToTargets(targets, wrapPolicy),
       });
-      if (target) targets.push(target);
+      targetSet = this.cloneGroupTargetSet(targetSet);
     }
-    if (targets.length === 0) {
+
+    if (targetSet.targets.length === 0) {
       if (usedCachedBootstrap) {
         throw new E2EEError(`V2 group: no target devices for group ${groupId}; bootstrap may be stale`, {
           code: V2_GROUP_STALE_BOOTSTRAP_CODE,
@@ -1050,22 +1147,11 @@ export class V2E2EECoordinator {
       throw new E2EEError(`V2 group: no target devices for group ${groupId}`);
     }
 
-    for (const dev of auditRecipientsRaw) {
-      const target = await client._v2BuildTargetFromDevice({
-        dev,
-        aid: String(dev.aid ?? ''),
-        deviceId: String(dev.device_id ?? ''),
-        role: 'audit',
-        defaultKeySource: 'peer_device_prekey',
-      });
-      if (target) targets.push(target);
-    }
-
     const envelope = encryptGroupMessage(
       session.getSenderIdentity(),
       groupId,
       epoch,
-      applyV2WrapPolicyToTargets(targets, wrapPolicy),
+      targetSet.targets,
       opts.payload,
       {
         messageId: opts.messageId,
@@ -1087,7 +1173,7 @@ export class V2E2EECoordinator {
       extra: {
         plaintext_payload: opts.payload,
         epoch,
-        target_count: targets.length,
+        target_count: targetSet.targets.length,
         audit_count: auditRecipientsRaw.length,
         state_version: stateCommitment.state_version,
         use_cache: useCache,
@@ -1110,6 +1196,7 @@ export class V2E2EECoordinator {
       explicitAfterSeq?: boolean;
       cursorParams?: Record<string, unknown>;
       ownsCursor?: boolean;
+      wireGroupId?: string;
     },
   ): Promise<Array<Record<string, unknown>>> {
     const client = this.client;
@@ -1125,6 +1212,7 @@ export class V2E2EECoordinator {
       }));
     }
     const decrypted: Array<Record<string, unknown>> = [];
+    const wireGroupId = String(opts?.wireGroupId ?? groupId ?? '').trim() || gid;
     const cursorParams = opts?.cursorParams ?? {};
     const ownsCursor = opts?.ownsCursor !== false;
     let nextAfterSeq = opts?.explicitAfterSeq ? afterSeq : (afterSeq || client._seqTracker.getContiguousSeq(ns));
@@ -1135,7 +1223,8 @@ export class V2E2EECoordinator {
       pageCount += 1;
       client._clientLog.debug(`group.v2.pull page request: group=${gid}, page=${pageCount}, after_seq=${nextAfterSeq}, limit=${limit}, ns=${ns}`);
       const result = await client._callRawV2Rpc('group.v2.pull', {
-        group_id: gid,
+        group_id: wireGroupId,
+        group_aid: gid,
         after_seq: nextAfterSeq,
         limit,
         ...cursorParams,
@@ -1282,7 +1371,7 @@ export class V2E2EECoordinator {
     }
     seq = client._clampAckSeq('group.v2.ack', 'up_to_seq', ns, seq);
     client._clientLog.debug(`group.v2.ack send: group=${gid}, ns=${ns}, up_to_seq=${seq}`);
-    const result = await client._callRawV2Rpc('group.v2.ack', { group_id: gid, up_to_seq: seq });
+    const result = await client._callRawV2Rpc('group.v2.ack', { group_id: gid, group_aid: gid, up_to_seq: seq });
     client._clientLog.debug(`group.v2.ack ok: group=${gid}, ns=${ns}, requested=${seq}, result=${client._debugJson(result)}`);
     return result;
   }
@@ -1803,21 +1892,4 @@ export class V2E2EECoordinator {
     }
   }
 
-  async handleV2EpochRotated(data: unknown): Promise<void> {
-    const client = this.client;
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
-    const d = data as Record<string, any>;
-    const groupId = String(d.group_id ?? '').trim();
-    if (!groupId) return;
-    const epoch = d.epoch ?? 0;
-    client._clientLog.debug(`_onV2EpochRotated: group=${groupId} epoch=${String(epoch)}`);
-    this.deleteBootstrapCacheEntry(`group:${groupId}`);
-    if (!client._v2Session) return;
-    try {
-      await client._v2Session.rotateSPK(client._v2CallFn());
-      client._clientLog.info(`SPK rotated after V2 epoch change: group=${groupId} epoch=${String(epoch)}`);
-    } catch (exc) {
-      client._clientLog.debug(`SPK rotation after V2 epoch change failed (non-fatal): ${formatE2EEError(exc)}`);
-    }
-  }
 }

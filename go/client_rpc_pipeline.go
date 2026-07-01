@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"container/list"
 	"context"
 	"crypto/ecdsa"
 	cryptorand "crypto/rand"
@@ -9,11 +10,100 @@ import (
 	"encoding/pem"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 func timeNowUnix() int64 { return time.Now().Unix() }
+
+const signingKeyCacheMax = 32
+
+type signingCacheEntry[T any] struct {
+	key   string
+	value T
+}
+
+type signingLRU[T any] struct {
+	mu    sync.Mutex
+	items map[string]*list.Element
+	order *list.List
+}
+
+func newSigningLRU[T any]() *signingLRU[T] {
+	return &signingLRU[T]{
+		items: make(map[string]*list.Element),
+		order: list.New(),
+	}
+}
+
+func (c *signingLRU[T]) get(key string) (T, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[key]; ok {
+		c.order.MoveToBack(elem)
+		return elem.Value.(signingCacheEntry[T]).value, true
+	}
+	var zero T
+	return zero, false
+}
+
+func (c *signingLRU[T]) put(key string, value T) T {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[key]; ok {
+		elem.Value = signingCacheEntry[T]{key: key, value: value}
+		c.order.MoveToBack(elem)
+		return value
+	}
+	elem := c.order.PushBack(signingCacheEntry[T]{key: key, value: value})
+	c.items[key] = elem
+	for len(c.items) > signingKeyCacheMax {
+		front := c.order.Front()
+		if front == nil {
+			break
+		}
+		entry := front.Value.(signingCacheEntry[T])
+		delete(c.items, entry.key)
+		c.order.Remove(front)
+	}
+	return value
+}
+
+var (
+	signingPrivateKeyCache = newSigningLRU[*ecdsa.PrivateKey]()
+	signingCertFPCache     = newSigningLRU[string]()
+)
+
+func signingCacheKey(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%x", sum)
+}
+
+func signingPrivateKey(privPEM string) (*ecdsa.PrivateKey, error) {
+	key := signingCacheKey(privPEM)
+	if cached, ok := signingPrivateKeyCache.get(key); ok {
+		return cached, nil
+	}
+	pk, err := parseECPrivateKeyPEM(privPEM)
+	if err != nil {
+		return nil, err
+	}
+	return signingPrivateKeyCache.put(key, pk), nil
+}
+
+func signingCertFingerprint(certPEM string) string {
+	key := signingCacheKey(certPEM)
+	if cached, ok := signingCertFPCache.get(key); ok {
+		return cached
+	}
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return ""
+	}
+	fp := sha256.Sum256(block.Bytes)
+	return signingCertFPCache.put(key, "sha256:"+fmt.Sprintf("%x", fp))
+}
 
 // signedMethods 需要附加客户端 ECDSA 签名的方法集合
 var signedMethods = map[string]bool{
@@ -36,10 +126,7 @@ var signedMethods = map[string]bool{
 	"group.add_member":                 true,
 	"group.leave":                      true,
 	"group.remove_member":              true,
-	"group.update_rules":               true,
 	"group.update":                     true,
-	"group.update_announcement":        true,
-	"group.update_join_requirements":   true,
 	"group.set_role":                   true,
 	"group.transfer_owner":             true,
 	"group.bind_group_aid":             true,
@@ -52,6 +139,8 @@ var signedMethods = map[string]bool{
 	"group.thought.put":                true,
 	"message.thought.put":              true,
 	"group.set_settings":               true,
+	"group.update_announcement":        true,
+	"group.update_rules":               true,
 	"group.fs.mkdir":                   true,
 	"group.fs.rm":                      true,
 	"group.fs.cp":                      true,
@@ -214,20 +303,20 @@ func (p *rpcPipeline) call(ctx context.Context, method string, params map[string
 		return c.ackV2Internal(ctx, params)
 	}
 	if method == "group.pull" {
-		gid, _ := params["group_id"].(string)
-		if c.v2GetState() != nil && gid != "" {
-			c.logEG.Debug("call route: group.pull → V2 pull group=%s", gid)
+		_, groupAID := groupIdentifierPairFromParams(params)
+		if c.v2GetState() != nil && groupAID != "" {
+			c.logEG.Debug("call route: group.pull → V2 pull group=%s", groupAID)
 			return c.pullGroupV2Internal(ctx, params)
 		}
 	}
 	if method == "group.ack_messages" {
-		gid, _ := params["group_id"].(string)
-		if c.v2GetState() != nil && gid != "" {
+		_, groupAID := groupIdentifierPairFromParams(params)
+		if c.v2GetState() != nil && groupAID != "" {
 			if c.groupCursorTargetsCurrentInstance(params) {
-				c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
+				c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", groupAID)
 				return c.ackGroupV2Internal(ctx, params)
 			}
-			c.logEG.Debug("call route: group.ack_messages external cursor → raw ack group=%s device_id=%s slot_id=%s", gid, stringFromAny(params["device_id"]), stringFromAny(params["slot_id"]))
+			c.logEG.Debug("call route: group.ack_messages external cursor → raw ack group=%s device_id=%s slot_id=%s", groupAID, stringFromAny(params["device_id"]), stringFromAny(params["slot_id"]))
 		}
 	}
 
@@ -312,7 +401,7 @@ func (p *rpcPipeline) preflight(method string, params map[string]any) (*rpcPrefl
 	state := c.state
 	c.mu.RUnlock()
 
-	if state != StateConnected {
+	if !clientStateIsReady(state) {
 		return nil, NewConnectionError("客户端未连接")
 	}
 	if internalOnlyMethods[method] {
@@ -325,6 +414,7 @@ func (p *rpcPipeline) preflight(method string, params map[string]any) (*rpcPrefl
 	if method == "message.send" || method == "group.send" {
 		p.normalizeOutboundMessagePayload(nextParams, method)
 	}
+	normalizeGroupCallIdentifier(c, method, nextParams)
 	if err := p.validateOutboundCall(method, nextParams); err != nil {
 		return nil, err
 	}
@@ -498,17 +588,17 @@ func (p *rpcPipeline) clampAckParams(method string, params map[string]any) {
 			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "p2p:"+myAID, toInt64(params["up_to_seq"]))
 		}
 	case "group.ack_messages":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		_, groupID := groupIdentifierPairFromParams(params)
 		if groupID != "" {
 			params["msg_seq"] = c.clampAckSeq(method, "msg_seq", "group:"+groupID, toInt64(params["msg_seq"]))
 		}
 	case "group.v2.ack":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		_, groupID := groupIdentifierPairFromParams(params)
 		if groupID != "" {
 			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "group:"+groupID, toInt64(params["up_to_seq"]))
 		}
 	case "group.ack_events":
-		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		_, groupID := groupIdentifierPairFromParams(params)
 		if groupID != "" {
 			params["event_seq"] = c.clampAckSeq(method, "event_seq", "group_event:"+groupID, toInt64(params["event_seq"]))
 		}
@@ -598,7 +688,7 @@ func (p *rpcPipeline) signClientOperation(method string, params map[string]any) 
 	paramsHash := fmt.Sprintf("%x", sha256.Sum256([]byte(paramsJSON)))
 	signData := []byte(fmt.Sprintf("%s|%s|%s|%s", method, aidStr, ts, paramsHash))
 
-	pk, err := parseECPrivateKeyPEM(privPEM)
+	pk, err := signingPrivateKey(privPEM)
 	if err != nil {
 		return NewClientSignatureError(fmt.Sprintf("客户端签名失败，拒绝发送无签名请求: %v", err))
 	}
@@ -611,11 +701,7 @@ func (p *rpcPipeline) signClientOperation(method string, params map[string]any) 
 	// 证书指纹：用于锁定签名时使用的证书版本
 	certFingerprint := ""
 	if certPEM != "" {
-		block, _ := pem.Decode([]byte(certPEM))
-		if block != nil {
-			fp := sha256.Sum256(block.Bytes)
-			certFingerprint = "sha256:" + fmt.Sprintf("%x", fp)
-		}
+		certFingerprint = signingCertFingerprint(certPEM)
 	}
 
 	params["client_signature"] = map[string]any{
@@ -702,13 +788,13 @@ func (p *rpcPipeline) pullGateKeyForCall(method string, params map[string]any) s
 		}
 		return ""
 	case "group.pull", "group.v2.pull":
-		gid := strings.TrimSpace(stringFromAny(params["group_id"]))
+		_, gid := groupIdentifierPairFromParams(params)
 		if gid != "" {
 			return "group:" + gid
 		}
 		return ""
 	case "group.pull_events":
-		gid := strings.TrimSpace(stringFromAny(params["group_id"]))
+		_, gid := groupIdentifierPairFromParams(params)
 		if gid != "" {
 			return "group_event:" + gid
 		}
@@ -882,8 +968,8 @@ func (p *rpcPipeline) postprocessGroupPull(method string, params map[string]any,
 		return
 	}
 	messages, _ := resultMap["messages"].([]any)
-	gid := strings.TrimSpace(stringFromAny(params["group_id"]))
-	c.logEG.Debug("group.pull returned %d messages: group=%s", len(messages), gid)
+	wireGID, gid := groupIdentifierPairFromParams(params)
+	c.logEG.Debug("group.pull returned %d messages: group=%s wire_group_id=%s", len(messages), gid, wireGID)
 	if gid == "" {
 		return
 	}
@@ -937,15 +1023,49 @@ func normalizeGroupCallContext(c *AUNClient, method string, params map[string]an
 	if !strings.HasPrefix(method, "group.") {
 		return
 	}
-	if rawGid, ok := params["group_id"]; ok {
-		if s, ok2 := rawGid.(string); ok2 && s != "" {
-			params["group_id"] = NormalizeGroupID(s, "")
-		}
-	}
+	normalizeGroupCallIdentifier(c, method, params)
 	if _, exists := params["device_id"]; !exists {
 		params["device_id"] = c.deviceID
 	}
 	if _, exists := params["slot_id"]; !exists {
 		params["slot_id"] = c.slotID
 	}
+}
+
+func normalizeGroupCallIdentifier(c *AUNClient, method string, params map[string]any) {
+	if !strings.HasPrefix(method, "group.") || params == nil {
+		return
+	}
+	rawKey := ""
+	var rawValue any
+	for _, key := range []string{"group_aid", "groupAid", "group_id", "groupId"} {
+		if value, exists := params[key]; exists && strings.TrimSpace(stringFromAny(value)) != "" {
+			rawKey = key
+			rawValue = value
+			break
+		}
+	}
+	if rawKey != "" {
+		rawText := strings.TrimSpace(stringFromAny(rawValue))
+		normalized := NormalizeGroupID(rawText, "")
+		if normalized != "" {
+			if normalized != rawText && c != nil {
+				c.log.Debug("call group identifier normalized: %s=%s -> %s method=%s", rawKey, rawText, normalized, method)
+			}
+			existingGroupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+			if existingGroupID == "" {
+				existingGroupID = strings.TrimSpace(stringFromAny(params["groupId"]))
+			}
+			if rawKey == "group_id" || rawKey == "groupId" {
+				params["group_id"] = rawText
+			} else if existingGroupID != "" {
+				params["group_id"] = existingGroupID
+			} else {
+				params["group_id"] = normalized
+			}
+			params["group_aid"] = normalized
+		}
+	}
+	delete(params, "groupAid")
+	delete(params, "groupId")
 }

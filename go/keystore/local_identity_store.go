@@ -343,7 +343,6 @@ func identityVerifyCertKeyMatch(certPEM, localPubB64 string) bool {
 
 var localIdentitySkipFields = map[string]bool{
 	"private_key_pem": true, "public_key_der_b64": true, "curve": true, "cert": true,
-	"e2ee_prekeys": true, "group_secrets": true, "e2ee_sessions": true,
 }
 
 func (f *LocalIdentityStore) SaveIdentity(aid string, identity map[string]any) error {

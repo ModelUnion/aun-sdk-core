@@ -105,6 +105,7 @@ func TestPullV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 
 func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 	groupID := "group.example.com/g1"
+	groupAID := NormalizeGroupID(groupID, "")
 	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
 		case "group.v2.pull":
@@ -153,7 +154,7 @@ func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 	if payload["text"] != "group-plain-v1" || msgs[0]["encrypted"] != false {
 		t.Fatalf("V1 群明文消息未正确透传: %#v", msgs[0])
 	}
-	if got := c.seqTracker.GetContiguousSeq("group:" + groupID); got != 3 {
+	if got := c.seqTracker.GetContiguousSeq("group:" + groupAID); got != 3 {
 		t.Fatalf("V1 群加密/空 payload 跳过后仍应推进 contiguous seq 到 3，got=%d", got)
 	}
 }

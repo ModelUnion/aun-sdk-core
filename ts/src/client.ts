@@ -179,6 +179,8 @@ export interface ConnectionOptions {
 
 export interface NotifyOptions {
   to?: string;
+  group_aid?: string;
+  groupAid?: string;
   group_id?: string;
   groupId?: string;
   device_id?: string;
@@ -262,8 +264,8 @@ const NON_IDEMPOTENT_TIMEOUT_MS = 35_000;
 const NON_IDEMPOTENT_METHODS = new Set([
   'message.send', 'group.send', 'group.create', 'group.invite',
   'group.kick', 'group.remove_member', 'group.leave', 'group.dissolve',
-  'group.update_name', 'group.update_avatar', 'group.update_announcement',
-  'group.update_settings',
+  'group.set_settings',
+  'group.update_announcement', 'group.update_rules',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.create_upload_session', 'storage.complete_upload',
@@ -304,9 +306,9 @@ const SIGNED_METHODS = new Set([
   'group.v2.propose_state', 'group.v2.confirm_state',
   'group.v2.get_proposal',
   'group.kick', 'group.add_member',
-  'group.leave', 'group.remove_member', 'group.update_rules',
-  'group.update', 'group.update_announcement',
-  'group.update_join_requirements', 'group.set_role',
+  'group.leave', 'group.remove_member',
+  'group.update',
+  'group.set_role',
   'group.transfer_owner', 'group.bind_group_aid', 'group.renew_group_aid', 'group.complete_transfer',
   'group.review_join_request',
   'group.batch_review_join_request',
@@ -314,6 +316,8 @@ const SIGNED_METHODS = new Set([
   'group.thought.put',
   'message.thought.put',
   'group.set_settings',
+  'group.update_announcement',
+  'group.update_rules',
   'storage.put_object', 'storage.delete_object', 'storage.get_by_share',
   'storage.create_share_link', 'storage.revoke_share_link',
   'storage.create_upload_session', 'storage.complete_upload',
@@ -879,10 +883,8 @@ export class AUNClient {
     this._dispatcher.subscribe('_raw.group.message_created', (data) => this._onRawGroupMessageCreated(data));
     // 群组消息撤回推送：在线 push 通道，与 pull 双 tombstone 兜底互补（SDK 去重只回调一次）
     this._dispatcher.subscribe('_raw.group.message_recalled', (data) => this._safeAsync(this._onRawGroupMessageRecalled(data)));
-    // 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
+    // 群组变更事件：透传并触发 V2 state/SPK 维护
     this._dispatcher.subscribe('_raw.group.changed', (data) => this._onRawGroupChanged(data));
-    // V2 epoch 轮换事件：清 bootstrap 缓存并触发 SPK rotation
-    this._dispatcher.subscribe('_raw.group.v2.epoch_rotated', (data) => this._safeAsync(this._onV2EpochRotated(data)));
     // V2 state proposal 服务平面事件：owner/admin 负责确认或重新提案
     this._dispatcher.subscribe('_raw.group.v2.state_proposed', (data) => this._safeAsync(this._onV2StateProposed(data)));
     this._dispatcher.subscribe('_raw.group.v2.state_retry_needed', (data) => this._safeAsync(this._onV2StateRetryNeeded(data)));
@@ -1215,7 +1217,19 @@ export class AUNClient {
    * 自动处理内部方法限制、E2EE 加解密、客户端签名等。
    */
   async call(method: string, params?: RpcParams): Promise<RpcResult> {
-    return await this._rpcPipeline.call(method, params);
+    try {
+      return await this._rpcPipeline.call(method, params);
+    } catch (err) {
+      await this._maybeHandleHalfOpenRpcFailure(err);
+      throw err;
+    }
+  }
+
+  private async _maybeHandleHalfOpenRpcFailure(err: unknown): Promise<void> {
+    if (this._closing || this.state !== ConnectionState.READY) return;
+    if (!this._sessionOptions?.auto_reconnect || this._reconnectActive) return;
+    if (!(err instanceof ConnectionError) && !(err instanceof TimeoutError)) return;
+    await this._handleTransportDisconnect(err);
   }
 
   async createGroup(params: RpcParams = {}): Promise<RpcResult> {
@@ -1275,7 +1289,7 @@ export class AUNClient {
       throw new ValidationError('bindGroupAid requires aidStore');
     }
 
-    const groupId = String(params.group_id ?? '').trim();
+    const groupId = String(params.group_id ?? params.group_aid ?? '').trim();
     const keystore = (store as any)._keystore; // AIDStore._keystore: LocalIdentityStore
     let keyPair: KeyPairRecord | null = null;
 
@@ -1303,6 +1317,9 @@ export class AUNClient {
     }
 
     const payload: RpcParams = { ...params };
+    if (!String(payload.group_id ?? '').trim() && groupId) {
+      payload.group_id = groupId;
+    }
     payload.public_key = keyPair.public_key_der_b64;
     payload.curve = keyPair.curve;
     const result = await this.call('group.bind_group_aid', payload);
@@ -1350,10 +1367,10 @@ export class AUNClient {
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
       const infoMap = isJsonObject(info as JsonValue | object | null | undefined) ? info as JsonObject : {};
       const grp = isJsonObject(infoMap.group as JsonValue | object | null | undefined) ? infoMap.group as JsonObject : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('startGroupTransfer: unable to determine group_aid');
@@ -1393,16 +1410,16 @@ export class AUNClient {
     if (!store) {
       throw new ValidationError('renewGroupAid requires aidStore');
     }
-    const groupId = String(params.group_id ?? '').trim();
+    const groupId = String(params.group_id ?? params.group_aid ?? '').trim();
     if (!groupId) {
-      throw new ValidationError('renewGroupAid requires group_id');
+      throw new ValidationError('renewGroupAid requires group_id or group_aid');
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
       const infoMap = isJsonObject(info as JsonValue | object | null | undefined) ? info as JsonObject : {};
       const grp = isJsonObject(infoMap.group as JsonValue | object | null | undefined) ? infoMap.group as JsonObject : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('renewGroupAid: unable to determine group_aid');
@@ -1451,6 +1468,9 @@ export class AUNClient {
     }
 
     const payload: RpcParams = { ...params };
+    if (!String(payload.group_id ?? '').trim()) {
+      payload.group_id = groupId;
+    }
     payload.group_aid = groupAid;
     payload.old_public_key = oldPublicKey;
     payload.new_public_key = newPublicKey;
@@ -1500,10 +1520,10 @@ export class AUNClient {
     }
     let groupAid = String(params.group_aid ?? '').trim();
     if (!groupAid) {
-      const info = await this.call('group.get', { group_id: groupId });
+      const info = await this.call('group.get_info', { group_id: groupId, required: ['member'] });
       const infoMap = isJsonObject(info as JsonValue | object | null | undefined) ? info as JsonObject : {};
       const grp = isJsonObject(infoMap.group as JsonValue | object | null | undefined) ? infoMap.group as JsonObject : infoMap;
-      groupAid = String(grp.group_aid ?? '').trim();
+      groupAid = String((info as any)?.group_aid ?? '').trim();
     }
     if (!groupAid) {
       throw new ValidationError('completeGroupTransfer: unable to determine group_aid');
@@ -1631,7 +1651,7 @@ export class AUNClient {
     }
 
     const targetAid = String(options.to ?? '').trim();
-    const targetGroupId = String(options.group_id ?? options.groupId ?? '').trim();
+    const targetGroupId = String(options.group_aid ?? options.groupAid ?? options.group_id ?? options.groupId ?? '').trim();
     const targetDeviceId = String(options.device_id ?? options.deviceId ?? '').trim();
     const targetSlotId = String(options.slot_id ?? options.slotId ?? '').trim();
     const ttl = AUNClient._normalizeNotifyTtl(options.ttl_ms ?? options.ttlMs);
@@ -1672,6 +1692,7 @@ export class AUNClient {
         throw new ValidationError('group_id is required for group notify');
       }
       const routeParams: RpcParams = {
+        group_aid: normalizedGroupId,
         group_id: normalizedGroupId,
         deliver: { method: eventMethod, params: payload },
       };
@@ -1710,8 +1731,10 @@ export class AUNClient {
     delete p.skip_auto_ack;
     delete (p as Record<string, unknown>)._group_cursor_params;
 
-    if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
-      p.group_id = normalizeGroupId(String(p.group_id)) || String(p.group_id);
+    if (method.startsWith('group.') && p.group_aid !== undefined && p.group_aid !== null) {
+      p.group_aid = normalizeGroupId(String(p.group_aid)) || String(p.group_aid);
+    } else if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
+      p.group_aid = normalizeGroupId(String(p.group_id)) || String(p.group_id);
     }
     if (method.startsWith('group.') && p.device_id === undefined) {
       p.device_id = this._deviceId;
@@ -1880,6 +1903,11 @@ export class AUNClient {
     return this._delivery.messageEnvelopeFieldsForDebug(message);
   }
 
+  private _isMessageDebugEnabled(): boolean {
+    const checker = (this._clientLog as unknown as { isDebugEnabled?: () => boolean }).isDebugEnabled;
+    return typeof checker === 'function' ? checker.call(this._clientLog) : true;
+  }
+
   private _logMessageDebug(
     stage: string,
     source: string,
@@ -1887,6 +1915,7 @@ export class AUNClient {
     message: unknown,
     opts: { payloadOverride?: unknown; extra?: Record<string, unknown> } = {},
   ): void {
+    if (!this._isMessageDebugEnabled()) return;
     this._delivery.logMessageDebug(stage, source, event, message, opts);
   }
 
@@ -2033,12 +2062,12 @@ export class AUNClient {
 
   private _extractGroupIdFromResult(result: JsonObject): string {
     const group = isJsonObject(result.group) ? result.group : null;
-    const gid = group ? String(group.group_id ?? '') : '';
+    const gid = group ? String(group.group_aid ?? group.group_id ?? '') : '';
     if (gid) return gid;
-    const directGid = String(result.group_id ?? '');
+    const directGid = String(result.group_aid ?? result.group_id ?? '');
     if (directGid) return directGid;
     const member = isJsonObject(result.member) ? result.member : null;
-    return member ? String(member.group_id ?? '') : '';
+    return member ? String(member.group_aid ?? member.group_id ?? '') : '';
   }
 
   private async _onRawGroupChanged(data: EventPayload): Promise<void> {
@@ -2046,7 +2075,7 @@ export class AUNClient {
     try {
     if (isJsonObject(data)) {
       const d = data;
-      const groupId = String(d.group_id ?? '');
+      const groupId = String(d.group_aid ?? d.group_id ?? '');
       const action = String(d.action ?? '');
       this._clientLog.debug(`_onRawGroupChanged enter: group_id=${groupId}, action=${action}, event_seq=${String(d.event_seq ?? '')}`);
       // 验签：有 client_signature 就验，没有默认安全（H20: 严格 boolean）
@@ -2855,6 +2884,7 @@ export class AUNClient {
       explicitAfterSeq?: boolean;
       cursorParams?: RpcParams;
       ownsCursor?: boolean;
+      wireGroupId?: string;
     },
   ): Promise<Array<Record<string, unknown>>> {
     return await this._v2E2EE.pullGroupV2(groupId, afterSeq, limit, opts);
@@ -3208,10 +3238,6 @@ export class AUNClient {
   /** Push 通知带 payload 时的就地解密（复用 _decryptV2Message） */
   private async _decryptV2PushMessage(data: EventPayload): Promise<Record<string, unknown> | null> {
     return await this._v2E2EE.decryptV2PushMessage(data);
-  }
-
-  private async _onV2EpochRotated(data: EventPayload): Promise<void> {
-    return this._v2E2EE.handleV2EpochRotated(data);
   }
 
   /** 按当前 AID 发现 Gateway；用于 authenticate()/connect() 的新入口。 */
@@ -3646,6 +3672,9 @@ export class AUNClient {
     this._clientLog.warn(`transport disconnected: closeCode=${closeCode ?? 'none'}, error=${error ? formatCaughtError(error) : 'none'}`);
     this._state = 'standby';
     this._stopBackgroundTasks();
+    void this._transport.close().catch((exc) => {
+      this._clientLog.debug(`transport cleanup skipped: ${formatCaughtError(exc)}`);
+    });
     await this._dispatcher.publish('state_change', { state: this._publicState(this._state), error });
 
     if (!this._sessionOptions.auto_reconnect) {
@@ -3835,4 +3864,3 @@ export class AUNClient {
     return true;
   }
 }
-

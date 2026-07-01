@@ -176,48 +176,6 @@ export class E2EEDecryptFailedError extends E2EEError {
   }
 }
 
-// ── 群组 E2EE 错误 ────────────────────────────────────────────
-
-/** 缺少群组密钥 */
-export class E2EEGroupSecretMissingError extends E2EEError {
-  constructor(message: string = 'group secret missing', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32040, localCode: 'E2EE_GROUP_SECRET_MISSING' });
-    this.name = 'E2EEGroupSecretMissingError';
-  }
-}
-
-/** 群组 epoch 不匹配 */
-export class E2EEGroupEpochMismatchError extends E2EEError {
-  constructor(message: string = 'group epoch mismatch', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32041, localCode: 'E2EE_GROUP_EPOCH_MISMATCH' });
-    this.name = 'E2EEGroupEpochMismatchError';
-  }
-}
-
-/** Membership Commitment 验证失败 */
-export class E2EEGroupCommitmentInvalidError extends E2EEError {
-  constructor(message: string = 'group commitment invalid', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32042, localCode: 'E2EE_GROUP_COMMITMENT_INVALID' });
-    this.name = 'E2EEGroupCommitmentInvalidError';
-  }
-}
-
-/** 密钥请求者不是群成员 */
-export class E2EEGroupNotMemberError extends E2EEError {
-  constructor(message: string = 'not a group member', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32043, localCode: 'E2EE_GROUP_NOT_MEMBER' });
-    this.name = 'E2EEGroupNotMemberError';
-  }
-}
-
-/** 群消息解密失败 */
-export class E2EEGroupDecryptFailedError extends E2EEError {
-  constructor(message: string = 'group message decrypt failed', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32044, localCode: 'E2EE_GROUP_DECRYPT_FAILED' });
-    this.name = 'E2EEGroupDecryptFailedError';
-  }
-}
-
 /** 对端证书已被吊销 */
 export class CertificateRevokedError extends AuthError {
   constructor(message: string = 'peer certificate has been revoked', opts: ConstructorParameters<typeof AUNError>[1] = {}) {
@@ -252,6 +210,12 @@ export class ClientSignatureError extends ValidationError {
 
 // ── 远程错误映射 ──────────────────────────────────────────────
 
+function isTransientGatewayDegradedError(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  return text.includes('gateway service degraded')
+    || text.includes('certificate not loaded');
+}
+
 /**
  * 将 JSON-RPC error 对象映射为具体的 AUNError 子类。
  * 与 Python SDK 的 map_remote_error 逻辑完全一致。
@@ -275,7 +239,8 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
   const SESSION_CODES = new Set([-32010, -32011, -32013]);
   const VALIDATION_CODES = new Set([-32600, -32601, -32602, 4000]);
 
-  const opts = { code, data, traceId, retryable: false };
+  const transientRetryable = isTransientGatewayDegradedError(message);
+  const opts = { code, data, traceId, retryable: transientRetryable };
 
   let err: AUNError;
 
@@ -299,19 +264,9 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
     err = new GroupStateError(message, opts);
   } else if (code >= -33009 && code <= -33004) {
     err = new GroupError(message, opts);
-  } else if (code === -32040) {
-    err = new E2EEGroupSecretMissingError(message, opts);
-  } else if (code === -32041) {
-    err = new E2EEGroupEpochMismatchError(message, opts);
-  } else if (code === -32042) {
-    err = new E2EEGroupCommitmentInvalidError(message, opts);
-  } else if (code === -32043) {
-    err = new E2EEGroupNotMemberError(message, opts);
-  } else if (code === -32044) {
-    err = new E2EEGroupDecryptFailedError(message, opts);
   } else {
     // 5000-5999 范围的服务端错误可重试
-    const retryable = code >= 5000 && code < 6000;
+    const retryable = transientRetryable || (code >= 5000 && code < 6000);
     err = new AUNError(message, { ...opts, retryable });
   }
 

@@ -6,6 +6,70 @@
 
 ---
 
+## 0.5.1 — 2026-07-01
+
+### ⚠️ 重大变更（Breaking Changes）
+
+#### 群组标识符统一为 GROUP_AID
+- **GROUP_ID 废弃**：历史 `group.{domain}/{base}` 格式已废弃，统一为 `{base}.{issuer}` 格式（group_aid）
+- **兼容转换**：`normalize_group_id()` 函数保留向后兼容，自动转换旧格式到新格式
+- **新增函数**：`convert_to_group_aid()` 显式转换任意历史格式到标准 group_aid
+- **RPC 参数**：`group_id` 字段名保留但值为 group_aid；新增 `group_aid` 参数与 `group_id` 等价
+- **影响范围**：所有群组相关 API（`group.send` / `group.pull` / `group.fs.*` 等）
+
+#### 移除 V1 E2EE 实现
+- **完全移除**：删除所有 V1 端到端加密代码（epoch key、`GroupE2EEManager`、V1 群组加密）
+- **仅保留 V2**：E2EE 功能完全迁移到 V2 协议（消息级密钥 + 逐设备 wrap + 状态签名）
+- **删除文件**：
+  - `tests/e2e_test_group_e2ee.py` — V1 群组加密 E2E 测试
+  - `tests/e2e_test_v2_group_e2ee.py` — V2 群组加密 E2E 测试（已合并到主测试套件）
+  - `tests/unit/test_e2ee.py` — V1 E2EE 单元测试
+- **简化接口**：`e2ee.py` 仅保留 V2 路径和元数据认证函数，文件从 3500+ 行精简到 78 行
+- **注意**：此版本不向后兼容 V1 加密消息
+
+### 新功能
+
+#### Storage & Group FS 能力扩展
+- **Storage VFS P4**：新增 `touch()` 方法，支持创建空文件或更新文件时间戳
+- **Storage VFS P4**：新增 `du()` 方法，支持查询目录或文件的磁盘使用统计
+- **Storage VFS P6**：扩展 `get_acl()` / `list_acl()` 方法，支持 ACL 权限查询
+- **Group FS**：新增 `get_acl()` / `list_acl()` / `remove_acl()` 方法，完善群文件 ACL 管理
+- **Storage LowLevel**：补齐底层 RPC 映射，覆盖 `storage.fs.*` / `storage.object.*` 完整能力
+
+#### CLI 增强
+- **fs 命令**：新增 `aun fs touch` / `aun fs du` 支持文件创建和磁盘使用查询
+- **group fs 命令**：新增 `aun group fs get-acl` / `aun group fs list-acl` / `aun group fs remove-acl` 支持群文件 ACL 管理
+
+### 修复
+
+#### Storage & Group FS
+- 修复 `group.send` / `group.pull` 缺失 `group_id` 必填校验问题
+- 修复 `group.fs` 权限角色 (`role`) 在 ACL 展示中的格式错误
+- 修复 `storage.fs.symlink` 符号链接操作的路径解析问题
+- 修复 `storage.fs.memberdata` 路由逻辑错误
+- 修复 `storage.fs.mount` 挂载点权限校验问题
+
+#### 服务端性能优化（影响 SDK 行为）
+- Gateway 连接池改为可配置，降低高并发下的连接瓶颈
+- Group 推送改为异步化，提升大群消息分发性能
+- Message seq 号段化分配，减少数据库争抢
+- Message 短暂消息 (`persist=false`) 改用内存缓冲 + 异步推送
+
+### 改进
+
+- 路径校验增强：`storage.fs` / `group.fs` 路径参数增加规范化校验，拒绝 `..` / 空路径 / 非法字符
+- 系统目录保护：`memberdata` / `group_data` 写操作增加保护，防止误删系统目录
+- Validators：新增跨语言 `validate_path()` / `validate_aid()` 等校验函数，四语言行为对齐
+
+### 测试
+
+- 新增 `test_storage_vfs_p4.py` 单元测试（`touch` / `du`）
+- 新增 `test_cli_fs_p4.py` CLI 测试（fs touch / du）
+- 新增 `test_cli_group_fs.py` CLI 测试（group fs ACL 操作）
+- 扩展 `e2e_test_fs_p3.py` / `e2e_test_group_fs_sdk.py` E2E 测试覆盖新增能力
+
+---
+
 ## 0.5.0 — 2026-06-17
 
 ### 新功能

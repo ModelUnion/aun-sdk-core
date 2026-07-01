@@ -87,61 +87,11 @@ export interface KeyPairRecord extends JsonObject {
   curve?: string;
 }
 
-/** E2EE prekey 记录 */
-export interface PrekeyRecord extends JsonObject {
-  prekey_id?: string;
-  public_key?: string;
-  signature?: string;
-  private_key_pem?: string;
-  created_at?: number;
-  updated_at?: number;
-  expires_at?: number;
-}
-
-/** prekey 映射 */
-export type PrekeyMap = Record<string, PrekeyRecord>;
-
-/** 群组旧 epoch 记录 */
-export interface GroupOldEpochRecord extends JsonObject {
-  epoch?: number;
-  secret?: string;
-  commitment?: string;
-  member_aids?: string[];
-  epoch_chain?: string;
-  epoch_chain_unverified?: boolean;
-  epoch_chain_unverified_reason?: string;
-  pending_rotation_id?: string;
-  pending_created_at?: number;
-  secret_protection?: JsonObject;
-  created_at?: number;
-  updated_at?: number;
-  expires_at?: number;
-}
-
-/** 群组密钥状态 */
-export interface GroupSecretRecord extends JsonObject {
-  group_id?: string;
-  epoch?: number;
-  secret?: string;
-  commitment?: string;
-  member_aids?: string[];
-  epoch_chain?: string;
-  epoch_chain_unverified?: boolean;
-  epoch_chain_unverified_reason?: string;
-  pending_rotation_id?: string;
-  pending_created_at?: number;
-  updated_at?: number;
-  secret_protection?: JsonObject;
-  old_epochs?: GroupOldEpochRecord[];
-}
-
 /** metadata 记录 */
 export interface MetadataRecord extends JsonObject {
   access_token?: string;
   refresh_token?: string;
   kite_token?: string;
-  e2ee_prekeys?: PrekeyMap;
-  e2ee_sessions?: JsonObject[];
 }
 
 /** 身份记录 */
@@ -151,17 +101,6 @@ export interface IdentityRecord extends MetadataRecord, KeyPairRecord {
   cert_pem?: string;
   token?: string;
   token_exp?: number;
-  expires_at?: number;
-}
-
-/** E2EE session 记录 */
-export interface SessionRecord extends JsonObject {
-  session_id?: string;
-  key?: string;
-  key_protection?: JsonObject;
-  peer_aid?: string;
-  created_at?: number;
-  updated_at?: number;
   expires_at?: number;
 }
 
@@ -187,6 +126,8 @@ export interface Message extends JsonObject {
   from?: string;
   /** 群组消息的群组 ID */
   group_id?: string;
+  /** 群组消息的目标态群 AID */
+  group_aid?: string;
   /** 群组消息的发送方 AID（服务端注入） */
   sender_aid?: string;
   type?: string;
@@ -201,10 +142,50 @@ export interface Message extends JsonObject {
 export interface SendResult extends JsonObject {
   ok?: boolean;
   message_id?: string;
+  group_id?: string;
+  group_aid?: string;
   seq?: number;
   timestamp?: number;
   status?: 'sent' | 'delivered' | 'duplicate';
   delivery_mode?: DeliveryMode;
+}
+
+/** 群组信息 */
+export interface GroupInfo extends JsonObject {
+  group_id?: string;
+  group_aid?: string;
+  name?: string;
+  owner_aid?: string;
+  created_by?: string;
+  type?: string;
+  status?: string;
+  avatar?: string;
+  announcement?: string;
+  member_count?: number;
+  created_at?: number;
+  updated_at?: number;
+  settings?: JsonObject;
+}
+
+/** 群成员信息 */
+export interface GroupMemberInfo extends JsonObject {
+  group_id?: string;
+  group_aid?: string;
+  aid?: string;
+  role?: string;
+  member_type?: string;
+  status?: string;
+  joined_at?: number;
+  updated_at?: number;
+  last_ack_seq?: number;
+  last_pull_at?: number;
+}
+
+/** 群消息结构 */
+export interface GroupMessage extends Message {
+  group_id?: string;
+  group_aid?: string;
+  sender_aid?: string;
 }
 
 /** ACK 结果 */

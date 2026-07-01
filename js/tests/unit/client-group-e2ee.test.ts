@@ -44,7 +44,7 @@ describe('AUNClient 群组 E2EE V2-only 语义', () => {
 });
 
 describe('群组成员变更事件的 V2-only 编排', () => {
-  it('member_removed 不再触发 V1 epoch 轮换或 group.e2ee.* RPC', async () => {
+  it('member_removed 不触发旧 epoch 轮换流程', async () => {
     const client = new AUNClient();
     (client as any)._aid = 'member.aid.com';
     (client as any)._identity = { aid: 'member.aid.com' };

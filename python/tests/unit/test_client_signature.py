@@ -138,9 +138,8 @@ class TestSignedMethodsCoverage:
         "group.v2.get_proposal",
         # 群管理
         "group.send", "group.kick", "group.add_member",
-        "group.leave", "group.remove_member", "group.recall", "group.update_rules",
-        "group.update", "group.update_announcement",
-        "group.update_join_requirements", "group.set_role",
+        "group.leave", "group.remove_member", "group.recall",
+        "group.update", "group.set_role",
         "group.transfer_owner", "group.complete_transfer", "group.bind_group_aid",
         "group.renew_group_aid",
         "group.review_join_request",
@@ -149,10 +148,9 @@ class TestSignedMethodsCoverage:
         "group.thought.put",
         "message.thought.put",
         "group.set_settings",
+        "group.update_announcement",
+        "group.update_rules",
         "group.commit_state",
-        # E2EE epoch 轮换
-        "group.e2ee.begin_rotation", "group.e2ee.commit_rotation",
-        "group.e2ee.abort_rotation",
         # 群生命周期
         "group.ban", "group.unban",
         "group.dissolve", "group.suspend", "group.resume",
@@ -165,14 +163,14 @@ class TestSignedMethodsCoverage:
         "group.add_member",
         "group.leave",
         "group.kick",
-        "group.update_rules",
         "group.send",
         "group.request_join",
         "group.use_invite_code",
         "group.thought.put",
         "group.update",
+        "group.set_settings",
         "group.update_announcement",
-        "group.update_join_requirements",
+        "group.update_rules",
         "group.set_role",
         "group.transfer_owner",
         "group.review_join_request",
@@ -234,7 +232,7 @@ class TestSignClientOperation:
     def test_signature_contains_cert_fingerprint(self, tmp_path):
         client, expected_fp = _make_client_with_identity(tmp_path)
         params = {"group_id": "g-test", "content": "hello"}
-        client._sign_client_operation("group.update_announcement", params)
+        client._sign_client_operation("group.set_settings", params)
 
         cs = params.get("client_signature")
         assert cs is not None, "应生成 client_signature"
@@ -352,7 +350,7 @@ class TestVerifyEventSignature:
             refresh_after=time.time() + _PEER_CERT_CACHE_TTL,
         )
         params = {"group_id": "g-test", "content": "hello"}
-        event = self._sign_and_build_event(client, "group.update_announcement", params)
+        event = self._sign_and_build_event(client, "group.set_settings", params)
 
         result = asyncio.run(client._verify_event_signature(event, event["client_signature"]))
         assert result is True
@@ -366,7 +364,7 @@ class TestVerifyEventSignature:
             refresh_after=time.time() + _PEER_CERT_CACHE_TTL,
         )
         params = {"group_id": "g-test", "content": "hello"}
-        event = self._sign_and_build_event(client, "group.update_announcement", params)
+        event = self._sign_and_build_event(client, "group.set_settings", params)
         # 篡改 params_hash
         event["client_signature"]["params_hash"] = "0" * 64
 

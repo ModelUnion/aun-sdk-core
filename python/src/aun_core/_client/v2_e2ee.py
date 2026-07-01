@@ -8,8 +8,22 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from ..group_id import normalize_group_id as _normalize_group_id
+from ..types import ConnectionState
 from ..v2.session import V2Session
 from .runtime import ClientRuntime
+
+
+def _group_identifier_pair(params: dict[str, Any]) -> tuple[str, str]:
+    wire_group_id = str(params.get("group_id") or params.get("groupId") or "").strip()
+    group_aid = str(params.get("group_aid") or params.get("groupAid") or "").strip()
+    if group_aid:
+        group_aid = _normalize_group_id(group_aid) or group_aid
+    elif wire_group_id:
+        group_aid = _normalize_group_id(wire_group_id) or wire_group_id
+    if not wire_group_id:
+        wire_group_id = group_aid
+    return wire_group_id, group_aid
 
 
 @dataclass(slots=True)
@@ -85,6 +99,34 @@ class V2E2EECoordinator:
         self.runtime = ClientRuntime.coerce(runtime)
         self.client = self.runtime.client
 
+    def _target_cache(self) -> dict[str, tuple[float, Any]]:
+        cache = getattr(self.client, "_v2_target_set_cache", None)
+        if cache is None:
+            cache = {}
+            self.client._v2_target_set_cache = cache
+        return cache
+
+    def _target_cache_get(self, key: str, ttl: float) -> Any | None:
+        cached = self._target_cache().get(key)
+        if not cached:
+            return None
+        created_at = float(cached[0] or 0)
+        if time.time() - created_at >= ttl:
+            self._target_cache().pop(key, None)
+            return None
+        return cached[1]
+
+    def _target_cache_put(self, key: str, value: Any) -> Any:
+        self._target_cache()[key] = (time.time(), value)
+        return value
+
+    def clear_bootstrap_cache(self, key: str) -> None:
+        self.client._v2_bootstrap_cache.pop(key, None)
+        self._target_cache().pop(key, None)
+
+    def clear_group_bootstrap_cache(self, group_id: str) -> None:
+        self.clear_bootstrap_cache(f"group:{group_id}")
+
     @staticmethod
     def _protected_headers_dict(value: Any) -> dict[str, Any] | None:
         to_dict = getattr(value, "to_dict", None)
@@ -137,6 +179,7 @@ class V2E2EECoordinator:
         )
         client._v2_session.ensure_keys()
         self.runtime.v2.bootstrap_cache.clear()
+        self._target_cache().clear()
         await client._v2_session.ensure_registered(client.call)
         client._log.debug(
             "client",
@@ -157,7 +200,7 @@ class V2E2EECoordinator:
 
         async def _run() -> None:
             try:
-                if client._state != "connected" or not client._v2_session:
+                if client._public_state != ConnectionState.READY or not client._v2_session:
                     return
                 await client._delivery().run_background_rpc(
                     lambda: client._v2_session.ensure_group_registered(group_id, client.call)
@@ -189,7 +232,7 @@ class V2E2EECoordinator:
 
         async def _run() -> None:
             try:
-                if client._state != "connected" or not client._v2_session:
+                if client._public_state != ConnectionState.READY or not client._v2_session:
                     return
                 session = client._v2_session
                 # 尝试记录轮换前的 group SPK，用于上传失败时回滚
@@ -509,6 +552,7 @@ class V2E2EECoordinator:
                 wrap_policy = None
 
             if peer_devices is None:
+                self._target_cache().pop(to, None)
                 bootstrap = await client.call("message.v2.bootstrap", {
                     "peer_aid": to,
                     "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
@@ -539,66 +583,75 @@ class V2E2EECoordinator:
             if not peer_devices:
                 raise E2EEError(f"V2 bootstrap: no devices found for {to}")
 
-            targets = []
-            for dev in peer_devices:
-                target = await client._v2_build_target_from_device(
-                    dev,
-                    aid=to,
-                    device_id=dev.get("device_id", ""),
-                    role="peer",
-                    default_key_source="peer_device_prekey",
-                )
-                if target:
-                    targets.append(target)
+            target_cache_key = to
+            target_set = self._target_cache_get(target_cache_key, client._V2_BOOTSTRAP_TTL) if use_cache else None
+            if target_set is None:
+                targets = []
+                for dev in peer_devices:
+                    target = await client._v2_build_target_from_device(
+                        dev,
+                        aid=to,
+                        device_id=dev.get("device_id", ""),
+                        role="peer",
+                        default_key_source="peer_device_prekey",
+                    )
+                    if target:
+                        targets.append(target)
 
-            audit_targets = []
-            for dev in audit_recipients_raw:
-                target = await client._v2_build_target_from_device(
-                    dev,
-                    aid=dev.get("aid", ""),
-                    device_id=dev.get("device_id", ""),
-                    role="audit",
-                    default_key_source="peer_device_prekey",
-                )
-                if target:
-                    audit_targets.append(target)
+                audit_targets = []
+                for dev in audit_recipients_raw:
+                    target = await client._v2_build_target_from_device(
+                        dev,
+                        aid=dev.get("aid", ""),
+                        device_id=dev.get("device_id", ""),
+                        role="audit",
+                        default_key_source="peer_device_prekey",
+                    )
+                    if target:
+                        audit_targets.append(target)
 
-            target_set = {"targets": targets, "audit_recipients": audit_targets}
+                if client._aid and client._aid != to:
+                    try:
+                        self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
+                        if self_devices is None:
+                            self_cached = client._v2_bootstrap_cache.get(client._aid)
+                            if self_cached and (time.time() - self_cached[1]) < client._V2_BOOTSTRAP_TTL:
+                                self_devices = self_cached[0]
+                            else:
+                                self_bs = await client.call("message.v2.bootstrap", {
+                                    "peer_aid": client._aid,
+                                    "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                                })
+                                self_devices = self_bs.get("peer_devices", [])
+                                if self_devices:
+                                    client._v2_bootstrap_cache[client._aid] = (self_devices, time.time())
+                        for dev in self_devices:
+                            has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                            if not has_dev_id or dev_id == client._device_id:
+                                continue
+                            target = await client._v2_build_target_from_device(
+                                dev,
+                                aid=client._aid,
+                                device_id=dev_id,
+                                role="self_sync",
+                                default_key_source="peer_device_prekey",
+                            )
+                            if target:
+                                targets.append(target)
+                    except Exception as exc:
+                        client._log.debug("client", "V2 self-sync bootstrap failed (non-fatal): %s", exc)
+
+                target_set = {
+                    "targets": _v2_apply_wrap_policy_to_targets(targets, wrap_policy),
+                    "audit_recipients": _v2_apply_wrap_policy_to_targets(audit_targets, wrap_policy),
+                }
+                self._target_cache_put(target_cache_key, target_set)
+            else:
+                target_set = {
+                    "targets": [dict(t) for t in target_set.get("targets", []) if isinstance(t, dict)],
+                    "audit_recipients": [dict(t) for t in target_set.get("audit_recipients", []) if isinstance(t, dict)],
+                }
             sender = client._v2_session.get_sender_identity()
-
-            if client._aid and client._aid != to:
-                try:
-                    self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
-                    if self_devices is None:
-                        self_cached = client._v2_bootstrap_cache.get(client._aid)
-                        if self_cached and (time.time() - self_cached[1]) < client._V2_BOOTSTRAP_TTL:
-                            self_devices = self_cached[0]
-                        else:
-                            self_bs = await client.call("message.v2.bootstrap", {
-                                "peer_aid": client._aid,
-                                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
-                            })
-                            self_devices = self_bs.get("peer_devices", [])
-                            if self_devices:
-                                client._v2_bootstrap_cache[client._aid] = (self_devices, time.time())
-                    for dev in self_devices:
-                        has_dev_id, dev_id = _v2_device_id_from_device(dev)
-                        if not has_dev_id or dev_id == client._device_id:
-                            continue
-                        target = await client._v2_build_target_from_device(
-                            dev,
-                            aid=client._aid,
-                            device_id=dev_id,
-                            role="self_sync",
-                            default_key_source="peer_device_prekey",
-                        )
-                        if target:
-                            targets.append(target)
-                except Exception as exc:
-                    client._log.debug("client", "V2 self-sync bootstrap failed (non-fatal): %s", exc)
-
-            target_set["targets"] = _v2_apply_wrap_policy_to_targets(target_set["targets"], wrap_policy)
-            target_set["audit_recipients"] = _v2_apply_wrap_policy_to_targets(target_set["audit_recipients"], wrap_policy)
             envelope = encrypt_p2p_message(
                 sender=sender,
                 target_set=target_set,
@@ -640,7 +693,7 @@ class V2E2EECoordinator:
             exc_code = getattr(exc, "code", None)
             if exc_code in (-33011, -33012, -33050, -33052, -33054):
                 client._log.debug("client", "V2 P2P speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
-                client._v2_bootstrap_cache.pop(to, None)
+                self.clear_bootstrap_cache(to)
                 result = await _attempt(use_cache=False)
             else:
                 raise
@@ -667,6 +720,7 @@ class V2E2EECoordinator:
         latest_seq = 0
         server_ack_seq = 0
         page_count = 0
+        last_auto_ack_seq = 0
         max_pages = int(params.get("max_pages", 100) or 100)
 
         while page_count < max_pages:
@@ -686,12 +740,16 @@ class V2E2EECoordinator:
                 result = {}
 
             messages = result.get("messages", [])
-            raw_messages = messages if isinstance(messages, list) else []
+            raw_page_messages = messages if isinstance(messages, list) else []
+            raw_messages = [
+                msg for msg in raw_page_messages
+                if isinstance(msg, dict) and int(msg.get("seq") or 0) > next_after_seq
+            ]
             total_raw_count += len(raw_messages)
             client._log.debug(
                 "client",
-                "message.v2.pull page response: page=%d raw_count=%d has_more=%s server_ack_seq=%s",
-                page_count, len(raw_messages), result.get("has_more"), result.get("server_ack_seq"),
+                "message.v2.pull page response: page=%d raw_count=%d stale_count=%d has_more=%s server_ack_seq=%s",
+                page_count, len(raw_messages), max(0, len(raw_page_messages) - len(raw_messages)), result.get("has_more"), result.get("server_ack_seq"),
             )
             for msg in raw_messages:
                 client._log_message_debug("pull-raw", "message.v2.pull", "message.received", msg)
@@ -805,8 +863,9 @@ class V2E2EECoordinator:
                     await client._drain_ordered_messages(ns)
                     client._persist_seq(ns)
                 ack_needed = (
-                    bool(raw_messages)
+                    bool(raw_page_messages)
                     and contig > 0
+                    and contig > last_auto_ack_seq
                     and (
                         contig_advanced
                         or (has_page_server_ack and contig > page_server_ack)
@@ -815,9 +874,10 @@ class V2E2EECoordinator:
                 if ack_needed:
                     client._log.debug("client", "message.v2.pull sending auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, contig, len(raw_messages))
                     await client._await_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P page auto-ack")
+                    last_auto_ack_seq = contig
 
             next_after = max(page_max_seq, next_after_seq)
-            if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
+            if not raw_messages or next_after <= next_after_seq:
                 break
             next_after_seq = next_after
 
@@ -1209,6 +1269,7 @@ class V2E2EECoordinator:
             self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
             wrap_policy = cached[4] if len(cached) > 4 else None
         else:
+            self._target_cache().pop(to, None)
             bootstrap = await client.call("message.v2.bootstrap", {
                 "peer_aid": to,
                 "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
@@ -1234,63 +1295,74 @@ class V2E2EECoordinator:
         if not peer_devices:
             raise E2EEError(f"V2 bootstrap: no devices found for {to}")
 
-        targets: list[dict[str, Any]] = []
-        for dev in peer_devices:
-            target = await client._v2_build_target_from_device(
-                dev,
-                aid=to,
-                device_id=dev.get("device_id", ""),
-                role="peer",
-                default_key_source="peer_device_prekey",
-            )
-            if target:
-                targets.append(target)
-
-        for dev in audit_recipients_raw:
-            target = await client._v2_build_target_from_device(
-                dev,
-                aid=dev.get("aid", ""),
-                device_id=dev.get("device_id", ""),
-                role="audit",
-                default_key_source="peer_device_prekey",
-            )
-            if target:
-                targets.append(target)
-
-        if client._aid and client._aid != to:
-            try:
-                self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
-                if self_devices is None:
-                    self_cached = client._v2_bootstrap_cache.get(client._aid)
-                    if self_cached and (time.time() - self_cached[1]) < client._V2_BOOTSTRAP_TTL:
-                        self_devices = self_cached[0]
-                    else:
-                        self_bs = await client.call("message.v2.bootstrap", {
-                            "peer_aid": client._aid,
-                            "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
-                        })
-                        self_devices = self_bs.get("peer_devices", [])
-                        if self_devices:
-                            client._v2_bootstrap_cache[client._aid] = (self_devices, time.time())
-                for dev in self_devices:
-                    has_dev_id, dev_id = _v2_device_id_from_device(dev)
-                    if not has_dev_id or dev_id == client._device_id:
-                        continue
-                    target = await client._v2_build_target_from_device(
-                        dev,
-                        aid=client._aid,
-                        device_id=dev_id,
-                        role="self_sync",
-                        default_key_source="peer_device_prekey",
-                    )
-                    if target:
-                        targets.append(target)
-            except Exception as exc:
-                client._log.debug("client", "V2 thought self-sync bootstrap failed (non-fatal): %s", exc)
-
         sender = client._v2_session.get_sender_identity()
-        targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
-        target_set = {"targets": targets, "audit_recipients": []}
+        target_set = self._target_cache_get(to, client._V2_BOOTSTRAP_TTL) if use_cache else None
+        if target_set is None:
+            targets: list[dict[str, Any]] = []
+            audit_targets: list[dict[str, Any]] = []
+            for dev in peer_devices:
+                target = await client._v2_build_target_from_device(
+                    dev,
+                    aid=to,
+                    device_id=dev.get("device_id", ""),
+                    role="peer",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
+
+            for dev in audit_recipients_raw:
+                target = await client._v2_build_target_from_device(
+                    dev,
+                    aid=dev.get("aid", ""),
+                    device_id=dev.get("device_id", ""),
+                    role="audit",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    audit_targets.append(target)
+
+            if client._aid and client._aid != to:
+                try:
+                    self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
+                    if self_devices is None:
+                        self_cached = client._v2_bootstrap_cache.get(client._aid)
+                        if self_cached and (time.time() - self_cached[1]) < client._V2_BOOTSTRAP_TTL:
+                            self_devices = self_cached[0]
+                        else:
+                            self_bs = await client.call("message.v2.bootstrap", {
+                                "peer_aid": client._aid,
+                                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                            })
+                            self_devices = self_bs.get("peer_devices", [])
+                            if self_devices:
+                                client._v2_bootstrap_cache[client._aid] = (self_devices, time.time())
+                    for dev in self_devices:
+                        has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                        if not has_dev_id or dev_id == client._device_id:
+                            continue
+                        target = await client._v2_build_target_from_device(
+                            dev,
+                            aid=client._aid,
+                            device_id=dev_id,
+                            role="self_sync",
+                            default_key_source="peer_device_prekey",
+                        )
+                        if target:
+                            targets.append(target)
+                except Exception as exc:
+                    client._log.debug("client", "V2 thought self-sync bootstrap failed (non-fatal): %s", exc)
+
+            target_set = {
+                "targets": _v2_apply_wrap_policy_to_targets(targets, wrap_policy),
+                "audit_recipients": _v2_apply_wrap_policy_to_targets(audit_targets, wrap_policy),
+            }
+            self._target_cache_put(to, target_set)
+        else:
+            target_set = {
+                "targets": [dict(t) for t in target_set.get("targets", []) if isinstance(t, dict)],
+                "audit_recipients": [dict(t) for t in target_set.get("audit_recipients", []) if isinstance(t, dict)],
+            }
         envelope = encrypt_p2p_message(
             sender=sender,
             target_set=target_set,
@@ -1318,7 +1390,7 @@ class V2E2EECoordinator:
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
-        group_id = str(params.get("group_id") or "").strip()
+        _wire_group_id, group_id = _group_identifier_pair(params)
         payload = params.get("payload") or {}
         if not group_id:
             raise ValidationError("group.send requires 'group_id'")
@@ -1369,8 +1441,10 @@ class V2E2EECoordinator:
                 wrap_policy = None
 
             if all_devices is None:
+                self._target_cache().pop(cache_key, None)
                 bootstrap = await client.call("group.v2.bootstrap", {
                     "group_id": group_id,
+                    "group_aid": group_id,
                     "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
                 })
                 all_devices = bootstrap.get("devices", [])
@@ -1419,55 +1493,60 @@ class V2E2EECoordinator:
             if not all_devices:
                 raise E2EEError(f"V2 group bootstrap: no devices found for group {group_id}")
 
-            targets = []
-            for dev in all_devices:
-                dev_aid = str(dev.get("aid", "") or "").strip()
-                has_dev_id, dev_id = _v2_device_id_from_device(dev)
-                if dev_aid == client._aid and has_dev_id and dev_id == client._device_id:
-                    continue
-                role = "self_sync" if dev_aid == client._aid else "member"
-                target = await client._v2_build_target_from_device(
-                    dev,
-                    aid=dev_aid,
-                    device_id=dev_id,
-                    role=role,
-                    default_key_source="peer_device_prekey",
-                )
-                if target:
-                    targets.append(target)
-
-            if not targets:
-                expected_peer_aids = _expected_peer_aids(
-                    member_aids=member_aids,
-                    committed_aids=committed_aids,
-                )
-                if expected_peer_aids:
-                    raise E2EEError(
-                        f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
-                        code=-33054,
-                        data={"expected_peer_aids": sorted(expected_peer_aids)},
+            targets = self._target_cache_get(cache_key, client._V2_GROUP_BOOTSTRAP_TTL) if use_cache else None
+            if targets is None:
+                targets = []
+                for dev in all_devices:
+                    dev_aid = str(dev.get("aid", "") or "").strip()
+                    has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                    if dev_aid == client._aid and has_dev_id and dev_id == client._device_id:
+                        continue
+                    role = "self_sync" if dev_aid == client._aid else "member"
+                    target = await client._v2_build_target_from_device(
+                        dev,
+                        aid=dev_aid,
+                        device_id=dev_id,
+                        role=role,
+                        default_key_source="peer_device_prekey",
                     )
-                if used_cached_bootstrap:
-                    raise E2EEError(
-                        f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
-                        code=-33054,
-                        data={"expected_peer_aids": []},
-                    )
-                raise E2EEError(f"V2 group: no target devices for group {group_id}")
+                    if target:
+                        targets.append(target)
 
-            for dev in audit_recipients_raw:
-                target = await client._v2_build_target_from_device(
-                    dev,
-                    aid=dev.get("aid", ""),
-                    device_id=dev.get("device_id", ""),
-                    role="audit",
-                    default_key_source="peer_device_prekey",
-                )
-                if target:
-                    targets.append(target)
+                if not targets:
+                    expected_peer_aids = _expected_peer_aids(
+                        member_aids=member_aids,
+                        committed_aids=committed_aids,
+                    )
+                    if expected_peer_aids:
+                        raise E2EEError(
+                            f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
+                            code=-33054,
+                            data={"expected_peer_aids": sorted(expected_peer_aids)},
+                        )
+                    if used_cached_bootstrap:
+                        raise E2EEError(
+                            f"V2 group: no target devices for group {group_id}; bootstrap may be stale",
+                            code=-33054,
+                            data={"expected_peer_aids": []},
+                        )
+                    raise E2EEError(f"V2 group: no target devices for group {group_id}")
+
+                for dev in audit_recipients_raw:
+                    target = await client._v2_build_target_from_device(
+                        dev,
+                        aid=dev.get("aid", ""),
+                        device_id=dev.get("device_id", ""),
+                        role="audit",
+                        default_key_source="peer_device_prekey",
+                    )
+                    if target:
+                        targets.append(target)
+                targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
+                self._target_cache_put(cache_key, targets)
+            else:
+                targets = [dict(t) for t in targets if isinstance(t, dict)]
 
             sender = client._v2_session.get_sender_identity()
-            targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
             envelope = encrypt_group_message(
                 sender=sender,
                 group_id=group_id,
@@ -1499,6 +1578,7 @@ class V2E2EECoordinator:
 
             result = await client.call("group.v2.send", {
                 "group_id": group_id,
+                "group_aid": group_id,
                 "envelope": envelope,
             })
             client._log.debug("client", "group.v2.send ok: group=%s use_cache=%s seq=%s", group_id, use_cache, result.get("seq") if isinstance(result, dict) else "")
@@ -1519,7 +1599,7 @@ class V2E2EECoordinator:
                     raise
                 retries += 1
                 client._log.debug("client", "group V2 speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
-                client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+                self.clear_group_bootstrap_cache(group_id)
                 use_cache = False
                 if exc_code == -33054 and retries > 1:
                     await asyncio.sleep(0.25 * (retries - 1))
@@ -1569,6 +1649,7 @@ class V2E2EECoordinator:
                 group_id, len(all_devices), len(audit_recipients_raw), epoch, state_commitment.get("state_version"),
             )
         else:
+            self._target_cache().pop(cache_key, None)
             bootstrap = await client.call("group.v2.bootstrap", {
                 "group_id": group_id,
                 "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
@@ -1607,39 +1688,44 @@ class V2E2EECoordinator:
         if not all_devices:
             raise E2EEError(f"V2 group bootstrap: no devices for {group_id}")
 
-        targets: list[dict[str, Any]] = []
-        for dev in all_devices:
-            dev_aid = dev.get("aid", "")
-            has_dev_id, dev_id = _v2_device_id_from_device(dev)
-            if dev_aid == client._aid and has_dev_id and dev_id == client._device_id:
-                continue
-            role = "self_sync" if dev_aid == client._aid else "member"
-            target = await client._v2_build_target_from_device(
-                dev,
-                aid=dev_aid,
-                device_id=dev_id,
-                role=role,
-                default_key_source="peer_device_prekey",
-            )
-            if target:
-                targets.append(target)
+        targets = self._target_cache_get(cache_key, client._V2_GROUP_BOOTSTRAP_TTL) if use_cache else None
+        if targets is None:
+            targets = []
+            for dev in all_devices:
+                dev_aid = dev.get("aid", "")
+                has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                if dev_aid == client._aid and has_dev_id and dev_id == client._device_id:
+                    continue
+                role = "self_sync" if dev_aid == client._aid else "member"
+                target = await client._v2_build_target_from_device(
+                    dev,
+                    aid=dev_aid,
+                    device_id=dev_id,
+                    role=role,
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
 
-        for dev in audit_recipients_raw:
-            target = await client._v2_build_target_from_device(
-                dev,
-                aid=dev.get("aid", ""),
-                device_id=dev.get("device_id", ""),
-                role="audit",
-                default_key_source="peer_device_prekey",
-            )
-            if target:
-                targets.append(target)
+            for dev in audit_recipients_raw:
+                target = await client._v2_build_target_from_device(
+                    dev,
+                    aid=dev.get("aid", ""),
+                    device_id=dev.get("device_id", ""),
+                    role="audit",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
 
-        if not targets:
-            raise E2EEError(f"V2 group: no target devices for {group_id}")
+            if not targets:
+                raise E2EEError(f"V2 group: no target devices for {group_id}")
+            targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
+            self._target_cache_put(cache_key, targets)
+        else:
+            targets = [dict(t) for t in targets if isinstance(t, dict)]
 
         sender = client._v2_session.get_sender_identity()
-        targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
         envelope = encrypt_group_message(
             sender=sender,
             group_id=group_id,
@@ -1739,7 +1825,7 @@ class V2E2EECoordinator:
             err_msg = str(exc).lower()
             if "device" in err_msg or "prekey" in err_msg or "recipient" in err_msg or "stale" in err_msg:
                 client._log.debug("client", "V2 P2P thought put speculative rejected, refreshing bootstrap: %s", exc)
-                client._v2_bootstrap_cache.pop(to_aid, None)
+                self.clear_bootstrap_cache(to_aid)
                 result = await _attempt(use_cache=False)
             else:
                 raise
@@ -1813,7 +1899,7 @@ class V2E2EECoordinator:
             err_msg = str(exc).lower()
             if "member" in err_msg or "device" in err_msg or "recipient" in err_msg or "stale" in err_msg or "epoch" in err_msg:
                 client._log.debug("client", "V2 group thought put speculative rejected, refreshing bootstrap: %s", exc)
-                client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+                self.clear_group_bootstrap_cache(group_id)
                 result = await _attempt(use_cache=False)
             else:
                 raise
@@ -2285,7 +2371,7 @@ class V2E2EECoordinator:
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
-        group_id = str(params.get("group_id") or "").strip()
+        wire_group_id, group_id = _group_identifier_pair(params)
         if "after_seq" in params:
             after_seq = int(params.get("after_seq") or 0)
             has_explicit_after_seq = True
@@ -2326,7 +2412,8 @@ class V2E2EECoordinator:
                 group_id, page_count, next_after_seq, limit, ns,
             )
             pull_params = {
-                "group_id": group_id,
+                "group_id": wire_group_id,
+                "group_aid": group_id,
                 "after_seq": next_after_seq,
                 "limit": limit,
                 **cursor_params,
@@ -2342,13 +2429,17 @@ class V2E2EECoordinator:
                 result = {}
 
             messages = result.get("messages", [])
-            raw_messages = messages if isinstance(messages, list) else []
+            raw_page_messages = messages if isinstance(messages, list) else []
+            raw_messages = [
+                msg for msg in raw_page_messages
+                if isinstance(msg, dict) and int(msg.get("seq") or 0) > next_after_seq
+            ]
             total_raw_count += len(raw_messages)
             cursor = result.get("cursor") if isinstance(result.get("cursor"), dict) else {}
             client._log.debug(
                 "client",
-                "group.v2.pull page response: group=%s page=%d raw_count=%d has_more=%s cursor_current=%s",
-                group_id, page_count, len(raw_messages), result.get("has_more"), cursor.get("current_seq"),
+                "group.v2.pull page response: group=%s page=%d raw_count=%d stale_count=%d has_more=%s cursor_current=%s",
+                group_id, page_count, len(raw_messages), max(0, len(raw_page_messages) - len(raw_messages)), result.get("has_more"), cursor.get("current_seq"),
             )
             for msg in raw_messages:
                 client._log_message_debug("pull-raw", "group.v2.pull", "group.message_created", msg)
@@ -2444,18 +2535,17 @@ class V2E2EECoordinator:
                 await client._drain_ordered_messages(ns)
                 client._persist_seq(ns)
             ack_needed = (
-                bool(raw_messages)
-                and contig > 0
+                contig > 0
                 and owns_cursor
                 and (
-                    contig_advanced
+                    (bool(raw_messages) and contig_advanced)
                     or (has_server_cursor and contig > server_ack)
                 )
             )
             if ack_needed:
                 client._log.debug("client", "group.v2.pull sending auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", group_id, ns, contig, len(raw_messages))
                 await client._await_ack("group.v2.ack", {
-                    "group_id": group_id, "up_to_seq": contig,
+                    "group_id": group_id, "group_aid": group_id, "up_to_seq": contig,
                 }, f"V2 群消息 page auto-ack group={group_id}")
             elif raw_messages and contig_advanced and contig > 0 and not owns_cursor:
                 client._log.debug(
@@ -2499,7 +2589,7 @@ class V2E2EECoordinator:
         """V2 Group 确认消费。内部方法，由 call("group.ack_messages") 路由调用。"""
         client = self.client
         background_rpc = bool(params.pop("_rpc_background", False))
-        group_id = str(params.get("group_id") or "").strip()
+        _wire_group_id, group_id = _group_identifier_pair(params)
         up_to_seq = int(params.get("msg_seq", 0) or params.get("up_to_seq", 0) or 0)
         ns = f"group:{group_id}"
         seq = up_to_seq or (client._seq_tracker.get_contiguous_seq(ns) if ns else 0)
@@ -2520,7 +2610,7 @@ class V2E2EECoordinator:
             for key in ("device_id", "slot_id")
             if key in params and params[key] is not None
         }
-        ack_params = {"group_id": group_id, "up_to_seq": seq, **cursor_params}
+        ack_params = {"group_id": group_id, "group_aid": group_id, "up_to_seq": seq, **cursor_params}
         if background_rpc:
             ack_params["_rpc_background"] = True
         result = await client.call("group.v2.ack", ack_params)

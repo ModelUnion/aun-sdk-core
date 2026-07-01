@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
@@ -14,7 +13,7 @@ import (
 
 // LocalTokenStore 基于文件（cert.pem）+ AIDDatabase（SQLite）的 token/状态存储。
 // 实现 TokenStore + StructuredKeyStore + InstanceStateStore + SeqTrackerStore +
-// SessionKeyStore + MetadataKeyStore + TrustRootStore + VersionedCertKeyStore。
+// MetadataKeyStore + TrustRootStore + VersionedCertKeyStore。
 // AUNClient / AuthFlow 持有此类型。
 type LocalTokenStore struct {
 	root          string
@@ -196,169 +195,6 @@ func (f *LocalTokenStore) SaveCertVersion(aid, certPEM, fp string, makeActive bo
 	return nil
 }
 
-// ── StructuredKeyStore 实现 ──────────────────────────────────
-
-func (f *LocalTokenStore) LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadPrekeys(strings.TrimSpace(deviceID)), nil
-}
-
-func (f *LocalTokenStore) LoadE2EEPrekeyByID(aid, prekeyID string) (map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadPrekeyByID(strings.TrimSpace(prekeyID)), nil
-}
-
-func (f *LocalTokenStore) SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return err
-	}
-	pem, _ := prekeyData["private_key_pem"].(string)
-	extra := make(map[string]any)
-	for k, v := range prekeyData {
-		if k != "private_key_pem" && k != "created_at" && k != "updated_at" && k != "expires_at" {
-			extra[k] = v
-		}
-	}
-	var ca, ea *int64
-	if v, ok := int64OrNil(prekeyData["created_at"]); ok {
-		ca = &v
-	}
-	if v, ok := int64OrNil(prekeyData["expires_at"]); ok {
-		ea = &v
-	}
-	db.SavePrekey(prekeyID, pem, strings.TrimSpace(deviceID), ca, ea, extra)
-	return nil
-}
-
-func (f *LocalTokenStore) CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.CleanupPrekeys(strings.TrimSpace(deviceID), cutoffMs, keepLatest), nil
-}
-
-func (f *LocalTokenStore) ListGroupSecretIDs(aid string) ([]string, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	for gid := range db.LoadAllGroupCurrent() {
-		seen[gid] = true
-	}
-	for _, gid := range db.LoadAllGroupIDsWithOldEpochs() {
-		seen[gid] = true
-	}
-	result := make([]string, 0, len(seen))
-	for gid := range seen {
-		result = append(result, gid)
-	}
-	sort.Strings(result)
-	return result, nil
-}
-
-func (f *LocalTokenStore) CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return 0, err
-	}
-	return db.CleanupGroupOldEpochs(groupID, cutoffMs), nil
-}
-
-func (f *LocalTokenStore) LoadGroupSecretEpoch(aid, groupID string, epoch *int) (map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadGroupSecretEpoch(groupID, epoch)
-}
-
-func (f *LocalTokenStore) LoadGroupSecretEpochs(aid, groupID string) ([]map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadGroupSecretEpochs(groupID)
-}
-
-func (f *LocalTokenStore) StoreGroupSecretTransition(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return false, err
-	}
-	return db.StoreGroupSecretTransition(groupID, opts)
-}
-
-func (f *LocalTokenStore) StoreGroupSecretEpoch(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return false, err
-	}
-	return db.StoreGroupSecretEpoch(groupID, opts)
-}
-
-func (f *LocalTokenStore) DiscardPendingGroupSecretState(aid, groupID string, epoch int, rotationID string) (bool, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return false, err
-	}
-	return db.DiscardPendingGroupSecretState(groupID, epoch, rotationID)
-}
-
-func (f *LocalTokenStore) DeleteGroupSecretState(aid, groupID string) error {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return err
-	}
-	db.DeleteGroupCurrent(groupID)
-	db.DeleteAllGroupOldEpochs(groupID)
-	return nil
-}
-
 func (f *LocalTokenStore) SaveGroupState(aid, groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error {
 	l := f.getLock(aid)
 	l.Lock()
@@ -427,31 +263,6 @@ func (f *LocalTokenStore) UpdateInstanceState(aid, deviceID, slotID string, upda
 	}
 	db.SaveInstanceState(deviceID, slotID, updated)
 	return deepCopyMap(updated), nil
-}
-
-// ── SessionKeyStore 实现 ─────────────────────────────────────
-
-func (f *LocalTokenStore) LoadE2EESessions(aid string) ([]map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadAllSessions(), nil
-}
-
-func (f *LocalTokenStore) SaveE2EESession(aid, sessionID string, data map[string]any) error {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return err
-	}
-	db.SaveSession(sessionID, data)
-	return nil
 }
 
 // ── SeqTrackerStore 实现 ─────────────────────────────────────

@@ -345,6 +345,32 @@ export class RPCTransport {
       this._ws = ws;
       this._closed = false;
       let initialResolved = false;
+      let connectTimeout: ReturnType<typeof globalThis.setTimeout> | null = null;
+
+      const clearConnectTimeout = (): void => {
+        if (connectTimeout !== null) {
+          clearTimeout(connectTimeout);
+          connectTimeout = null;
+        }
+      };
+
+      const cleanupHandshake = (): void => {
+        ws.onopen = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        ws.onclose = null;
+      };
+
+      const rollbackHandshake = (): void => {
+        cleanupHandshake();
+        this._ws = null;
+        this._closed = true;
+        try {
+          ws.close();
+        } catch {
+          // ignore close errors during handshake rollback
+        }
+      };
 
       ws.onopen = () => {
         // 连接已建立，等待首条消息
@@ -353,6 +379,8 @@ export class RPCTransport {
       ws.onerror = (event) => {
         if (!initialResolved) {
           initialResolved = true;
+          clearConnectTimeout();
+          rollbackHandshake();
           this._log.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=websocket_error`);
           reject(new ConnectionError(`websocket connection failed to ${url}`));
         }
@@ -362,6 +390,7 @@ export class RPCTransport {
         if (!initialResolved) {
           // 首条消息：可能是 challenge
           initialResolved = true;
+          clearConnectTimeout();
           try {
             const message = this._decodeMessage(event.data);
             if (message.method === 'challenge') {
@@ -382,6 +411,7 @@ export class RPCTransport {
               resolve(null);
             }
           } catch (err) {
+            rollbackHandshake();
             this._log.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
             reject(err instanceof Error ? err : new ConnectionError(String(err)));
           }
@@ -394,10 +424,24 @@ export class RPCTransport {
         this._lastCloseReason = event.reason ?? '';
         if (!initialResolved) {
           initialResolved = true;
+          clearConnectTimeout();
+          cleanupHandshake();
+          this._ws = null;
+          this._closed = true;
           this._log.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=closed_before_initial code=${event.code}`);
           reject(new ConnectionError(`websocket closed before initial message: code=${event.code}`));
         }
       };
+
+      // 覆盖 WebSocket open 后服务端迟迟不发 challenge 的半开握手。
+      connectTimeout = globalThis.setTimeout(() => {
+        if (!initialResolved) {
+          initialResolved = true;
+          rollbackHandshake();
+          this._log.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=connect_timeout`);
+          reject(new ConnectionError('websocket connect timeout'));
+        }
+      }, this._timeout * 1000);
     });
   }
 

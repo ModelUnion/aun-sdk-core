@@ -7,7 +7,16 @@ import json
 import time
 from typing import Any
 
+from ..group_id import normalize_group_id
 from .runtime import ClientRuntime
+
+
+def _group_cache_ids(raw_group_id: Any, group_aid: str) -> list[str]:
+    ids: list[str] = []
+    for value in (group_aid, str(raw_group_id or "").strip()):
+        if value and value not in ids:
+            ids.append(value)
+    return ids
 
 
 class GroupStateCoordinator:
@@ -27,9 +36,9 @@ class GroupStateCoordinator:
         } and isinstance(result, dict) and getattr(client, "_v2_session", None):
             gid = ""
             if isinstance(result.get("group"), dict):
-                gid = str(result["group"].get("group_id") or "").strip()
+                gid = normalize_group_id(result["group"].get("group_aid") or result["group"].get("group_id", ""))
             if not gid:
-                gid = str(params.get("group_id") or "").strip()
+                gid = normalize_group_id(params.get("group_aid") or params.get("group_id", ""))
             if gid:
                 try:
                     await client._v2_auto_propose_state(gid)
@@ -45,11 +54,13 @@ class GroupStateCoordinator:
         """处理 group.changed 中和 V2 群状态相关的缓存、SPK 与自动提案。"""
         client = self.client
         action = data.get("action", "")
-        group_id = data.get("group_id", "")
+        raw_group_id = data.get("group_aid") or data.get("group_id", "")
+        group_id = normalize_group_id(raw_group_id)
         if group_id:
             bootstrap_cache = getattr(client, "_v2_bootstrap_cache", None)
             if bootstrap_cache is not None:
-                bootstrap_cache.pop(f"group:{group_id}", None)
+                for cache_group_id in _group_cache_ids(raw_group_id, group_id):
+                    bootstrap_cache.pop(f"group:{cache_group_id}", None)
             membership_actions = {
                 "member_added", "member_left", "member_removed", "role_changed",
                 "owner_transferred", "joined", "join_approved", "invite_code_used",
@@ -98,7 +109,7 @@ class GroupStateCoordinator:
         _t_start = time.time()
         if not isinstance(data, dict):
             return
-        group_id = str(data.get("group_id") or "").strip()
+        group_id = normalize_group_id(data.get("group_aid") or data.get("group_id", ""))
         if not group_id:
             return
         client._log.debug("client", "_on_group_state_committed enter: group=%s state_version=%s", group_id, data.get("state_version", "-"))
@@ -256,8 +267,9 @@ class GroupStateCoordinator:
                     extra = server_members - signed_members
                     if extra:
                         try:
-                            req_resp = await client.call("group.get_join_requirements", {"group_id": group_id})
-                            mode = str(req_resp.get("mode", "") or "").strip() if isinstance(req_resp, dict) else ""
+                            req_resp = await client.call("group.get_settings", {"group_id": group_id, "keys": ["join.mode"]})
+                            settings = {s["key"]: s["value"] for s in req_resp.get("settings", [])}
+                            mode = str(settings.get("join.mode", "") or "").strip()
                         except Exception:
                             mode = ""
                         if mode not in ("open", "invite_code", "invite_only"):
@@ -381,12 +393,10 @@ class GroupStateCoordinator:
         task.add_done_callback(_discard)
 
     async def auto_propose_state(self, group_id: str, *, leader_delay: bool = False) -> None:
-        from ..group_id import normalize_group_id as _normalize_group_id
-
         client = self.client
         if not client._v2_auto_state_management_enabled:
             return
-        normalized_group_id = _normalize_group_id(str(group_id or "").strip()) if group_id else ""
+        normalized_group_id = normalize_group_id(group_id) if group_id else ""
         if not normalized_group_id:
             return
         if leader_delay:
@@ -716,7 +726,7 @@ class GroupStateCoordinator:
             for g in groups:
                 if not isinstance(g, dict):
                     continue
-                group_id = str(g.get("group_id") or "").strip()
+                group_id = normalize_group_id(g.get("group_aid") or g.get("group_id", ""))
                 my_role = str(g.get("role") or g.get("my_role") or "").strip()
                 if not group_id or my_role not in ("owner", "admin"):
                     continue
@@ -737,7 +747,7 @@ class GroupStateCoordinator:
         client = self.client
         if not isinstance(data, dict) or not client._v2_session:
             return
-        group_id = str(data.get("group_id") or "").strip()
+        group_id = normalize_group_id(data.get("group_aid") or data.get("group_id", ""))
         if not group_id:
             return
         await client._dispatcher.publish("group.v2.state_proposed", data)
@@ -754,7 +764,7 @@ class GroupStateCoordinator:
         client = self.client
         if not isinstance(data, dict) or not client._v2_session:
             return
-        group_id = str(data.get("group_id") or "").strip()
+        group_id = normalize_group_id(data.get("group_aid") or data.get("group_id", ""))
         if not group_id:
             return
         await client._dispatcher.publish("group.v2.state_retry_needed", data)
@@ -769,7 +779,12 @@ class GroupStateCoordinator:
         client = self.client
         if not isinstance(data, dict):
             return
-        group_id = str(data.get("group_id") or "").strip()
+        raw_group_id = data.get("group_aid") or data.get("group_id", "")
+        group_id = normalize_group_id(raw_group_id)
         if group_id:
-            client._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+            for cache_group_id in _group_cache_ids(raw_group_id, group_id):
+                client._v2_bootstrap_cache.pop(f"group:{cache_group_id}", None)
+                target_cache = getattr(client, "_v2_target_set_cache", None)
+                if isinstance(target_cache, dict):
+                    target_cache.pop(f"group:{cache_group_id}", None)
         await client._dispatcher.publish("group.v2.state_confirmed", data)

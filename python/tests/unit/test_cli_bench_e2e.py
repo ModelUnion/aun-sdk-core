@@ -2,6 +2,10 @@ import asyncio
 import json
 
 
+def _aid_csv(prefix, count):
+    return ",".join(f"{prefix}{index}.agentid.pub" for index in range(1, count + 1))
+
+
 def test_recorder_ignores_historical_bench_id_for_current_run():
     from aun_cli.commands.bench_e2e import E2ERecorder
 
@@ -51,10 +55,22 @@ def test_e2e_send_collects_delivery_without_receiver_ack_rpc(monkeypatch):
             self.aid = aid
 
     class FakeClient:
+        status_calls = 0
+
         def __init__(self, aid_obj=None):
             self.aid = aid_obj.aid if aid_obj else ""
             self.handlers = {}
             self.connected_options = None
+            self._p2p_gap_fill_stats = {
+                "gap_fill_started": 1,
+                "gap_fill_pages": 1,
+                "gap_fill_raw_messages": 2,
+                "gap_fill_published_messages": 2,
+                "push_auto_pull_started": 1,
+                "push_auto_pull_pages": 1,
+                "push_auto_pull_raw_messages": 1,
+                "push_auto_pull_published_messages": 1,
+            }
             clients_by_aid[self.aid] = self
 
         async def authenticate(self):
@@ -73,6 +89,24 @@ def test_e2e_send_collects_delivery_without_receiver_ack_rpc(monkeypatch):
             return Subscription()
 
         async def call(self, method, params):
+            if method == "message.status":
+                FakeClient.status_calls += 1
+                enqueue = 10 + FakeClient.status_calls * 3
+                return {
+                    "stats": {
+                        "async_push_queue": {
+                            "enqueue": enqueue,
+                            "sent": enqueue - 1,
+                            "send_error": 0,
+                            "dropped_by_capacity": 0,
+                            "conflation_append": FakeClient.status_calls,
+                            "conflation_replace": FakeClient.status_calls * 2,
+                            "worker_started": 1,
+                            "worker_exited": 0,
+                            "conflation_enabled": True,
+                        }
+                    }
+                }
             if method == "message.send":
                 receiver = clients_by_aid["bob.agentid.pub"]
                 message = {
@@ -134,7 +168,7 @@ def test_e2e_send_collects_delivery_without_receiver_ack_rpc(monkeypatch):
             "--count",
             "3",
             "--concurrency",
-            "2",
+            "1",
             "--no-encrypt",
             "--timeout-ms",
             "1000",
@@ -151,6 +185,15 @@ def test_e2e_send_collects_delivery_without_receiver_ack_rpc(monkeypatch):
     assert data["bench_handlers"]["published_seen"] == 3
     assert data["receiver_seq"]["drain"]["status"] == "drained"
     assert data["receiver_seq"]["drain"]["settle"]["status"] == "drained"
+    assert data["receiver_seq"]["p2p_gap_fill"]["gap_fill_started"] == 1
+    assert data["receiver_seq"]["p2p_gap_fill"]["gap_fill_raw_messages"] == 2
+    assert data["receiver_seq"]["p2p_gap_fill"]["push_auto_pull_started"] == 1
+    assert data["receiver_seq"]["p2p_gap_fill"]["push_auto_pull_raw_messages"] == 1
+    assert data["service_push_queue_delta"]["enqueue"] == 3
+    assert data["service_push_queue_delta"]["sent"] == 3
+    assert data["service_push_queue_delta"]["conflation_append"] == 1
+    assert data["service_push_queue_delta"]["conflation_replace"] == 2
+    assert data["service_push_queue_delta"]["conflation_replace_rate"] == 0.666667
     assert data["raw_to_delivered_gap"] == 0
     assert data["delivered"] == 3
     assert data["acked"] == 0
@@ -362,6 +405,171 @@ def test_e2e_send_auto_creates_inferred_receiver(monkeypatch):
     assert registered == ["yayi2002.agentid.pub"]
 
 
+def test_p2p_e2e_uses_sender_receiver_pairs_with_serial_lane(monkeypatch):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import bench_e2e
+    from aun_cli.main import app
+
+    clients_by_aid = {}
+    send_calls = []
+    in_flight = {}
+    max_in_flight = {}
+
+    class FakeStore:
+        def __init__(self, resolved):
+            self.resolved = resolved
+
+        def load(self, aid):
+            class Result:
+                ok = True
+                data = {"aid": FakeAid(aid)}
+                error = None
+
+            return Result()
+
+        def close(self):
+            pass
+
+    class FakeAid:
+        def __init__(self, aid):
+            self.aid = aid
+
+    class FakeClient:
+        def __init__(self, aid_obj=None):
+            self.aid = aid_obj.aid if aid_obj else ""
+            self.handlers = {}
+            clients_by_aid[self.aid] = self
+
+        async def authenticate(self):
+            return {}
+
+        async def connect(self, options):
+            self.options = dict(options)
+
+        def on(self, event, handler):
+            self.handlers.setdefault(event, []).append(handler)
+
+        async def call(self, method, params):
+            if method == "message.send":
+                in_flight[self.aid] = int(in_flight.get(self.aid) or 0) + 1
+                max_in_flight[self.aid] = max(int(max_in_flight.get(self.aid) or 0), in_flight[self.aid])
+                await asyncio.sleep(0)
+                send_calls.append((self.aid, params["to"], params["payload"]["index"]))
+                receiver = clients_by_aid[params["to"]]
+                message = {
+                    "message_id": params["message_id"],
+                    "from": self.aid,
+                    "to": params["to"],
+                    "seq": params["payload"]["index"] + 1,
+                    "payload": params["payload"],
+                }
+                for handler in receiver.handlers.get("_raw.message.received", []):
+                    await handler(message)
+                for handler in receiver.handlers.get("message.received", []):
+                    await handler(message)
+                in_flight[self.aid] -= 1
+                return {"message_id": params["message_id"], "seq": message["seq"]}
+            if method == "message.pull":
+                return {"messages": [], "raw_count": 0, "has_more": False}
+            raise AssertionError(method)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        bench_e2e,
+        "resolve_profile_config",
+        lambda ctx: {
+            "profile_name": "default",
+            "aid": "s1.agentid.pub",
+            "aun_path": "fake",
+            "debug": False,
+            "timeout": 5,
+            "encryption_seed": "",
+            "trace": "off",
+            "active_group": None,
+        },
+    )
+    monkeypatch.setattr(bench_e2e, "make_aid_store", lambda resolved: FakeStore(resolved))
+    monkeypatch.setattr(bench_e2e, "_make_quiet_aid_store", lambda resolved: FakeStore(resolved))
+    monkeypatch.setattr(bench_e2e, "AUNClientFactory", FakeClient)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--json",
+            "bench",
+            "e2e",
+            "send",
+            "--senders",
+            "s1.agentid.pub,s2.agentid.pub,s3.agentid.pub",
+            "--receivers",
+            "r1.agentid.pub,r2.agentid.pub,r3.agentid.pub",
+            "--count",
+            "6",
+            "--concurrency",
+            "2",
+            "--no-encrypt",
+            "--timeout-ms",
+            "1000",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["concurrency"] == 2
+    assert data["requested_concurrency"] == 2
+    assert data["lane_model"]["active_lanes"] == 2
+    assert {call[:2] for call in send_calls} == {
+        ("s1.agentid.pub", "r1.agentid.pub"),
+        ("s2.agentid.pub", "r2.agentid.pub"),
+    }
+    assert not any(call[0] == "s3.agentid.pub" or call[1] == "r3.agentid.pub" for call in send_calls)
+    assert all(value == 1 for value in max_in_flight.values())
+
+
+def test_p2p_autoscale_rejects_max_larger_than_pairs(monkeypatch):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import bench_e2e
+    from aun_cli.main import app
+
+    monkeypatch.setattr(
+        bench_e2e,
+        "resolve_profile_config",
+        lambda ctx: {
+            "profile_name": "default",
+            "aid": "s1.agentid.pub",
+            "aun_path": "fake",
+            "debug": False,
+            "timeout": 5,
+            "encryption_seed": "",
+            "trace": "off",
+            "active_group": None,
+        },
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--json",
+            "bench",
+            "autoscale",
+            "send",
+            "--senders",
+            "s1.agentid.pub,s2.agentid.pub",
+            "--receivers",
+            "r1.agentid.pub,r2.agentid.pub",
+            "--max",
+            "3",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--max 需要小于等于 sender/receiver 对数" in result.output
+
+
 def test_autoscale_records_plateau_but_continues_to_max(monkeypatch):
     from typer.testing import CliRunner
 
@@ -398,9 +606,9 @@ def test_autoscale_records_plateau_but_continues_to_max(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 8),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 8),
             "--count",
             "10",
             "--step-seconds",
@@ -435,6 +643,62 @@ def test_autoscale_records_plateau_but_continues_to_max(monkeypatch):
     assert data["summary"]["peak_concurrency"] == 8
     assert data["steps"][1]["rates"]["success"] == 1.0
     assert data["steps"][2]["comparisons"]["rps_gain_ratio"] < 0.1
+
+
+def test_p2p_autoscale_defaults_to_linear_pair_growth(monkeypatch):
+    from typer.testing import CliRunner
+
+    from aun_cli.commands import bench_e2e
+    from aun_cli.main import app
+
+    async def fake_run_e2e_scenario(ctx, config, autoscale_config):
+        return {
+            "scenario": config.scenario,
+            "count": config.count,
+            "concurrency": config.concurrency,
+            "requested_concurrency": config.concurrency,
+            "ok": config.count,
+            "failed": 0,
+            "delivered": config.count,
+            "acked": config.count,
+            "rps": float(config.concurrency * 10),
+            "latency_ms": {
+                "send_rtt": {"p99": 20.0},
+                "delivery": {"p99": 20.0},
+                "ack": {"p99": 20.0},
+            },
+            "errors": [],
+            "backpressure": {"signals": []},
+        }
+
+    monkeypatch.setattr(bench_e2e, "_run_autoscale_stage", fake_run_e2e_scenario)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--json",
+            "bench",
+            "autoscale",
+            "send",
+            "--senders",
+            _aid_csv("s", 3),
+            "--receivers",
+            _aid_csv("r", 3),
+            "--count",
+            "10",
+            "--step-seconds",
+            "0.01",
+            "--start",
+            "1",
+            "--max",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert [step["concurrency"] for step in data["steps"]] == [1, 2, 3]
+    assert [step["requested_concurrency"] for step in data["steps"]] == [1, 2, 3]
 
 
 def test_autoscale_p99_spike_uses_baseline_floor(monkeypatch):
@@ -475,9 +739,9 @@ def test_autoscale_p99_spike_uses_baseline_floor(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 4),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 4),
             "--count",
             "10",
             "--step-seconds",
@@ -545,9 +809,9 @@ def test_autoscale_default_p99_scope_ignores_delivery_backlog(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 2),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 2),
             "--count",
             "10",
             "--step-seconds",
@@ -609,9 +873,9 @@ def test_autoscale_p99_scope_max_keeps_legacy_delivery_spike_stop(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 2),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 2),
             "--count",
             "10",
             "--step-seconds",
@@ -674,9 +938,9 @@ def test_autoscale_can_stop_on_plateau_for_compat(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 4),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 4),
             "--count",
             "10",
             "--step-seconds",
@@ -746,9 +1010,9 @@ def test_autoscale_summary_reports_raw_delivery_gap(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 4),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 4),
             "--count",
             "10",
             "--step-seconds",
@@ -828,9 +1092,9 @@ def test_autoscale_summary_reports_receiver_ordered_gap_diagnostics(monkeypatch)
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 2),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 2),
             "--count",
             "10",
             "--step-seconds",
@@ -890,9 +1154,9 @@ def test_autoscale_uses_send_rps_for_peak_and_plateau(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 4),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 4),
             "--count",
             "10",
             "--step-seconds",
@@ -955,9 +1219,9 @@ def test_autoscale_does_not_stop_on_ack_incomplete_when_delivery_complete(monkey
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 2),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 2),
             "--count",
             "10",
             "--step-seconds",
@@ -1047,9 +1311,9 @@ def test_autoscale_reports_backpressure_trigger_condition(monkeypatch):
             "autoscale",
             "send",
             "--senders",
-            "alice.agentid.pub",
+            _aid_csv("s", 2),
             "--receivers",
-            "bob.agentid.pub",
+            _aid_csv("r", 2),
             "--count",
             "10",
             "--step-seconds",

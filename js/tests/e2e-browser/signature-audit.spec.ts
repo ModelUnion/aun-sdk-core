@@ -3,7 +3,7 @@
 // 覆盖：
 //   1. 更新公告携带签名 — set_settings(announcement.content) 事件包含 actor_aid + client_signature
 //   2. 踢人操作携带签名 — kick 事件包含 actor_aid + client_signature
-//   3. 只读操作安全 — group.info / group.list_my 无需签名即可正常执行
+//   3. 只读操作安全 — group.get_info / group.list_my 无需签名即可正常执行
 //
 // 运行方法：
 //   npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/signature-audit.spec.ts --reporter=line
@@ -445,7 +445,7 @@ test.describe('签名审计: 只读操作安全（浏览器）', () => {
     await installP0Helpers(page);
   });
 
-  test('group.info 和 group.list_my 无需签名正常执行', async ({ page }) => {
+  test('group.get_info 和 group.list_my 无需签名正常执行', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const { sleep, makeAndConnect, ensureConnected, runId } = (window as any).__aunP0;
       const rid = runId();
@@ -478,15 +478,15 @@ test.describe('签名审计: 只读操作安全（浏览器）', () => {
 
         await sleep(500);
 
-        // 测试 group.info（只读操作）
+        // 测试 group.get_info（只读操作）
         let infoOk = false;
         try {
-          const infoResult = await alice.call('group.info', { group_id: groupId });
+          const infoResult = await alice.call('group.get_info', { group_id: groupId, required: ['member'] });
           infoOk = infoResult != null;
         } catch (e: any) {
           const msg = (e.message ?? '').toLowerCase();
           if (msg.includes('not implement') || msg.includes('method not found')) {
-            return { skip: true, reason: 'group.info 未实现' };
+            return { skip: true, reason: 'group.get_info 未实现' };
           }
           return { skip: false, error: `info failed: ${e.message}` };
         }

@@ -30,15 +30,6 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
     expect(proto._rotateGroupEpoch).toBeUndefined();
   });
 
-  it('legacy group.e2ee RPC 应被客户端拦截，不透传 transport', async () => {
-    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
-
-    await expect(client.call('group.e2ee.get_epoch', { group_id: 'grp01' }))
-      .rejects.toThrow('legacy E2EE method is removed');
-
-    expect((client as any)._transport.call).not.toHaveBeenCalled();
-  });
-
   it('group.send 默认加密必须走 V2 session，encrypt=false 才能走明文 RPC', async () => {
     const transportCall = vi.fn().mockResolvedValue({ ok: true });
     (client as any)._transport.call = transportCall;
@@ -57,7 +48,6 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
       group_id: 'grp01',
       payload: { type: 'text', text: 'plain' },
     }), expect.any(Number), undefined, false);
-    expect(transportCall.mock.calls.map(([method]) => method)).not.toContain('group.e2ee.get_epoch');
   });
 });
 

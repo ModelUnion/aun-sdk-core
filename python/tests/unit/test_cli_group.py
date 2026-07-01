@@ -397,7 +397,10 @@ def test_group_info_displays_service_core_fields(monkeypatch, tmp_path):
     result = CliRunner().invoke(app, ["group", "info"])
 
     assert result.exit_code == 0, result.output
-    assert calls == [("group.info", {"group_id": "group.agentid.pub/11455"})]
+    assert calls == [("group.get_info", {
+        "group_id": "group.agentid.pub/11455",
+        "required": ["member", "state", "e2ee"],
+    })]
     assert "Owner AID" in result.output
     assert "yayi2000.agentid.pub" in result.output
     assert "State Version" in result.output

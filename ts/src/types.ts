@@ -141,6 +141,7 @@ export interface Message extends JsonObject {
   timestamp?: number;
   e2ee?: JsonObject;
   group_id?: string;
+  group_aid?: string;
   sender_aid?: string;
   direction?: string;
 }
@@ -149,10 +150,50 @@ export interface Message extends JsonObject {
 export interface SendResult extends JsonObject {
   ok?: boolean;
   message_id?: string;
+  group_id?: string;
+  group_aid?: string;
   seq?: number;
   timestamp?: number;
   status?: 'sent' | 'delivered' | 'duplicate';
   delivery_mode?: DeliveryMode;
+}
+
+/** 群组信息 */
+export interface GroupInfo extends JsonObject {
+  group_id?: string;
+  group_aid?: string;
+  name?: string;
+  owner_aid?: string;
+  created_by?: string;
+  type?: string;
+  status?: string;
+  avatar?: string;
+  announcement?: string;
+  member_count?: number;
+  created_at?: number;
+  updated_at?: number;
+  settings?: JsonObject;
+}
+
+/** 群成员信息 */
+export interface GroupMemberInfo extends JsonObject {
+  group_id?: string;
+  group_aid?: string;
+  aid?: string;
+  role?: string;
+  member_type?: string;
+  status?: string;
+  joined_at?: number;
+  updated_at?: number;
+  last_ack_seq?: number;
+  last_pull_at?: number;
+}
+
+/** 群消息结构 */
+export interface GroupMessage extends Message {
+  group_id?: string;
+  group_aid?: string;
+  sender_aid?: string;
 }
 
 /** 确认结果 */

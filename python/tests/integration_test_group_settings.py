@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""group.set_settings / group.get_settings / group.info 集成测试。
+"""group.set_settings / group.get_settings / group.get_info 集成测试。
 
 覆盖：
   1. set_settings 写入 groups 表字段（name, visibility）
@@ -10,14 +10,12 @@
   6. get_settings 全量读取
   7. get_settings keys 过滤读取
   8. info 基本信息（成员视角）
-  9. info include=["stats"]
-  10. info 非成员看公开群
-  11. info 非成员看私有群被拒
-  12. 老方法写入 → 新方法能读到（兼容性）
-  13. 新方法写入 → 老方法能读到（兼容性）
-  14. 老方法返回含 _deprecated 字段
-  15. visibility=invite_only 向后兼容映射到 private
-  16. info include=["metrics"] 仅 admin 可见
+  9. info 非成员看公开群
+  10. info 非成员看私有群被拒
+  11. 老方法写入 → 新方法能读到（兼容性）
+  12. 新方法写入 → 老方法能读到（兼容性）
+  13. 老方法返回含 _deprecated 字段
+  14. visibility=invite_only 向后兼容映射到 private
 
 使用方法：
   AUN_DATA_ROOT="D:/modelunion/kite/docker-deploy/data/sdk-tester-aun" \
@@ -241,35 +239,19 @@ async def main():
                f"got: {keys_7}")
         print()
 
-        # ── 8. info: 成员视角 ──
-        print("--- 8. info: 成员视角 ---")
-        r8 = await alice.call("group.info", {"group_id": group_id})
-        _check("info 返回 group_id", r8.get("group_id") == group_id)
-        _check("info 含 name", r8.get("name") == f"Mixed-{_run_id}")
-        _check("info 含 owner_aid", r8.get("owner_aid") == _ALICE_AID)
-        _check("info 含 member_count", isinstance(r8.get("member_count"), int))
-        _check("info 含 message_seq", "message_seq" in r8)
-        _check("info 含 updated_at", "updated_at" in r8)
+        # ── 8. get_info: 成员视角 ──
+        print("--- 8. get_info: 成员视角 ---")
+        r8 = await alice.call("group.get_info", {"group_id": group_id, "required": ["member"]})
+        _check("get_info 返回 group_id", r8.get("group_id") == group_id)
+        _check("get_info 含 name", r8.get("name") == f"Mixed-{_run_id}")
+        _check("get_info 含 owner_aid", r8.get("owner_aid") == _ALICE_AID)
+        _check("get_info 含 member_count", isinstance(r8.get("member_count"), int))
+        _check("get_info 含 message_seq", "message_seq" in r8)
+        _check("get_info 含 updated_at", "updated_at" in r8)
         print()
 
-        # ── 9. info: include=["stats"] ──
-        print("--- 9. info: include=[\"stats\"] ---")
-        r9 = await alice.call("group.info", {
-            "group_id": group_id,
-            "include": ["stats"],
-        })
-        stats = r9.get("stats", {})
-        _check("stats 存在", isinstance(stats, dict) and len(stats) > 0)
-        _check("stats.human_count >= 0", stats.get("human_count", -1) >= 0)
-        _check("stats.admin_count >= 0", stats.get("admin_count", -1) >= 0)
-        # Alice 是 owner/admin，应看到额外字段
-        _check("admin 可见 pending_join_request_count",
-               "pending_join_request_count" in stats)
-        _check("admin 可见 ban_count", "ban_count" in stats)
-        print()
-
-        # ── 10. info: 非成员看公开群 ──
-        print("--- 10. info: 非成员看公开群 ---")
+        # ── 9. get_info: 非成员看公开群 ──
+        print("--- 9. get_info: 非成员看公开群 ---")
         # Bob 不在 private 群里，但 public 群他是成员。用 private_gid 不行因为它是 private。
         # 创建另一个 public 群，Bob 不加入
         pub2_name = f"PubNoMember-{_run_id}"
@@ -278,7 +260,7 @@ async def main():
             "visibility": "public",
         })
         pub2_gid = (cr_pub2.get("group") or {}).get("group_id", "")
-        r10 = await bob.call("group.info", {"group_id": pub2_gid})
+        r10 = await bob.call("group.get_info", {"group_id": pub2_gid})
         _check("非成员能看公开群基础信息", r10.get("group_id") == pub2_gid)
         _check("非成员看到 name", r10.get("name") == pub2_name)
         _check("非成员看不到 owner_aid", "owner_aid" not in r10)
@@ -289,64 +271,17 @@ async def main():
             pass
         print()
 
-        # ── 11. info: 非成员看私有群被拒 ──
-        print("--- 11. info: 非成员看私有群被拒 ---")
+        # ── 10. get_info: 非成员看私有群被拒 ──
+        print("--- 10. get_info: 非成员看私有群被拒 ---")
         try:
-            await bob.call("group.info", {"group_id": private_gid})
+            await bob.call("group.get_info", {"group_id": private_gid})
             _check("非成员看私有群应被拒", False, "没有抛异常")
         except Exception as exc:
             _check("非成员看私有群被拒", True, str(exc)[:80])
         print()
 
-        # ── 12. 老方法写 → 新方法读（兼容性）──
-        print("--- 12. 老方法写 → 新方法读 ---")
-        await alice.call("group.update_rules", {
-            "group_id": group_id,
-            "content": "老方法写的群规",
-        })
-        r12 = await alice.call("group.get_settings", {
-            "group_id": group_id,
-            "keys": ["rules.content"],
-        })
-        rules_from_new = None
-        for s in r12.get("settings", []):
-            if s["key"] == "rules.content":
-                rules_from_new = s["value"]
-        _check("新方法能读到老方法写的群规",
-               rules_from_new == "老方法写的群规",
-               f"got: {rules_from_new}")
-        print()
-
-        # ── 13. 新方法写 → 老方法读（兼容性）──
-        print("--- 13. 新方法写 → 老方法读 ---")
-        await alice.call("group.set_settings", {
-            "group_id": group_id,
-            "settings": {"rules.content": "新方法写的群规"},
-        })
-        r13 = await alice.call("group.get_rules", {"group_id": group_id})
-        _check("老方法能读到新方法写的群规",
-               r13.get("rules", {}).get("content") == "新方法写的群规",
-               f"got: {r13.get('rules', {}).get('content')}")
-        print()
-
-        # ── 14. 老方法返回 _deprecated ──
-        print("--- 14. 老方法返回 _deprecated ---")
-        r14_rules = await alice.call("group.update_rules", {
-            "group_id": group_id,
-            "content": "再次写入",
-        })
-        _check("update_rules 返回含 _deprecated",
-               "_deprecated" in r14_rules,
-               f"keys: {list(r14_rules.keys())}")
-
-        r14_ann = await alice.call("group.get_announcement", {"group_id": group_id})
-        _check("get_announcement 返回含 _deprecated",
-               "_deprecated" in r14_ann,
-               f"keys: {list(r14_ann.keys())}")
-        print()
-
-        # ── 15. invite_only 向后兼容 ──
-        print("--- 15. visibility=invite_only 向后兼容 ---")
+        # ── 11. invite_only 向后兼容 ──
+        print("--- 11. visibility=invite_only 向后兼容 ---")
         await alice.call("group.set_settings", {
             "group_id": group_id,
             "settings": {"visibility": "invite_only"},
@@ -361,24 +296,6 @@ async def main():
                 visibility_value = s["value"]
         _check("invite_only 被映射为 private", visibility_value == "private",
                f"got: {visibility_value}")
-        print()
-
-        # ── 16. info: metrics 仅 admin 可见 ──
-        print("--- 16. info: metrics 仅 admin 可见 ---")
-        r16 = await alice.call("group.info", {
-            "group_id": group_id,
-            "include": ["metrics"],
-        })
-        _check("admin 可见 metrics", "metrics" in r16,
-               f"keys: {list(r16.keys())}")
-        try:
-            await bob.call("group.info", {
-                "group_id": group_id,
-                "include": ["metrics"],
-            })
-            _check("非 admin 应被拒绝 metrics", False, "没有抛异常")
-        except Exception as exc:
-            _check("非 admin 被拒绝 metrics", True, str(exc)[:80])
         print()
 
     except Exception as exc:
