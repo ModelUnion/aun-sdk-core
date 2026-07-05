@@ -31,6 +31,14 @@ import (
 
 // v2GroupBootstrapTTL 群 bootstrap 缓存有效期。
 const v2GroupBootstrapTTL = time.Hour
+const v2GroupSendIdempotencyTTL = 10 * time.Minute
+const v2GroupSendIdempotencyMaxEntries = 512
+
+type v2GroupSendIdempotencyEntry struct {
+	Envelope  map[string]any
+	Result    map[string]any
+	UpdatedAt time.Time
+}
 
 // v2GroupBootstrapEntry 群 bootstrap 缓存项。
 type v2GroupBootstrapEntry struct {
@@ -40,6 +48,102 @@ type v2GroupBootstrapEntry struct {
 	StateCommitment *e2ee.StateCommitmentAAD
 	CachedAt        time.Time
 	WrapPolicy      *v2WrapPolicy
+}
+
+func v2GroupSendIdempotencyKey(groupID, messageID string) string {
+	groupID = strings.TrimSpace(groupID)
+	messageID = strings.TrimSpace(messageID)
+	if groupID == "" || messageID == "" {
+		return ""
+	}
+	return groupID + "\x00" + messageID
+}
+
+func (v *v2E2EECoordinator) pruneGroupSendIdempotencyLocked(now time.Time) {
+	if v.groupSendIdempotency == nil {
+		v.groupSendIdempotency = make(map[string]v2GroupSendIdempotencyEntry)
+		return
+	}
+	for key, entry := range v.groupSendIdempotency {
+		if entry.UpdatedAt.IsZero() || now.Sub(entry.UpdatedAt) > v2GroupSendIdempotencyTTL {
+			delete(v.groupSendIdempotency, key)
+		}
+	}
+	if len(v.groupSendIdempotency) <= v2GroupSendIdempotencyMaxEntries {
+		return
+	}
+	target := v2GroupSendIdempotencyMaxEntries / 2
+	for key := range v.groupSendIdempotency {
+		delete(v.groupSendIdempotency, key)
+		if len(v.groupSendIdempotency) <= target {
+			break
+		}
+	}
+}
+
+func (v *v2E2EECoordinator) getGroupSendCachedResult(key string) (map[string]any, bool) {
+	if key == "" {
+		return nil, false
+	}
+	v.groupSendIdempotencyMu.Lock()
+	defer v.groupSendIdempotencyMu.Unlock()
+	v.pruneGroupSendIdempotencyLocked(time.Now())
+	entry, ok := v.groupSendIdempotency[key]
+	if !ok || entry.Result == nil {
+		return nil, false
+	}
+	return copyMapShallow(entry.Result), true
+}
+
+func (v *v2E2EECoordinator) getGroupSendCachedEnvelope(key string) (map[string]any, bool) {
+	if key == "" {
+		return nil, false
+	}
+	v.groupSendIdempotencyMu.Lock()
+	defer v.groupSendIdempotencyMu.Unlock()
+	v.pruneGroupSendIdempotencyLocked(time.Now())
+	entry, ok := v.groupSendIdempotency[key]
+	if !ok || entry.Envelope == nil {
+		return nil, false
+	}
+	return copyMapShallow(entry.Envelope), true
+}
+
+func (v *v2E2EECoordinator) rememberGroupSendEnvelope(key string, envelope map[string]any) {
+	if key == "" || envelope == nil {
+		return
+	}
+	v.groupSendIdempotencyMu.Lock()
+	defer v.groupSendIdempotencyMu.Unlock()
+	now := time.Now()
+	v.pruneGroupSendIdempotencyLocked(now)
+	entry := v.groupSendIdempotency[key]
+	entry.Envelope = copyMapShallow(envelope)
+	entry.UpdatedAt = now
+	v.groupSendIdempotency[key] = entry
+}
+
+func (v *v2E2EECoordinator) rememberGroupSendResult(key string, result map[string]any) {
+	if key == "" || result == nil {
+		return
+	}
+	v.groupSendIdempotencyMu.Lock()
+	defer v.groupSendIdempotencyMu.Unlock()
+	now := time.Now()
+	v.pruneGroupSendIdempotencyLocked(now)
+	entry := v.groupSendIdempotency[key]
+	entry.Result = copyMapShallow(result)
+	entry.UpdatedAt = now
+	v.groupSendIdempotency[key] = entry
+}
+
+func (v *v2E2EECoordinator) dropGroupSendIdempotency(key string) {
+	if key == "" {
+		return
+	}
+	v.groupSendIdempotencyMu.Lock()
+	delete(v.groupSendIdempotency, key)
+	v.groupSendIdempotencyMu.Unlock()
 }
 
 // SendGroupV2 V2 Group 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
@@ -74,17 +178,26 @@ func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID str
 		resultParams["timestamp"] = opts.Timestamp
 	}
 
+	idempotencyKey := v2GroupSendIdempotencyKey(groupID, opts.MessageID)
+	if cachedResult, ok := v.getGroupSendCachedResult(idempotencyKey); ok {
+		c.logE2.Debug("group.v2.send cached result hit: group=%s message_id=%s", groupID, opts.MessageID)
+		return c.delivery().attachSendResultEnvelope("group.send", resultParams, cachedResult, true).(map[string]any), nil
+	}
+
 	resp, err := v.v2GroupSendOnce(ctx, state, groupID, payload, true, opts)
 	if err == nil {
+		v.rememberGroupSendResult(idempotencyKey, resp)
 		return c.delivery().attachSendResultEnvelope("group.send", resultParams, resp, true).(map[string]any), nil
 	}
 	if isV2RetryableError(err) {
 		c.logE2.Debug("V2 Group speculative send rejected (code=%d), refreshing bootstrap", v2ErrorCode(err))
 		v.deleteGroupBootstrapCache(groupID)
+		v.dropGroupSendIdempotency(idempotencyKey)
 		resp, retryErr := v.v2GroupSendOnce(ctx, state, groupID, payload, false, opts)
 		if retryErr != nil {
 			return nil, retryErr
 		}
+		v.rememberGroupSendResult(idempotencyKey, resp)
 		return c.delivery().attachSendResultEnvelope("group.send", resultParams, resp, true).(map[string]any), nil
 	}
 	return nil, err
@@ -94,6 +207,25 @@ func (v *v2E2EECoordinator) SendGroupV2WithOpts(ctx context.Context, groupID str
 func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
 	c := v.runtime.client
 	c.logE2.Debug("group.v2.send attempt: group=%s use_cache=%v", groupID, useCache)
+	idempotencyKey := v2GroupSendIdempotencyKey(groupID, opts.MessageID)
+	if cachedEnvelope, ok := v.getGroupSendCachedEnvelope(idempotencyKey); ok {
+		c.logE2.Debug("group.v2.send reuse cached envelope: group=%s message_id=%s", groupID, opts.MessageID)
+		raw, err := c.Call(ctx, "group.v2.send", map[string]any{
+			"group_id":  groupID,
+			"group_aid": groupID,
+			"envelope":  cachedEnvelope,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if m, ok := raw.(map[string]any); ok {
+			c.logE2.Debug("group.v2.send ok: group=%s cached_envelope=true seq=%d", groupID, toInt64(m["seq"]))
+			return m, nil
+		}
+		c.logE2.Debug("group.v2.send ok: group=%s cached_envelope=true seq=<unknown>", groupID)
+		return map[string]any{}, nil
+	}
+
 	allDevices, epoch, sc, auditRaw, wrapPolicy, usedCachedBootstrap, err := v.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
@@ -153,6 +285,7 @@ func (v *v2E2EECoordinator) v2GroupSendOnce(ctx context.Context, state *v2P2PSta
 		"audit_count":       len(auditRaw),
 		"use_cache":         useCache,
 	})
+	v.rememberGroupSendEnvelope(idempotencyKey, envelope)
 
 	raw, err := c.Call(ctx, "group.v2.send", map[string]any{
 		"group_id":  groupID,
@@ -235,6 +368,7 @@ type groupV2PullOptions struct {
 	explicitAfterSeq bool
 	cursorParams     map[string]any
 	wireGroupID      string
+	ackUpToSeq       int64
 }
 
 // PullGroupV2 拉取并解密 V2 Group 消息。
@@ -242,8 +376,89 @@ type groupV2PullOptions struct {
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // limit<=0 时默认 50。
 func (v *v2E2EECoordinator) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
-	msgs, _, err := v.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{})
-	return msgs, err
+	c := v.runtime.client
+	rawGroupID := strings.TrimSpace(groupID)
+	groupAID := groupAIDOrRaw(rawGroupID)
+	if groupAID == "" {
+		return nil, errors.New("pull_group_v2: group_id 不能为空")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	ns := "group:" + groupAID
+	nextAfterSeq := afterSeq
+	if nextAfterSeq == 0 {
+		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
+	}
+	allMsgs := make([]map[string]any, 0)
+	lastAutoAckSeq := int64(0)
+	pendingAckSeq := int64(0)
+	for pageCount := 0; pageCount < 100; pageCount++ {
+		pageContigBefore := c.seqTracker.GetContiguousSeq(ns)
+		ackUpToSeq := pendingAckSeq
+		msgs, pageMeta, err := v.pullGroupV2WithOptions(ctx, groupAID, nextAfterSeq, limit, groupV2PullOptions{
+			ackUpToSeq:  ackUpToSeq,
+			wireGroupID: rawGroupID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if ackUpToSeq > 0 {
+			pendingAckSeq = 0
+			if ackUpToSeq > lastAutoAckSeq {
+				lastAutoAckSeq = ackUpToSeq
+			}
+		}
+		nextAfter := nextAfterSeq
+		if pageMeta.latestSeq > nextAfter {
+			nextAfter = pageMeta.latestSeq
+		}
+		if nextAfter > nextAfterSeq {
+			allMsgs = append(allMsgs, msgs...)
+		}
+		contig := c.seqTracker.GetContiguousSeq(ns)
+		ackNeeded := contig > 0 &&
+			int64(contig) > lastAutoAckSeq &&
+			(contig != pageContigBefore || (pageMeta.hasServerAck && int64(contig) > pageMeta.serverAckSeq))
+		if ackNeeded {
+			ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
+			if ackSeq > 0 {
+				canContinuePage := pageMeta.latestSeq > nextAfterSeq
+				if canContinuePage {
+					if ackSeq > pendingAckSeq {
+						pendingAckSeq = ackSeq
+					}
+					if ackSeq > lastAutoAckSeq {
+						lastAutoAckSeq = ackSeq
+					}
+					c.logE2.Debug("group.v2.pull queued piggyback auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", groupAID, ns, pendingAckSeq, pageMeta.rawCount)
+				} else {
+					if _, err := v.ackGroupV2(ctx, groupAID, ackSeq); err != nil {
+						return nil, err
+					}
+					if ackSeq > lastAutoAckSeq {
+						lastAutoAckSeq = ackSeq
+					}
+				}
+			}
+		}
+		canContinuePage := pageMeta.rawCount > 0 && nextAfter > nextAfterSeq
+		fullPage := canContinuePage && limit > 0 && pageMeta.rawCount >= limit
+		shouldContinue := canContinuePage && (fullPage || pendingAckSeq > 0)
+		if !shouldContinue {
+			break
+		}
+		if delay := v2PullTailDelay(pageMeta.rawCount, limit); delay > 0 {
+			sleepWithCancel(ctx, delay)
+		}
+		nextAfterSeq = nextAfter
+	}
+	if pendingAckSeq > 0 {
+		if _, err := v.ackGroupV2(ctx, groupAID, pendingAckSeq); err != nil {
+			return nil, err
+		}
+	}
+	return allMsgs, nil
 }
 
 func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID string, afterSeq int64, limit int, opts groupV2PullOptions) ([]map[string]any, v2PullPageMeta, error) {
@@ -275,13 +490,19 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
-	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ns=%s", groupID, effectiveAfterSeq, limit, ns)
-	raw, err := v.rawGroupV2Pull(ctx, wireGroupID, groupID, effectiveAfterSeq, limit, opts.cursorParams)
+	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ack_up_to_seq=%d ns=%s", groupID, effectiveAfterSeq, limit, opts.ackUpToSeq, ns)
+	raw, err := v.rawGroupV2Pull(ctx, wireGroupID, groupID, effectiveAfterSeq, limit, opts.cursorParams, opts.ackUpToSeq)
 	if err != nil {
 		return nil, meta, err
 	}
 	result, _ := raw.(map[string]any)
-	messages := v2ToMapList(result["messages"])
+	pageMessages := v2ToMapList(result["messages"])
+	messages := make([]map[string]any, 0, len(pageMessages))
+	for _, msg := range pageMessages {
+		if toInt64(msg["seq"]) > effectiveAfterSeq {
+			messages = append(messages, msg)
+		}
+	}
 	serverAckSeq := int64(0)
 	hasServerAckSeq := false
 	if cursor, ok := result["cursor"].(map[string]any); ok {
@@ -293,7 +514,7 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 		serverAckSeq: serverAckSeq,
 		hasServerAck: hasServerAckSeq,
 	}
-	c.logE2.Debug("group.v2.pull response: group=%s raw_count=%d cursor_current=%d has_more=%v", groupID, len(messages), serverAckSeq, result["has_more"])
+	c.logE2.Debug("group.v2.pull response: group=%s raw_count=%d stale_count=%d cursor_current=%d has_more=%v", groupID, len(messages), len(pageMessages)-len(messages), serverAckSeq, result["has_more"])
 	for _, msg := range messages {
 		c.logMessageDebug("pull-raw", "group.v2.pull", "group.message_created", msg, nil)
 	}
@@ -310,6 +531,7 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 			maxSeq = seq
 		}
 	}
+	meta.latestSeq = maxSeq
 
 	if v.canParallelDecryptV2Page(messages, groupID, false) {
 		for _, plaintext := range v.decryptV2PageParallel(ctx, state, messages, groupID, false) {
@@ -372,7 +594,7 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 	return decrypted, meta, nil
 }
 
-func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, wireGroupID string, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, wireGroupID string, groupID string, afterSeq int64, limit int, cursorParams map[string]any, ackUpToSeq int64) (any, error) {
 	c := v.runtime.client
 	wireGroupID = strings.TrimSpace(wireGroupID)
 	groupID = groupAIDOrRaw(groupID)
@@ -389,6 +611,9 @@ func (v *v2E2EECoordinator) rawGroupV2Pull(ctx context.Context, wireGroupID stri
 		if v != nil {
 			params[k] = v
 		}
+	}
+	if ackUpToSeq > 0 {
+		params["ack_up_to_seq"] = ackUpToSeq
 	}
 	if _, exists := params["device_id"]; !exists {
 		params["device_id"] = c.deviceID
@@ -472,7 +697,7 @@ func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, 
 }
 
 func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
-	return c.getV2E2EECoordinator().rawGroupV2Pull(ctx, groupID, groupAIDOrRaw(groupID), afterSeq, limit, cursorParams)
+	return c.getV2E2EECoordinator().rawGroupV2Pull(ctx, groupID, groupAIDOrRaw(groupID), afterSeq, limit, cursorParams, 0)
 }
 
 func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {

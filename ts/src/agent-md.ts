@@ -485,7 +485,7 @@ export class AgentMdManager {
     if (etag && owner) this.observeMeta(owner, etag, '', 'rpc.self');
     const etags = meta.agent_md_etags;
     if (isJsonObject(etags as JsonValue | object | null | undefined)) {
-      for (const key of ['requester', 'peer', 'receiver', 'target', 'to', 'sender', 'from']) {
+      for (const key of ['requester', 'peer', 'group', 'receiver', 'target', 'to', 'sender', 'from']) {
         const item = (etags as JsonObject)[key];
         if (!isJsonObject(item as JsonValue | object | null | undefined)) continue;
         const obj = item as JsonObject;
@@ -504,19 +504,34 @@ export class AgentMdManager {
     const env = envelope as JsonObject;
     if (!isJsonObject(env.agent_md as JsonValue | object | null | undefined)) return;
     const agentMd = env.agent_md as JsonObject;
-    if (!isJsonObject(agentMd.sender as JsonValue | object | null | undefined)) return;
-    const sender = agentMd.sender as JsonObject;
-    let senderAid = String(sender.aid ?? '').trim();
-    if (!senderAid) {
-      const aad = isJsonObject(env.aad as JsonValue | object | null | undefined) ? env.aad as JsonObject : {};
-      senderAid = String(aad.from ?? env.from ?? '').trim();
+    if (isJsonObject(agentMd.sender as JsonValue | object | null | undefined)) {
+      const sender = agentMd.sender as JsonObject;
+      let senderAid = String(sender.aid ?? '').trim();
+      if (!senderAid) {
+        const aad = isJsonObject(env.aad as JsonValue | object | null | undefined) ? env.aad as JsonObject : {};
+        senderAid = String(aad.from ?? env.from ?? '').trim();
+      }
+      this.observeMeta(
+        senderAid,
+        String(sender.etag ?? ''),
+        String(sender.last_modified ?? sender.lastModified ?? ''),
+        'envelope.sender',
+      );
     }
-    this.observeMeta(
-      senderAid,
-      String(sender.etag ?? ''),
-      String(sender.last_modified ?? sender.lastModified ?? ''),
-      'envelope',
-    );
+    if (isJsonObject(agentMd.group as JsonValue | object | null | undefined)) {
+      const group = agentMd.group as JsonObject;
+      let groupAid = String(group.aid ?? '').trim();
+      if (!groupAid) {
+        const aad = isJsonObject(env.aad as JsonValue | object | null | undefined) ? env.aad as JsonObject : {};
+        groupAid = String(env.group_aid ?? env.group_id ?? aad.group_aid ?? aad.group_id ?? '').trim();
+      }
+      this.observeMeta(
+        groupAid,
+        String(group.etag ?? ''),
+        String(group.last_modified ?? group.lastModified ?? ''),
+        'envelope.group',
+      );
+    }
   }
 
   eventSnapshot(aid?: string | null): { local_etag: string; remote_etag: string } | null {

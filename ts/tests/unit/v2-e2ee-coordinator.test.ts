@@ -46,6 +46,16 @@ function createCoordinator(): { coordinator: V2E2EECoordinator; client: Record<s
   return { client, coordinator: new V2E2EECoordinator(new ClientRuntime(client)) };
 }
 
+function createSeqTracker(): Record<string, any> {
+  const contiguous = new Map<string, number>();
+  return {
+    getContiguousSeq: vi.fn((ns: string) => contiguous.get(ns) ?? 0),
+    forceContiguousSeq: vi.fn((ns: string, seq: number) => {
+      contiguous.set(ns, seq);
+    }),
+  };
+}
+
 describe('V2E2EECoordinator 组件边界', () => {
   it('bootstrap cache 支持 set/get/delete/clear 和 TTL prune', () => {
     const { coordinator } = createCoordinator();
@@ -118,6 +128,73 @@ describe('V2E2EECoordinator 组件边界', () => {
     expect(coordinator.getBootstrapCacheEntry('alice.agentid.pub')).toBeUndefined();
     expect(client._buildV2P2PEnvelope.mock.calls.map((call: any[]) => call[0].useCache)).toEqual([true, false]);
     expect(client._transport.call).toHaveBeenCalledTimes(2);
+  });
+
+  it('message.v2.pull 将自动 ack piggyback 到下一页 pull', async () => {
+    const { coordinator, client } = createCoordinator();
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    client._ensureV2SessionReady = vi.fn(async () => undefined);
+    client._seqTracker = createSeqTracker();
+    client._clampAckSeq = vi.fn((_method: string, _field: string, _ns: string, seq: number) => seq);
+    client._drainOrderedMessages = vi.fn(async () => undefined);
+    client._persistSeq = vi.fn();
+    client._publishPulledMessage = vi.fn(async () => true);
+    client._decryptV2Message = vi.fn(async (msg: Record<string, unknown>) => ({ seq: msg.seq, payload: { type: 'text' } }));
+    client._callRawV2Rpc = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params: { ...params } });
+      if (method === 'message.v2.pull') {
+        if (Number(params.after_seq ?? 0) === 0) {
+          return { messages: [{ version: 'v2', seq: 1 }, { version: 'v2', seq: 2 }], has_more: false };
+        }
+        return { messages: [], has_more: false };
+      }
+      throw new Error(`unexpected rpc ${method}`);
+    });
+
+    const messages = await coordinator.pullV2(0, 2, { gateLocked: true });
+
+    expect(messages).toHaveLength(2);
+    const pullCalls = calls.filter((call) => call.method === 'message.v2.pull');
+    expect(pullCalls).toHaveLength(2);
+    expect(pullCalls[1].params.ack_up_to_seq).toBe(2);
+    expect(calls.some((call) => call.method === 'message.v2.ack')).toBe(false);
+  });
+
+  it('group.v2.pull 将自动 ack piggyback 到下一页 pull', async () => {
+    const { coordinator, client } = createCoordinator();
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    client._ensureV2SessionReady = vi.fn(async () => undefined);
+    client._seqTracker = createSeqTracker();
+    client._clampAckSeq = vi.fn((_method: string, _field: string, _ns: string, seq: number) => seq);
+    client._drainOrderedMessages = vi.fn(async () => undefined);
+    client._persistSeq = vi.fn();
+    client._publishPulledMessage = vi.fn(async () => true);
+    client._pullRetentionFloor = vi.fn(() => 0);
+    client._delivery.recallEventFromGroupMessage = vi.fn(() => null);
+    client._callRawV2Rpc = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params: { ...params } });
+      if (method === 'group.v2.pull') {
+        if (Number(params.after_seq ?? 0) === 0) {
+          return {
+            messages: [
+              { version: 'v1', seq: 1, message_id: 'gm-1', from_aid: 'alice.agentid.pub', payload: { type: 'text', text: '1' } },
+              { version: 'v1', seq: 2, message_id: 'gm-2', from_aid: 'alice.agentid.pub', payload: { type: 'text', text: '2' } },
+            ],
+            has_more: false,
+          };
+        }
+        return { messages: [], has_more: false };
+      }
+      throw new Error(`unexpected rpc ${method}`);
+    });
+
+    const messages = await coordinator.pullGroupV2('group.example.com/g1', 0, 2, { gateLocked: true });
+
+    expect(messages).toHaveLength(2);
+    const pullCalls = calls.filter((call) => call.method === 'group.v2.pull');
+    expect(pullCalls).toHaveLength(2);
+    expect(pullCalls[1].params.ack_up_to_seq).toBe(2);
+    expect(calls.some((call) => call.method === 'group.v2.ack')).toBe(false);
   });
 
   it('encrypted push 解密失败时只发布 header-only undecryptable 事件', async () => {

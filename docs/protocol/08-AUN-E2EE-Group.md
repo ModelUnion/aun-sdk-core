@@ -4,7 +4,7 @@
 > 状态：规范性文档
 > 适用范围：AUN 客户端 SDK、客户端应用、跨语言实现
 > 不适用范围：Group Service 服务端加解密实现
-> 前置依赖：[08-AUN-E2EE](./08-AUN-E2EE.md)（P2P E2EE 规范，V2 群组复用其 Prekey 体系、AAD 序列化规则）、[10-Group-子协议](./10-Group-子协议.md)
+> 前置依赖：当前 P2P V2 链路见 [E2EE_V2消息通信时序图](../sdk/E2EE_V2消息通信时序图.md) 和 [05-E2EE加密通信](../sdk/05-E2EE加密通信.md)；旧 P2P 信封见 [08-AUN-E2EE](./08-AUN-E2EE.md)；群组基础语义见 [10-Group-子协议](./10-Group-子协议.md)。
 > 定位：**群组消息端到端加密层**，基于 per-message 密钥 + per-recipient 包裹机制
 
 ---
@@ -42,7 +42,7 @@ Group Service **绝不做**：
 | 原则 | 说明 |
 |------|------|
 | **消息级密钥** | 每条消息使用独立随机密钥，发送方一次性会话密钥用完即弃，不维护群级长期对称密钥 |
-| **复用 P2P V2 Prekey 体系** | 接收方设备密钥包裹基于 P2P E2EE（[08-AUN-E2EE](./08-AUN-E2EE.md)）的 IK/SPK Prekey 机制，缺少群内设备 Prekey 时可回退到该设备已注册的 P2P Prekey |
+| **复用 V2 设备密钥体系** | 接收方设备密钥包裹基于当前 E2EE V2 的 IK/SPK 机制；群内优先使用 `group_device_prekey`，缺少群内设备 Prekey 时可回退到该设备已注册的 P2P Prekey |
 | **不信任服务端** | 消息密钥从未经过服务端明文；接收方按设备分别持有的密钥包裹只有对应设备的私钥能解开 |
 | **成员状态可验证** | 群成员集合与权限的变更通过签名的状态版本链（state_version/state_chain）記录，接收方可据此检测状态分叉或篡改 |
 
@@ -52,7 +52,7 @@ Group Service **绝不做**：
 
 AUN-E2EE-Group 建立在以下核心能力之上：
 
-- **P2P E2EE V2**（[08-AUN-E2EE](./08-AUN-E2EE.md)）：设备 Prekey（IK/SPK）注册与管理机制、AAD 序列化规则（Canonical JSON）均直接复用
+- **P2P E2EE V2**：设备 Prekey（IK/SPK）注册与管理机制、recipient wrap、AAD 序列化规则（Canonical JSON）均与 SDK V2 多设备 wrap 保持一致
 - **Group 子协议**（[10-Group-子协议](./10-Group-子协议.md)）：群组管理、成员管理、消息传输
 - **AID + 证书链身份体系**：成员身份验证
 
@@ -95,7 +95,7 @@ AUN-E2EE-Group 建立在以下核心能力之上：
 | 接收方设备身份密钥（IK） | 接收方，AID 级别 | 长期 | 与 AID 身份证书绑定 |
 | 接收方设备 Prekey（SPK） | 接收方，设备级别 | 定期轮换 | 群内设备 Prekey（`group_device_prekey`）通过 `group.v2.put_group_pk` 注册；缺失时回退到该设备已注册的 P2P Prekey，此时安全强度降级为仅身份密钥参与协商 |
 
-具体的密钥协商组合方式（是否使用 Prekey、密钥派生的哈希函数与输入构成）与 [08-AUN-E2EE](./08-AUN-E2EE.md) 的 P2P V2 加密模式一致，本规范不重复列出精确公式，实现请参照该文档及各语言 SDK 的密码学模块源码。
+具体的密钥协商组合方式（是否使用 SPK、密钥派生的哈希函数与输入构成）与当前 P2P V2 recipient wrap 机制一致，本规范不重复列出精确公式，实现请参照 SDK V2 时序文档及各语言 SDK 的密码学模块源码。
 
 ### 4.2 每条消息的密钥包裹
 
@@ -184,7 +184,7 @@ AUN-E2EE-Group 建立在以下核心能力之上：
 | `epoch` | 消息所属的密钥版本号 |
 | `state_commitment` | 绑定发送时刻的成员状态摘要（`state_version`/`state_hash`/`state_chain`） |
 
-AAD 采用 Canonical JSON 序列化（递归键排序、UTF-8 直出、紧凑格式），规则与 [08-AUN-E2EE §8.3](./08-AUN-E2EE.md) 完全一致。
+AAD 采用 Canonical JSON 序列化（递归键排序、UTF-8 直出、紧凑格式），规则与当前 SDK V2 recipient wrap 实现保持一致。
 
 ### 7.2 外层信封
 
@@ -202,7 +202,7 @@ AAD 采用 Canonical JSON 序列化（递归键排序、UTF-8 直出、紧凑格
 ## 9. 客户端密钥存储
 
 - 发送方一次性会话密钥用后即弃，不持久化。
-- 接收方的设备身份密钥（IK）与设备 Prekey（SPK）私钥的存储、保护方式与 [08-AUN-E2EE](./08-AUN-E2EE.md) 的 P2P V2 Prekey 存储机制一致（本地密钥库 + 平台级密钥保护，明文不落盘）。
+- 接收方的设备身份密钥（IK）与设备 Prekey（SPK）私钥由本地 V2 key store 保存，并按平台能力使用本地密钥保护；明文私钥不得落入服务端。
 - 消息密钥本身不需要持久化——每条消息独立生成、独立解出、用后即弃；除非应用层自行缓存明文消息以支持离线查看。
 
 ---
@@ -236,15 +236,14 @@ AAD 覆盖所有路由关键字段（`group_id`、`from`、`epoch`、`message_id
 
 ### 11.2 客户端操作签名
 
-以下群组操作 **MUST** 附加客户端 ECDSA 签名（`client_signature` 字段），服务端强制验签：
+`client_signature` 是 Gateway / 服务端用于校验客户端业务操作来源的签名，不等同于 E2EE 信封里的 `sender_signature`。当前 Gateway 语义如下：
 
-- `group.send` / `group.v2.send`
-- `group.add_member`
-- `group.kick`
-- `group.leave`
-- `group.update_rules`
+- `group.send` / `group.v2.send` / `group.v2.pull` / `group.v2.ack` 等常规消息 RPC 在连接级认证身份与 RPC 参数声明身份一致时，使用连接级身份 fast path，不重复执行 ECDSA 验签。
+- 群管理、成员变更、状态提交、E2EE bootstrap / state proposal 等敏感操作仍可要求或验证 `client_signature`。
+- 如果 RPC 参数中的 `aid` / `device_id` / `slot_id` 等身份声明与连接级身份不一致，Gateway 必须要求 `client_signature` 并完成验签；签名 AID 与连接 AID 不一致时只允许明确支持能力身份的命名空间。
+- 客户端主动携带 `client_signature` 时，Gateway 会按当前缓存策略验证签名并向下游注入已验证上下文。
 
-签名生成、`params_hash` 计算规则与验签流程见 [10-Group-子协议](./10-Group-子协议.md) 及 SDK RPC 手册中对应方法的说明，本规范不重复列出。
+E2EE 安全性仍由接收端验证 `sender_signature`、AAD、recipient proof / digest 和 state commitment 保证；Gateway 不应移除 E2EE 信封中的签名字段。
 
 ### 11.3 成员移除后的安全保证
 

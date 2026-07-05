@@ -697,7 +697,7 @@ class AgentMdManager:
             self.observe_meta(owner, etag, "", source="rpc.self")
         etags = meta.get("agent_md_etags")
         if isinstance(etags, dict):
-            for key in ("requester", "peer", "receiver", "target", "to", "sender", "from"):
+            for key in ("requester", "peer", "group", "receiver", "target", "to", "sender", "from"):
                 item = etags.get(key)
                 if not isinstance(item, dict):
                     continue
@@ -715,18 +715,35 @@ class AgentMdManager:
         if not isinstance(agent_md, dict):
             return
         sender = agent_md.get("sender")
-        if not isinstance(sender, dict):
-            return
-        sender_aid = str(sender.get("aid") or "").strip()
-        if not sender_aid:
-            aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
-            sender_aid = str(aad.get("from") or envelope.get("from") or "").strip()
-        self.observe_meta(
-            sender_aid,
-            str(sender.get("etag") or ""),
-            str(sender.get("last_modified") or sender.get("lastModified") or ""),
-            source="envelope",
-        )
+        if isinstance(sender, dict):
+            sender_aid = str(sender.get("aid") or "").strip()
+            if not sender_aid:
+                aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+                sender_aid = str(aad.get("from") or envelope.get("from") or "").strip()
+            self.observe_meta(
+                sender_aid,
+                str(sender.get("etag") or ""),
+                str(sender.get("last_modified") or sender.get("lastModified") or ""),
+                source="envelope.sender",
+            )
+        group = agent_md.get("group")
+        if isinstance(group, dict):
+            group_aid = str(group.get("aid") or "").strip()
+            if not group_aid:
+                aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+                group_aid = str(
+                    envelope.get("group_aid")
+                    or envelope.get("group_id")
+                    or aad.get("group_aid")
+                    or aad.get("group_id")
+                    or ""
+                ).strip()
+            self.observe_meta(
+                group_aid,
+                str(group.get("etag") or ""),
+                str(group.get("last_modified") or group.get("lastModified") or ""),
+                source="envelope.group",
+            )
 
     def event_snapshot(self, aid: str | None = None) -> dict[str, str] | None:
         target = str(aid or self._owner_aid() or "").strip()

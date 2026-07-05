@@ -1,10 +1,12 @@
-# AUN-E2EE 扩展规范
+# AUN-E2EE 历史扩展规范（Legacy）
 
 > 版本：2.0-draft
-> 状态：规范性文档
+> 状态：历史兼容文档
 > 适用范围：AUN 客户端 SDK、客户端应用、跨语言实现
 > 不适用范围：Gateway、Message 模块的加解密实现
-> 定位：**独立安全层**，横跨 `gateway`、`peer`、`relay` 三种连接模式
+> 定位：旧 P2P E2EE 信封说明；当前默认主路径已迁移到 E2EE V2 多设备 wrap
+
+> **当前实现说明**：最近版本的 SDK 默认使用 V2 多设备 wrap。P2P 加密消息通过 `message.send` 承载 `e2ee.p2p_encrypted` envelope，Group 加密消息通过 `group.v2.send` 承载 `e2ee.group_encrypted` envelope；每条消息一把 `master_key`，按 recipient 设备生成 `3DH` / `1DH` wrap，接收端验证 `sender_signature`、AAD、recipient digest/proof 后解密。当前 V2 链路见 [E2EE_V2消息通信时序图](../sdk/E2EE_V2消息通信时序图.md)；群组 V2 规范见 [08-AUN-E2EE-Group](08-AUN-E2EE-Group.md)。本文保留 `prekey_ecdh_v2` / `long_term_key` 旧格式，用于历史兼容和迁移排查，不应作为新实现的默认发送格式。
 
 ---
 
@@ -108,7 +110,7 @@ AUN-E2EE 是 Layer 3 扩展协议，建立在以下核心能力之上：
 
 ### 5.2 密文消息
 
-通过 `message.send` 传输的加密业务消息，`encrypted` 必须为 `true`，`payload.type` 必须为 `e2ee.encrypted`。
+旧 `e2ee.encrypted` 信封通过 `message.send` 传输时，`encrypted` 必须为 `true`，`payload.type` 必须为 `e2ee.encrypted`。当前新实现应使用 V2 `e2ee.p2p_encrypted` 信封。
 
 ---
 
@@ -186,7 +188,7 @@ AUN-E2EE 支持两种加密模式，SDK 自动按优先级选择。
 
 ### 7.3 模式选择策略
 
-SDK **MUST** 按以下优先级自动选择：
+旧版 SDK 在 legacy 信封中按以下优先级自动选择：
 
 1. **优先**：prekey_ecdh_v2（服务端有接收方 prekey）
 2. **降级**：long_term_key（无 prekey 时，需客户端安全策略允许）
@@ -195,7 +197,7 @@ SDK **MUST** 按以下优先级自动选择：
 
 ### 7.4 兼容性
 
-- 发送端 **MUST** 使用 `prekey_ecdh_v2` 模式发送
+- 旧版发送端应优先使用 `prekey_ecdh_v2` 模式发送；当前新实现应使用 V2 多设备 wrap。
 
 ---
 

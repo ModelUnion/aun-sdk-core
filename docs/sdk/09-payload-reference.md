@@ -2,7 +2,7 @@
 
 `message.send.params.payload`、`message.thought.put.params.payload`、`group.send.params.payload` 和 `group.thought.put.params.payload` 使用同一套业务负载约定。`payload` 是应用层 JSON 对象，服务端只做大小、JSON 可序列化、信封/封装类型和加密相关的必要检查；业务字段由发送端和接收端协商，服务端不按本文字段做强制校验。
 
-示例展示的是 `payload` 片段：P2P 完整请求仍需要在同级传入 `to`；群消息完整请求仍需要在同级传入 `group_id`；思考内容需要在顶层通过 `context.type + context.id` 指定 selector。文本、图片、文件、思考内容等业务消息类型只能放在 `payload.type`；`message.send.params.type` / `message.thought.put.params.type` / `group.send.params.type` / `group.thought.put.params.type` 是信封或封装类型，例如 SDK 加密发送时自动填充的 `e2ee.encrypted` / `e2ee.group_encrypted`。
+示例展示的是 `payload` 片段：P2P 完整请求仍需要在同级传入 `to`；群消息完整请求仍需要在同级传入 `group_id`（兼容参数名，值使用目标态 `group_aid`）；思考内容需要在顶层通过 `context.type + context.id` 指定 selector。文本、图片、文件、思考内容等业务消息类型只能放在 `payload.type`；`message.send.params.type` / `message.thought.put.params.type` / `group.send.params.type` / `group.thought.put.params.type` 是信封或封装类型，例如 SDK V2 加密发送时自动填充的 `e2ee.p2p_encrypted` / `e2ee.group_encrypted`。
 
 ## 类型总览
 
@@ -38,14 +38,14 @@
 | 字段 | 所在位置 | 说明 |
 |------|----------|------|
 | `to` | `message.send.params` | P2P 接收方 AID |
-| `group_id` | `group.send.params` 和群消息信封 | 群组 ID |
+| `group_id` | `group.send.params` 和群消息信封 | 兼容字段名；值语义为目标态 `group_aid` |
 | `context.type + context.id` | `message.thought.put/get.params` 和 `group.thought.put/get.params` | 思考内容 selector；必填，不要只放在 payload 内 |
 | `protected_headers` / `headers` | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 参数 | E2EE 信封元数据，类似 HTTP headers；推荐 `protected_headers`，`headers` 仅为兼容别名；SDK 验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
 | `from` / `sender_aid` | 服务端生成的消息信封 | 发送方身份 |
 | `message_id` / `seq` / `timestamp` / `created_at` | 服务端生成或发送参数 | 当前消息 ID、序号和服务端时间 |
 | `encrypted` / `delivery_mode` | 发送参数或连接上下文 | 加密和 P2P 投递语义 |
 | `dispatch_mode` | 群消息信封和 SDK 注入的群消息 payload | 群消息应用层分发模式标签：`broadcast` / `mention`；由群设置决定，不作为 `group.send` 单次入参 |
-| `type` / `message_type` | 发送参数或消息信封 | 信封/封装类型，如 `e2ee.encrypted` / `e2ee.group_encrypted` |
+| `type` / `message_type` | 发送参数或消息信封 | 信封/封装类型，如 `e2ee.p2p_encrypted` / `e2ee.group_encrypted` |
 | `dispatch` / `duty_state` / `message_dispatch` | `group.send` 响应和群消息事件 | 群消息运行时分发状态和值班分发结果 |
 
 `protected_headers` 用于可见但需防篡改的信封元数据，例如 `device_id`、`slot_id`、`sdk_version`。它不属于业务 payload，也不提供机密性；需要端到端保密的上下文仍应放在 `payload.client_context` 或其他 payload 字段内。

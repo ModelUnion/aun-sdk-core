@@ -111,8 +111,26 @@ def finish_cli_invocation() -> None:
         _CURRENT_STATS = None
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_use_uvloop() -> bool:
+    return any(
+        _env_enabled(name)
+        for name in ("AUN_SDK_UVLOOP", "AUN_CLI_UVLOOP", "AUN_BENCH_UVLOOP")
+    )
+
+
 def run_async(coro) -> Any:
     """同步入口调用 SDK 异步方法"""
+    if _should_use_uvloop() and sys.platform != "win32":
+        try:
+            import uvloop
+
+            return uvloop.run(coro)
+        except ImportError:
+            pass
     return asyncio.run(coro)
 
 

@@ -87,21 +87,44 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if nsBefore != "" {
 		contigBefore = c.seqTracker.GetContiguousSeq(nsBefore)
 	}
-	allMsgs := make([]map[string]any, 0)
-	pullMeta := v2PullPageMeta{}
+	out := make([]any, 0)
 	nextAfterSeq := afterSeq
 	if !force && nextAfterSeq == 0 && nsBefore != "" {
 		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(nsBefore))
 	}
+	lastAutoAckSeq := int64(0)
+	pendingAckSeq := int64(0)
+	fireAck := func(ackSeq int64) {
+		if ackSeq <= 0 {
+			return
+		}
+		ackParams := map[string]any{
+			"up_to_seq": ackSeq,
+		}
+		go func() {
+			ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c.signClientOperation("message.v2.ack", ackParams)
+			ackParams["_rpc_background"] = true
+			if _, ackErr := c.transport.Call(ackCtx, "message.v2.ack", ackParams); ackErr != nil {
+				c.log.Debug("V2 P2P auto-ack failed: %v", ackErr)
+			}
+		}()
+	}
 	for pageCount := 0; pageCount < 100; pageCount++ {
-		msgs, pageMeta, err := c.pullV2WithForce(ctx, nextAfterSeq, limit, force)
+		pageContigBefore := contigBefore
+		if nsBefore != "" {
+			pageContigBefore = c.seqTracker.GetContiguousSeq(nsBefore)
+		}
+		ackUpToSeq := pendingAckSeq
+		msgs, pageMeta, err := c.pullV2WithForce(ctx, nextAfterSeq, limit, force, ackUpToSeq)
 		if err != nil {
 			return nil, err
 		}
-		if pageMeta.hasServerAck {
-			pullMeta.hasServerAck = true
-			if pageMeta.serverAckSeq > pullMeta.serverAckSeq {
-				pullMeta.serverAckSeq = pageMeta.serverAckSeq
+		if ackUpToSeq > 0 {
+			pendingAckSeq = 0
+			if ackUpToSeq > lastAutoAckSeq {
+				lastAutoAckSeq = ackUpToSeq
 			}
 		}
 		nextAfter := nextAfterSeq
@@ -109,55 +132,56 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 			nextAfter = pageMeta.latestSeq
 		}
 		if nextAfter > nextAfterSeq {
-			allMsgs = append(allMsgs, msgs...)
-			pullMeta.rawCount += pageMeta.rawCount
+			for _, m := range msgs {
+				out = append(out, m)
+				seq := toInt64(m["seq"])
+				event, payload := p2pAppEventForMessage(m)
+				if seq <= 0 || nsBefore == "" {
+					c.publishAppEvent(event, payload)
+					continue
+				}
+				c.publishPulledMessage(event, nsBefore, int(seq), payload)
+			}
 		}
-		if pageMeta.rawCount <= 0 || nextAfter <= nextAfterSeq {
+		if nsBefore != "" {
+			contig := c.seqTracker.GetContiguousSeq(nsBefore)
+			ackNeeded := contig > 0 &&
+				int64(contig) > lastAutoAckSeq &&
+				(contig != pageContigBefore || (pageMeta.hasServerAck && int64(contig) > pageMeta.serverAckSeq))
+			if ackNeeded {
+				ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", nsBefore, int64(contig))
+				if ackSeq > 0 {
+					canContinuePage := pageMeta.latestSeq > nextAfterSeq
+					if canContinuePage {
+						if ackSeq > pendingAckSeq {
+							pendingAckSeq = ackSeq
+						}
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+						c.log.Debug("message.v2.pull queued piggyback auto-ack: ns=%s ack_seq=%d raw_count=%d", nsBefore, pendingAckSeq, pageMeta.rawCount)
+					} else {
+						fireAck(ackSeq)
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+					}
+				}
+			}
+		}
+		canContinuePage := pageMeta.rawCount > 0 && nextAfter > nextAfterSeq
+		fullPage := canContinuePage && limit > 0 && pageMeta.rawCount >= limit
+		shouldContinue := canContinuePage && (fullPage || pendingAckSeq > 0)
+		if !shouldContinue {
 			break
+		}
+		if delay := v2PullTailDelay(pageMeta.rawCount, limit); delay > 0 {
+			sleepWithCancel(ctx, delay)
 		}
 		nextAfterSeq = nextAfter
 	}
-	out := make([]any, 0, len(allMsgs))
-	for _, m := range allMsgs {
-		out = append(out, m)
-	}
-	// 与 V1 路径一致：发布到应用层 + auto-ack；这里 PullV2 已自行更新 SeqTracker，
-	// 但还需要 publish 应用层事件 + 触发 auto-ack。
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	ns := ""
-	if myAID != "" {
-		ns = "p2p:" + myAID
-	}
-	for _, m := range allMsgs {
-		seq := toInt64(m["seq"])
-		event, payload := p2pAppEventForMessage(m)
-		if seq <= 0 || ns == "" {
-			c.publishAppEvent(event, payload)
-			continue
-		}
-		c.publishPulledMessage(event, ns, int(seq), payload)
-	}
-	if ns != "" {
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		ackNeeded := contig > 0 && (contig != contigBefore ||
-			(pullMeta.rawCount > 0 && pullMeta.hasServerAck && int64(contig) > pullMeta.serverAckSeq))
-		if ackNeeded {
-			ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(contig))
-			ackParams := map[string]any{
-				"up_to_seq": ackSeq,
-			}
-			go func() {
-				ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				c.signClientOperation("message.v2.ack", ackParams)
-				ackParams["_rpc_background"] = true
-				if _, ackErr := c.transport.Call(ackCtx, "message.v2.ack", ackParams); ackErr != nil {
-					c.log.Debug("V2 P2P auto-ack failed: %v", ackErr)
-				}
-			}()
-		}
+	if pendingAckSeq > 0 {
+		fireAck(pendingAckSeq)
 	}
 	return map[string]any{"messages": out}, nil
 }
@@ -240,39 +264,18 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	ns := "group:" + groupAID
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
 	ownsCursor := c.groupCursorTargetsCurrentInstance(params)
-	msgs, pullMeta, err := c.pullGroupV2WithOptions(ctx, groupAID, afterSeq, limit, groupV2PullOptions{
-		explicitAfterSeq: explicitAfterSeq,
-		cursorParams:     groupCursorParams(params),
-		wireGroupID:      wireGroupID,
-	})
-	if err != nil {
-		return nil, err
+	cursorParams := groupCursorParams(params)
+	out := make([]any, 0)
+	nextAfterSeq := afterSeq
+	if !explicitAfterSeq && nextAfterSeq == 0 {
+		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
-	out := make([]any, 0, len(msgs))
-	for _, m := range msgs {
-		seq := toInt64(m["seq"])
-		// 群撤回 tombstone（占位 / 通知 / legacy V1）：先识别再决定是否进列表。
-		// 命中则归一化为 group.message_recalled 事件并占 seq，但绝不 append 进返回的 messages
-		// 列表（否则撤回 tombstone 会作为"普通消息"泄漏给应用层）。对齐 Python/TS：识别后直接 continue。
-		if _, isRecall := recallEventFromGroupMessage(m); isRecall {
-			c.delivery().publishGroupRecallTombstone(groupAID, int(seq), m)
-			if seq > 0 {
-				c.markPushedSeq(ns, int(seq))
-			}
-			continue
+	lastAutoAckSeq := int64(0)
+	pendingAckSeq := int64(0)
+	fireAck := func(ackSeq int64) {
+		if ackSeq <= 0 {
+			return
 		}
-		out = append(out, m)
-		if seq <= 0 {
-			c.publishAppEvent("group.message_created", m)
-			continue
-		}
-		c.publishPulledMessage("group.message_created", ns, int(seq), m)
-	}
-	contig := c.seqTracker.GetContiguousSeq(ns)
-	ackNeeded := contig > 0 && ownsCursor && (contig != contigBefore ||
-		(pullMeta.rawCount > 0 && pullMeta.hasServerAck && int64(contig) > pullMeta.serverAckSeq))
-	if ackNeeded {
-		ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
 		ackParams := map[string]any{
 			"group_id":  groupAID,
 			"group_aid": groupAID,
@@ -287,6 +290,98 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 				c.logEG.Debug("V2 group auto-ack failed: group=%s %v", groupAID, ackErr)
 			}
 		}()
+	}
+	for pageCount := 0; pageCount < 100; pageCount++ {
+		pageContigBefore := contigBefore
+		if ownsCursor {
+			pageContigBefore = c.seqTracker.GetContiguousSeq(ns)
+		}
+		ackUpToSeq := int64(0)
+		if ownsCursor {
+			ackUpToSeq = pendingAckSeq
+		}
+		msgs, pageMeta, err := c.pullGroupV2WithOptions(ctx, groupAID, nextAfterSeq, limit, groupV2PullOptions{
+			explicitAfterSeq: explicitAfterSeq,
+			cursorParams:     cursorParams,
+			wireGroupID:      wireGroupID,
+			ackUpToSeq:       ackUpToSeq,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if ackUpToSeq > 0 {
+			pendingAckSeq = 0
+			if ackUpToSeq > lastAutoAckSeq {
+				lastAutoAckSeq = ackUpToSeq
+			}
+		}
+		nextAfter := nextAfterSeq
+		if pageMeta.latestSeq > nextAfter {
+			nextAfter = pageMeta.latestSeq
+		}
+		if nextAfter > nextAfterSeq {
+			for _, m := range msgs {
+				seq := toInt64(m["seq"])
+				// 群撤回 tombstone（占位 / 通知 / legacy V1）：先识别再决定是否进列表。
+				// 命中则归一化为 group.message_recalled 事件并占 seq，但绝不 append 进返回的 messages
+				// 列表（否则撤回 tombstone 会作为"普通消息"泄漏给应用层）。对齐 Python/TS：识别后直接 continue。
+				if _, isRecall := recallEventFromGroupMessage(m); isRecall {
+					c.delivery().publishGroupRecallTombstone(groupAID, int(seq), m)
+					if seq > 0 {
+						c.markPushedSeq(ns, int(seq))
+					}
+					continue
+				}
+				out = append(out, m)
+				if seq <= 0 {
+					c.publishAppEvent("group.message_created", m)
+					continue
+				}
+				c.publishPulledMessage("group.message_created", ns, int(seq), m)
+			}
+		}
+		if ownsCursor {
+			contig := c.seqTracker.GetContiguousSeq(ns)
+			ackNeeded := contig > 0 &&
+				int64(contig) > lastAutoAckSeq &&
+				(contig != pageContigBefore || (pageMeta.hasServerAck && int64(contig) > pageMeta.serverAckSeq))
+			if ackNeeded {
+				ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
+				if ackSeq > 0 {
+					canContinuePage := pageMeta.latestSeq > nextAfterSeq
+					if canContinuePage {
+						if ackSeq > pendingAckSeq {
+							pendingAckSeq = ackSeq
+						}
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+						c.logEG.Debug("group.v2.pull queued piggyback auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", groupAID, ns, pendingAckSeq, pageMeta.rawCount)
+					} else {
+						fireAck(ackSeq)
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+					}
+				}
+			}
+		}
+		if !ownsCursor {
+			break
+		}
+		canContinuePage := pageMeta.rawCount > 0 && nextAfter > nextAfterSeq
+		fullPage := canContinuePage && limit > 0 && pageMeta.rawCount >= limit
+		shouldContinue := canContinuePage && (fullPage || pendingAckSeq > 0)
+		if !shouldContinue {
+			break
+		}
+		if delay := v2PullTailDelay(pageMeta.rawCount, limit); delay > 0 {
+			sleepWithCancel(ctx, delay)
+		}
+		nextAfterSeq = nextAfter
+	}
+	if pendingAckSeq > 0 {
+		fireAck(pendingAckSeq)
 	}
 	return map[string]any{"messages": out}, nil
 }

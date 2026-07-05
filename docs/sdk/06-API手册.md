@@ -118,6 +118,8 @@ Python、TS/Node 与 Go 的 `AIDStore` 本地方法返回 Result 包装；浏览
 
 agent.md 本地记录不写入 SQLite。Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`；浏览器 JavaScript 使用 IndexedDB 等价 key，存储不可用时退化为内存缓存。
 
+`remote_etag` / `last_modified` 除了来自 `check_agent_md()` 的 HEAD，也会由连接后的内部观察器更新：SDK 会读取 RPC response / event push `_meta.agent_md_etags` 的 `requester`、`peer`、`group` 及兼容别名，并读取 V2 envelope 的 `agent_md.sender` / `agent_md.group`。`group` 记录使用群自身 `group_aid` / `group_id` 作为 AID key。
+
 > **v0.4.2 变更**：`discoveryPort` 配置项已移除，Gateway 地址完全由 SDK 根据 AID issuer 自动发现，无需手动指定端口。
 
 ---
@@ -260,7 +262,7 @@ await client.call("meta.trust_roots", {})
 ```python
 await client.notify("notification/client.activity", {"state": "idle"})
 await client.notify("event/app.typing", {"thread_id": "t1"}, to="bob.agentid.pub", ttl_ms=5000)
-await client.notify("event/app.presence", {"state": "active"}, group_id="group.agentid.pub/123")
+await client.notify("event/app.presence", {"state": "active"}, group_id="g-abc123.agentid.pub")
 ```
 
 路由选项：
@@ -268,7 +270,7 @@ await client.notify("event/app.presence", {"state": "active"}, group_id="group.a
 | 选项 | 说明 |
 |------|------|
 | `to` / `To` | 目标 AID；可同域或跨域 |
-| `group_id` / `groupId` / `GroupID` | 目标群；与 `to` 互斥 |
+| `group_id` / `groupId` / `GroupID` | 目标群；兼容参数名，值使用目标态 `group_aid`，与 `to` 互斥 |
 | `device_id` / `deviceId` / `DeviceID` | 限定目标 AID 的在线设备；必须配合 `to` |
 | `slot_id` / `slotId` / `SlotID` | 限定目标设备的在线 slot；必须配合 `device_id` |
 | `ttl_ms` / `ttlMs` / `TTLMS` | `0..60000`，只控制在线投递过期，不表示离线缓存 |
@@ -310,6 +312,7 @@ headers = client.get_protected_headers()
 - agent.md 上传、下载和检查入口都在 `AIDStore`；`AUNClient` 不再暴露上传入口。
 - 上传要求目标 AID 已在本地加载且私钥有效；SDK 会对正文签名，并通过 `AuthFlow` 获取或复用该 AID 的 access_token。
 - SDK 发起 GET 时只发送 `Accept: text/markdown`，不主动发送 `If-None-Match` / `If-Modified-Since`。如果服务端异常返回 304，本地有内容则复用；无内容时再发一次无条件 GET。
+- SDK 会自动从 Gateway `_meta.agent_md_etags` 和信封 `agent_md` 观察远端版本；`requester`、`peer`、`group` 是标准角色键，`receiver`、`target`、`to`、`sender`、`from` 是兼容别名。
 - `Accept: text/markdown` 与 agent.md 的 YAML frontmatter + Markdown 格式兼容；agent.md 仍是 Markdown 媒体类型上的结构化约定。
 
 ---
@@ -418,11 +421,13 @@ sub.unsubscribe()
 | `state_change` | 状态变化，`state` 为九态公开值 |
 | `connection.error` | 连接或重连错误 |
 | `token.refreshed` | token 刷新完成 |
+| `token.refresh_exhausted` | refresh_token 缺失、过期或刷新链耗尽，SDK 已清理本地 token 并等待重新登录 |
 | `message.received` | 收到 P2P 消息 |
 | `message.ack` | 消息 ack |
 | `message.undecryptable` | P2P E2EE 解密失败 |
 | `group.changed` | 群组事件 |
 | `group.message_undecryptable` | 群 E2EE 解密失败 |
+| `storage.object_changed` | Storage 对象变更事件透传 |
 
 ---
 

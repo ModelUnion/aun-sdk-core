@@ -77,7 +77,10 @@ js/_packed_docs/
 
 # 内部脚本和跨 SDK 测试（不发布到 GitHub）
 scripts/
-tests/cross-sdk/
+tests/cross-sdk/*
+!tests/cross-sdk/
+!tests/cross-sdk/docker-compose.cross-sdk.yml
+!tests/cross-sdk/cases.inbox-migration.json
 
 # 性能测试临时数据
 autoscale-*.json

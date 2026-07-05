@@ -28,47 +28,48 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `group_id` | string | 群组唯一 ID（自动生成或自定义） |
+| `group_aid` | string | 群组主标识，目标态格式为 `{base}.{issuer-domain}` |
+| `group_id` | string | 兼容字段；新群通常等于 `group_aid`，旧群可能保留历史值 |
 | `name` | string | 群组名称 |
 | `owner_aid` | string | 群主 AID |
 | `creator_aid` | string | 创建者 AID |
 | `visibility` | string | `"public"` / `"private"` |
-| `status` | string | `"active"` / `"suspended"` / `"closed"` |
+| `status` | string | `"active"` / `"suspended"` / `"dissolved"` |
 | `description` | string | 群组描述 |
 | `metadata` | object | 自定义元数据 |
 | `dispatch_mode` | string | 群分发模式：`"broadcast"`（默认）/ `"mention"`，详见 [10.2.x 群分发模式](#1023-群分发模式dispatch_mode) |
 | `member_count` | integer | 成员数量 |
 | `message_seq` | integer | 最新消息序号 |
 | `event_seq` | integer | 最新事件序号 |
-| `created_at` | integer | 创建时间（Unix 秒） |
+| `created_at` | integer | 创建时间（Unix 毫秒） |
 
-### Group ID 格式与规范化
+### Group AID / Group ID 兼容规范
 
-`group_id` 是群组的全网唯一标识，前缀 `g-` 为 Group 保留前缀（legacy 格式）。普通 AID 的本地名称不得以 `g-` 开头，避免与群 ID 混淆。
+当前实现的群组主标识是 `group_aid`，格式为 `{base}.{issuer-domain}`，例如 `10042.agentid.pub`、`team01.agentid.pub`、`g-abc123.agentid.pub`。`group_id` 字段名和参数名继续保留，用于兼容旧 SDK / 旧数据库行；新建群以 `group_aid` 为准，新群的 `group_id` 通常也写入同一个 `group_aid` 值。前缀 `g-` 为 Group 保留前缀（legacy base 格式），普通 AID 的本地名称不得以 `g-` 开头，避免与群标识混淆。
 
 **支持的 base 格式**（不含域名部分）：
 - **Legacy 格式**: `g-[a-z0-9]{4,32}` — 以 `g-` 开头，后接 4 到 32 位小写字母或数字
 - **新格式**: `[a-z0-9]{5,}` — 5 位或更多小写字母或数字，无上限
 - **Group name 格式**: `[a-z0-9][a-z0-9_-]{3,63}` — 4 到 64 个字符，可包含下划线和短横线
 
-服务端必须接受以下输入形式，并在内部统一为 canonical group_id：
+服务端必须接受以下输入形式，并在 API 边界统一为目标态 `group_aid`：
 
-| 输入形式 | 用途 | canonical 结果 |
+| 输入形式 | 用途 | 规范化结果 |
 |----------|------|----------------|
-| `{base}` | 本地域内简写（base 为上述任一格式） | 若本域 issuer 为 `issuer-domain`，规范化为 `group.issuer-domain/{base}` |
-| `{base}@issuer-domain` | 跨域传播兼容形式 | 规范化为 `group.issuer-domain/{base}` |
-| `{base}.issuer-domain` | 旧 canonical 形式 | 规范化为 `group.issuer-domain/{base}` |
-| `group.issuer-domain/{base}` | 新 canonical 形式 | 保持为 `group.issuer-domain/{base}` |
+| `{base}` | 本地域内简写（base 为上述任一格式） | 若本域 issuer 为 `issuer-domain`，规范化为 `{base}.issuer-domain` |
+| `{base}@issuer-domain` | 旧跨域兼容形式 | 规范化为 `{base}.issuer-domain` |
+| `{base}.issuer-domain` | 目标态形式 | 保持为 `{base}.issuer-domain` |
+| `group.issuer-domain/{base}` | 旧 URL 风格兼容形式 | 规范化为 `{base}.issuer-domain` |
 
 规范化规则：
 
-- `group_id` 比较、数据库存储、成员归属、权限校验、E2EE AAD / 签名输入均必须使用 canonical group_id（`group.{issuer}/{base}` 格式）。
-- 输入必须先 trim 并转换为小写；`@issuer-domain` 和 `.issuer-domain` 形式仅作为兼容输入，进入内部前必须转换为 `group.{issuer}/{base}`。
-- 本域内客户端可以提交 `{base}` 简写；服务端按本域 `AUN_ISSUER_DOMAIN` 解析为 canonical group_id。没有本域 issuer 配置时，简写保持为 `{base}`。
-- 跨域消息、邀请传播、日志和协议响应应使用 canonical group_id，避免远端误把短 ID 当成本域群。
-- `group.create` 可以指定 `group_id`；指定时必须满足上述格式且未被占用，被占用时返回错误。未指定时由服务端自动分配。
-- 自动生成的群 ID 使用随机小写十六进制短字符串（长度 14），服务端必须通过唯一约束或等效机制保证 canonical group_id 唯一；发现碰撞时重新生成。
-- 在 `group.{issuer-domain}` 这类已携带 issuer 的公开 HTTP 主机下，生成的群链接 path 应使用本域简写，例如 `https://group.issuer-domain/{base}` 或 `https://group.issuer-domain/{base}/invite/ic-xxx`。
+- `group_aid` 比较、成员归属、权限校验、E2EE AAD / 签名输入应使用目标态 `{base}.{issuer-domain}`。
+- 输入必须先 trim 并转换为小写；`group.{issuer}/{base}`、`{base}@issuer` 等形式仅作为兼容输入，进入主流程前必须转换为目标态 `group_aid`。
+- 本域内客户端可以提交 `{base}` 简写；服务端按本域 `AUN_ISSUER_DOMAIN` 解析为 `{base}.{issuer-domain}`。没有本域 issuer 配置时，简写保持为 `{base}`。
+- 跨域消息、邀请传播、日志和协议响应应优先使用 `group_aid`，避免远端误把短 ID 当成本域群。
+- `group.create` 可以指定 `group_aid`；`group_id` 仍作为兼容别名。指定时必须满足上述格式且未被占用，被占用时返回错误。未指定时由服务端自动分配数字 base。
+- 自动生成的群标识使用单调群号 base（例如 `10042`）并按本域 issuer 生成 `{group_no}.{issuer-domain}`；服务端通过唯一约束或等效机制保证 `group_aid` 唯一，发现碰撞时重新生成。
+- 在 `https://group.{issuer-domain}/...` 这类已携带 issuer 的公开 HTTP 主机下，当前生成的群链接 path 使用单段 `group_aid`，例如 `https://group.agentid.pub/10042.agentid.pub/invite/ic-xxx`。历史 `{base}` 简写链接可继续由服务端兼容解析。
 
 ### 10.2.3 群分发模式（dispatch_mode）
 
@@ -104,16 +105,16 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `aid` | string | 成员 AID |
-| `group_id` | string | 群组 ID |
+| `group_id` | string | 群组标识兼容字段，值语义为 `group_aid` |
 | `role` | string | `"owner"` / `"admin"` / `"member"` |
-| `joined_at` | integer | 加入时间（Unix 秒） |
+| `joined_at` | integer | 加入时间（Unix 毫秒） |
 | `last_ack_seq` | integer | 最后已读消息序号 |
 
 ### Message 对象
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `group_id` | string | 群组 ID |
+| `group_id` | string | 群组标识兼容字段，值语义为 `group_aid` |
 | `seq` | integer | 消息序号（群内单调递增） |
 | `message_id` | string | 消息 UUID |
 | `sender_aid` | string | 发送者 AID |
@@ -153,7 +154,8 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
 | `name` | string | ✅ | 群组名称 |
-| `group_id` | string | ❌ | 自定义群 ID，支持 legacy 格式 `g-[a-z0-9]{4,32}` 或新格式 `[a-z0-9]{5,}` 或 group name 格式 `[a-z0-9][a-z0-9_-]{3,63}`；不提供则服务端自动生成；已被占用时返回错误 |
+| `group_aid` | string | ❌ | 自定义群主标识，目标态为 `{base}.{issuer-domain}`；不提供则服务端自动生成 |
+| `group_id` | string | ❌ | 兼容别名，值语义同 `group_aid`；支持 legacy base `g-[a-z0-9]{4,32}`、新 base `[a-z0-9]{5,64}` 或 group name `[a-z0-9][a-z0-9_-]{3,63}` |
 | `visibility` | string | ❌ | `"public"` / `"private"`，默认由服务配置决定 |
 | `description` | string | ❌ | 群组描述 |
 | `metadata` | object | ❌ | 自定义元数据 |
@@ -168,6 +170,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 {
     "group": {
         "group_id": "g-abc123.agentid.pub",
+        "group_aid": "g-abc123.agentid.pub",
         "name": "测试群",
         "owner_aid": "alice.agentid.pub",
         "creator_aid": "alice.agentid.pub",
@@ -176,7 +179,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
         "member_count": 1,
         "message_seq": 0,
         "event_seq": 0,
-        "created_at": 1234567890
+        "created_at": 1234567890000
     },
     "aid": "alice.agentid.pub"
 }
@@ -190,7 +193,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID 或 group AID |
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
 | `required` | string[] | ❌ | 可选值：`member` / `state` / `e2ee` / `avatar` |
 
 **响应**：平铺对象。默认字段包含 `found`、`group_id`、`group_aid`、`name`、`visibility`、`status`、`description`、`member_count`、`created_at`。
@@ -258,7 +261,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
 | `aid` | string | ✅ | 要添加的 AID |
 | `role` | string | ❌ | `"member"` / `"admin"`，默认 `"member"` |
 | `member_type` | string | ❌ | `"human"` / `"ai"`，默认 `"human"` |
@@ -305,7 +308,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|:----:|--------|------|
-| `group_id` | string | ✅ | — | 群组 ID |
+| `group_id` | string | ✅ | — | 群组标识兼容字段，值语义为 `group_aid` |
 | `page` | integer | ❌ | 1 | 页码 |
 | `size` | integer | ❌ | 50 | 每页条数 |
 | `role` | string | ❌ | — | 按角色过滤 |
@@ -348,14 +351,14 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
 | `type` | string | ❌ | 信封/封装类型，普通业务消息无需填写；SDK 加密群消息时自动使用 `e2ee.group_encrypted` |
 | `payload` | object | ✅ | 消息内容 |
 | `attachments` | array | ❌ | 存储引用列表 |
 
 ##### Payload 参考约定
 
-`group.send.params.payload` 的统一业务负载格式见 [消息Payload参考约定](../sdk/消息Payload参考约定.md)。完整群消息请求仍在 `payload` 同级传入 `group_id`；业务类型放在 `payload.type`，不要与 `group.send.params.type` 信封/封装类型混用。
+`group.send.params.payload` 的统一业务负载格式见 [消息Payload参考约定](../sdk/消息Payload参考约定.md)。完整群消息请求仍在 `payload` 同级传入 `group_id`（兼容参数名，值使用目标态 `group_aid`）；业务类型放在 `payload.type`，不要与 `group.send.params.type` 信封/封装类型混用。
 
 协议层只要求 `payload` 是 JSON 对象，并按服务端配置做大小、信封/封装类型和 E2EE epoch 相关检查；字段语义由应用层约定，接收端应对未知 `payload.type`、未知 `kind` 和缺失展示字段做降级处理。
 
@@ -396,9 +399,9 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|:----:|--------|------|
-| `group_id` | string | ✅ | — | 群组 ID |
+| `group_id` | string | ✅ | — | 群组标识兼容字段，值语义为 `group_aid` |
 | `after_message_seq` | integer | ❌ | 0 | 拉取该 seq 之后的消息 |
-| `limit` | integer | ❌ | 100 | 最大条数 |
+| `limit` | integer | ❌ | 50 | 最大条数（最大 50；`pull_max_limit` 配置只能进一步收紧） |
 | `device_id` | string | ❌ | — | 设备 ID（多设备模式） |
 
 **响应**：
@@ -409,7 +412,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
     "messages": [ ... ],
     "latest_message_seq": 42,
     "has_more": false,
-    "limit": 100
+    "limit": 50
 }
 ```
 
@@ -443,7 +446,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|:----:|--------|------|
-| `group_id` | string | ✅ | — | 群组 ID |
+| `group_id` | string | ✅ | — | 群组标识兼容字段，值语义为 `group_aid` |
 | `status` | string | ❌ | `"pending"` | `"pending"` / `"approved"` / `"rejected"` |
 | `page` | integer | ❌ | 1 | 页码 |
 | `size` | integer | ❌ | 50 | 每页条数 |
@@ -458,7 +461,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
 | `aid` | string | ✅ | 申请人 AID |
 | `approve` | boolean | ❌ | 批准（true）或拒绝（false），默认 true |
 | `reason` | string | ❌ | 拒绝原因 |
@@ -481,7 +484,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `group_id` | string | ✅ | 群组 ID |
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
 | `code` | string | ❌ | 自定义邀请码，不提供则自动生成 |
 | `max_uses` | integer | ❌ | 最大使用次数，默认 1，必须 > 0 |
 | `expires_in_seconds` | integer | ❌ | 有效期（秒），默认由配置决定（7 天） |
@@ -617,13 +620,6 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 | `suspended` | 群组暂停 |
 | `resumed` | 群组恢复 |
 | `dissolved` | 群组解散 |
-| `resource_put` | 资源添加/更新 |
-| `resource_updated` | 资源元数据更新 |
-| `resource_deleted` | 资源删除 |
-| `resource_request_created` | 资源申请创建 |
-| `resource_direct_added` | 资源直接添加（owner） |
-| `resource_request_approved` | 资源申请批准 |
-| `resource_request_rejected` | 资源申请拒绝 |
 
 ### `event/group.message_created`
 
@@ -673,7 +669,7 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 | -32602 | Invalid params（如缺少 group_id） | 检查参数 |
 | -32004 | Permission denied（权限不足） | 提示用户，不重试 |
 | -32001 | Authentication failed | 重新认证 |
-| -33001 | Group not found | 检查 group_id |
+| -33001 | Group not found | 检查规范化后的 `group_aid`（`group_id` 为兼容参数名） |
 | -33002 | Group state invalid（群状态不允许该操作） | 检查群状态 |
 | -33003 | Group suspended | 等待恢复或联系管理员 |
 | -33004 | Group member limit reached | 不重试 |

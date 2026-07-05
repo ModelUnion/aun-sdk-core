@@ -1,21 +1,149 @@
-# Python SDK 变更清单（v0.3.3 → v0.5.1）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.5.2）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) + 工作区 (v0.5.1)。
+涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) → `9eadd3a8` (v0.5.1 发布基线) + 工作区 (v0.5.2)。
+
+---
+
+## v0.5.2 — 相对于 v0.5.1 发布基线的变更
+
+> 基线：当前 `HEAD` = `9eadd3a8`（v0.5.1 发布提交）vs 当前工作区（目标版本 v0.5.2，`pyproject.toml` / `version.py` 已标 0.5.2）。
+>
+> 行号说明：本节所有 `Lx` / `Lx~Ly` 均指**当前工作区文件行号**。定位格式统一为 `file:func:line`；模块级常量或版本号使用 `file:<module>:line`。
+>
+> 变更块：**① 版本号**、**② agent.md group 元数据**、**③ V2 P2P/Group pull + ack 调度**、**④ push auto-pull 串行合并**、**⑤ CLI bench/uvloop**、**⑥ 测试覆盖与对齐优先级**。
+
+### 版本号
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `pyproject.toml:<module>:L7` | 修改 | Python 包版本升级为 `0.5.2` |
+| `src/aun_core/version.py:<module>:L1` | 修改 | SDK 运行时 `__version__` 升级为 `0.5.2` |
+
+### 块① agent.md group 元数据观察
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/agent_md.py:AgentMdManager.observe_rpc_meta:L691~709` | 修改 | `agent_md_etags` 角色列表新增 `group`，与 `requester/peer/sender` 等角色同级处理；落盘 source 为 `rpc.group` |
+| `src/aun_core/agent_md.py:AgentMdManager.observe_envelope:L711~746` | 修改 | envelope 中 `agent_md.sender` 与 `agent_md.group` 分别观察；不再因 sender 缺失直接 return |
+| `src/aun_core/agent_md.py:AgentMdManager.observe_envelope:L729~746` | 新增 | `agent_md.group` 的 AID fallback 顺序为 `group.aid` → `envelope.group_aid` → `envelope.group_id` → `aad.group_aid` → `aad.group_id`；ETag/Last-Modified 落盘 source 为 `envelope.group` |
+
+**对齐要点**：Go / TypeScript / JavaScript SDK 的 agent.md 元数据观察器必须把 `group` 当成一等角色。群消息 envelope 即使只有 group ETag、没有 sender ETag，也不能丢弃 group agent.md 元数据。
+
+### 块② V2 P2P / Group pull 与 ack 调度
+
+#### 通用分页参数
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/v2_e2ee.py:<module>:L17~20` | 新增 | V2 pull 默认/最大 page limit 固定为 50；tail delay 下限 5ms、上限 500ms |
+| `src/aun_core/_client/v2_e2ee.py:_v2_effective_page_limit:L35~40` | 新增 | `limit` 统一夹取到 `1..50`；非法值回退默认 50 |
+| `src/aun_core/_client/v2_e2ee.py:_v2_pull_tail_delay_seconds:L43~54` | 新增 | 非空非满页延迟 `1s / (pulled_messages + 1)`，再按 5ms~500ms 夹取；空页和满页返回 0 |
+
+#### P2P `message.v2.pull`
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L730` | 修改 | P2P V2 pull 主入口；本节语义均在该函数内实现 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L739` | 修改 | 使用 `_v2_effective_page_limit()`，不再直接信任调用方 limit |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L752~768` | 修改 | 引入 `pending_ack_seq`，下一页 pull 通过 `ack_up_to_seq` piggyback 自动 ack |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L779~782` | 修改 | 过滤 `seq <= next_after_seq` 的 stale 原始消息，避免重复处理或重复 ack |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L811~818` | 新增 | 计算 `raw_count/can_continue_page/full_page`，后续不再盲信服务端 `has_more=true` |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L895~918` | 修改 | 只对实际 delivered seq 调用 `on_message_seq()`；ack 条件要求 raw page 存在、contiguous 推进或服务端 ack 落后 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L920~936` | 修改 | 可继续翻页时只排队 `pending_ack_seq`，末页才发 terminal `message.v2.ack` |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L938~944` | 修改 | 续拉条件改为 `full_page or pending_ack_seq > 0`；非满页有 pending ack 时 tail delay 后补一页 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L946~951` | 修改 | 达到 `max_pages` 时 flush 尚未 piggyback 的 `pending_ack_seq` |
+
+#### Group `group.v2.pull`
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2431` | 修改 | Group V2 pull 主入口；本节语义均在该函数内实现 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2450` | 修改 | 使用 `_v2_effective_page_limit()`，与 P2P page limit 口径一致 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2456~2461` | 保留/关键 | 只有当前 device/slot 拥有 cursor 时才允许自动 ack；外部 cursor pull 不推进服务端 ack |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2471~2496` | 修改 | 引入 `pending_ack_seq`，cursor owner 下一页 pull 通过 `ack_up_to_seq` piggyback 自动 ack |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2505~2510` | 修改 | 过滤 `seq <= next_after_seq` 的 stale 群消息 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2539~2542` | 新增 | 计算 `raw_count/can_continue_page/full_page`，续拉不再依赖服务端 `has_more=true` |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2616~2624` | 修改 | 自动 ack 条件要求 owns cursor、contiguous 推进或服务端 cursor 落后 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2625~2643` | 修改 | 可继续翻页时排队 piggyback；末页发 terminal `group.v2.ack`，参数同时带 `group_id/group_aid/up_to_seq` |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2651~2659` | 修改 | 非 cursor owner 直接停止；cursor owner 仅在满页或有 pending ack 时续拉，并按 tail delay 调度 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2661~2672` | 修改 | 达到 `max_pages` 时 flush 尚未 piggyback 的 group ack |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2677~2685` | 修改 | `has_more` 只在 max_pages 截断或 latest seq 明确大于本次最新 seq 时置真 |
+
+**对齐要点**：其他 SDK 不能把 `has_more=true` 视为无条件续拉依据。当前目标语义是：满页立即续拉；非满页如果有 pending ack，则 tail delay 后再拉一页以 piggyback ack；否则停止。stale row 不能推进 ack；空页不能确认已有 contiguous seq。
+
+### 块③ Push auto-pull 串行合并
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.record_pending_p2p_pull:L1697~1710` | 关键依赖 | 记录 push 已见到但当前 pull 尚未覆盖的 upper seq；只保留最大上界 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.schedule_pending_p2p_pull_if_needed:L1712~1751` | 关键依赖 | pull 结束后若 pending upper 仍大于 contiguous 且 client READY，则调度 follow-up gap fill |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_v2_push_notification:L2077` | 修改 | V2 push 通知处理入口 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_v2_push_notification:L2152~2179` | 修改 | payload push 或纯通知发现 pull in-flight 时，不并发拉取，只记录 pending upper seq |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_v2_push_notification:L2182~2230` | 修改 | auto-pull body 通过 namespace lock + `gap_fill_done` 去重，再交给 `run_pull_serialized()` 串行执行；finally 中释放 dedup 并调度 pending follow-up |
+| `src/aun_core/_client/rpc_pipeline.py:ClientRPCPipeline.run_pull_serialized:L483` | 依赖 | P2P auto-pull 复用已有 pull gate，确保同一 namespace 同时只有一条 pull 管线 |
+
+**对齐要点**：push 通知只能“推动”已有 pull 状态机前进，不能绕过 pull gate 启动并发 pull。并发 push 的正确行为是合并为一次 auto-pull，必要时用 pending upper 追加一次 follow-up。
+
+### 块④ CLI bench / uvloop
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_cli/adapter.py:_env_enabled:L114~115` | 新增 | 统一解析布尔环境变量：`1/true/yes/on` 视为启用 |
+| `src/aun_cli/adapter.py:_should_use_uvloop:L118~122` | 新增 | 新增 `AUN_SDK_UVLOOP` / `AUN_CLI_UVLOOP` / `AUN_BENCH_UVLOOP` 三个 uvloop 开关 |
+| `src/aun_cli/adapter.py:run_async:L125~134` | 修改 | 非 Windows 且安装 uvloop 时用 `uvloop.run()`；缺失 uvloop 自动回退 `asyncio.run()` |
+| `src/aun_cli/commands/bench_e2e.py:AutoscaleConfig:L72~99` | 修改 | `perf_trace` 默认值改为 `False`，避免默认采集污染吞吐数据 |
+| `src/aun_cli/commands/bench_e2e.py:<module>._SEND_PERF_PHASES:L438~471` | 修改 | send_perf 阶段新增 V2 send 细分：validate、audit_check、peer/self devices、wrap_prepare、write、seq_alloc、push_dispatch 等 |
+| `src/aun_cli/commands/bench_e2e.py:run_autoscale:L2359~2458` | 修改 | `perf_enabled = perf_trace or perf_log_root`；显式给 `--perf-log-root` 时即使 `--no-perf-trace` 也会聚合日志 |
+| `src/aun_cli/commands/bench_e2e.py:autoscale_send:L3757~3780` | 修改 | `--perf-trace/--no-perf-trace` 默认改为关闭 |
+| `src/aun_cli/commands/bench_e2e.py:autoscale_group:L3831~3855` | 修改 | group autoscale 的 perf_trace 默认同样改为关闭 |
+
+**对齐要点**：bench 默认口径应低侵入；服务端 send_perf 聚合只在用户显式开启 `--perf-trace` 或提供 `--perf-log-root` 时启用。uvloop 是可选优化，必须无依赖回退。
+
+### 块⑤ 测试覆盖与跨 SDK 对齐优先级
+
+#### 新增/重点测试入口
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `tests/unit/test_client_agent_md_api.py:test_observe_rpc_meta_persists_structured_meta_and_downloads_missing_local:L229` | 修改 | RPC `_meta.agent_md_etags.group` 应持久化并触发缺失 agent.md 下载 |
+| `tests/unit/test_client_agent_md_api.py:test_observe_envelope_agent_md_persists_group_etag:L291` | 新增 | envelope `agent_md.group` 在缺失 group.aid 时从 `group_aid` fallback 并落盘 |
+| `tests/unit/test_client.py:test_v2_p2p_pull_batches_piggyback_ack_with_final_contiguous_seq:L1787` | 修改 | P2P pull 自动 ack 应通过下一页 `ack_up_to_seq` piggyback，不发独立 ack |
+| `tests/unit/test_client.py:test_v2_group_pull_batches_piggyback_ack_with_final_contiguous_seq:L1915` | 修改 | Group pull 自动 ack 应通过下一页 `ack_up_to_seq` piggyback，不发独立 ack |
+| `tests/unit/test_client.py:test_v2_p2p_pull_continues_pages_and_piggybacks_each_ack:L2040` | 修改 | P2P 多页满页续拉时每页 ack 通过下一页 piggyback |
+| `tests/unit/test_client.py:test_v2_group_pull_continues_pages_and_piggybacks_each_ack:L2422` | 修改 | Group 多页满页续拉时每页 ack 通过下一页 piggyback |
+| `tests/unit/test_client.py:test_v2_p2p_background_pull_partial_page_waits_tail_delay:L2152` | 新增 | 非满页 background pull 使用 `1000ms/(pulled+1)` tail delay；满页/空页不延迟 |
+| `tests/unit/test_client.py:test_v2_p2p_pull_ignores_has_more_true_when_page_not_full_without_ack:L2267` | 新增 | 非满页且无 pending ack 时忽略 `has_more=true`，避免盲目续拉 |
+| `tests/unit/test_client.py:test_v2_p2p_pull_stale_raw_without_contiguous_advance_does_not_ack:L2749` | 新增 | P2P stale raw page 不推进 contiguous，不发送自动 ack |
+| `tests/unit/test_client.py:test_v2_group_pull_stale_raw_without_contiguous_advance_does_not_ack:L2920` | 新增 | Group stale raw page 不推进 cursor，不发送自动 ack |
+| `tests/unit/test_client.py:test_v2_p2p_concurrent_notification_push_coalesces_auto_pull:L3436` | 新增 | 并发 notification push 合并为一次 auto-pull，验证 pull gate/去重生效 |
+| `tests/unit/test_client.py:test_v2_p2p_pull_piggybacks_auto_ack_before_return_when_decrypt_fails:L3530` | 修改 | 解密失败但 contiguous 推进时仍通过下一页 pull piggyback ack |
+| `tests/unit/test_client.py:test_v2_p2p_pull_drains_pending_payload_after_gap_is_filled_and_acks_once:L3575` | 修改 | gap 填平后 drain pending payload，并只通过 piggyback ack 一次 |
+| `tests/unit/test_client_strict_api.py:_python_project_root:L32~43` | 测试基础设施 | strict API 测试不再假设固定 checkout 深度，适配 `/sdk` / `/workspace/python` 路径 |
+
+#### 对齐优先级建议
+
+| 优先级 | 范围 | 必须对齐的 file:func:line |
+|--------|------|---------------------------|
+| P0 | V2 pull/ack 正确性 | `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L730`、`src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2431`、`src/aun_core/_client/v2_e2ee.py:_v2_pull_tail_delay_seconds:L43` |
+| P0 | stale 过滤与 `has_more` 语义 | `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L779`、`src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2505`、`src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2677` |
+| P0 | push auto-pull 串行合并 | `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_v2_push_notification:L2077`、`src/aun_core/_client/delivery.py:MessageDeliveryEngine.record_pending_p2p_pull:L1697`、`src/aun_core/_client/rpc_pipeline.py:ClientRPCPipeline.run_pull_serialized:L483` |
+| P1 | agent.md group 元数据 | `src/aun_core/agent_md.py:AgentMdManager.observe_rpc_meta:L691`、`src/aun_core/agent_md.py:AgentMdManager.observe_envelope:L711` |
+| P2 | bench/uvloop 口径 | `src/aun_cli/adapter.py:run_async:L125`、`src/aun_cli/commands/bench_e2e.py:run_autoscale:L2359`、`src/aun_cli/commands/bench_e2e.py:<module>._SEND_PERF_PHASES:L438` |
 
 ---
 
 
 ## v0.5.1 — 相对于对外发布 v0.5.0 的变更
 
-> 基线：`v0.5.0^{}` = `1a92fbf6`（对外发布的 v0.5.0 commit；`v0.5.0` 本身是 annotated tag，tag object 为 `b0328ef2`）vs 当前工作区（目标版本 v0.5.1，`pyproject.toml` / `version.py` 已标 0.5.1）。
+> 基线：`v0.5.0^{}` = `1a92fbf6`（对外发布的 v0.5.0 commit；`v0.5.0` 本身是 annotated tag，tag object 为 `b0328ef2`）vs v0.5.1 发布整理时的目标工作区（当时 `pyproject.toml` / `version.py` 已标 0.5.1）。
 >
 > 提交范围：`42e1694b`（gateway/group/message 性能优化 + storage VFS/group-resources 四语言对齐）→ `3f3fa167`（storage 与 group.fs SDK/服务端对齐）+ 工作区未提交改动。
 >
-> 行号说明：本节所有 `Lx` / `Lx~Ly` 均指**当前工作区文件行号**，用于 Go / TypeScript / JavaScript SDK 对齐实现时快速定位。相对路径默认以 `python/` 为基准。
+> 行号说明：本节所有 `Lx` / `Lx~Ly` 保留 v0.5.1 整理时的实现定位，用于 Go / TypeScript / JavaScript SDK 对齐历史实现时快速定位。相对路径默认以 `python/` 为基准。
 >
 > 七大变更块：**① `group_id` → `group_aid` 目标态与校验层**、**② V1 E2EE 移除与 V2-only/keystore 简化**、**③ group_aid 身份生命周期与签名集合**、**④ Storage VFS / group.fs 增量**、**⑤ V2 消息、seq_tracker、push/gap-fill 性能与可靠性**、**⑥ transport/logger/errors/CLI bench**、**⑦ 测试覆盖与对齐优先级**。
 

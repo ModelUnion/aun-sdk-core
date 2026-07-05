@@ -1,0 +1,106 @@
+{
+  "suite": "cross-sdk-inbox-migration-python-ts-go-js",
+  "timeout_ms": 30000,
+  "cases": [
+    {
+      "id": "health_ready",
+      "type": "health"
+    },
+    {
+      "id": "inbox_p2p_plain_python_to_ts",
+      "type": "p2p",
+      "from": "python",
+      "to": "ts",
+      "e2ee": false,
+      "text": "inbox migration p2p plain python to ts"
+    },
+    {
+      "id": "inbox_p2p_plain_ts_to_go",
+      "type": "p2p",
+      "from": "ts",
+      "to": "go",
+      "e2ee": false,
+      "text": "inbox migration p2p plain ts to go"
+    },
+    {
+      "id": "inbox_p2p_plain_go_to_js",
+      "type": "p2p",
+      "from": "go",
+      "to": "js",
+      "e2ee": false,
+      "text": "inbox migration p2p plain go to js"
+    },
+    {
+      "id": "inbox_p2p_plain_js_to_python",
+      "type": "p2p",
+      "from": "js",
+      "to": "python",
+      "e2ee": false,
+      "text": "inbox migration p2p plain js to python"
+    },
+    {
+      "id": "inbox_p2p_e2ee_python_to_go",
+      "type": "p2p",
+      "from": "python",
+      "to": "go",
+      "e2ee": true,
+      "ack": true,
+      "text": "inbox migration p2p e2ee python to go"
+    },
+    {
+      "id": "inbox_p2p_e2ee_go_to_ts",
+      "type": "p2p",
+      "from": "go",
+      "to": "ts",
+      "e2ee": true,
+      "ack": true,
+      "text": "inbox migration p2p e2ee go to ts"
+    },
+    {
+      "id": "inbox_p2p_e2ee_ts_to_js",
+      "type": "p2p",
+      "from": "ts",
+      "to": "js",
+      "e2ee": true,
+      "ack": true,
+      "text": "inbox migration p2p e2ee ts to js"
+    },
+    {
+      "id": "inbox_p2p_e2ee_js_to_python",
+      "type": "p2p",
+      "from": "js",
+      "to": "python",
+      "e2ee": true,
+      "ack": true,
+      "text": "inbox migration p2p e2ee js to python"
+    },
+    {
+      "id": "inbox_group_plain_matrix_python_ts_go_js",
+      "type": "group_matrix",
+      "participants": [
+        "python",
+        "ts",
+        "go",
+        "js"
+      ],
+      "owner": "python",
+      "e2ee": false,
+      "ack": true,
+      "text": "inbox migration group plain matrix python ts go js"
+    },
+    {
+      "id": "inbox_group_e2ee_matrix_python_ts_go_js",
+      "type": "group_matrix",
+      "participants": [
+        "python",
+        "ts",
+        "go",
+        "js"
+      ],
+      "owner": "python",
+      "e2ee": true,
+      "ack": true,
+      "text": "inbox migration group e2ee matrix python ts go js"
+    }
+  ]
+}

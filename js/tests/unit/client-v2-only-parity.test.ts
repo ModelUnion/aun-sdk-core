@@ -492,9 +492,11 @@ describe('AUNClient V2-only parity', () => {
     const result = await (client as any)._pullV2(0, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }]]);
+    expect(pullCalls[1]).toEqual(['message.v2.pull', { after_seq: 3, limit: 10, ack_up_to_seq: 3 }]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 批量消息只 ack 一次最终 contiguous_seq', async () => {
@@ -522,9 +524,11 @@ describe('AUNClient V2-only parity', () => {
     const result = await (client as any)._pullGroupV2('grp01', 0, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'dev-alice', slot_id: 'slot-a' }]]);
+    expect(pullCalls[1]).toEqual(['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 3, limit: 10, device_id: 'dev-alice', slot_id: 'slot-a', ack_up_to_seq: 3 }]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 应使用 group_aid 作为本地 namespace，并保留旧 group_id 查询字段', async () => {
@@ -562,16 +566,17 @@ describe('AUNClient V2-only parity', () => {
         device_id: 'dev-alice',
         slot_id: 'slot-a',
       })],
-    ]);
-    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', expect.objectContaining({
-        group_id: 'g1.example.com',
+      ['group.v2.pull', expect.objectContaining({
+        group_id: 'group.example.com/g1',
         group_aid: 'g1.example.com',
-        up_to_seq: 1,
+        after_seq: 1,
+        limit: 10,
         device_id: 'dev-alice',
         slot_id: 'slot-a',
+        ack_up_to_seq: 1,
       })],
     ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -608,13 +613,10 @@ describe('AUNClient V2-only parity', () => {
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 2 }],
-      ['message.v2.pull', { after_seq: 2, limit: 2 }],
-      ['message.v2.pull', { after_seq: 3, limit: 2 }],
+      ['message.v2.pull', { after_seq: 2, limit: 2, ack_up_to_seq: 2 }],
+      ['message.v2.pull', { after_seq: 3, limit: 2, ack_up_to_seq: 3 }],
     ]);
-    expect(ackCalls).toEqual([
-      ['message.v2.ack', { up_to_seq: 2 }],
-      ['message.v2.ack', { up_to_seq: 3 }],
-    ]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -649,12 +651,10 @@ describe('AUNClient V2-only parity', () => {
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
       ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 0, limit: 2 })],
-      ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 2, limit: 2 })],
+      ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 2, limit: 2, ack_up_to_seq: 2 })],
+      ['group.v2.pull', expect.objectContaining({ group_id: 'grp01', after_seq: 3, limit: 2, ack_up_to_seq: 3 })],
     ]);
-    expect(ackCalls).toEqual([
-      ['group.v2.ack', expect.objectContaining({ group_id: 'grp01', up_to_seq: 2 })],
-      ['group.v2.ack', expect.objectContaining({ group_id: 'grp01', up_to_seq: 3 })],
-    ]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('message.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
@@ -735,9 +735,10 @@ describe('AUNClient V2-only parity', () => {
 
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
-    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([
-      ['message.v2.ack', { up_to_seq: 5 }],
-    ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull')).toContainEqual(
+      ['message.v2.pull', { after_seq: 5, limit: 10, ack_up_to_seq: 5 }],
+    );
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
 
   it('message.v2.pull 发布消息前应先推进 contiguous_seq，避免事件处理器 ack 拉到旧边界', async () => {
@@ -813,7 +814,7 @@ describe('AUNClient V2-only parity', () => {
     const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
-    expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
+    expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
   });

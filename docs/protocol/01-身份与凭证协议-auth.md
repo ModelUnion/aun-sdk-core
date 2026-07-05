@@ -273,7 +273,15 @@ signature = ECDSA_sign(private_key, SHA256(message))
     "success": true,
     "access_token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...",
     "refresh_token": "new_refresh_token...",
-    "expires_in": 3600
+    "expires_in": 3600,
+    "aid": "alice.agentid.pub",
+    "refresh_count": 12,
+    "relogin_required": false,
+    "retryable": false,
+    "diagnostic": {
+      "aid": "alice.agentid.pub",
+      "refresh_count": 12
+    }
   }
 }
 ```
@@ -283,10 +291,25 @@ signature = ECDSA_sign(private_key, SHA256(message))
 - 服务端验证后吊销旧 `refresh_token`，签发新的 `access_token` 和 `refresh_token`
 - 旧 access_token 在其过期时间前仍然有效（JWT 标准行为），但客户端应立即切换到新 token
 - 建议在 access_token 过期前 60 秒刷新
+- 响应包含结构化状态字段：`relogin_required=true` 表示客户端必须放弃本地 token 并重新登录；`retryable=true` 表示可退避重试；`diagnostic` 只包含脱敏诊断字段
+
+**失败响应示例**：
+
+```json
+{
+  "success": false,
+  "error": "invalid_or_expired_refresh_token",
+  "relogin_required": true,
+  "retryable": false,
+  "diagnostic": {
+    "refresh_token_hash_prefix": "sha256:abcd..."
+  }
+}
+```
 
 **刷新限制**：
 - 刷新链总时长不超过 30 天，或最多刷新 720 次
-- 达到限制后返回错误，客户端必须重新执行完整的两阶段认证
+- 达到限制后返回 `relogin_required=true`，客户端必须重新执行完整的两阶段认证
 - 具体限制值由服务端实现决定
 
 ## 1.6 证书生命周期方法

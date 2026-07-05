@@ -29,6 +29,36 @@ func waitForParityCondition(timeout time.Duration, fn func() bool) bool {
 	return fn()
 }
 
+func countParityRPCCalls(calls []testRPCCall, method string) int {
+	count := 0
+	for _, call := range calls {
+		if call.Method == method {
+			count++
+		}
+	}
+	return count
+}
+
+func hasP2PPullPiggybackAck(calls []testRPCCall, seq int64) bool {
+	for _, call := range calls {
+		if call.Method == "message.v2.pull" && toInt64(call.Params["ack_up_to_seq"]) == seq {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGroupPullPiggybackAck(calls []testRPCCall, groupAID string, seq int64) bool {
+	for _, call := range calls {
+		if call.Method == "group.v2.pull" &&
+			strings.TrimSpace(v2AsString(call.Params["group_aid"])) == groupAID &&
+			toInt64(call.Params["ack_up_to_seq"]) == seq {
+			return true
+		}
+	}
+	return false
+}
+
 func TestV2BuildTargetAllowsExplicitEmptyDeviceID(t *testing.T) {
 	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
@@ -99,6 +129,35 @@ func TestV2GroupSendCachedSelfOnlyBootstrapIsRetryable(t *testing.T) {
 	ae, ok := err.(*AUNError)
 	if !ok || ae.Code != -33054 || !isV2RetryableError(err) {
 		t.Fatalf("旧 group bootstrap 缓存应映射为 -33054 可重试错误，实际: %#v", err)
+	}
+}
+
+func TestV2GroupSendIdempotencyCacheStoresCopies(t *testing.T) {
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	coord := c.getV2E2EECoordinator()
+	key := v2GroupSendIdempotencyKey("group.example.com", "m-1")
+	envelope := map[string]any{"message_id": "m-1", "ciphertext": "c1"}
+	result := map[string]any{"message_id": "m-1", "seq": int64(7)}
+
+	coord.rememberGroupSendEnvelope(key, envelope)
+	envelope["ciphertext"] = "mutated"
+	cachedEnvelope, ok := coord.getGroupSendCachedEnvelope(key)
+	if !ok || cachedEnvelope["ciphertext"] != "c1" {
+		t.Fatalf("cached envelope 应保存拷贝，实际: %#v", cachedEnvelope)
+	}
+	cachedEnvelope["ciphertext"] = "changed-again"
+	cachedEnvelope, _ = coord.getGroupSendCachedEnvelope(key)
+	if cachedEnvelope["ciphertext"] != "c1" {
+		t.Fatalf("cached envelope 返回值也应是拷贝，实际: %#v", cachedEnvelope)
+	}
+
+	coord.rememberGroupSendResult(key, result)
+	result["seq"] = int64(8)
+	cachedResult, ok := coord.getGroupSendCachedResult(key)
+	if !ok || toInt64(cachedResult["seq"]) != 7 {
+		t.Fatalf("cached result 应保存拷贝，实际: %#v", cachedResult)
 	}
 }
 
@@ -1101,25 +1160,12 @@ func TestV2P2PPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 		t.Fatalf("message.pull 应返回 3 条消息: %#v", result)
 	}
 
-	if !waitForParityCondition(time.Second, func() bool {
-		count := 0
-		for _, call := range getCalls() {
-			if call.Method == "message.v2.ack" {
-				count++
-			}
-		}
-		return count == 1
-	}) {
-		t.Fatalf("message.v2.pull 批量消息应只 ack 一次，calls=%#v", getCalls())
+	calls := getCalls()
+	if !hasP2PPullPiggybackAck(calls, 3) {
+		t.Fatalf("message.v2.pull 应通过下一页 ack_up_to_seq=3 piggyback ack，calls=%#v", calls)
 	}
-	var ackCalls []testRPCCall
-	for _, call := range getCalls() {
-		if call.Method == "message.v2.ack" {
-			ackCalls = append(ackCalls, call)
-		}
-	}
-	if len(ackCalls) != 1 || toInt64(ackCalls[0].Params["up_to_seq"]) != 3 {
-		t.Fatalf("message.v2.pull 应 ack 最终 contiguous_seq=3，ackCalls=%#v", ackCalls)
+	if countParityRPCCalls(calls, "message.v2.ack") != 0 {
+		t.Fatalf("message.v2.pull piggyback 后不应再单独 message.v2.ack，calls=%#v", calls)
 	}
 }
 
@@ -1266,30 +1312,12 @@ func TestV2P2PPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	if len(observed) != 3 || observed[0] != 3 || observed[1] != 3 || observed[2] != 3 {
 		t.Fatalf("message.received 发布时 contiguous_seq 应已推进到 3，observed=%#v", observed)
 	}
-	if !waitForParityCondition(time.Second, func() bool {
-		ackCount := 0
-		ackOK := false
-		for _, call := range getCalls() {
-			if call.Method == "message.v2.ack" {
-				ackCount++
-				ackOK = toInt64(call.Params["up_to_seq"]) == 3
-			}
-		}
-		return ackCount == 1 && ackOK
-	}) {
-		t.Fatalf("message.v2.pull 本页应只 ack 一次，calls=%#v", getCalls())
+	calls := getCalls()
+	if !hasP2PPullPiggybackAck(calls, 3) {
+		t.Fatalf("message.v2.pull 本页应通过下一页 ack_up_to_seq=3 piggyback ack，calls=%#v", calls)
 	}
-	ackCount := 0
-	for _, call := range getCalls() {
-		if call.Method == "message.v2.ack" {
-			ackCount++
-			if toInt64(call.Params["up_to_seq"]) != 3 {
-				t.Fatalf("message.v2.ack 应使用最终 contiguous_seq=3，call=%#v", call)
-			}
-		}
-	}
-	if ackCount != 1 {
-		t.Fatalf("message.v2.pull 本页应只 ack 一次，calls=%#v", getCalls())
+	if countParityRPCCalls(calls, "message.v2.ack") != 0 {
+		t.Fatalf("message.v2.pull piggyback 后不应再单独 message.v2.ack，calls=%#v", calls)
 	}
 }
 
@@ -1337,15 +1365,12 @@ func TestV2P2PPullReacksWhenServerAckLagsExistingContiguousSeq(t *testing.T) {
 	if got := c.seqTracker.GetContiguousSeq(ns); got != 5 {
 		t.Fatalf("contiguous_seq 应保持 5，got=%d", got)
 	}
-	if !waitForParityCondition(time.Second, func() bool {
-		for _, call := range getCalls() {
-			if call.Method == "message.v2.ack" && toInt64(call.Params["up_to_seq"]) == 5 {
-				return true
-			}
-		}
-		return false
-	}) {
-		t.Fatalf("server_ack_seq 落后时应补 message.v2.ack 到 5，calls=%#v", getCalls())
+	calls := getCalls()
+	if !hasP2PPullPiggybackAck(calls, 5) {
+		t.Fatalf("server_ack_seq 落后时应通过下一页 ack_up_to_seq=5 piggyback 补 ack，calls=%#v", calls)
+	}
+	if countParityRPCCalls(calls, "message.v2.ack") != 0 {
+		t.Fatalf("message.v2.pull piggyback 补 ack 后不应再单独 message.v2.ack，calls=%#v", calls)
 	}
 }
 
@@ -1409,25 +1434,12 @@ func TestV2GroupPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 		t.Fatalf("group.pull 应返回 3 条消息: %#v", result)
 	}
 
-	if !waitForParityCondition(time.Second, func() bool {
-		count := 0
-		for _, call := range getCalls() {
-			if call.Method == "group.v2.ack" {
-				count++
-			}
-		}
-		return count == 1
-	}) {
-		t.Fatalf("group.v2.pull 批量消息应只 ack 一次，calls=%#v", getCalls())
+	calls := getCalls()
+	if !hasGroupPullPiggybackAck(calls, groupAID, 3) {
+		t.Fatalf("group.v2.pull 应通过下一页 ack_up_to_seq=3 piggyback ack，calls=%#v", calls)
 	}
-	var ackCalls []testRPCCall
-	for _, call := range getCalls() {
-		if call.Method == "group.v2.ack" {
-			ackCalls = append(ackCalls, call)
-		}
-	}
-	if len(ackCalls) != 1 || strings.TrimSpace(v2AsString(ackCalls[0].Params["group_id"])) != groupAID || toInt64(ackCalls[0].Params["up_to_seq"]) != 3 {
-		t.Fatalf("group.v2.pull 应 ack 最终 contiguous_seq=3，ackCalls=%#v", ackCalls)
+	if countParityRPCCalls(calls, "group.v2.ack") != 0 {
+		t.Fatalf("group.v2.pull piggyback 后不应再单独 group.v2.ack，calls=%#v", calls)
 	}
 }
 
@@ -1471,30 +1483,12 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	if len(observed) != 3 || observed[0] != 3 || observed[1] != 3 || observed[2] != 3 {
 		t.Fatalf("group.message_created 发布时 contiguous_seq 应已推进到 3，observed=%#v", observed)
 	}
-	if !waitForParityCondition(time.Second, func() bool {
-		ackCount := 0
-		ackOK := false
-		for _, call := range getCalls() {
-			if call.Method == "group.v2.ack" {
-				ackCount++
-				ackOK = strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupAID && toInt64(call.Params["up_to_seq"]) == 3
-			}
-		}
-		return ackCount == 1 && ackOK
-	}) {
-		t.Fatalf("group.v2.pull 本页应只 ack 一次，calls=%#v", getCalls())
+	calls := getCalls()
+	if !hasGroupPullPiggybackAck(calls, groupAID, 3) {
+		t.Fatalf("group.v2.pull 本页应通过下一页 ack_up_to_seq=3 piggyback ack，calls=%#v", calls)
 	}
-	ackCount := 0
-	for _, call := range getCalls() {
-		if call.Method == "group.v2.ack" {
-			ackCount++
-			if strings.TrimSpace(v2AsString(call.Params["group_id"])) != groupAID || toInt64(call.Params["up_to_seq"]) != 3 {
-				t.Fatalf("group.v2.ack 应使用最终 contiguous_seq=3，call=%#v", call)
-			}
-		}
-	}
-	if ackCount != 1 {
-		t.Fatalf("group.v2.pull 本页应只 ack 一次，calls=%#v", getCalls())
+	if countParityRPCCalls(calls, "group.v2.ack") != 0 {
+		t.Fatalf("group.v2.pull piggyback 后不应再单独 group.v2.ack，calls=%#v", calls)
 	}
 }
 

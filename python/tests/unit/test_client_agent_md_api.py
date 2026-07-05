@@ -251,18 +251,25 @@ def test_observe_rpc_meta_persists_structured_meta_and_downloads_missing_local(m
                 "etag": '"bob-cloud"',
                 "last_modified": "Sun, 24 May 2026 00:00:01 GMT",
             },
+            "group": {
+                "aid": "team.group.agentid.pub",
+                "etag": '"group-cloud"',
+                "last_modified": "Sun, 24 May 2026 00:00:02 GMT",
+            },
             "sender": {"aid": "dave.agentid.pub", "etag": '"dave-cloud"'},
         },
     })
 
     records = {
         aid: _read_record(client, aid)
-        for aid in ("alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub")
+        for aid in ("alice.agentid.pub", "bob.agentid.pub", "team.group.agentid.pub", "dave.agentid.pub")
     }
     assert records["alice.agentid.pub"]["remote_etag"] == '"alice-cloud-2"'
     assert records["bob.agentid.pub"]["remote_etag"] == '"bob-cloud"'
+    assert records["team.group.agentid.pub"]["remote_etag"] == '"group-cloud"'
+    assert records["team.group.agentid.pub"]["last_modified"] == "Sun, 24 May 2026 00:00:02 GMT"
     assert records["dave.agentid.pub"]["remote_etag"] == '"dave-cloud"'
-    assert downloaded == ["alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"]
+    assert downloaded == ["alice.agentid.pub", "team.group.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"]
     assert client._agent_md_manager.file_path("bob.agentid.pub").read_text(encoding="utf-8") == "# bob.agentid.pub\n"
     client._token_store.close()
 
@@ -278,6 +285,32 @@ def test_observe_envelope_agent_md_persists_sender_etag(monkeypatch, tmp_path: P
 
     rec = _read_record(client, "alice.agentid.pub")
     assert rec["remote_etag"] == '"alice-cloud"'
+    client._token_store.close()
+
+
+def test_observe_envelope_agent_md_persists_group_etag(monkeypatch, tmp_path: Path):
+    client = _make_client(tmp_path, aid="bob.agentid.pub")
+
+    async def fake_download(aid):
+        return {"aid": aid}
+
+    monkeypatch.setattr(client._agent_md_manager, "download", fake_download)
+    client._agent_md_manager.observe_envelope({
+        "group_aid": "team.group.agentid.pub",
+        "agent_md": {
+            "sender": {"aid": "alice.agentid.pub", "etag": '"alice-cloud"'},
+            "group": {
+                "etag": '"group-cloud"',
+                "last_modified": "Sun, 24 May 2026 00:00:02 GMT",
+            },
+        },
+    })
+
+    sender = _read_record(client, "alice.agentid.pub")
+    group = _read_record(client, "team.group.agentid.pub")
+    assert sender["remote_etag"] == '"alice-cloud"'
+    assert group["remote_etag"] == '"group-cloud"'
+    assert group["last_modified"] == "Sun, 24 May 2026 00:00:02 GMT"
     client._token_store.close()
 
 

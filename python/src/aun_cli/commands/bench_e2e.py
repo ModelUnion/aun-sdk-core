@@ -92,7 +92,7 @@ class AutoscaleConfig:
     group_id: str | None
     timeout_ms: int
     p99_scope: str = "send"
-    perf_trace: bool = True
+    perf_trace: bool = False
     perf_log_root: str | None = None
     drain_receivers: bool = False
     drain_timeout_ms: int | None = None
@@ -453,6 +453,21 @@ _SEND_PERF_PHASES: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...]
     ("msg_sync_insert_logical", ("msg_sync_insert_logical_begin",), ("msg_sync_insert_logical_done",), "first"),
     ("msg_sync_store_recipient", ("msg_sync_store_recipient_begin",), ("msg_sync_store_recipient_done",), "first"),
     ("msg_sync_store_self", ("msg_sync_store_self_begin",), ("msg_sync_store_self_done",), "first"),
+    ("msg_v2_validate", ("msg_v2_validate_begin",), ("msg_v2_validate_done",), "first"),
+    ("msg_v2_audit_check", ("msg_v2_audit_check_begin",), ("msg_v2_audit_check_done",), "first"),
+    ("msg_v2_peer_devices", ("msg_v2_peer_devices_begin",), ("msg_v2_peer_devices_done",), "first"),
+    ("msg_v2_self_devices", ("msg_v2_self_devices_begin",), ("msg_v2_self_devices_done",), "first"),
+    ("msg_v2_wrap_prepare", ("msg_v2_wrap_prepare_begin",), ("msg_v2_wrap_prepare_done",), "first"),
+    ("msg_v2_write", ("msg_v2_write_begin",), ("msg_v2_write_done",), "first"),
+    ("msg_v2_write_prepare", ("msg_v2_write_prepare_begin",), ("msg_v2_write_prepare_done",), "first"),
+    ("msg_v2_pending_lookup", ("msg_v2_pending_lookup_begin",), ("msg_v2_pending_lookup_done",), "first"),
+    ("msg_v2_existing_lookup", ("msg_v2_existing_lookup_begin",), ("msg_v2_existing_lookup_done",), "first"),
+    ("msg_v2_seq_alloc", ("msg_v2_seq_alloc_begin",), ("msg_v2_seq_alloc_done",), "first"),
+    ("msg_v2_pending_reserve", ("msg_v2_pending_reserve_begin",), ("msg_v2_pending_reserve_done",), "first"),
+    ("msg_v2_wal_backlog_wait", ("msg_v2_wal_backlog_wait_begin",), ("msg_v2_wal_backlog_wait_done",), "first"),
+    ("msg_v2_wal_append", ("msg_v2_wal_append_begin",), ("msg_v2_wal_append_done",), "first"),
+    ("msg_v2_pending_enqueue", ("msg_v2_pending_enqueue_begin",), ("msg_v2_pending_enqueue_done",), "first"),
+    ("msg_v2_push_dispatch", ("msg_v2_push_dispatch_begin",), ("msg_v2_push_dispatch_done",), "first"),
 )
 
 
@@ -2348,7 +2363,8 @@ async def run_autoscale(ctx: typer.Context, config: AutoscaleConfig) -> dict[str
     knee: dict[str, Any] = {"found": False}
     soft_knee: dict[str, Any] = {"found": False}
     concurrency = config.start
-    perf_tail = SendPerfLogTail(config.perf_log_root) if config.perf_trace else None
+    perf_enabled = bool(config.perf_trace or config.perf_log_root)
+    perf_tail = SendPerfLogTail(config.perf_log_root) if perf_enabled else None
     perf_stage_totals: dict[str, list[float]] = {}
     perf_trace_totals: list[float] = []
     perf_event_count = 0
@@ -2438,7 +2454,7 @@ async def run_autoscale(ctx: typer.Context, config: AutoscaleConfig) -> dict[str
         trace_count=perf_trace_count,
         event_count=perf_event_count,
         log_paths=sorted(perf_log_paths),
-        enabled=config.perf_trace,
+        enabled=perf_enabled,
     )
     return {
         "scenario": config.scenario,
@@ -3760,7 +3776,7 @@ def autoscale_send(
     prefix: str = typer.Option("bench-autoscale", "--prefix", help="消息内容前缀"),
     timeout_ms: int = typer.Option(5000, "--timeout-ms", help="等待 delivery/ack 的毫秒数"),
     p99_scope: str = typer.Option("send", "--p99-scope", help="p99 判定范围：send/delivery/ack/max；默认只看发送 RPC RTT"),
-    perf_trace: bool = typer.Option(True, "--perf-trace/--no-perf-trace", help="聚合服务端 send_perf 阶段耗时"),
+    perf_trace: bool = typer.Option(False, "--perf-trace/--no-perf-trace", help="聚合服务端 send_perf 阶段耗时"),
     perf_log_root: str | None = typer.Option(None, "--perf-log-root", help="Kite 实例目录或日志根目录"),
     drain_receivers: bool = typer.Option(False, "--drain-receivers/--no-drain-receivers", help="每个台阶发送前先让 receiver 拉完历史积压"),
     drain_timeout_ms: int | None = typer.Option(None, "--drain-timeout-ms", help="receiver 历史积压清空最长等待毫秒数；不设置则不限时"),
@@ -3835,7 +3851,7 @@ def autoscale_group(
     prefix: str = typer.Option("bench-autoscale", "--prefix", help="消息内容前缀"),
     timeout_ms: int = typer.Option(5000, "--timeout-ms", help="等待 delivery/ack 的毫秒数"),
     p99_scope: str = typer.Option("send", "--p99-scope", help="p99 判定范围：send/delivery/ack/max；默认只看发送 RPC RTT"),
-    perf_trace: bool = typer.Option(True, "--perf-trace/--no-perf-trace", help="聚合服务端 send_perf 阶段耗时"),
+    perf_trace: bool = typer.Option(False, "--perf-trace/--no-perf-trace", help="聚合服务端 send_perf 阶段耗时"),
     perf_log_root: str | None = typer.Option(None, "--perf-log-root", help="Kite 实例目录或日志根目录"),
     drain_receivers: bool = typer.Option(False, "--drain-receivers/--no-drain-receivers", help="每个台阶发送前先让 receiver 拉完历史积压"),
     drain_timeout_ms: int | None = typer.Option(None, "--drain-timeout-ms", help="receiver 历史积压清空最长等待毫秒数；不设置则不限时"),

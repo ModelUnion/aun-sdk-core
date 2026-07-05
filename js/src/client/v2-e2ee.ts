@@ -42,6 +42,19 @@ const MEMBERSHIP_ACTIONS = new Set([
 
 const JOIN_ACTIONS = new Set(['member_added', 'joined', 'join_approved', 'invite_code_used']);
 
+function v2PullTailDelayMs(msgCount: number, pageLimit: number): number {
+  const count = Math.trunc(Number(msgCount || 0));
+  const limit = Math.trunc(Number(pageLimit || 0));
+  if (count <= 0 || (limit > 0 && count >= limit)) return 0;
+  return Math.min(500, Math.max(5, 1000 / (count + 1)));
+}
+
+function v2Sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, ms);
+  });
+}
+
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.slice().buffer as ArrayBuffer;
 }
@@ -761,15 +774,22 @@ export class V2E2EECoordinator {
     let nextAfterSeq = opts?.force ? afterSeq : (afterSeq || (ns ? client._seqTracker.getContiguousSeq(ns) : 0));
     let pageCount = 0;
     let lastAutoAckSeq = 0;
+    let pendingAckSeq = 0;
     const maxPages = 100;
 
     while (pageCount < maxPages) {
       pageCount += 1;
+      const ackUpToSeq = pendingAckSeq;
       const result = await client._callRawV2Rpc('message.v2.pull', {
         after_seq: nextAfterSeq,
         limit,
         ...(opts?.force ? { force: true } : {}),
+        ...(ackUpToSeq > 0 ? { ack_up_to_seq: ackUpToSeq } : {}),
       }) as Record<string, unknown>;
+      if (ackUpToSeq > 0) {
+        pendingAckSeq = 0;
+        lastAutoAckSeq = Math.max(lastAutoAckSeq, ackUpToSeq);
+      }
       const pageMessages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
       const messages = pageMessages.filter((msg) => {
         const seq = Number(msg.seq ?? 0);
@@ -861,18 +881,35 @@ export class V2E2EECoordinator {
           && ackSeq > lastAutoAckSeq
           && (contigAdvanced || (hasServerAckSeq && ackSeq > serverAckSeq));
         if (ackNeeded) {
-          await this.ackV2(ackSeq);
-          lastAutoAckSeq = ackSeq;
+          const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
+          const canContinuePage = messages.length > 0 && nextAfter > nextAfterSeq;
+          if (canContinuePage) {
+            pendingAckSeq = Math.max(pendingAckSeq, ackSeq);
+            lastAutoAckSeq = Math.max(lastAutoAckSeq, ackSeq);
+          } else {
+            await this.ackV2(ackSeq);
+            lastAutoAckSeq = Math.max(lastAutoAckSeq, ackSeq);
+          }
         }
       }
 
       const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
-      if (messages.length === 0 || nextAfter <= nextAfterSeq) break;
+      const rawCount = messages.length;
+      const canContinuePage = rawCount > 0 && nextAfter > nextAfterSeq;
+      const fullPage = canContinuePage && limit > 0 && rawCount >= limit;
+      const shouldContinue = canContinuePage && (fullPage || pendingAckSeq > 0);
+      if (!shouldContinue) break;
+      const tailDelayMs = v2PullTailDelayMs(rawCount, limit);
+      if (tailDelayMs > 0) await v2Sleep(tailDelayMs);
       nextAfterSeq = nextAfter;
     }
 
     if (pageCount >= maxPages) {
       client._clientLog.warn(`message.v2.pull reached max_pages=${maxPages} after_seq=${nextAfterSeq}`);
+      if (pendingAckSeq > 0) {
+        await this.ackV2(pendingAckSeq);
+        pendingAckSeq = 0;
+      }
     }
     return decrypted;
   }
@@ -1006,18 +1043,30 @@ export class V2E2EECoordinator {
     const ownsCursor = opts?.ownsCursor !== false;
     let nextAfterSeq = opts?.explicitAfterSeq ? afterSeq : (afterSeq || client._seqTracker.getContiguousSeq(ns));
     let pageCount = 0;
+    let lastAutoAckSeq = 0;
+    let pendingAckSeq = 0;
     const maxPages = 100;
 
     while (pageCount < maxPages) {
       pageCount += 1;
+      const ackUpToSeq = ownsCursor ? pendingAckSeq : 0;
       const result = await client._callRawV2Rpc('group.v2.pull', {
         group_id: wireGroupId,
         group_aid: gid,
         after_seq: nextAfterSeq,
         limit,
         ...cursorParams,
+        ...(ackUpToSeq > 0 ? { ack_up_to_seq: ackUpToSeq } : {}),
       }) as Record<string, unknown>;
-      const messages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
+      if (ackUpToSeq > 0) {
+        pendingAckSeq = 0;
+        lastAutoAckSeq = Math.max(lastAutoAckSeq, ackUpToSeq);
+      }
+      const pageMessages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
+      const messages = pageMessages.filter((msg) => {
+        const seq = Number(msg.seq ?? 0);
+        return Number.isFinite(seq) && seq > nextAfterSeq;
+      });
       const seqs = messages
         .map((msg) => Number(msg.seq ?? 0))
         .filter((seq) => Number.isFinite(seq) && seq > 0);
@@ -1109,22 +1158,41 @@ export class V2E2EECoordinator {
         client._persistSeq(ns);
       }
       const hasServerCursor = cursor !== null && Object.prototype.hasOwnProperty.call(cursor, 'current_seq');
-      const ackNeeded = messages.length > 0
+      const ackNeeded = pageMessages.length > 0
         && ackSeq > 0
+        && ackSeq > lastAutoAckSeq
         && ownsCursor
         && (contigAdvanced || (hasServerCursor && ackSeq > cursorCurrentSeq));
       if (ackNeeded) {
-        await this.ackGroupV2(gid, ackSeq);
+        const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
+        const canContinuePage = messages.length > 0 && nextAfter > nextAfterSeq && ownsCursor;
+        if (canContinuePage) {
+          pendingAckSeq = Math.max(pendingAckSeq, ackSeq);
+          lastAutoAckSeq = Math.max(lastAutoAckSeq, ackSeq);
+        } else {
+          await this.ackGroupV2(gid, ackSeq);
+          lastAutoAckSeq = Math.max(lastAutoAckSeq, ackSeq);
+        }
       }
 
       const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
       if (!ownsCursor) break;
-      if (messages.length === 0 || nextAfter <= nextAfterSeq || result.has_more === false) break;
+      const rawCount = messages.length;
+      const canContinuePage = rawCount > 0 && nextAfter > nextAfterSeq;
+      const fullPage = canContinuePage && limit > 0 && rawCount >= limit;
+      const shouldContinue = canContinuePage && (fullPage || pendingAckSeq > 0);
+      if (!shouldContinue) break;
+      const tailDelayMs = v2PullTailDelayMs(rawCount, limit);
+      if (tailDelayMs > 0) await v2Sleep(tailDelayMs);
       nextAfterSeq = nextAfter;
     }
 
     if (pageCount >= maxPages) {
       client._clientLog.warn(`group.v2.pull reached max_pages=${maxPages} group=${gid} after_seq=${nextAfterSeq}`);
+      if (pendingAckSeq > 0) {
+        await this.ackGroupV2(gid, pendingAckSeq);
+        pendingAckSeq = 0;
+      }
     }
     return decrypted;
   }

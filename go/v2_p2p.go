@@ -33,7 +33,20 @@ type v2PullPageMeta struct {
 	serverAckSeq int64
 	hasServerAck bool
 	latestSeq    int64
-	hasMore      bool
+}
+
+func v2PullTailDelay(rawCount int, pageLimit int) time.Duration {
+	if rawCount <= 0 || (pageLimit > 0 && rawCount >= pageLimit) {
+		return 0
+	}
+	delay := time.Second / time.Duration(rawCount+1)
+	if delay < 5*time.Millisecond {
+		return 5 * time.Millisecond
+	}
+	if delay > 500*time.Millisecond {
+		return 500 * time.Millisecond
+	}
+	return delay
 }
 
 // v2BootstrapEntry 单条 peer_aid 缓存项。
@@ -404,8 +417,8 @@ func (c *AUNClient) pullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 	return c.getV2E2EECoordinator().pullV2(ctx, afterSeq, limit)
 }
 
-func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
-	return c.getV2E2EECoordinator().pullV2WithForce(ctx, afterSeq, limit, force)
+func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool, ackUpToSeq int64) ([]map[string]any, v2PullPageMeta, error) {
+	return c.getV2E2EECoordinator().pullV2WithForce(ctx, afterSeq, limit, force, ackUpToSeq)
 }
 
 func (c *AUNClient) ackV2(ctx context.Context, upToSeq int64) (map[string]any, error) {

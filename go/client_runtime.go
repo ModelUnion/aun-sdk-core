@@ -68,6 +68,9 @@ func (s *runtimeIdentityState) setInstanceContext(deviceID, slotID string) {
 	c := s.runtime.client
 	c.deviceID = deviceID
 	c.slotID = slotID
+	if c.logger != nil {
+		c.logger.BindDeviceID(deviceID)
+	}
 	if c.auth != nil {
 		c.auth.SetInstanceContext(deviceID, slotID)
 	}

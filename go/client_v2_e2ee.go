@@ -22,6 +22,8 @@ type v2E2EECoordinator struct {
 	groupSpkRegistrationInflight   map[string]bool
 	groupSpkRotationInflight       map[string]bool
 	groupSpkPeerFallbackRegistered map[string]bool
+	groupSendIdempotencyMu         sync.Mutex
+	groupSendIdempotency           map[string]v2GroupSendIdempotencyEntry
 }
 
 func newV2E2EECoordinator(runtime *clientRuntime) *v2E2EECoordinator {
@@ -30,6 +32,7 @@ func newV2E2EECoordinator(runtime *clientRuntime) *v2E2EECoordinator {
 		groupSpkRegistrationInflight:   make(map[string]bool),
 		groupSpkRotationInflight:       make(map[string]bool),
 		groupSpkPeerFallbackRegistered: make(map[string]bool),
+		groupSendIdempotency:           make(map[string]v2GroupSendIdempotencyEntry),
 	}
 }
 
@@ -1168,10 +1171,23 @@ func (v *v2E2EECoordinator) pullV2(ctx context.Context, afterSeq int64, limit in
 		nextAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 	allMsgs := make([]map[string]any, 0)
+	lastAutoAckSeq := int64(0)
+	pendingAckSeq := int64(0)
 	for pageCount := 0; pageCount < 100; pageCount++ {
-		msgs, pageMeta, err := v.pullV2WithForce(ctx, nextAfterSeq, limit, false)
+		pageContigBefore := 0
+		if ns != "" {
+			pageContigBefore = c.seqTracker.GetContiguousSeq(ns)
+		}
+		ackUpToSeq := pendingAckSeq
+		msgs, pageMeta, err := v.pullV2WithForce(ctx, nextAfterSeq, limit, false, ackUpToSeq)
 		if err != nil {
 			return nil, err
+		}
+		if ackUpToSeq > 0 {
+			pendingAckSeq = 0
+			if ackUpToSeq > lastAutoAckSeq {
+				lastAutoAckSeq = ackUpToSeq
+			}
 		}
 		nextAfter := nextAfterSeq
 		if pageMeta.latestSeq > nextAfter {
@@ -1180,15 +1196,54 @@ func (v *v2E2EECoordinator) pullV2(ctx context.Context, afterSeq int64, limit in
 		if nextAfter > nextAfterSeq {
 			allMsgs = append(allMsgs, msgs...)
 		}
-		if len(msgs) <= 0 || nextAfter <= nextAfterSeq {
+		if ns != "" {
+			contig := c.seqTracker.GetContiguousSeq(ns)
+			ackNeeded := contig > 0 &&
+				int64(contig) > lastAutoAckSeq &&
+				(contig != pageContigBefore || (pageMeta.hasServerAck && int64(contig) > pageMeta.serverAckSeq))
+			if ackNeeded {
+				ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(contig))
+				if ackSeq > 0 {
+					canContinuePage := pageMeta.latestSeq > nextAfterSeq
+					if canContinuePage {
+						if ackSeq > pendingAckSeq {
+							pendingAckSeq = ackSeq
+						}
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+						c.logE2.Debug("message.v2.pull queued piggyback auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, pendingAckSeq, pageMeta.rawCount)
+					} else {
+						if _, err := v.ackV2(ctx, ackSeq); err != nil {
+							return nil, err
+						}
+						if ackSeq > lastAutoAckSeq {
+							lastAutoAckSeq = ackSeq
+						}
+					}
+				}
+			}
+		}
+		canContinuePage := pageMeta.rawCount > 0 && nextAfter > nextAfterSeq
+		fullPage := canContinuePage && limit > 0 && pageMeta.rawCount >= limit
+		shouldContinue := canContinuePage && (fullPage || pendingAckSeq > 0)
+		if !shouldContinue {
 			break
 		}
+		if delay := v2PullTailDelay(pageMeta.rawCount, limit); delay > 0 {
+			sleepWithCancel(ctx, delay)
+		}
 		nextAfterSeq = nextAfter
+	}
+	if pendingAckSeq > 0 {
+		if _, err := v.ackV2(ctx, pendingAckSeq); err != nil {
+			return nil, err
+		}
 	}
 	return allMsgs, nil
 }
 
-func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
+func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool, ackUpToSeq int64) ([]map[string]any, v2PullPageMeta, error) {
 	c := v.runtime.client
 	meta := v2PullPageMeta{}
 	state := c.v2GetState()
@@ -1212,13 +1267,16 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
-	c.logE2.Debug("message.v2.pull request: after_seq=%d limit=%d ns=%s", effectiveAfterSeq, limit, ns)
+	c.logE2.Debug("message.v2.pull request: after_seq=%d limit=%d ack_up_to_seq=%d ns=%s", effectiveAfterSeq, limit, ackUpToSeq, ns)
 	pullParams := map[string]any{
 		"after_seq": effectiveAfterSeq,
 		"limit":     limit,
 	}
 	if force {
 		pullParams["force"] = true
+	}
+	if ackUpToSeq > 0 {
+		pullParams["ack_up_to_seq"] = ackUpToSeq
 	}
 	if err := c.signClientOperation("message.v2.pull", pullParams); err != nil {
 		return nil, meta, err
@@ -1240,12 +1298,10 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 	}
 	_, hasServerAckSeq := result["server_ack_seq"]
 	serverAckSeq := toInt64(result["server_ack_seq"])
-	hasMore, _ := result["has_more"].(bool)
 	meta = v2PullPageMeta{
-		rawCount:     len(pageMessages),
+		rawCount:     len(messages),
 		serverAckSeq: serverAckSeq,
 		hasServerAck: hasServerAckSeq,
-		hasMore:      hasMore,
 	}
 	c.logE2.Debug("message.v2.pull response: raw_count=%d stale_count=%d server_ack_seq=%d has_more=%v", len(messages), len(pageMessages)-len(messages), serverAckSeq, result["has_more"])
 	for _, msg := range messages {

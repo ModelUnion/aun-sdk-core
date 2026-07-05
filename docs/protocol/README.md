@@ -39,7 +39,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 |------|------|
 | [06-服务协议.md](06-服务协议.md) | 业务层方法：message.* / meta.* / search.* / task.* / 跨域消息路由 / E2EE 摘要 / `pki.{issuer}` 与 `ct.{issuer}` 公开端点 |
 | [07-错误码与状态机.md](07-错误码与状态机.md) | 错误码分层汇总、各模式状态机、可重试/不可重试分类 |
-| [08-AUN-E2EE.md](08-AUN-E2EE.md) | 端到端加密安全层：密文格式、签名、防重放、prekey 管理（横跨三种模式） |
+| [08-AUN-E2EE.md](08-AUN-E2EE.md) | Legacy P2P E2EE 信封说明；当前默认主路径见 SDK V2 多设备 wrap 文档 |
 | [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE V2：消息级密钥、逐设备密钥包裹、成员状态签名验证 |
 | [16-系统目录保护方案.md](16-系统目录保护方案.md) | `memberdata` 与 `group_data` 的系统目录保护、`group_data` 目录树隐藏与读下载/写保护边界、Group FS 授权路径和配额归属 |
 
@@ -58,7 +58,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 | I | [附录I-跨域消息路由实现指南.md](附录I-跨域消息路由实现指南.md) | 跨域消息路由实现 |
 | J | [附录J-客户端接入示例.md](附录J-客户端接入示例.md) | 客户端接入示例 |
 | K | [附录K-Agent_Web发现协议.md](附录K-Agent_Web发现协议.md) | Agent Web 发现协议 |
-| L | [附录L-E2EE实现指南.md](附录L-E2EE实现指南.md) | E2EE 实现指南 |
+| L | [附录L-E2EE实现指南.md](附录L-E2EE实现指南.md) | Legacy E2EE 实现指南 |
 | M | [附录M-JWT认证实现指南.md](附录M-JWT认证实现指南.md) | JWT 认证实现指南 |
 
 ## 快速导航
@@ -67,7 +67,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 
 **协议实现者**：[02-证书体系](02-证书与信任体系.md) → [01-auth](01-身份与凭证协议-auth.md) → [04-Peer](04-Peer-子协议.md) → [06-服务协议](06-服务协议.md) → [07-错误码](07-错误码与状态机.md)
 
-**安全审计**：[02-证书体系](02-证书与信任体系.md) → [09-安全考虑](09-安全考虑.md) → [AUN-E2EE](08-AUN-E2EE.md)
+**安全审计**：[02-证书体系](02-证书与信任体系.md) → [09-安全考虑](09-安全考虑.md) → [E2EE V2 时序](../sdk/E2EE_V2消息通信时序图.md) / [群组 E2EE V2](08-AUN-E2EE-Group.md)；旧 P2P 信封再查 [AUN-E2EE Legacy](08-AUN-E2EE.md)
 
 **SDK 设计**：[00-总览](00-总览与分层.md) → [06-服务协议](06-服务协议.md) → [AUN-SDK-跨语言设计方案](../../AUN-SDK-跨语言设计方案.md)
 

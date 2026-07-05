@@ -1644,12 +1644,18 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     await writeAgentFile(client, 'bob.agentid.pub', '# Bob\n');
     await writeAgentFile(client, 'carol.agentid.pub', '# Carol\n');
     await writeAgentFile(client, 'dave.agentid.pub', '# Dave\n');
+    await writeAgentFile(client, 'team.group.agentid.pub', '# Group\n');
 
     await (client as any)._observeRpcMeta({
       agent_md_etag: '"alice-cloud"',
       agent_md_etags: {
         to: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
         target: { aid: 'carol.agentid.pub', etag: '"carol-cloud"' },
+        group: {
+          aid: 'team.group.agentid.pub',
+          etag: '"group-cloud"',
+          last_modified: 'Sun, 24 May 2026 00:00:02 GMT',
+        },
         sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
       },
     });
@@ -1658,6 +1664,8 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect((await readAgentMeta(client, 'alice.agentid.pub')).remote_etag).toBe('"alice-cloud"');
     expect((await readAgentMeta(client, 'bob.agentid.pub')).remote_etag).toBe('"bob-cloud"');
     expect((await readAgentMeta(client, 'carol.agentid.pub')).remote_etag).toBe('"carol-cloud"');
+    expect((await readAgentMeta(client, 'team.group.agentid.pub')).remote_etag).toBe('"group-cloud"');
+    expect((await readAgentMeta(client, 'team.group.agentid.pub')).last_modified).toBe('Sun, 24 May 2026 00:00:02 GMT');
     expect((await readAgentMeta(client, 'dave.agentid.pub')).remote_etag).toBe('"dave-cloud"');
   });
 
@@ -1687,6 +1695,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
     await writeAgentFile(client, 'bob.agentid.pub', '# Bob\n');
+    await writeAgentFile(client, 'team.group.agentid.pub', '# Group\n');
     const publish = vi.fn().mockResolvedValue(undefined);
     (client as any)._dispatcher.publish = publish;
     (client as any)._v2Session = {
@@ -1703,9 +1712,13 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'chat.text',
         aad: { from: 'bob.agentid.pub', from_device: 'bob-dev' },
+        group_aid: 'team.group.agentid.pub',
         recipients: [['alice.agentid.pub', 'device-001', 'peer', 'peer_device_prekey', 'fp', 'missing-spk', 'n', 'w']],
         protected_headers: { payload_type: 'chat.text', sdk_lang: 'js', _auth: 'secret' },
-        agent_md: { sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' } },
+        agent_md: {
+          sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
+          group: { etag: '"group-cloud"', last_modified: 'Sun, 24 May 2026 00:00:02 GMT' },
+        },
       }),
       t_server: 123,
     });
@@ -1714,10 +1727,16 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect(publish).toHaveBeenCalledWith('message.undecryptable', expect.objectContaining({
       payload_type: 'chat.text',
       protected_headers: { payload_type: 'chat.text', sdk_lang: 'js' },
-      agent_md: { sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' } },
+      agent_md: {
+        sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
+        group: { etag: '"group-cloud"', last_modified: 'Sun, 24 May 2026 00:00:02 GMT' },
+      },
     }));
     const record = await readAgentMeta(client, 'bob.agentid.pub');
     expect(record.remote_etag).toBe('"bob-cloud"');
+    const groupRecord = await readAgentMeta(client, 'team.group.agentid.pub');
+    expect(groupRecord.remote_etag).toBe('"group-cloud"');
+    expect(groupRecord.last_modified).toBe('Sun, 24 May 2026 00:00:02 GMT');
   });
 
   it('checkAgentMd 应使用 HEAD 返回的云端 ETag 与本地 content ETag 比较并落到 agentmd.json', async () => {

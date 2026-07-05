@@ -77,7 +77,7 @@ aun config list
 |------|------|
 | `aid` | 默认操作身份 |
 | `aun_path` | 本地身份、密钥、日志等数据目录 |
-| `active_group` | 默认群组；省略 group_id 时使用 |
+| `active_group` | 默认群组；值使用目标态 `group_aid`，省略 `group_id` 兼容参数时使用 |
 | `debug` / `trace` / `timeout` | 调试、trace 和超时配置 |
 
 有效 profile 选择顺序：
@@ -113,7 +113,7 @@ aun identity check alice.agentid.pub
 | `aun send <target-aid> -` | 从 stdin 读取消息 |
 | `aun pull [--from aid] [--limit N] [--after-seq N]` | 拉取离线消息 |
 | `aun ack <sender-aid> --seq N` | 确认消息 seq |
-| `aun listen [--from aid] [--group group_id]` | 实时监听 P2P 和群消息 |
+| `aun listen [--from aid] [--group group_id]` | 实时监听 P2P 和群消息；`group_id` 是兼容参数名，值使用 `group_aid` |
 
 示例：
 
@@ -301,7 +301,7 @@ aun logs --follow
 
 ```powershell
 aun bench send bob.agentid.pub --count 100 --concurrency 4
-aun bench group-send group.agentid.pub/10042 --count 100 --concurrency 4
+aun bench group-send 10042.agentid.pub --count 100 --concurrency 4
 aun bench group send --count 100
 ```
 

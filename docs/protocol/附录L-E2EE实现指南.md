@@ -1,11 +1,11 @@
-# 附录 L：E2EE 实现指南（非规范性）
+# 附录 L：E2EE Legacy 实现指南（非规范性）
 
 > **本文档为非规范性内容**：提供端到端加密的实现建议、交互流程、代码示例和安全考虑，不是协议强制要求。
-> 规范性定义见 [08-AUN-E2EE.md](08-AUN-E2EE.md)。
+> 本文保留旧 `prekey_ecdh_v2` / `long_term_key` 实现说明，用于历史兼容和迁移排查。当前 SDK 默认使用 E2EE V2 多设备 wrap：P2P 为 `e2ee.p2p_encrypted`，Group 为 `e2ee.group_encrypted`，详见 `../sdk/E2EE_V2消息通信时序图.md` 和 [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md)。
 
 ## L.0 加密模式概述
 
-AUN-E2EE 支持两种加密模式，SDK 实现应同时支持。
+旧版 AUN-E2EE 支持两种加密模式。新实现不应把这两种旧信封作为默认发送格式。
 
 ### L.0.1 模式 1：prekey_ecdh_v2（优先）
 
@@ -264,6 +264,6 @@ AES-GCM + AAD 验证保证消息完整性。AAD 包含以下字段，按 Canonic
 
 ## L.7 兼容性说明
 
-- 发送端 **MUST** 使用 `prekey_ecdh_v2`（四路 ECDH）模式发送新消息
+- 旧版发送端应优先使用 `prekey_ecdh_v2`（四路 ECDH）模式发送；当前新实现应使用 E2EE V2 多设备 wrap。
 
 

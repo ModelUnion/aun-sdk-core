@@ -8,6 +8,43 @@
 
 ---
 
+## 0.5.2 — 2026-07-05
+
+### 新功能
+
+#### agent.md 元数据
+- 支持从 RPC `_meta.agent_md_etags.group` 和 V2 envelope `agent_md.group` 观察群组 agent.md ETag / Last-Modified，并自动维护群 AID 的本地缓存。
+- 群消息 agent.md 观察逻辑补齐 sender / group 两类来源，提升跨设备、跨群消息场景下的版本一致性提示能力。
+
+#### Group V2 发送幂等
+- `group.v2.send` 增加 `(group_id, message_id)` 级别的短期幂等缓存，重复发送可复用已生成 envelope 或已返回 result，降低重试时重复生成、重复发送的风险。
+
+### 修复
+
+#### V2 P2P / Group 拉取
+- `message.v2.pull` / `group.v2.pull` 自动 ack 改为通过下一次 pull 的 `ack_up_to_seq` piggyback，减少独立 ack RPC。
+- 修复非满页返回 `has_more=true` 时盲目续拉的问题；满页继续立即拉，非满页仅在有待合并 ack 时追加一页。
+- 过滤 `seq <= after_seq` 的 stale 原始消息，避免重复处理或错误推进 ack。
+- stale 原始页未推进 contiguous seq 时不再发送自动 ack，避免把未真正拉齐的数据误确认。
+
+#### 身份与设备上下文
+- `LoadIdentity()` / runtime 重建时使用 `AIDStore.Load()` 返回的 `DeviceID` 切换当前设备上下文，避免复用旧 client device id。
+- logger 绑定随身份切换同步更新到新的 device id，保证日志与 RPC 身份上下文一致。
+
+### 改进
+
+- V2 pull 增加非满页 tail delay：`1000ms / (pulled_messages + 1)`，最大 500ms；满页和空页仍立即结束或续拉。
+- Group V2 发送幂等缓存设置 10 分钟 TTL 和 512 条上限，并对缓存 envelope / result 使用浅拷贝，避免外部 mutation 污染缓存。
+- SDK `Version()` 和 V2 E2EE 元数据版本更新为 `0.5.2`。
+
+### 测试
+
+- 扩展 V2 Python parity 测试，覆盖 `ack_up_to_seq` piggyback、非满页 tail delay、stale 过滤和 group pull 对齐。
+- 新增 `LoadIdentity` stale device id 回归测试，覆盖身份切换后的 device id / logger 绑定。
+- 新增 Group V2 send 幂等缓存测试，验证缓存命中和浅拷贝保护。
+
+---
+
 ## 0.5.1 — 2026-07-01
 
 ### ⚠️ 重大变更（Breaking Changes）

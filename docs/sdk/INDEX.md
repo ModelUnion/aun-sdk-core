@@ -11,15 +11,15 @@
 | [01-快速开始](01-快速开始.md) | 安装 · 三主体模型 · 最小示例 · 多语言构造 |
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · JSON-RPC 消息格式 · 裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID · AIDStore · AUNClient · 九态状态机 · E2EE |
-| [04-连接与认证](04-连接与认证.md) | 注册加载 · 认证连接 · 网关发现 · 事件 · agent.md |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE 消息 · ProtectedHeaders · 密钥管理 · 高级存储 |
+| [04-连接与认证](04-连接与认证.md) | 注册加载 · 认证连接 · 网关发现 · 事件 · agent.md 自动观察 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE V2 消息 · ProtectedHeaders · agent.md 版本提示 · recipient wrap |
 | [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md) | V2 P2P/GROUP 明文与加密主链路 |
-| [06-API手册](06-API手册.md) | AIDStore · AID · AUNClient · 事件 · E2EE 高级 API · RPC 索引 |
+| [06-API手册](06-API手册.md) | AIDStore · AID · AUNClient · 事件 · agent.md · E2EE 高级 API · RPC 索引 |
 | [07-错误处理](07-错误处理.md) | Result · 错误类层级 · 错误码 · 重试 |
 | [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · 测试数据保护 |
 | [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
-| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group.fs.*` 群文件系统 RPC、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义） |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group_aid` / `group_id` 兼容规范、`group.fs.*` 群文件系统 RPC、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义） |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
 | [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 标签 / GC / reflog / revert） |
 | [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md) | `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计，含群自有区角色 ACL、`parents` 和 JS string 语义 |
@@ -39,6 +39,7 @@
 
 - AID 格式、证书、不可变值对象 → [03-核心概念](03-核心概念.md)
 - `AIDStore.register()` / `load()` / `exists()` / `resolve()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
+- agent.md 上传/下载/检查、`remote_etag` / `last_modified` 自动观察、`requester` / `peer` / `group` 角色 → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)、[远程 agent.md 缓存与 ETag 透传方案](../agent.md/远程agent.md缓存与etag透传方案.md)
 - AID 构造约束与多语言入口 → [01-快速开始](01-快速开始.md)、[06-API手册](06-API手册.md)
 - 认证链路和 token → [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md)
 - AID 托管恢复 / 跨设备复制 → [09-custody-api-manual](09-custody-api-manual.md)
@@ -53,7 +54,7 @@
 ### E2EE
 
 - E2EE 原理和默认行为 → [03-核心概念](03-核心概念.md)
-- ProtectedHeaders、prekey、replay guard → [05-E2EE加密通信](05-E2EE加密通信.md)
+- ProtectedHeaders、agent.md 版本提示边界、V2 recipient wrap、sender_signature / AAD / recipient proof → [05-E2EE加密通信](05-E2EE加密通信.md)
 - V2 P2P/GROUP 时序 → [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md)
 - 高级 E2EE API → [06-API手册](06-API手册.md)
 - 解密失败排查 → [07-错误处理](07-错误处理.md)
@@ -63,7 +64,7 @@
 - `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
-- Group RPC 与群文件系统 `group.fs.*` 控制面、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
+- Group RPC、`group_aid` / `group_id` 兼容规范、群文件系统 `group.fs.*` 控制面、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
 - 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs`、`cp/mv` POSIX 化语义和 JS string 差异 → [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
 - Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / `storage.fs.touch` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
@@ -98,15 +99,15 @@
 
 ### 04-连接与认证
 
-描述 `AIDStore` 注册加载、`AUNClient` 身份加载、显式认证、连接选项、长短连接共存、网关发现、agent.md 和 RPC 调用。
+描述 `AIDStore` 注册加载、`AUNClient` 身份加载、显式认证、连接选项、长短连接共存、网关发现、agent.md 上传/下载/检查，以及连接后从 Gateway `_meta.agent_md_etags` 和信封 `agent_md` 自动观察远端版本。
 
 ### 05-E2EE加密通信
 
-覆盖默认加密发送、接收自动解密、ProtectedHeaders、prekey、群 E2EE、replay guard 和高级存储扩展边界。
+覆盖默认加密发送、接收自动解密、E2EE V2 多设备 wrap、ProtectedHeaders、agent.md 版本提示与 E2EE 安全边界、`sender_signature` / AAD / recipient proof、群 E2EE 和高级存储扩展边界。
 
 ### 06-API手册
 
-列出 AIDStore、AID、AUNClient、事件、ServiceProxyClient、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
+列出 AIDStore、AID、AUNClient、事件、agent.md、ServiceProxyClient、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
 
 ### 07-错误处理
 

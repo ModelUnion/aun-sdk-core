@@ -254,7 +254,7 @@ describe('client AIDs agent.md 文件存储', () => {
 
       mgr.observeRpcMeta({
         agent_md_etags: {
-          sender: { aid: '127.0.0.1', etag: etag(body), last_modified: 'Sun, 24 May 2026 00:00:01 GMT' },
+          group: { aid: '127.0.0.1', etag: etag(body), last_modified: 'Sun, 24 May 2026 00:00:01 GMT' },
         },
       });
       await vi.waitFor(() => {

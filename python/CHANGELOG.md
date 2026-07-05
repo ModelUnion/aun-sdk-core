@@ -6,6 +6,41 @@
 
 ---
 
+## 0.5.2 — 2026-07-05
+
+### 新功能
+
+#### agent.md 元数据
+- 支持从 RPC `_meta.agent_md_etags.group` 和 V2 envelope `agent_md.group` 观察群组 agent.md ETag / Last-Modified，并自动维护群 AID 的本地缓存。
+- 群消息 agent.md 观察逻辑补齐 sender / group 两类来源，提升跨设备、跨群消息场景下的版本一致性提示能力。
+
+#### CLI / Bench
+- `aun_cli` 支持通过 `AUN_SDK_UVLOOP` / `AUN_CLI_UVLOOP` / `AUN_BENCH_UVLOOP` 在非 Windows 环境启用 `uvloop`。
+
+### 修复
+
+#### V2 P2P / Group 拉取
+- `message.v2.pull` / `group.v2.pull` 自动 ack 改为通过下一次 pull 的 `ack_up_to_seq` piggyback，减少独立 ack RPC。
+- 修复 push 通知并发触发 auto-pull 时可能重复拉取的问题；pull 进行中会记录 pending 上界，完成后串行补拉。
+- 修复非满页返回 `has_more=true` 时盲目续拉的问题；满页继续立即拉，非满页仅在有待合并 ack 时追加一页。
+- 过滤 `seq <= after_seq` 的 stale 原始消息，避免重复处理或错误推进 ack。
+- stale 原始页未推进 contiguous seq 时不再发送自动 ack，避免把未真正拉齐的数据误确认。
+
+### 改进
+
+- V2 pull 默认/最大 page limit 收敛为 50，并对传入 `limit` 做 1..50 夹取。
+- V2 pull 增加非满页 tail delay：`1000ms / (pulled_messages + 1)`，最大 500ms；满页和空页仍立即结束或续拉。
+- Bench `perf_trace` 默认关闭，避免默认采集影响吞吐；设置 `--perf-log-root` 时仍会聚合服务端 `send_perf`。
+- Bench 扩展 V2 send 阶段统计，覆盖 validate、write、seq alloc、push dispatch 等关键路径。
+
+### 测试
+
+- 扩展 V2 P2P / Group pull 单元测试，覆盖 `ack_up_to_seq` piggyback、非满页 tail delay、stale 过滤和 max pages flush。
+- 新增并发 push auto-pull 合并测试，覆盖 in-flight pull 下的 pending 上界补拉。
+- 扩展 agent.md 测试，覆盖群组 ETag 观察、下载缓存和持久化。
+
+---
+
 ## 0.5.1 — 2026-07-01
 
 ### ⚠️ 重大变更（Breaking Changes）

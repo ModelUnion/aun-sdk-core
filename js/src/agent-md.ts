@@ -345,7 +345,7 @@ export class AgentMdManager {
     }
     const etags = meta.agent_md_etags;
     if (!isJsonObject(etags)) return;
-    for (const key of ['requester', 'peer', 'receiver', 'target', 'to', 'sender', 'from']) {
+    for (const key of ['requester', 'peer', 'group', 'receiver', 'target', 'to', 'sender', 'from']) {
       const item = etags[key];
       if (!isJsonObject(item)) continue;
       await this.observeMeta(
@@ -361,19 +361,34 @@ export class AgentMdManager {
     if (!isJsonObject(envelope)) return;
     if (!isJsonObject(envelope.agent_md)) return;
     const agentMd = envelope.agent_md;
-    if (!isJsonObject(agentMd.sender)) return;
-    const sender = agentMd.sender;
-    let senderAid = String(sender.aid ?? '').trim();
-    if (!senderAid) {
-      const aad = isJsonObject(envelope.aad) ? envelope.aad : {};
-      senderAid = String(aad.from ?? envelope.from ?? '').trim();
+    if (isJsonObject(agentMd.sender)) {
+      const sender = agentMd.sender;
+      let senderAid = String(sender.aid ?? '').trim();
+      if (!senderAid) {
+        const aad = isJsonObject(envelope.aad) ? envelope.aad : {};
+        senderAid = String(aad.from ?? envelope.from ?? '').trim();
+      }
+      await this.observeMeta(
+        senderAid,
+        String(sender.etag ?? '').trim(),
+        String(sender.last_modified ?? sender.lastModified ?? '').trim(),
+        'envelope.sender',
+      );
     }
-    await this.observeMeta(
-      senderAid,
-      String(sender.etag ?? '').trim(),
-      String(sender.last_modified ?? sender.lastModified ?? '').trim(),
-      'envelope',
-    );
+    if (isJsonObject(agentMd.group)) {
+      const group = agentMd.group;
+      let groupAid = String(group.aid ?? '').trim();
+      if (!groupAid) {
+        const aad = isJsonObject(envelope.aad) ? envelope.aad : {};
+        groupAid = String(envelope.group_aid ?? envelope.group_id ?? aad.group_aid ?? aad.group_id ?? '').trim();
+      }
+      await this.observeMeta(
+        groupAid,
+        String(group.etag ?? '').trim(),
+        String(group.last_modified ?? group.lastModified ?? '').trim(),
+        'envelope.group',
+      );
+    }
   }
 
   eventSnapshot(): { local_etag: string; remote_etag: string } | null {

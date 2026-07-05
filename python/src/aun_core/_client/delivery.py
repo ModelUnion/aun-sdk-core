@@ -2179,29 +2179,52 @@ class MessageDeliveryEngine:
                 )
                 return
 
-        client._gap_fill_done[dedup_key] = time.time()
+        async def _run_push_auto_pull_once() -> None:
+            nonlocal contig_before
+            async with client._get_ns_lock(ns):
+                current_contig = client._seq_tracker.get_contiguous_seq(ns) if ns else 0
+                if push_seq_int > 0 and push_seq_int <= current_contig:
+                    client._log.debug(
+                        "client",
+                        "_on_v2_push_notification: push seq=%d already covered before auto-pull, contiguous_seq=%d",
+                        push_seq_int, current_contig,
+                    )
+                    return
+                if dedup_key in client._gap_fill_done:
+                    if push_seq_int > 0:
+                        client._record_pending_p2p_pull(ns, push_seq_int)
+                    client._log.debug(
+                        "client",
+                        "_on_v2_push_notification: pull became in-flight before auto-pull, record pending push_seq=%d",
+                        push_seq_int,
+                    )
+                    return
+                contig_before = current_contig
+                client._gap_fill_done[dedup_key] = time.time()
 
-        try:
-            self.record_p2p_gap_fill("push_auto_pull_started")
-            result = await self.run_background_rpc(lambda: client._pull_v2_internal({}))
-            if isinstance(result, dict):
-                messages = result.get("messages", [])
-                published_count = len(messages) if isinstance(messages, list) else 0
-                raw_count = int(result.get("raw_count") or 0)
-                self.record_p2p_gap_fill("push_auto_pull_pages")
-                self.record_p2p_gap_fill("push_auto_pull_raw_messages", raw_count)
-                self.record_p2p_gap_fill("push_auto_pull_published_messages", published_count)
-                if raw_count <= 0:
-                    self.record_p2p_gap_fill("push_auto_pull_empty_pages")
-            new_contig = client._seq_tracker.get_contiguous_seq(ns) if ns else -1
-            client._log.debug(
-                "client",
-                "_on_v2_push_notification pull done: contiguous_seq=%d->%d (push_seq=%s)",
-                contig_before, new_contig, push_seq,
-            )
-        except Exception as exc:
-            self.record_p2p_gap_fill("push_auto_pull_failed")
-            client._log.warn("client", "V2 push auto-pull failed: %s", exc)
-        finally:
-            client._gap_fill_done.pop(dedup_key, None)
-            client._schedule_pending_p2p_pull_if_needed(ns, reason="push-auto-pull-complete")
+            try:
+                self.record_p2p_gap_fill("push_auto_pull_started")
+                result = await self.run_background_rpc(lambda: client._pull_v2_internal({}))
+                if isinstance(result, dict):
+                    messages = result.get("messages", [])
+                    published_count = len(messages) if isinstance(messages, list) else 0
+                    raw_count = int(result.get("raw_count") or 0)
+                    self.record_p2p_gap_fill("push_auto_pull_pages")
+                    self.record_p2p_gap_fill("push_auto_pull_raw_messages", raw_count)
+                    self.record_p2p_gap_fill("push_auto_pull_published_messages", published_count)
+                    if raw_count <= 0:
+                        self.record_p2p_gap_fill("push_auto_pull_empty_pages")
+                new_contig = client._seq_tracker.get_contiguous_seq(ns) if ns else -1
+                client._log.debug(
+                    "client",
+                    "_on_v2_push_notification pull done: contiguous_seq=%d->%d (push_seq=%s)",
+                    contig_before, new_contig, push_seq,
+                )
+            except Exception as exc:
+                self.record_p2p_gap_fill("push_auto_pull_failed")
+                client._log.warn("client", "V2 push auto-pull failed: %s", exc)
+            finally:
+                client._gap_fill_done.pop(dedup_key, None)
+                client._schedule_pending_p2p_pull_if_needed(ns, reason="push-auto-pull-complete")
+
+        await client._rpc().run_pull_serialized(ns, _run_push_auto_pull_once)

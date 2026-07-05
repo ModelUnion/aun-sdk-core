@@ -252,6 +252,7 @@ describe('js client AIDs IndexedDB 存储', () => {
       agent_md_etag: '"alice-cloud"',
       agent_md_etags: {
         requester: { aid: 'alice.agentid.pub', etag: '"alice-cloud-2"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' },
+        group: { aid: 'team.group.agentid.pub', etag: '"group-cloud"', last_modified: 'Sun, 24 May 2026 00:00:02 GMT' },
         receiver: { aid: 'bob.agentid.pub', etag: '"bob-cloud"', last_modified: 'Sun, 24 May 2026 00:00:01 GMT' },
         sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
       },
@@ -263,9 +264,12 @@ describe('js client AIDs IndexedDB 存储', () => {
     const bobRecord = await readMeta(client, 'bob.agentid.pub');
     expect(bobRecord.remote_etag).toBe('"bob-cloud"');
     expect(bobRecord.last_modified).toBe('Sun, 24 May 2026 00:00:01 GMT');
+    const groupRecord = await readMeta(client, 'team.group.agentid.pub');
+    expect(groupRecord.remote_etag).toBe('"group-cloud"');
+    expect(groupRecord.last_modified).toBe('Sun, 24 May 2026 00:00:02 GMT');
     const daveRecord = await readMeta(client, 'dave.agentid.pub');
     expect(daveRecord.remote_etag).toBe('"dave-cloud"');
-    expect(fetched).toEqual(['alice.agentid.pub', 'bob.agentid.pub', 'dave.agentid.pub']);
+    expect(fetched).toEqual(['alice.agentid.pub', 'team.group.agentid.pub', 'bob.agentid.pub', 'dave.agentid.pub']);
     expect(await readContent(client, 'bob.agentid.pub')).toBe('# bob.agentid.pub\n');
   });
 

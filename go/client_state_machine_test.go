@@ -151,6 +151,31 @@ func TestLoadIdentity_FromEmpty(t *testing.T) {
 	}
 }
 
+func TestLoadIdentity_ReplacesStaleDeviceIDWithAIDStoreDevice(t *testing.T) {
+	c := NewAUNClientEmpty()
+	defer func() { _ = c.Close() }()
+	c.deviceID = "stale-device-from-previous-aun-path"
+	c.auth.SetInstanceContext(c.deviceID, c.slotID)
+
+	aid, aunPath := loadTestAID(t, "load-device-context.aid.com")
+	wantDeviceID := GetDeviceID(aunPath)
+	if aid.DeviceID != wantDeviceID {
+		t.Fatalf("测试 AID 应携带 AIDStore 的 device_id: got=%q want=%q", aid.DeviceID, wantDeviceID)
+	}
+	if err := c.LoadIdentity(aid); err != nil {
+		t.Fatalf("LoadIdentity 失败: %v", err)
+	}
+	if c.deviceID != wantDeviceID {
+		t.Fatalf("LoadIdentity 应切换到 AIDStore device_id: got=%q want=%q", c.deviceID, wantDeviceID)
+	}
+	if c.auth.deviceID != wantDeviceID {
+		t.Fatalf("AuthFlow device_id 未同步: got=%q want=%q", c.auth.deviceID, wantDeviceID)
+	}
+	if got := c.AunPath(); got != aunPath {
+		t.Fatalf("LoadIdentity 应切换 aun_path: got=%q want=%q", got, aunPath)
+	}
+}
+
 func TestLoadIdentity_NilRejected(t *testing.T) {
 	c := NewAUNClientEmpty()
 	defer func() { _ = c.Close() }()

@@ -3,7 +3,7 @@ import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group';
 import { decryptMessage } from '../../src/v2/e2ee/decrypt';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh';
 
-const SDK_VERSION = '0.5.1';
+const SDK_VERSION = '0.5.2';
 
 describe('encryptGroupMessage - self loop', () => {
   it('group 3DH+1DH: bob 3DH, carol 1DH', async () => {

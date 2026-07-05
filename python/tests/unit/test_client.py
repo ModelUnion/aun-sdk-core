@@ -1784,7 +1784,7 @@ def test_message_pull_empty_result_applies_server_ack_floor_without_direct_ack()
 
 
 @pytest.mark.asyncio
-async def test_v2_p2p_pull_batches_auto_ack_once_with_final_contiguous_seq():
+async def test_v2_p2p_pull_batches_piggyback_ack_with_final_contiguous_seq():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -1822,13 +1822,15 @@ async def test_v2_p2p_pull_batches_auto_ack_once_with_final_contiguous_seq():
     client._transport = _Transport()
 
     result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
+    pull_calls = [(method, params) for method, params in calls if method == "message.v2.pull"]
     ack_calls = [(method, params) for method, params in calls if method == "message.v2.ack"]
     assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
-    assert ack_calls == [("message.v2.ack", {"up_to_seq": 3})]
+    assert pull_calls == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 3, "limit": 10, "ack_up_to_seq": 3}),
+    ]
+    assert ack_calls == []
 
 
 @pytest.mark.asyncio
@@ -1910,7 +1912,7 @@ async def test_v2_p2p_public_pull_gate_serializes_full_pipeline():
 
 
 @pytest.mark.asyncio
-async def test_v2_group_pull_batches_auto_ack_once_with_final_contiguous_seq():
+async def test_v2_group_pull_batches_piggyback_ack_with_final_contiguous_seq():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -1946,17 +1948,30 @@ async def test_v2_group_pull_batches_auto_ack_once_with_final_contiguous_seq():
     client._transport = _Transport()
 
     result = await client.call("group.pull", {"group_id": "g1.agentid.pub", "after_seq": 0, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "group.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
+    pull_calls = [(method, params) for method, params in calls if method == "group.v2.pull"]
     ack_calls = [(method, params) for method, params in calls if method == "group.v2.ack"]
     assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
-    assert ack_calls == [("group.v2.ack", {
-        "group_id": "g1.agentid.pub",
-        "group_aid": "g1.agentid.pub",
-        "up_to_seq": 3,
-    })]
+    assert pull_calls == [
+        ("group.v2.pull", {
+            "group_id": "g1.agentid.pub",
+            "group_aid": "g1.agentid.pub",
+            "after_seq": 0,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+        ("group.v2.pull", {
+            "group_id": "g1.agentid.pub",
+            "group_aid": "g1.agentid.pub",
+            "after_seq": 3,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+            "ack_up_to_seq": 3,
+        }),
+    ]
+    assert ack_calls == []
 
 
 @pytest.mark.asyncio
@@ -2007,15 +2022,22 @@ async def test_v2_group_pull_uses_group_aid_namespace_and_keeps_legacy_wire_grou
             "limit": 10,
             "device_id": "device-1",
             "slot_id": "slot-a",
+        }),
+        ("group.v2.pull", {
+            "group_id": "group.example.com/g1",
+            "group_aid": "g1.example.com",
+            "after_seq": 1,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+            "ack_up_to_seq": 1,
         })
     ]
-    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == [
-        ("group.v2.ack", {"group_id": "g1.example.com", "group_aid": "g1.example.com", "up_to_seq": 1})
-    ]
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
 
 
 @pytest.mark.asyncio
-async def test_v2_p2p_pull_continues_pages_and_acks_each_page():
+async def test_v2_p2p_pull_continues_pages_and_piggybacks_each_ack():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -2060,9 +2082,6 @@ async def test_v2_p2p_pull_continues_pages_and_acks_each_page():
     client._transport = _Transport()
 
     result = await client.call("message.pull", {"after_seq": 0, "limit": 2})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and len([c for c in calls if c[0] == "message.v2.ack"]) < 2:
-        await asyncio.sleep(0.01)
 
     pull_calls = [(method, params) for method, params in calls if method == "message.v2.pull"]
     ack_calls = [(method, params) for method, params in calls if method == "message.v2.ack"]
@@ -2071,13 +2090,10 @@ async def test_v2_p2p_pull_continues_pages_and_acks_each_page():
     assert result["latest_seq"] == 3
     assert pull_calls == [
         ("message.v2.pull", {"after_seq": 0, "limit": 2}),
-        ("message.v2.pull", {"after_seq": 2, "limit": 2}),
-        ("message.v2.pull", {"after_seq": 3, "limit": 2}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 2, "ack_up_to_seq": 2}),
+        ("message.v2.pull", {"after_seq": 3, "limit": 2, "ack_up_to_seq": 3}),
     ]
-    assert ack_calls == [
-        ("message.v2.ack", {"up_to_seq": 2}),
-        ("message.v2.ack", {"up_to_seq": 3}),
-    ]
+    assert ack_calls == []
 
 
 @pytest.mark.asyncio
@@ -2127,7 +2143,72 @@ async def test_v2_p2p_pull_confirms_empty_page_after_nonempty_has_more_false():
     assert result["raw_count"] == 1
     assert pull_calls == [
         ("message.v2.pull", {"after_seq": 0, "limit": 2}),
-        ("message.v2.pull", {"after_seq": 1, "limit": 2}),
+        ("message.v2.pull", {"after_seq": 1, "limit": 2, "ack_up_to_seq": 1}),
+    ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_background_pull_partial_page_waits_tail_delay(monkeypatch):
+    from aun_core._client import v2_e2ee as v2_e2ee_module
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+    delays: list[float] = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(v2_e2ee_module.asyncio, "sleep", fake_sleep)
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                after_seq = int(params.get("after_seq") or 0)
+                seqs = (1, 2) if after_seq == 0 else ()
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"m-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": f"m-{seq}"},
+                            },
+                        }
+                        for seq in seqs
+                    ],
+                }
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    assert v2_e2ee_module._v2_pull_tail_delay_seconds(1, 50) == 0.5
+    assert v2_e2ee_module._v2_pull_tail_delay_seconds(2, 50) == pytest.approx(1.0 / 3.0)
+    assert v2_e2ee_module._v2_pull_tail_delay_seconds(50, 50) == 0.0
+
+    result = await client.call("message.pull", {
+        "after_seq": 0,
+        "limit": 10,
+        "_rpc_background": True,
+    })
+
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2]
+    assert delays == [pytest.approx(1.0 / 3.0)]
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 10, "ack_up_to_seq": 2}),
     ]
 
 
@@ -2177,7 +2258,51 @@ async def test_v2_p2p_pull_legacy_missing_has_more_continues_until_empty():
     assert result["raw_count"] == 1
     assert pull_calls == [
         ("message.v2.pull", {"after_seq": 0, "limit": 2}),
-        ("message.v2.pull", {"after_seq": 1, "limit": 2}),
+        ("message.v2.pull", {"after_seq": 1, "limit": 2, "ack_up_to_seq": 1}),
+    ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_ignores_has_more_true_when_page_not_full_without_ack():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = ""
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                after_seq = int(params.get("after_seq") or 0)
+                return {
+                    "has_more": True,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": 1,
+                            "message_id": "m-1",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": 1,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": f"after-{after_seq}"},
+                            },
+                        }
+                    ] if after_seq == 0 else [],
+                }
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 2})
+
+    assert [msg["seq"] for msg in result["messages"]] == [1]
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 2}),
     ]
 
 
@@ -2235,9 +2360,11 @@ async def test_v2_p2p_pull_parallel_decrypts_multi_message_page_only():
     assert parallel_called is True
     assert [msg["seq"] for msg in result["messages"]] == [1, 2]
     assert result["messages"][0]["payload"] == {"type": "text", "text": "m-1"}
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 2})
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 10, "ack_up_to_seq": 2}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -2292,7 +2419,7 @@ async def test_v2_p2p_pull_keeps_single_message_on_serial_path():
 
 
 @pytest.mark.asyncio
-async def test_v2_group_pull_continues_pages_and_acks_each_page():
+async def test_v2_group_pull_continues_pages_and_piggybacks_each_ack():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -2335,9 +2462,6 @@ async def test_v2_group_pull_continues_pages_and_acks_each_page():
     client._transport = _Transport()
 
     result = await client.call("group.pull", {"group_id": "g1.agentid.pub", "after_seq": 0, "limit": 2})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and len([c for c in calls if c[0] == "group.v2.ack"]) < 2:
-        await asyncio.sleep(0.01)
 
     pull_calls = [(method, params) for method, params in calls if method == "group.v2.pull"]
     ack_calls = [(method, params) for method, params in calls if method == "group.v2.ack"]
@@ -2360,12 +2484,19 @@ async def test_v2_group_pull_continues_pages_and_acks_each_page():
             "limit": 2,
             "device_id": "device-1",
             "slot_id": "slot-a",
+            "ack_up_to_seq": 2,
+        }),
+        ("group.v2.pull", {
+            "group_id": "g1.agentid.pub",
+            "group_aid": "g1.agentid.pub",
+            "after_seq": 3,
+            "limit": 2,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+            "ack_up_to_seq": 3,
         }),
     ]
-    assert ack_calls == [
-        ("group.v2.ack", {"group_id": "g1.agentid.pub", "group_aid": "g1.agentid.pub", "up_to_seq": 2}),
-        ("group.v2.ack", {"group_id": "g1.agentid.pub", "group_aid": "g1.agentid.pub", "up_to_seq": 3}),
-    ]
+    assert ack_calls == []
 
 
 @pytest.mark.asyncio
@@ -2424,9 +2555,26 @@ async def test_v2_group_pull_parallel_decrypts_multi_message_page():
     assert [msg["seq"] for msg in result["messages"]] == [1, 2]
     assert result["messages"][0]["group_id"] == group_id
     assert result["messages"][0]["payload"] == {"type": "text", "text": "gm-1"}
-    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == [
-        ("group.v2.ack", {"group_id": group_id, "group_aid": group_id, "up_to_seq": 2})
+    assert [(method, params) for method, params in calls if method == "group.v2.pull"] == [
+        ("group.v2.pull", {
+            "group_id": group_id,
+            "group_aid": group_id,
+            "after_seq": 0,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+        ("group.v2.pull", {
+            "group_id": group_id,
+            "group_aid": group_id,
+            "after_seq": 2,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+            "ack_up_to_seq": 2,
+        }),
     ]
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -2680,9 +2828,11 @@ async def test_v2_p2p_pull_reacks_when_server_ack_lags_existing_contiguous_seq()
     assert result["messages"] == []
     assert result["server_ack_seq"] == 4
     assert client._seq_tracker.get_contiguous_seq(ns) == 5
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 5})
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 4, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 5, "limit": 10, "ack_up_to_seq": 5}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -2727,14 +2877,13 @@ async def test_v2_p2p_pull_publishes_after_contiguous_advance_and_acks_once():
     client._transport = _Transport()
 
     await client.call("message.pull", {"after_seq": 0, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
     assert observed_contig == [3, 3, 3]
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 3}),
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 3, "limit": 10, "ack_up_to_seq": 3}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -2895,14 +3044,28 @@ async def test_v2_group_pull_publishes_after_contiguous_advance_and_acks_once():
     client._transport = _Transport()
 
     await client.call("group.pull", {"group_id": "g1.agentid.pub", "after_seq": 0, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "group.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
     assert observed_contig == [3, 3, 3]
-    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == [
-        ("group.v2.ack", {"group_id": "g1.agentid.pub", "group_aid": "g1.agentid.pub", "up_to_seq": 3}),
+    assert [(method, params) for method, params in calls if method == "group.v2.pull"] == [
+        ("group.v2.pull", {
+            "group_id": "g1.agentid.pub",
+            "group_aid": "g1.agentid.pub",
+            "after_seq": 0,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+        ("group.v2.pull", {
+            "group_id": "g1.agentid.pub",
+            "group_aid": "g1.agentid.pub",
+            "after_seq": 3,
+            "limit": 10,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+            "ack_up_to_seq": 3,
+        }),
     ]
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -3270,6 +3433,51 @@ async def test_v2_p2p_notification_string_seq_triggers_pull():
 
 
 @pytest.mark.asyncio
+async def test_v2_p2p_concurrent_notification_push_coalesces_auto_pull():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 7)
+    pull_started = asyncio.Event()
+    release_pull = asyncio.Event()
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        pull_started.set()
+        await release_pull.wait()
+        client._seq_tracker.force_contiguous_seq(ns, 10)
+        return {"messages": [], "raw_count": 0}
+
+    client._pull_v2_internal = fake_pull
+
+    first = asyncio.create_task(client._on_v2_push_notification({
+        "seq": 10,
+        "message_id": "m-push-10-a",
+        "from_aid": "bob.agentid.pub",
+    }))
+    await asyncio.wait_for(pull_started.wait(), timeout=1)
+    second = asyncio.create_task(client._on_v2_push_notification({
+        "seq": 10,
+        "message_id": "m-push-10-b",
+        "from_aid": "bob.agentid.pub",
+    }))
+    await asyncio.sleep(0)
+    release_pull.set()
+    await asyncio.gather(first, second)
+
+    assert pull_calls == [{}]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 10
+    assert f"p2p_pull:{ns}" not in client._gap_fill_done
+    assert client._p2p_gap_fill_stats["push_auto_pull_started"] == 1
+
+
+@pytest.mark.asyncio
 async def test_v2_p2p_pull_preserves_raw_seq_metadata_when_decrypt_fails():
     client = AUNClient()
     client._state = "connected"
@@ -3303,9 +3511,6 @@ async def test_v2_p2p_pull_preserves_raw_seq_metadata_when_decrypt_fails():
     client._decrypt_v2_message = fake_decrypt
 
     result = await client.call("message.pull", {"after_seq": 1, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
     assert result["messages"] == []
     assert result["latest_seq"] == 3
@@ -3314,13 +3519,15 @@ async def test_v2_p2p_pull_preserves_raw_seq_metadata_when_decrypt_fails():
     assert result["_contig_before"] == 0
     assert client._seq_tracker.get_contiguous_seq(ns) == 9
     assert client._seq_tracker.get_max_seen_seq(ns) == 9
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 9})
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 1, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 3, "limit": 10, "ack_up_to_seq": 9}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio
-async def test_v2_p2p_pull_awaits_auto_ack_before_return_when_decrypt_fails():
+async def test_v2_p2p_pull_piggybacks_auto_ack_before_return_when_decrypt_fails():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -3357,9 +3564,11 @@ async def test_v2_p2p_pull_awaits_auto_ack_before_return_when_decrypt_fails():
     assert result["latest_seq"] == 2
     assert result["raw_count"] == 1
     assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 2
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 2})
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 1, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 10, "ack_up_to_seq": 2}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio
@@ -3418,17 +3627,16 @@ async def test_v2_p2p_pull_drains_pending_payload_after_gap_is_filled_and_acks_o
     client._decrypt_v2_message = fake_decrypt
 
     result = await client.call("message.pull", {"after_seq": 1, "limit": 10})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
-        await asyncio.sleep(0.01)
 
     assert [msg["seq"] for msg in result["messages"]] == [2]
     assert client._seq_tracker.get_contiguous_seq(ns) == 3
     assert [event["payload"]["text"] for event in events] == ["pull-2", "push-3"]
     assert not client._is_pending_ordered_seq(ns, 3)
-    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
-        ("message.v2.ack", {"up_to_seq": 3})
+    assert [(method, params) for method, params in calls if method == "message.v2.pull"] == [
+        ("message.v2.pull", {"after_seq": 1, "limit": 10}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 10, "ack_up_to_seq": 3}),
     ]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
 
 
 @pytest.mark.asyncio

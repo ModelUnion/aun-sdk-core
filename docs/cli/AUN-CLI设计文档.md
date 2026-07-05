@@ -100,8 +100,10 @@ timeout = 30
 [profiles.default]
 aid = "alice.agentid.pub"
 aun_path = "~/.aun/profiles/default"
-active_group = "group.agentid.pub/10042"
+active_group = "10042.agentid.pub"
 ```
+
+`active_group` 保存当前群的目标态 `group_aid`。旧格式 `group.{issuer}/{base}` 可作为兼容输入解析，但新配置应写 `{base}.{issuer}`。
 
 有效 profile 解析顺序：
 

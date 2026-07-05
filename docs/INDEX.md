@@ -14,11 +14,13 @@
 | [AUNClient 门面化与 Runtime 状态迁移细化方案](design/AUNClient门面化与Runtime状态迁移细化方案.md) | AUNClient 完全门面化、ClientRuntime 单一状态源和四端分批迁移步骤 |
 | [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md) | 多语言 SDK 同网同服、test-runner 控制面的跨语言 E2E 方案 |
 | [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md) | SDK bootstrap 能力声明 + 服务端 policy 控制 1DH/per-AID wrap 的兼容方案 |
+| [E2EE V2 消息通信时序图](sdk/E2EE_V2消息通信时序图.md) | 当前 V2-only P2P / Group 明文与加密主链路、设备密钥注册和 pull/ack 时序 |
 | [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md) | RPC trace 诊断字段与 enter/exit span 设计 |
 | [AUN 服务端消息通信诊断面板方案](design/AUN服务端消息通信诊断面板方案.md) | aun-console 消息通信页的服务端可观察诊断面板总体方案 |
 | [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md) | aun-console 消息通信页的服务端可观察 P0 诊断面板 |
+| [消息收件箱统一迁移方案](design/消息收件箱统一迁移方案.md) | P2P `message_inbox` 与群消息 `group_inbox` 的统一读模型、后台回填和旧表清理方案 |
 | [AUN 反向代理服务方案与 TDD 实施计划](design/AUN反向代理服务方案与TDD实施计划.md) | AUN Service Proxy、service_proxy 服务模块、SDK service-proxy-client、URL 路由、隧道协议、Web 边界和分阶段 TDD 落地计划 |
-| [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
+| [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、Gateway `_meta.agent_md_etags` 角色、消息信封 ETag 和注入节流方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE、Storage VFS、Group FS 和 Collab 的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
 | [AUN CLI 手册](cli/CLI手册.md) | Python CLI 源码位置、安装运行入口、全局选项、profile 配置和主要命令集 |
@@ -57,7 +59,7 @@
 
 ### SDK 使用与协议
 
-- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE 机制、Storage VFS、Group FS、Collab GC/reflog/reset → [SDK 文档索引](sdk/INDEX.md)
+- Python / TS / Go / JS SDK 使用手册、RPC 参数、E2EE V2 机制、Storage VFS、Group FS、Collab GC/reflog/reset → [SDK 文档索引](sdk/INDEX.md)
 - 按主题和行区间查 SDK 文档 → [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md)
 - Python CLI 源码位置、安装运行入口、全局选项、profile 配置、身份/消息/群组/Storage/Group FS/Collab/诊断等命令用法 → [AUN CLI 手册](cli/CLI手册.md)
 - Python CLI 当前实现架构、`main.py` 命令注册、`CLISession` SDK 桥接、配置解析和实现边界 → [AUN CLI 设计文档](cli/AUN-CLI设计文档.md)
@@ -73,7 +75,7 @@
 - collab 协作层服务端编排、`collab.*` RPC、版本台账、snapshot、群协作注册表和后续四语言 SDK/CLI/E2E 计划 → [collab 协作层服务端编排设计](<aun-fs/collab/2026-06-10-collab层服务端编排详细设计.md>)、[Plan 1](<aun-fs/collab/2026-06-10-collab服务端编排-plan1.md>)、[Plan 2](<aun-fs/collab/2026-06-12-collab协作层-plan2.md>)、[Plan 3](<aun-fs/collab/2026-06-12-collab协作层-plan3.md>)
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
-- agent.md 远程缓存、`remote_etag` / `local_etag`、消息信封 ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
+- agent.md 远程缓存、`remote_etag` / `local_etag`、`requester` / `peer` / `group` 角色、消息信封与 Gateway `_meta` ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
 
 ### Service Proxy 与服务暴露
 
@@ -87,12 +89,13 @@
 - RPC trace span、跨模块诊断字段、安全字段白名单 → [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md)
 - aun-console 消息通信服务端可观察总体面板、事实/推断边界 → [AUN 服务端消息通信诊断面板方案](design/AUN服务端消息通信诊断面板方案.md)
 - 服务端可观察的消息通信 P0 面板、过滤语义、数据来源 → [服务端消息通信诊断面板 P0 方案](design/服务端消息通信诊断面板P0方案.md)
+- P2P `message_inbox`、群消息 `group_inbox`、迁移期 fallback、后台 batch 回填和旧表 drop 收口 → [消息收件箱统一迁移方案](design/消息收件箱统一迁移方案.md)
 - 测试日志路径、测试输出、容器日志查看 → [aun测试运行指南](aun测试运行指南.md)
 - 跨语言 E2E trace 字段、日志产物、失败分类 → [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 
 ### E2EE 与跨语言一致性
 
-- SDK E2EE API、会话管理、ProtectedHeaders → [SDK 文档索引](sdk/INDEX.md)
+- SDK E2EE V2 API、会话管理、ProtectedHeaders、P2P/Group 当前主链路 → [SDK 文档索引](sdk/INDEX.md)、[E2EE V2 消息通信时序图](sdk/E2EE_V2消息通信时序图.md)
 - E2EE V2 1DH/per-AID wrap、bootstrap 能力声明、服务端 fanout → [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md)
 - 共享测试向量、transcript 回放、Python / TS / Go / JS 互通 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 
@@ -102,7 +105,7 @@
 
 ### aun测试运行指南
 
-记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 83 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三/四成员同群矩阵、storage ticket/ACL、group.fs 与 group.fs POSIX、collab 与 collab ACL、连续消息、ack、预期失败和混合明文/E2EE 场景，另包含固定身份目录、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口、message/group WAL 回归检查和数据保护规则。
+记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 83 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三/四成员同群矩阵、storage ticket/ACL、group.fs 与 group.fs POSIX、collab 与 collab ACL、连续消息、ack、预期失败和混合明文/E2EE 场景，另包含固定身份目录、bench-pairs16 性能身份池、uvloop bench 环境变量、Gateway 客户端 mock 网络延迟、`--perf-trace` 开关、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口、message/group WAL 回归检查和数据保护规则。
 
 ### AUN SDK 重构修改清单
 
@@ -136,17 +139,21 @@
 
 定义 aun-console 消息通信页的 P0 服务端诊断面板。范围限定为 Gateway、Message/Group、Federation 和 Service Plane 可观察事实，不采集 SDK 本地状态。文档给出发送端、接收端、消息 ID、Group ID 和任意方向过滤语义，并定义服务端 Trace、投递路径、Pull/ACK/GAP、E2EE、Federation、Service Plane 六个子标签，其中服务端自主 Trace 是默认关闭的运行时开关，`message.ack` 需区分 RPC 与同名事件的设备字段语义。
 
+### 消息收件箱统一迁移方案
+
+定义 P2P `message_inbox` 与群消息 `group_inbox` 的统一 receiver 读模型。方案要求 SDK RPC 契约不变，`group_events` 保持独立；迁移期新写入只写新 inbox，旧表仅作为 source/fallback，后台仅在 writer queue 空闲时 batch 回填并删除旧 batch，确认完成后再执行旧表 drop 和旧 DDL/fallback 收口。
+
 ### AUN 反向代理服务方案与 TDD 实施计划
 
 定义 AUN Service Proxy / AUN 服务代理的整体方案：服务侧新增 `service_proxy` 模块，`service-proxy-server` 负责公网 HTTP/HTTPS 入口、WSS 隧道、在线连接索引和协议桥接；SDK 侧 `service-proxy-client` 负责 provider 侧 embedded registry、本地 endpoint 调用和服务摘要上报。方案明确去掉 ACP GlobalRegistry/RSA 同步，URL 以 `https://proxy.{issuer}/{user_name}/{svc_name}/...` 为 canonical，`https://{user_name}.{issuer}/proxy/{svc_name}/...` 由 NameService 跳转；Web 服务推荐 host-root 模式，目录式 path-prefix 只做受限转发。文档还按 Phase 0 到 Phase 11 给出 TDD 实施步骤，记录 Phase 10 已新增宿主机进程内 7 类 HTTP/SSE/WS/NameService/Web/ACL/双域边界 E2E，以及单域和双域 Docker E2E 脚本入口；真实 Docker 执行仍需先满足模块启用、镜像包含新模块和 `/ws/client` AUN 身份 resolver 前置条件。
 
 ### 远程 agent.md 缓存与 ETag 透传方案
 
-定义每个远程 AID 在 SDK 内存和本地持久化记录中维护一条 agent.md 状态：Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`，浏览器 JavaScript 使用 IndexedDB logical key。方案同时规定 `message.send` 响应向发送端透传 `to` 的 agent.md ETag，消息信封向接收端透传 `from` 的 agent.md ETag，并给出按需下载、无条件 GET、304 兼容、竞态和跨 SDK 一致性规则。
+定义每个远程 AID 在 SDK 内存和本地持久化记录中维护一条 agent.md 状态：Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`，浏览器 JavaScript 使用 IndexedDB logical key。方案规定 Gateway 在 RPC response / event push 的 `_meta.agent_md_etags` 中按 `requester`、`peer`、`group` 注入元数据，保留旧别名兼容，并通过 300 秒正缓存、60 秒负缓存和默认 60 秒发送节流控制热路径开销；Message Service V2 P2P 信封携带 `agent_md.sender`。四端 SDK 自动观察 `_meta` 和信封 `agent_md.sender/group`，写入 `remote_etag` / `last_modified`，并遵守按需下载、无条件 GET、304 兼容、竞态和跨 SDK 一致性规则。
 
 ### SDK 文档索引
 
-`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group FS、Collab GC/reflog/reset 和各类 RPC 手册。
+`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE V2、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group FS、Collab GC/reflog/reset 和各类 RPC 手册。
 
 ### Service Proxy RPC 手册
 

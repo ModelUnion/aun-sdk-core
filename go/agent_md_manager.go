@@ -567,23 +567,46 @@ func (m *AgentMdManager) observeAgentMDFromEnvelope(envelope map[string]any) {
 		return
 	}
 	sender, _ := agentMD["sender"].(map[string]any)
-	if sender == nil {
-		return
-	}
-	senderAID := strings.TrimSpace(v2AsString(sender["aid"]))
-	if senderAID == "" {
-		if aad, ok := envelope["aad"].(map[string]any); ok {
-			senderAID = strings.TrimSpace(v2AsString(aad["from"]))
+	if sender != nil {
+		senderAID := strings.TrimSpace(v2AsString(sender["aid"]))
+		if senderAID == "" {
+			if aad, ok := envelope["aad"].(map[string]any); ok {
+				senderAID = strings.TrimSpace(v2AsString(aad["from"]))
+			}
 		}
+		if senderAID == "" {
+			senderAID = strings.TrimSpace(v2AsString(envelope["from"]))
+		}
+		lastModified := strings.TrimSpace(v2AsString(sender["last_modified"]))
+		if lastModified == "" {
+			lastModified = strings.TrimSpace(v2AsString(sender["lastModified"]))
+		}
+		m.observeAgentMDMeta(senderAID, v2AsString(sender["etag"]), lastModified, "envelope.sender")
 	}
-	if senderAID == "" {
-		senderAID = strings.TrimSpace(v2AsString(envelope["from"]))
+
+	group, _ := agentMD["group"].(map[string]any)
+	if group != nil {
+		groupAID := strings.TrimSpace(v2AsString(group["aid"]))
+		if groupAID == "" {
+			groupAID = strings.TrimSpace(v2AsString(envelope["group_aid"]))
+		}
+		if groupAID == "" {
+			groupAID = strings.TrimSpace(v2AsString(envelope["group_id"]))
+		}
+		if groupAID == "" {
+			if aad, ok := envelope["aad"].(map[string]any); ok {
+				groupAID = strings.TrimSpace(v2AsString(aad["group_aid"]))
+				if groupAID == "" {
+					groupAID = strings.TrimSpace(v2AsString(aad["group_id"]))
+				}
+			}
+		}
+		lastModified := strings.TrimSpace(v2AsString(group["last_modified"]))
+		if lastModified == "" {
+			lastModified = strings.TrimSpace(v2AsString(group["lastModified"]))
+		}
+		m.observeAgentMDMeta(groupAID, v2AsString(group["etag"]), lastModified, "envelope.group")
 	}
-	lastModified := strings.TrimSpace(v2AsString(sender["last_modified"]))
-	if lastModified == "" {
-		lastModified = strings.TrimSpace(v2AsString(sender["lastModified"]))
-	}
-	m.observeAgentMDMeta(senderAID, v2AsString(sender["etag"]), lastModified, "envelope")
 }
 
 func verifyAgentMDResultToMap(result *VerifyAgentMdResult, certPEM string) map[string]any {
@@ -1048,7 +1071,7 @@ func (m *AgentMdManager) ObserveRPCMeta(meta map[string]any) {
 		return
 	}
 	// role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
-	for _, key := range []string{"requester", "peer", "receiver", "target", "to", "sender", "from"} {
+	for _, key := range []string{"requester", "peer", "group", "receiver", "target", "to", "sender", "from"} {
 		item, _ := etags[key].(map[string]any)
 		if item == nil {
 			continue

@@ -14,6 +14,12 @@ from ..v2.session import V2Session
 from .runtime import ClientRuntime
 
 
+_V2_PULL_DEFAULT_PAGE_LIMIT = 50
+_V2_PULL_MAX_PAGE_LIMIT = 50
+_V2_PULL_TAIL_DELAY_MIN_S = 0.005
+_V2_PULL_TAIL_DELAY_MAX_S = 0.500
+
+
 def _group_identifier_pair(params: dict[str, Any]) -> tuple[str, str]:
     wire_group_id = str(params.get("group_id") or params.get("groupId") or "").strip()
     group_aid = str(params.get("group_aid") or params.get("groupAid") or "").strip()
@@ -24,6 +30,28 @@ def _group_identifier_pair(params: dict[str, Any]) -> tuple[str, str]:
     if not wire_group_id:
         wire_group_id = group_aid
     return wire_group_id, group_aid
+
+
+def _v2_effective_page_limit(value: Any) -> int:
+    try:
+        requested = int(value or _V2_PULL_DEFAULT_PAGE_LIMIT)
+    except (TypeError, ValueError):
+        requested = _V2_PULL_DEFAULT_PAGE_LIMIT
+    return max(1, min(requested, _V2_PULL_MAX_PAGE_LIMIT))
+
+
+def _v2_pull_tail_delay_seconds(msg_count: int, page_limit: int) -> float:
+    try:
+        count = int(msg_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        limit = int(page_limit or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if count <= 0 or (limit > 0 and count >= limit):
+        return 0.0
+    return min(_V2_PULL_TAIL_DELAY_MAX_S, max(_V2_PULL_TAIL_DELAY_MIN_S, 1.0 / float(count + 1)))
 
 
 @dataclass(slots=True)
@@ -708,7 +736,7 @@ class V2E2EECoordinator:
         if not client._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
         after_seq = int(params.get("after_seq", 0) or 0)
-        limit = int(params.get("limit", 50) or 50)
+        limit = _v2_effective_page_limit(params.get("limit"))
         force = params.get("force") is True
 
         ns = f"p2p:{client._aid}" if client._aid else ""
@@ -721,19 +749,26 @@ class V2E2EECoordinator:
         server_ack_seq = 0
         page_count = 0
         last_auto_ack_seq = 0
+        pending_ack_seq = 0
         max_pages = int(params.get("max_pages", 100) or 100)
 
         while page_count < max_pages:
             page_count += 1
+            ack_up_to_seq = pending_ack_seq
             client._log.debug(
                 "client",
-                "message.v2.pull page request: page=%d after_seq=%d limit=%d ns=%s",
-                page_count, next_after_seq, limit, ns or "<none>",
+                "message.v2.pull page request: page=%d after_seq=%d limit=%d ack_up_to_seq=%d ns=%s",
+                page_count, next_after_seq, limit, ack_up_to_seq, ns or "<none>",
             )
             pull_params = {"after_seq": next_after_seq, "limit": limit}
             if force:
                 pull_params["force"] = True
+            if ack_up_to_seq > 0:
+                pull_params["ack_up_to_seq"] = ack_up_to_seq
             result = await client._rpc().raw_call("message.v2.pull", pull_params, background=background_rpc)
+            if ack_up_to_seq > 0:
+                pending_ack_seq = 0
+                last_auto_ack_seq = max(last_auto_ack_seq, ack_up_to_seq)
             if isinstance(result, dict):
                 response.update(result)
             else:
@@ -773,12 +808,31 @@ class V2E2EECoordinator:
             else:
                 page_max_seq = next_after_seq
 
+            next_after = max(page_max_seq, next_after_seq)
+            raw_count = len(raw_messages)
+            can_continue_page = raw_count > 0 and next_after > next_after_seq
+            full_page = can_continue_page and limit > 0 and raw_count >= limit
+            delivered_seqs: list[int] = []
+            has_page_server_ack = "server_ack_seq" in result
+            page_server_ack = int(result.get("server_ack_seq") or 0)
+            server_ack_seq = max(server_ack_seq, page_server_ack)
+            if ns and page_server_ack > 0:
+                contig = client._seq_tracker.get_contiguous_seq(ns)
+                if contig < page_server_ack:
+                    client._log.info(
+                        "client",
+                        "message.v2.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
+                        ns, contig, page_server_ack,
+                    )
+                    client._seq_tracker.force_contiguous_seq(ns, page_server_ack)
+
             if ns and self._can_parallel_decrypt_v2_page(raw_messages, expected_group_id=""):
                 page_decrypted = await self._decrypt_p2p_page_parallel(raw_messages)
                 for item in page_decrypted:
                     plaintext = await self._apply_p2p_decrypt_result(item, ns)
                     if plaintext is not None:
                         decrypted.append(plaintext)
+                        delivered_seqs.append(item.seq)
                     else:
                         client._log.debug("client", "message.v2.pull decrypt returned None: ns=%s seq=%d", ns or "<none>", item.seq)
             else:
@@ -813,6 +867,7 @@ class V2E2EECoordinator:
                             else:
                                 await client._publish_app_event(event_name, event_payload, source="pull")
                             decrypted.append(v1_msg)
+                            delivered_seqs.append(seq)
                             client._log.debug("client", "message.v2.pull plaintext legacy row delivered: ns=%s seq=%d", ns or "<none>", seq)
                         else:
                             client._log.debug("client", "v2.pull skipping legacy envelope seq=%d payload_type=%s (old E2EE removed)",
@@ -834,21 +889,12 @@ class V2E2EECoordinator:
                     else:
                         await client._publish_app_event("message.received", plaintext, source="pull")
                     decrypted.append(plaintext)
+                    delivered_seqs.append(seq)
                     client._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", plaintext)
 
             if ns:
-                has_page_server_ack = "server_ack_seq" in result
-                page_server_ack = int(result.get("server_ack_seq") or 0)
-                server_ack_seq = max(server_ack_seq, page_server_ack)
-                if page_server_ack > 0:
-                    contig = client._seq_tracker.get_contiguous_seq(ns)
-                    if contig < page_server_ack:
-                        client._log.info(
-                            "client",
-                            "message.v2.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
-                            ns, contig, page_server_ack,
-                        )
-                        client._seq_tracker.force_contiguous_seq(ns, page_server_ack)
+                for delivered_seq in sorted(set(delivered_seqs)):
+                    client._seq_tracker.on_message_seq(ns, delivered_seq)
 
                 if not raw_messages and not decrypted and client._seq_tracker.has_pending_gaps(ns):
                     client._log.info(
@@ -872,17 +918,37 @@ class V2E2EECoordinator:
                     )
                 )
                 if ack_needed:
-                    client._log.debug("client", "message.v2.pull sending auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, contig, len(raw_messages))
-                    await client._await_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P page auto-ack")
-                    last_auto_ack_seq = contig
+                    if can_continue_page:
+                        pending_ack_seq = max(pending_ack_seq, contig)
+                        last_auto_ack_seq = max(last_auto_ack_seq, contig)
+                        client._log.debug(
+                            "client",
+                            "message.v2.pull queued piggyback auto-ack: ns=%s ack_seq=%d raw_count=%d full_page=%s",
+                            ns, pending_ack_seq, raw_count, full_page,
+                        )
+                    else:
+                        client._log.debug(
+                            "client",
+                            "message.v2.pull sending terminal auto-ack: ns=%s ack_seq=%d raw_count=%d",
+                            ns, contig, raw_count,
+                        )
+                        await client._await_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P terminal auto-ack")
+                        last_auto_ack_seq = max(last_auto_ack_seq, contig)
 
-            next_after = max(page_max_seq, next_after_seq)
-            if not raw_messages or next_after <= next_after_seq:
+            should_continue = can_continue_page and (full_page or pending_ack_seq > 0)
+            if not should_continue:
                 break
+            tail_delay = _v2_pull_tail_delay_seconds(raw_count, limit)
+            if tail_delay > 0:
+                await asyncio.sleep(tail_delay)
             next_after_seq = next_after
 
         if page_count >= max_pages:
             client._log.warn("client", "message.v2.pull reached max_pages=%d after_seq=%d", max_pages, next_after_seq)
+            if pending_ack_seq > 0:
+                client._log.debug("client", "message.v2.pull flushing pending auto-ack after max_pages: ns=%s ack_seq=%d", ns, pending_ack_seq)
+                await client._await_ack("message.v2.ack", {"up_to_seq": pending_ack_seq}, "V2 P2P max_pages auto-ack")
+                pending_ack_seq = 0
 
         response["messages"] = decrypted
         response["_contig_before"] = first_contig_before
@@ -2381,7 +2447,7 @@ class V2E2EECoordinator:
         else:
             after_seq = 0
             has_explicit_after_seq = False
-        limit = int(params.get("limit", 50) or 50)
+        limit = _v2_effective_page_limit(params.get("limit"))
         cursor_params = {
             key: params[key]
             for key in ("device_id", "slot_id", "device_name", "device_type")
@@ -2402,14 +2468,17 @@ class V2E2EECoordinator:
         total_raw_count = 0
         latest_seq = 0
         page_count = 0
+        last_auto_ack_seq = 0
+        pending_ack_seq = 0
         max_pages = int(params.get("max_pages", 100) or 100)
 
         while page_count < max_pages:
             page_count += 1
+            ack_up_to_seq = pending_ack_seq if owns_cursor else 0
             client._log.debug(
                 "client",
-                "group.v2.pull page request: group=%s page=%d after_seq=%d limit=%d ns=%s",
-                group_id, page_count, next_after_seq, limit, ns,
+                "group.v2.pull page request: group=%s page=%d after_seq=%d limit=%d ack_up_to_seq=%d ns=%s",
+                group_id, page_count, next_after_seq, limit, ack_up_to_seq, ns,
             )
             pull_params = {
                 "group_id": wire_group_id,
@@ -2422,7 +2491,12 @@ class V2E2EECoordinator:
                 pull_params["device_id"] = client._device_id
             if "slot_id" not in pull_params:
                 pull_params["slot_id"] = client._slot_id
+            if ack_up_to_seq > 0:
+                pull_params["ack_up_to_seq"] = ack_up_to_seq
             result = await client._rpc().raw_call("group.v2.pull", pull_params, background=background_rpc)
+            if ack_up_to_seq > 0:
+                pending_ack_seq = 0
+                last_auto_ack_seq = max(last_auto_ack_seq, ack_up_to_seq)
             if isinstance(result, dict):
                 response.update(result)
             else:
@@ -2461,6 +2535,11 @@ class V2E2EECoordinator:
                 )
             else:
                 page_max_seq = next_after_seq
+
+            next_after = max(page_max_seq, next_after_seq)
+            raw_count = len(raw_messages)
+            can_continue_page = raw_count > 0 and next_after > next_after_seq and owns_cursor
+            full_page = can_continue_page and limit > 0 and raw_count >= limit
 
             if self._can_parallel_decrypt_v2_page(raw_messages, expected_group_id=group_id):
                 page_decrypted = await self._decrypt_page_parallel(raw_messages, expected_group_id=group_id)
@@ -2536,6 +2615,7 @@ class V2E2EECoordinator:
                 client._persist_seq(ns)
             ack_needed = (
                 contig > 0
+                and contig > last_auto_ack_seq
                 and owns_cursor
                 and (
                     (bool(raw_messages) and contig_advanced)
@@ -2543,10 +2623,24 @@ class V2E2EECoordinator:
                 )
             )
             if ack_needed:
-                client._log.debug("client", "group.v2.pull sending auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", group_id, ns, contig, len(raw_messages))
-                await client._await_ack("group.v2.ack", {
-                    "group_id": group_id, "group_aid": group_id, "up_to_seq": contig,
-                }, f"V2 群消息 page auto-ack group={group_id}")
+                if can_continue_page:
+                    pending_ack_seq = max(pending_ack_seq, contig)
+                    last_auto_ack_seq = max(last_auto_ack_seq, contig)
+                    client._log.debug(
+                        "client",
+                        "group.v2.pull queued piggyback auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d full_page=%s",
+                        group_id, ns, pending_ack_seq, raw_count, full_page,
+                    )
+                else:
+                    client._log.debug(
+                        "client",
+                        "group.v2.pull sending terminal auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d",
+                        group_id, ns, contig, raw_count,
+                    )
+                    await client._await_ack("group.v2.ack", {
+                        "group_id": group_id, "group_aid": group_id, "up_to_seq": contig,
+                    }, f"V2 群消息 terminal auto-ack group={group_id}")
+                    last_auto_ack_seq = max(last_auto_ack_seq, contig)
             elif raw_messages and contig_advanced and contig > 0 and not owns_cursor:
                 client._log.debug(
                     "client",
@@ -2554,15 +2648,28 @@ class V2E2EECoordinator:
                     group_id, ns, request_device_id, request_slot_id, contig,
                 )
 
-            next_after = max(page_max_seq, next_after_seq)
             if not owns_cursor:
                 break
-            if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
+            should_continue = can_continue_page and (full_page or pending_ack_seq > 0)
+            if not should_continue:
                 break
+            tail_delay = _v2_pull_tail_delay_seconds(raw_count, limit)
+            if tail_delay > 0:
+                await asyncio.sleep(tail_delay)
             next_after_seq = next_after
 
         if page_count >= max_pages:
             client._log.warn("client", "group.v2.pull reached max_pages=%d group=%s after_seq=%d", max_pages, group_id, next_after_seq)
+            if pending_ack_seq > 0:
+                client._log.debug(
+                    "client",
+                    "group.v2.pull flushing pending auto-ack after max_pages: group=%s ns=%s ack_seq=%d",
+                    group_id, ns, pending_ack_seq,
+                )
+                await client._await_ack("group.v2.ack", {
+                    "group_id": group_id, "group_aid": group_id, "up_to_seq": pending_ack_seq,
+                }, f"V2 群消息 max_pages auto-ack group={group_id}")
+                pending_ack_seq = 0
 
         response["messages"] = decrypted
         response["_contig_before"] = first_contig_before

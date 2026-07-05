@@ -9,6 +9,7 @@
 - P2P 加密 envelope 类型为 `e2ee.p2p_encrypted`，通过 `message.send` 提交，服务端按 V2 分流处理。
 - GROUP 加密 envelope 类型为 `e2ee.group_encrypted`，通过 `group.v2.send` 提交。
 - 服务端只做认证、路由、结构校验、密文存储和事件通知，不持有明文 payload，也不执行端到端解密。
+- 图中的 `group_id` 是 RPC 兼容参数名，传值语义均为规范化后的 `group_aid`（`{base}.{issuer}`）。
 
 ## V2 设备密钥注册
 

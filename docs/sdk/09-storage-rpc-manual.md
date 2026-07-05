@@ -1202,7 +1202,7 @@ fs 目录节点视图。
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| `group_id` | string | 是 | — | 群 ID |
+| `group_id` | string | 是 | — | 群组标识兼容字段，值语义为目标态 `group_aid` |
 | `group_owner_aid` | string | 是 | — | 群 owner AID |
 | `member_aid` | string | 否 | — | 成员 AID（不传=全员） |
 | `reason` | string | 否 | `"membership_changed"` | `dissolved` / `membership_changed` |

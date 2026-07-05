@@ -3766,7 +3766,7 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 	c.config = nextRaw
 	c.configModel = nextCfg
 	c.agentMD().setAgentMDPath(filepath.Join(nextCfg.AUNPath, "AIDs"))
-	deviceID := c.deviceID
+	deviceID := strings.TrimSpace(aid.DeviceID)
 	if deviceID == "" {
 		deviceID = nextCfg.DeviceID()
 	}

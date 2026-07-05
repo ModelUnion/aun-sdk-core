@@ -61,6 +61,7 @@ sequenceDiagram
             "affinity_ttl_ms": 300000
         },
         "options": { "kind": "long" },
+        "extra_info": { "app": "demo" },
         "capabilities": {
             "e2ee": true,
             "group_e2ee": true
@@ -77,6 +78,7 @@ sequenceDiagram
 - `delivery_mode` 决定该 AID 当前连接的投递语义；同一 AID 的所有在线连接必须保持一致。
 - `options.kind` 声明连接类型：`"long"`（默认）= 长连接，承担服务端推送 / 事件订阅；`"short"` = 短连接，仅用于发送 RPC 并等待响应即断开。同 `(aid, device.id, slotIsolationKey(client.slot_id))` 隔离槽下，长连接最多 1 条，短连接最多 10 条；短连接不会顶掉长连接。
 - `options.short_ttl_ms` 仅在 `kind="short"` 时有效，可选；服务端兜底超时后主动关闭短连接，防止占名额。
+- `extra_info` 是应用层自定义连接信息，可用于审计、踢人提示或排障；SDK 会过滤下划线开头的内部键。
 - `capabilities` 是客户端能力声明；`hello-ok.result.capabilities` 是服务端能力公告，不是双方能力交集。
 
 ### (3) hello-ok — 握手完成

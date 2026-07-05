@@ -64,7 +64,7 @@ WebSocket 连接建立
   ← challenge（服务端推送 nonce）
   → auth.aid_login1 (可选，已有 token 时跳过)
   → auth.aid_login2 (可选)
-  → auth.connect(nonce, auth, protocol, device, client, delivery_mode, capabilities)
+  → auth.connect(nonce, auth, protocol, device, client, delivery_mode, options, extra_info, capabilities)
   ← {status: "ok", protocol, identity, ...}
   → READY，进入 Gateway 业务态
 ```
@@ -96,6 +96,9 @@ WebSocket 连接建立
 | delivery_mode.mode | string | 否 | 连接级投递模式：`fanout` 或 `queue` |
 | delivery_mode.routing | string | 否 | 仅 `queue` 时有效：`round_robin` 或 `sender_affinity` |
 | delivery_mode.affinity_ttl_ms | integer | 否 | 仅 `queue + sender_affinity` 时有效，表示发送者粘性保持时长 |
+| options.kind | string | 否 | 连接类型：`long`（默认）或 `short` |
+| options.short_ttl_ms | integer | 否 | 短连接服务端兜底超时，仅 `kind="short"` 时有效 |
+| extra_info | object | 否 | 应用层自定义连接信息；SDK 会过滤下划线开头的内部键 |
 | capabilities | object | 否 | 客户端能力声明 |
 | client | object | 否 | 客户端信息（名称、版本等） |
 

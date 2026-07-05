@@ -1,4 +1,4 @@
-# AID 和 Group ID 格式校验实现 (2026-06-18)
+# AID 和 Group AID / Group ID 格式校验实现 (2026-06-18)
 
 ## 背景
 
@@ -7,7 +7,7 @@
 ## 问题
 
 1. SDK 没有在关键发送接口进行格式校验
-2. 文档中的 Group ID 格式描述与实际代码不一致
+2. 文档中的群组标识格式描述与实际代码不一致
 
 ## 解决方案
 
@@ -80,7 +80,9 @@
 - ❌ `__system__` (无 issuer，包含非法字符)
 - ❌ `guest.aid.pub` (以 guest 开头)
 
-## Group ID 格式规范
+## Group AID / Group ID 格式规范
+
+当前实现中，群组主标识是 `group_aid`，目标态格式为 `{base}.{issuer}`。`group_id` 字段名和 `validate_group_id_format()` 函数名继续保留用于兼容，但规范化结果也返回目标态 `group_aid`，不再返回 `group.{issuer}/{base}`。
 
 ### Base 格式（不含域名部分）
 
@@ -104,14 +106,15 @@
 
 ### 完整格式
 
-- `group.{issuer}/{base}` — canonical 格式
-- `{base}.{issuer}` — 旧格式（会被规范化）
+- `{base}.{issuer}` — 目标态 `group_aid`
+- `group.{issuer}/{base}` — 旧 URL 风格兼容格式（会被规范化）
 - `{base}@{issuer}` — 兼容格式（会被规范化）
 - `{base}` — 本域简写（需要服务端补全）
 
 **示例**:
 - ✅ `g-abc123.aid.pub`
-- ✅ `group.aid.pub/g-test1`
+- ✅ `g-test1.aid.pub`
+- ✅ `group.aid.pub/g-test1`（兼容输入，规范化为 `g-test1.aid.pub`）
 - ✅ `team_alpha`
 - ✅ `12345678`
 - ❌ `g-1` (只有 3 个字符)
@@ -122,12 +125,12 @@
 服务端在 `group.create` 中已经有以下校验：
 
 ```python
-# extensions/services/group/service.py:1036-1037
+# extensions/services/group/service.py
 if requested_group_id and self._is_numeric_group_id(requested_group_id):
     raise ValueError("custom group_id cannot be numeric; numeric group_id is reserved for generated group_no")
 ```
 
-**规则**: 创建命名群时，群 ID 不能为纯数字。纯数字的 ID 只能由系统自动分配，以免冲突。
+**规则**: 创建命名群或自定义群标识时，base 不能为纯数字。纯数字 base 保留给系统自动分配的群号，以免冲突。
 
 ## 验证效果
 

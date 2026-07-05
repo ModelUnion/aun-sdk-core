@@ -1606,9 +1606,11 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._pullV2(0, 10);
     await Promise.resolve();
 
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
+    expect(pullCalls[1]).toEqual(['message.v2.pull', { after_seq: 3, limit: 10, ack_up_to_seq: 3 }, undefined, undefined, true]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('message.pull(force=true) 应透传 force 且不改写显式 after_seq=0', async () => {
@@ -1660,10 +1662,9 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
     const v2AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     const v1AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.ack');
-    // _pullV2 内部已持续拉到空页，外层 gap-fill 不再额外递归确认。
+    // skipAutoAck 下没有 pending ack 可 piggyback，非满页按 pulled_msgs == page_limit 语义停止。
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 50 }, undefined, undefined, true],
-      ['message.v2.pull', { after_seq: 3, limit: 50 }, undefined, undefined, true],
     ]);
     expect(v2AckCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
     expect(v1AckCalls).toEqual([]);
@@ -1744,9 +1745,11 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._pullGroupV2('grp01', 0, 10);
     await Promise.resolve();
 
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(pullCalls[1]).toEqual(['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 3, limit: 10, device_id: 'device-001', slot_id: 'slot-a', ack_up_to_seq: 3 }, undefined, undefined, true]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 应使用 group_aid 作为本地 namespace，并保留旧 group_id 查询字段', async () => {
@@ -1784,16 +1787,17 @@ describe('AUNClient E2EE V2-only 编排', () => {
         device_id: 'device-001',
         slot_id: 'slot-a',
       }, undefined, undefined, true],
-    ]);
-    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
-      ['group.v2.ack', {
-        group_id: 'g1.example.com',
+      ['group.v2.pull', {
+        group_id: 'group.example.com/g1',
         group_aid: 'g1.example.com',
-        up_to_seq: 1,
+        after_seq: 1,
+        limit: 10,
         device_id: 'device-001',
         slot_id: 'slot-a',
+        ack_up_to_seq: 1,
       }, undefined, undefined, true],
     ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -1829,13 +1833,10 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
       ['message.v2.pull', { after_seq: 0, limit: 2 }, undefined, undefined, true],
-      ['message.v2.pull', { after_seq: 2, limit: 2 }, undefined, undefined, true],
-      ['message.v2.pull', { after_seq: 3, limit: 2 }, undefined, undefined, true],
+      ['message.v2.pull', { after_seq: 2, limit: 2, ack_up_to_seq: 2 }, undefined, undefined, true],
+      ['message.v2.pull', { after_seq: 3, limit: 2, ack_up_to_seq: 3 }, undefined, undefined, true],
     ]);
-    expect(ackCalls).toEqual([
-      ['message.v2.ack', { up_to_seq: 2 }, undefined, undefined, true],
-      ['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true],
-    ]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -1869,12 +1870,10 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
       ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a', ack_up_to_seq: 2 }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 3, limit: 2, device_id: 'device-001', slot_id: 'slot-a', ack_up_to_seq: 3 }, undefined, undefined, true],
     ]);
-    expect(ackCalls).toEqual([
-      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-      ['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
-    ]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('message.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
@@ -1956,9 +1955,10 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     expect(result).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
-    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([
-      ['message.v2.ack', { up_to_seq: 5 }, undefined, undefined, true],
-    ]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull')).toContainEqual(
+      ['message.v2.pull', { after_seq: 5, limit: 10, ack_up_to_seq: 5 }, undefined, undefined, true],
+    );
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
 
   it('message.v2.pull 发布事件时应已推进 contiguous_seq，且本页只 ack 一次', async () => {
@@ -1993,8 +1993,10 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
+    expect(pullCalls[1]).toEqual(['message.v2.pull', { after_seq: 3, limit: 10, ack_up_to_seq: 3 }, undefined, undefined, true]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('group.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
@@ -2040,7 +2042,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const result = await (client as any)._pullGroupV2('grp01', 5, 10);
     await Promise.resolve();
 
-    expect(result.map((msg) => msg.seq)).toEqual([5]);
+    expect(result.map((msg) => msg.seq)).toEqual([]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
   });
@@ -2108,8 +2110,10 @@ describe('AUNClient E2EE V2-only 编排', () => {
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'grp01', group_aid: 'grp01', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
+    expect(pullCalls[1]).toEqual(['group.v2.pull', { group_id: 'grp01', group_aid: 'grp01', after_seq: 3, limit: 10, device_id: 'device-001', slot_id: 'slot-a', ack_up_to_seq: 3 }, undefined, undefined, true]);
+    expect(ackCalls).toEqual([]);
   });
 
   it('V2 target 构建应接受显式空 device_id', async () => {
@@ -3663,6 +3667,11 @@ describe('AUNClient agent.md ETag 缓存', () => {
       agent_md_etags: {
         to: { aid: 'bob1.agentid.pub', etag: '"bob-cloud"' },
         target: { aid: 'carol.agentid.pub', etag: '"carol-cloud"' },
+        group: {
+          aid: 'team.group.agentid.pub',
+          etag: '"group-cloud"',
+          last_modified: 'Sun, 24 May 2026 00:00:02 GMT',
+        },
         sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
       },
     });
@@ -3670,6 +3679,8 @@ describe('AUNClient agent.md ETag 缓存', () => {
     expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
     expect(readAgentRecord(client, 'bob1.agentid.pub').remote_etag).toBe('"bob-cloud"');
     expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
+    expect(readAgentRecord(client, 'team.group.agentid.pub').remote_etag).toBe('"group-cloud"');
+    expect(readAgentRecord(client, 'team.group.agentid.pub').last_modified).toBe('Sun, 24 May 2026 00:00:02 GMT');
     expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
     (client as any)._tokenStore?.close?.();
   });
@@ -3707,14 +3718,23 @@ describe('AUNClient agent.md ETag 缓存', () => {
         suite: 'P256_HKDF_SHA256_AES_256_GCM',
         payload_type: 'chat.text',
         protected_headers: { payload_type: 'chat.text', sdk_lang: 'ts' },
-        agent_md: { sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' } },
+        group_aid: 'team.group.agentid.pub',
+        agent_md: {
+          sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' },
+          group: { etag: '"group-cloud"', last_modified: 'Sun, 24 May 2026 00:00:02 GMT' },
+        },
       },
     });
 
     expect(event.payload_type).toBe('chat.text');
     expect(event.protected_headers).toEqual({ payload_type: 'chat.text', sdk_lang: 'ts' });
-    expect(event.agent_md).toEqual({ sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' } });
+    expect(event.agent_md).toEqual({
+      sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' },
+      group: { etag: '"group-cloud"', last_modified: 'Sun, 24 May 2026 00:00:02 GMT' },
+    });
     expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
+    expect(readAgentRecord(client, 'team.group.agentid.pub').remote_etag).toBe('"group-cloud"');
+    expect(readAgentRecord(client, 'team.group.agentid.pub').last_modified).toBe('Sun, 24 May 2026 00:00:02 GMT');
     (client as any)._tokenStore?.close?.();
   });
 });

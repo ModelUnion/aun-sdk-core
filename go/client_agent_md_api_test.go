@@ -361,10 +361,13 @@ func TestDownloadAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
 
 func TestObserveRPCMetaAgentMDEtagsPersistToList(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob1.agentid.pub", "carol.agentid.pub", "dave.agentid.pub")
-	c.observeRPCMeta(map[string]any{"agent_md_etag": "\"self-cloud\"", "agent_md_etags": map[string]any{"to": map[string]any{"aid": "bob1.agentid.pub", "etag": "\"bob-cloud\""}, "target": map[string]any{"aid": "carol.agentid.pub", "etag": "\"carol-cloud\""}, "sender": map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""}}})
+	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "bob1.agentid.pub", "carol.agentid.pub", "dave.agentid.pub", "team.group.agentid.pub")
+	c.observeRPCMeta(map[string]any{"agent_md_etag": "\"self-cloud\"", "agent_md_etags": map[string]any{"to": map[string]any{"aid": "bob1.agentid.pub", "etag": "\"bob-cloud\""}, "target": map[string]any{"aid": "carol.agentid.pub", "etag": "\"carol-cloud\""}, "sender": map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""}, "group": map[string]any{"aid": "team.group.agentid.pub", "etag": "\"group-cloud\"", "last_modified": "Sun, 24 May 2026 00:00:02 GMT"}}})
 	records := readAgentMDListRecords(t, c)
-	if records["alice.agentid.pub"]["remote_etag"] != "\"self-cloud\"" || records["bob1.agentid.pub"]["remote_etag"] != "\"bob-cloud\"" || records["carol.agentid.pub"]["remote_etag"] != "\"carol-cloud\"" || records["dave.agentid.pub"]["remote_etag"] != "\"dave-cloud\"" {
+	if records["alice.agentid.pub"]["remote_etag"] != "\"self-cloud\"" || records["bob1.agentid.pub"]["remote_etag"] != "\"bob-cloud\"" || records["carol.agentid.pub"]["remote_etag"] != "\"carol-cloud\"" || records["dave.agentid.pub"]["remote_etag"] != "\"dave-cloud\"" || records["team.group.agentid.pub"]["remote_etag"] != "\"group-cloud\"" {
+		t.Fatalf("bad records: %#v", records)
+	}
+	if records["team.group.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:02 GMT" {
 		t.Fatalf("bad records: %#v", records)
 	}
 }
@@ -386,6 +389,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 		"agent_md_etag": "\"alice-cloud\"",
 		"agent_md_etags": map[string]any{
 			"requester": map[string]any{"aid": "alice.agentid.pub", "etag": "\"alice-cloud-2\"", "last_modified": "Sun, 24 May 2026 00:00:00 GMT"},
+			"group":     map[string]any{"aid": "team.group.agentid.pub", "etag": "\"group-cloud\"", "last_modified": "Sun, 24 May 2026 00:00:02 GMT"},
 			"receiver":  map[string]any{"aid": "bob1.agentid.pub", "etag": "\"bob-cloud\"", "last_modified": "Sun, 24 May 2026 00:00:01 GMT"},
 			"sender":    map[string]any{"aid": "dave.agentid.pub", "etag": "\"dave-cloud\""},
 		},
@@ -393,7 +397,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 
 	got := map[string]bool{}
 	deadline := time.After(2 * time.Second)
-	for len(got) < 3 {
+	for len(got) < 4 {
 		select {
 		case aid := <-downloaded:
 			got[aid] = true
@@ -401,7 +405,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 			t.Fatalf("timed out waiting for auto download, got=%v", got)
 		}
 	}
-	for _, aid := range []string{"alice.agentid.pub", "bob1.agentid.pub", "dave.agentid.pub"} {
+	for _, aid := range []string{"alice.agentid.pub", "bob1.agentid.pub", "team.group.agentid.pub", "dave.agentid.pub"} {
 		if !got[aid] {
 			t.Fatalf("missing downloaded aid %s, got=%v", aid, got)
 		}
@@ -412,9 +416,11 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 		records = readAgentMDListRecords(t, c)
 		if records["alice.agentid.pub"]["remote_etag"] == "\"alice-cloud-2\"" &&
 			records["bob1.agentid.pub"]["remote_etag"] == "\"bob-cloud\"" &&
+			records["team.group.agentid.pub"]["remote_etag"] == "\"group-cloud\"" &&
 			records["dave.agentid.pub"]["remote_etag"] == "\"dave-cloud\"" &&
 			records["alice.agentid.pub"]["local_etag"] != "" &&
 			records["bob1.agentid.pub"]["local_etag"] != "" &&
+			records["team.group.agentid.pub"]["local_etag"] != "" &&
 			records["dave.agentid.pub"]["local_etag"] != "" {
 			break
 		}
@@ -425,7 +431,8 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	}
 	waitAgentMDFetchesIdle(t, c)
 	if records["alice.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:00 GMT" ||
-		records["bob1.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:01 GMT" {
+		records["bob1.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:01 GMT" ||
+		records["team.group.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:02 GMT" {
 		t.Fatalf("last_modified not persisted: %#v", records)
 	}
 	for aid, rec := range records {
@@ -439,6 +446,29 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	}
 	if data, err := os.ReadFile(p); err != nil || string(data) != "# bob1.agentid.pub\n" {
 		t.Fatalf("bob content not saved: data=%q err=%v", string(data), err)
+	}
+}
+
+func TestObserveEnvelopeAgentMDGroupPersistsToList(t *testing.T) {
+	c := newClientForTest(t, "bob.agentid.pub")
+	seedAgentMDLocalContent(t, c, "alice.agentid.pub", "team.group.agentid.pub")
+	c.observeAgentMDFromEnvelope(map[string]any{
+		"group_aid": "team.group.agentid.pub",
+		"agent_md": map[string]any{
+			"sender": map[string]any{"aid": "alice.agentid.pub", "etag": "\"alice-cloud\""},
+			"group": map[string]any{
+				"etag":          "\"group-cloud\"",
+				"last_modified": "Sun, 24 May 2026 00:00:02 GMT",
+			},
+		},
+	})
+	records := readAgentMDListRecords(t, c)
+	if records["alice.agentid.pub"]["remote_etag"] != "\"alice-cloud\"" {
+		t.Fatalf("sender etag not observed: %#v", records)
+	}
+	if records["team.group.agentid.pub"]["remote_etag"] != "\"group-cloud\"" ||
+		records["team.group.agentid.pub"]["last_modified"] != "Sun, 24 May 2026 00:00:02 GMT" {
+		t.Fatalf("group meta not observed: %#v", records)
 	}
 }
 
