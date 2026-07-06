@@ -317,6 +317,64 @@ describe('MessageDeliveryEngine 组件边界', () => {
     }
   });
 
+  it('P2P recall push/pull tombstone 按原消息去重', async () => {
+    const { engine, published } = createEngine();
+
+    await engine.publishMessageRecallTombstone(5, {
+      message_id: 'recall-push',
+      seq: 5,
+      type: 'message.recalled',
+      payload: { type: 'message.recalled', message_ids: ['m-aaa'], recalled_at: 1007 },
+    });
+    await engine.publishMessageRecallTombstone(6, {
+      message_id: 'recall-pull',
+      seq: 6,
+      type: 'message.recalled',
+      payload: { type: 'message.recalled', message_ids: ['m-aaa'], recalled_at: 1000 },
+    });
+
+    const recallEvents = published.filter((item) => item.event === 'message.recalled');
+    expect(recallEvents).toHaveLength(1);
+    expect(recallEvents[0].payload.message_ids).toEqual(['m-aaa']);
+  });
+
+  it('P2P recall 顶层字段参与归一化和去重', () => {
+    const { engine } = createEngine();
+
+    const event = engine.recallEventFromMessage({
+      message_id: 'notice-1',
+      seq: 5,
+      type: 'message.recalled',
+      message_ids: ['m-aaa'],
+      target_message_seqs: [3],
+      recalled_by: 'alice.agentid.pub',
+      recalled_at: 1000,
+    });
+
+    expect(event?.message_ids).toEqual(['m-aaa']);
+    expect(event?.target_message_seqs).toEqual([3]);
+    expect(event?.recalled_by).toBe('alice.agentid.pub');
+  });
+
+  it('group recall 顶层字段参与归一化和去重', () => {
+    const { engine } = createEngine();
+
+    const event = engine.recallEventFromGroupMessage({
+      message_id: 'notice-1',
+      group_id: 'grp-1',
+      seq: 5,
+      type: 'group.message_recalled',
+      message_ids: ['m-aaa'],
+      target_message_seqs: [3],
+      recalled_by: 'alice.agentid.pub',
+      recalled_at: 1000,
+    });
+
+    expect(event?.message_ids).toEqual(['m-aaa']);
+    expect(event?.target_message_seqs).toEqual([3]);
+    expect(event?.recalled_by).toBe('alice.agentid.pub');
+  });
+
   it('messageTargetsCurrentInstance 按 device_id / slot_id 过滤实例消息', () => {
     const { engine } = createEngine();
 

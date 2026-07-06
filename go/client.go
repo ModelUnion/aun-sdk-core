@@ -68,6 +68,7 @@ const (
 	reconnectMaxBaseDelaySeconds = 64.0
 	pushedSeqsLimit              = 50000
 	pendingOrderedLimit          = 50000
+	messageRecallSeenLimit       = 10000
 	groupRecallSeenLimit         = 10000
 )
 
@@ -627,7 +628,11 @@ type AUNClient struct {
 	groupSynced   map[string]bool
 	groupSyncedMu sync.Mutex
 
-	// 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次
+	// P2P 撤回去重：原始 message_id -> 时间戳，保证应用层只回调一次
+	messageRecallSeen   map[string]int64
+	messageRecallSeenMu sync.Mutex
+
+	// 群撤回去重：group_id|sorted(message_ids) -> 时间戳，保证应用层只回调一次
 	groupRecallSeen   map[string]int64
 	groupRecallSeenMu sync.Mutex
 
@@ -762,6 +767,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                   make(map[string]map[int]bool),
 		pendingOrderedMsgs:           make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                  make(map[string]bool),
+		messageRecallSeen:            make(map[string]int64),
 		groupRecallSeen:              make(map[string]int64),
 		onlineUnreadHintQueue:        make(map[string]map[string]any),
 		onlineUnreadHintInitialDelay: 750 * time.Millisecond,
@@ -815,6 +821,10 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 	events.Subscribe("_raw.message.received", func(payload any) {
 		c.onRawMessageReceived(payload)
 	})
+	// P2P 消息撤回推送：在线 push 与 pull tombstone 去重后再发布给应用层
+	events.Subscribe("_raw.message.recalled", func(payload any) {
+		c.onRawMessageRecalled(payload)
+	})
 	// 群组消息推送：自动解密后 re-publish
 	events.Subscribe("_raw.group.message_created", func(payload any) {
 		c.onRawGroupMessageCreated(payload)
@@ -832,9 +842,6 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		c.onRawGroupStateCommitted(payload)
 	})
 	// 其他事件直接透传
-	events.Subscribe("_raw.message.recalled", func(payload any) {
-		events.Publish("message.recalled", payload)
-	})
 	events.Subscribe("_raw.message.ack", func(payload any) {
 		events.Publish("message.ack", payload)
 	})

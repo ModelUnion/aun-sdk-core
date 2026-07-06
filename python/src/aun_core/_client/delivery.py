@@ -16,6 +16,7 @@ from .runtime import ClientRuntime
 
 _PUSHED_SEQS_LIMIT = 50000
 _PENDING_ORDERED_LIMIT = 50000
+_MESSAGE_RECALL_SEEN_LIMIT = 10000
 _GROUP_RECALL_SEEN_LIMIT = 10000
 _ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
 _ONLINE_UNREAD_HINT_INTERVAL = 0.05
@@ -39,6 +40,14 @@ _APP_MESSAGE_ENVELOPE_KEYS = (
     "context", "protected_headers", "headers", "payload_type",
 )
 
+_RECALL_PAYLOAD_KEYS = (
+    "message_ids", "target_message_seqs",
+    "recalled_message_id", "target_message_id", "original_message_id",
+    "target_seq", "original_seq",
+    "notice_message_id", "notice_seq", "event_seq",
+    "sender_aid", "recalled_by", "recalled_at", "reason",
+)
+
 _APP_GROUP_EVENT_ENVELOPE_KEYS = (
     "module_id", "event_id", "event_seq", "seq", "event_type", "action", "group_id",
     "actor_aid", "sender_aid", "member_aid", "target_aid", "operator_aid",
@@ -59,6 +68,8 @@ class MessageDeliveryEngine:
     def __init__(self, runtime: Any) -> None:
         self.runtime = ClientRuntime.coerce(runtime)
         self.client = self.runtime.client
+        self._message_recall_dedup_lock = asyncio.Lock()
+        self._group_recall_dedup_locks: dict[str, asyncio.Lock] = {}
 
     async def postprocess_result(self, method: str, params: dict[str, Any], result: Any) -> Any:
         if method == "message.pull" and isinstance(result, dict):
@@ -162,6 +173,9 @@ class MessageDeliveryEngine:
         client = self.client
         if event == "group.changed" and self.is_group_event_namespace(ns):
             await self.publish_ordered_group_changed(payload, source=source)
+            return
+        if event == "message.recalled":
+            await self.publish_message_recall_tombstone(seq, payload)
             return
         await client._publish_app_event(event, payload, source=source)
 
@@ -481,6 +495,9 @@ class MessageDeliveryEngine:
         for key in _APP_MESSAGE_ENVELOPE_KEYS:
             if key in message and key not in event:
                 event[key] = message[key]
+        for key in _RECALL_PAYLOAD_KEYS:
+            if key in message and key not in event:
+                event[key] = message[key]
         raw_ids = event.get("message_ids")
         if isinstance(raw_ids, list):
             message_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
@@ -516,6 +533,70 @@ class MessageDeliveryEngine:
         return "message.received", message
 
     @staticmethod
+    def message_recall_dedup_key(payload: dict[str, Any]) -> str:
+        """P2P 撤回去重键：原始消息标识优先，避免 push/pull/reconnect 重复回调。"""
+        ids = payload.get("message_ids")
+        if isinstance(ids, list):
+            id_part = ",".join(sorted(str(i or "").strip() for i in ids if str(i or "").strip()))
+            if id_part:
+                return f"p2p|id:{id_part}"
+        else:
+            id_part = str(ids or "").strip()
+            if id_part:
+                return f"p2p|id:{id_part}"
+        for key in ("recalled_message_id", "target_message_id", "original_message_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return f"p2p|id:{value}"
+        seqs = payload.get("target_message_seqs")
+        if isinstance(seqs, list):
+            seq_part = ",".join(sorted(str(seq or "").strip() for seq in seqs if str(seq or "").strip()))
+        else:
+            seq_part = str(seqs or payload.get("target_seq") or payload.get("original_seq") or "").strip()
+        if seq_part:
+            from_aid = str(payload.get("from") or payload.get("from_aid") or payload.get("sender_aid") or "").strip()
+            to_aid = str(payload.get("to") or payload.get("to_aid") or "").strip()
+            return f"p2p|from:{from_aid}|to:{to_aid}|seq:{seq_part}"
+        tombstone_id = str(payload.get("tombstone_message_id") or payload.get("message_id") or "").strip()
+        if tombstone_id:
+            return f"p2p|tombstone:{tombstone_id}"
+        return f"p2p|unknown:{id(payload)}"
+
+    async def publish_message_recall_tombstone(self, seq: Any, message: Any) -> bool:
+        """把 P2P 撤回 tombstone 归一化并按原消息去重发布一次 message.recalled。"""
+        client = self.client
+        event_payload = self.recall_event_from_message(message)
+        if event_payload is None:
+            return False
+        dedup_key = self.message_recall_dedup_key(event_payload)
+        async with self._message_recall_dedup_lock:
+            seen = getattr(client, "_message_recall_seen", None)
+            if seen is None:
+                seen = {}
+                try:
+                    client._message_recall_seen = seen
+                except Exception:
+                    seen = {}
+            if dedup_key in seen:
+                client._log.debug(
+                    "client",
+                    "message.recalled 去重抑制: seq=%s key=%s",
+                    seq, dedup_key,
+                )
+                return False
+            seen[dedup_key] = time.time()
+            if len(seen) > _MESSAGE_RECALL_SEEN_LIMIT:
+                for old_key in sorted(seen, key=lambda k: seen[k])[: len(seen) - _MESSAGE_RECALL_SEEN_LIMIT]:
+                    seen.pop(old_key, None)
+        await client._publish_app_event("message.recalled", event_payload, source="message-recall")
+        client._log.debug(
+            "client",
+            "message.recalled 发布: seq=%s message_ids=%s",
+            seq, event_payload.get("message_ids"),
+        )
+        return True
+
+    @staticmethod
     def recall_event_from_group_message(message: Any) -> dict[str, Any] | None:
         """把 pull / push 收到的群撤回 tombstone 归一化为 group.message_recalled payload。
 
@@ -533,6 +614,9 @@ class MessageDeliveryEngine:
             return None
         event = dict(payload_dict)
         for key in _APP_MESSAGE_ENVELOPE_KEYS:
+            if key in message and key not in event:
+                event[key] = message[key]
+        for key in _RECALL_PAYLOAD_KEYS:
             if key in message and key not in event:
                 event[key] = message[key]
         raw_ids = event.get("message_ids")
@@ -563,19 +647,49 @@ class MessageDeliveryEngine:
 
     @staticmethod
     def group_recall_dedup_key(group_id: str, payload: dict[str, Any]) -> str:
-        """群撤回去重键：group_id + 排序后的 message_ids。
+        """群撤回去重键：group_id + 原始消息标识。
 
         一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
-        (group_id, sorted message_ids) 已能唯一标识一次撤回。
+        (group_id, sorted message_ids) 已能唯一标识一次撤回。若某条兼容路径未携带
+        message_ids，则依次退到原消息 id、原消息 seq；最后才使用 tombstone id，避免
+        生成空键把不同撤回误合并。
         去重键不含 recalled_at：占位/通知 tombstone（pull）与在线 push 三条通道对同一次撤回
         可能携带不同来源的时间戳（push 在事务后重取），纳入 recalled_at 会使去重失效、回调多次。
         """
         ids = payload.get("message_ids")
         if isinstance(ids, list):
             id_part = ",".join(sorted(str(i or "").strip() for i in ids if str(i or "").strip()))
+            if id_part:
+                return f"{group_id}|id:{id_part}"
         else:
-            id_part = str(ids or "")
-        return f"{group_id}|{id_part}"
+            id_part = str(ids or "").strip()
+            if id_part:
+                return f"{group_id}|id:{id_part}"
+        for key in ("recalled_message_id", "target_message_id", "original_message_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return f"{group_id}|id:{value}"
+        seqs = payload.get("target_message_seqs")
+        if isinstance(seqs, list):
+            seq_part = ",".join(sorted(str(seq or "").strip() for seq in seqs if str(seq or "").strip()))
+            if seq_part:
+                return f"{group_id}|seq:{seq_part}"
+        else:
+            seq_part = str(seqs or payload.get("original_seq") or "").strip()
+            if seq_part:
+                return f"{group_id}|seq:{seq_part}"
+        tombstone_id = str(payload.get("tombstone_message_id") or payload.get("message_id") or "").strip()
+        if tombstone_id:
+            return f"{group_id}|tombstone:{tombstone_id}"
+        return f"{group_id}|unknown:{id(payload)}"
+
+    def _group_recall_dedup_lock(self, group_id: str) -> asyncio.Lock:
+        key = str(group_id or "")
+        lock = self._group_recall_dedup_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._group_recall_dedup_locks[key] = lock
+        return lock
 
     async def publish_group_recall_tombstone(self, group_id: str, seq: Any, message: Any) -> bool:
         """把群撤回 tombstone 归一化并按去重键发布一次 group.message_recalled。
@@ -586,26 +700,31 @@ class MessageDeliveryEngine:
         event_payload = self.recall_event_from_group_message(message)
         if event_payload is None:
             return False
-        dedup_key = self.group_recall_dedup_key(group_id, event_payload)
-        seen = getattr(client, "_group_recall_seen", None)
-        if seen is None:
-            seen = {}
-            try:
-                client._group_recall_seen = seen
-            except Exception:
+        raw_group_id = str(event_payload.get("group_id") or group_id or "").strip()
+        dedup_group_id = _normalize_group_id(raw_group_id) or raw_group_id
+        if dedup_group_id:
+            event_payload["group_id"] = dedup_group_id
+        dedup_key = self.group_recall_dedup_key(dedup_group_id, event_payload)
+        async with self._group_recall_dedup_lock(dedup_group_id):
+            seen = getattr(client, "_group_recall_seen", None)
+            if seen is None:
                 seen = {}
-        if dedup_key in seen:
-            client._log.debug(
-                "client",
-                "group.message_recalled 去重抑制: group=%s seq=%s key=%s",
-                group_id, seq, dedup_key,
-            )
-            return False
-        seen[dedup_key] = time.time()
-        # 限制去重表大小，避免长期运行无限增长。
-        if len(seen) > _GROUP_RECALL_SEEN_LIMIT:
-            for old_key in sorted(seen, key=lambda k: seen[k])[: len(seen) - _GROUP_RECALL_SEEN_LIMIT]:
-                seen.pop(old_key, None)
+                try:
+                    client._group_recall_seen = seen
+                except Exception:
+                    seen = {}
+            if dedup_key in seen:
+                client._log.debug(
+                    "client",
+                    "group.message_recalled 去重抑制: group=%s seq=%s key=%s",
+                    group_id, seq, dedup_key,
+                )
+                return False
+            seen[dedup_key] = time.time()
+            # 限制去重表大小，避免长期运行无限增长。
+            if len(seen) > _GROUP_RECALL_SEEN_LIMIT:
+                for old_key in sorted(seen, key=lambda k: seen[k])[: len(seen) - _GROUP_RECALL_SEEN_LIMIT]:
+                    seen.pop(old_key, None)
         await client._publish_app_event("group.message_recalled", event_payload, source="group-recall")
         client._log.debug(
             "client",
@@ -863,10 +982,14 @@ class MessageDeliveryEngine:
             seq_i = int(seq)
         except (TypeError, ValueError):
             client._log.debug("client", "publish pulled direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq)
+            if event == "message.recalled":
+                return await self.publish_message_recall_tombstone(seq, payload)
             await client._publish_app_event(event, payload, source="pull")
             return True
         if seq_i <= 0 or not ns:
             client._log.debug("client", "publish pulled direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq_i)
+            if event == "message.recalled":
+                return await self.publish_message_recall_tombstone(seq_i, payload)
             await client._publish_app_event(event, payload, source="pull")
             return True
         if client._is_published_seq(ns, seq_i):
@@ -882,6 +1005,11 @@ class MessageDeliveryEngine:
             pending.pop(seq_i, None)
             if not pending:
                 client._pending_ordered().pop(ns, None)
+        if event == "message.recalled":
+            published = await self.publish_message_recall_tombstone(seq_i, payload)
+            client._mark_published_seq(ns, seq_i)
+            client._log.debug("client", "publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
+            return published
         await client._publish_app_event(event, payload, source="pull")
         client._mark_published_seq(ns, seq_i)
         client._log.debug("client", "publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
@@ -1031,6 +1159,36 @@ class MessageDeliveryEngine:
         loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
         loop.create_task(client._process_and_publish_message(data))
         client._log.debug("client", "_on_raw_message_received exit: elapsed=%.3fs", time.time() - t_start)
+
+    async def on_raw_message_recalled(self, data: Any) -> None:
+        """处理 message.recalled 在线推送，并与 pull tombstone 按原消息去重。"""
+        client = self.client
+        if not isinstance(data, dict):
+            return
+        wrapped = dict(data)
+        wrapped.setdefault("type", "message.recalled")
+        if not client._message_targets_current_instance(wrapped):
+            return
+        seq = wrapped.get("seq")
+        if seq is None or not client._aid:
+            await self.publish_message_recall_tombstone(seq, wrapped)
+            return
+        ns = f"p2p:{client._aid}"
+        async with client._get_ns_lock(ns):
+            seq_i = _coerce_positive_seq(seq)
+            if seq_i > 0:
+                client._seq_tracker.update_max_seen(ns, seq_i)
+                need_pull = client._seq_tracker.on_message_seq(ns, seq_i)
+                client._persist_seq(ns)
+                if need_pull:
+                    loop = getattr(client, "_loop", None) or asyncio.get_running_loop()
+                    loop.create_task(client._fill_p2p_gap())
+            await client._publish_ordered_message("message.recalled", ns, seq, wrapped)
+            contig = client._seq_tracker.get_contiguous_seq(ns)
+            if contig > 0:
+                client._fire_ack("message.ack", {
+                    "seq": contig, "device_id": client._device_id, "slot_id": client._slot_id,
+                }, "P2P recall auto-ack")
 
     async def process_and_publish_message(self, data: Any) -> None:
         """实际处理 P2P 推送消息的异步任务。"""

@@ -2,6 +2,7 @@ package aun
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -37,6 +38,14 @@ var appMessageEnvelopeKeys = []string{
 	"from", "from_aid", "sender_aid", "to", "to_aid", "group_id",
 	"timestamp", "created_at", "encrypted",
 	"context", "protected_headers", "headers", "payload_type",
+}
+
+var recallPayloadKeys = []string{
+	"message_ids", "target_message_seqs",
+	"recalled_message_id", "target_message_id", "original_message_id",
+	"target_seq", "original_seq",
+	"notice_message_id", "notice_seq", "event_seq",
+	"sender_aid", "recalled_by", "recalled_at", "reason",
 }
 
 var appSendEnvelopeMethods = map[string]bool{
@@ -315,6 +324,13 @@ func recallEventFromMessage(message any) (map[string]any, bool) {
 			}
 		}
 	}
+	for _, key := range recallPayloadKeys {
+		if _, exists := event[key]; !exists {
+			if value, ok := msg[key]; ok {
+				event[key] = value
+			}
+		}
+	}
 	messageIDs := []any{}
 	if rawIDs, ok := event["message_ids"].([]any); ok {
 		for _, item := range rawIDs {
@@ -383,6 +399,95 @@ func p2pAppEventForMessage(message any) (string, any) {
 	return "message.received", message
 }
 
+func messageRecallDedupKey(payload map[string]any) string {
+	idParts := []string{}
+	if rawIDs, ok := payload["message_ids"].([]any); ok {
+		for _, item := range rawIDs {
+			v := strings.TrimSpace(stringFromAny(item))
+			if v != "" {
+				idParts = append(idParts, v)
+			}
+		}
+	} else if v := strings.TrimSpace(stringFromAny(payload["message_ids"])); v != "" {
+		idParts = append(idParts, v)
+	}
+	sort.Strings(idParts)
+	if len(idParts) > 0 {
+		return "p2p|id:" + strings.Join(idParts, ",")
+	}
+	for _, key := range []string{"recalled_message_id", "target_message_id", "original_message_id"} {
+		value := strings.TrimSpace(getStr(payload, key, ""))
+		if value != "" {
+			return "p2p|id:" + value
+		}
+	}
+	seqParts := []string{}
+	if rawSeqs, ok := payload["target_message_seqs"].([]any); ok {
+		for _, item := range rawSeqs {
+			v := strings.TrimSpace(stringFromAny(item))
+			if v != "" {
+				seqParts = append(seqParts, v)
+			}
+		}
+	} else {
+		for _, key := range []string{"target_message_seqs", "target_seq", "original_seq"} {
+			value := strings.TrimSpace(stringFromAny(payload[key]))
+			if value != "" {
+				seqParts = append(seqParts, value)
+				break
+			}
+		}
+	}
+	sort.Strings(seqParts)
+	if len(seqParts) > 0 {
+		from := firstNonEmptyDelivery(getStr(payload, "from", ""), getStr(payload, "from_aid", ""), getStr(payload, "sender_aid", ""))
+		to := firstNonEmptyDelivery(getStr(payload, "to", ""), getStr(payload, "to_aid", ""))
+		return "p2p|from:" + from + "|to:" + to + "|seq:" + strings.Join(seqParts, ",")
+	}
+	tombstoneID := firstNonEmptyDelivery(getStr(payload, "tombstone_message_id", ""), getStr(payload, "message_id", ""))
+	if tombstoneID != "" {
+		return "p2p|tombstone:" + tombstoneID
+	}
+	return fmt.Sprintf("p2p|unknown:%p", payload)
+}
+
+func (d *messageDeliveryEngine) publishMessageRecallTombstone(seq int, message any) bool {
+	c := d.runtime.client
+	eventPayload, ok := recallEventFromMessage(message)
+	if !ok {
+		return false
+	}
+	dedupKey := messageRecallDedupKey(eventPayload)
+	c.messageRecallSeenMu.Lock()
+	if c.messageRecallSeen == nil {
+		c.messageRecallSeen = make(map[string]int64)
+	}
+	if _, seen := c.messageRecallSeen[dedupKey]; seen {
+		c.messageRecallSeenMu.Unlock()
+		c.log.Debug("message.recalled dedup suppressed: seq=%d key=%s", seq, dedupKey)
+		return false
+	}
+	c.messageRecallSeen[dedupKey] = time.Now().UnixMilli()
+	if len(c.messageRecallSeen) > messageRecallSeenLimit {
+		type kv struct {
+			k string
+			v int64
+		}
+		entries := make([]kv, 0, len(c.messageRecallSeen))
+		for k, v := range c.messageRecallSeen {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].v < entries[j].v })
+		for i := 0; i < len(entries)-messageRecallSeenLimit; i++ {
+			delete(c.messageRecallSeen, entries[i].k)
+		}
+	}
+	c.messageRecallSeenMu.Unlock()
+	c.publishAppEventSync("message.recalled", eventPayload)
+	c.log.Debug("message.recalled published: seq=%d", seq)
+	return true
+}
+
 // recallEventFromGroupMessage 把 pull / push 收到的群撤回 tombstone 归一化为
 // group.message_recalled payload。占位 tombstone（原 seq）与通知 tombstone（新 seq）
 // 都满足识别条件，统一归一化，由 publishGroupRecallTombstone 负责去重。
@@ -414,6 +519,13 @@ func recallEventFromGroupMessage(message any) (map[string]any, bool) {
 		event[k] = v
 	}
 	for _, key := range appMessageEnvelopeKeys {
+		if _, exists := event[key]; !exists {
+			if value, ok := msg[key]; ok {
+				event[key] = value
+			}
+		}
+	}
+	for _, key := range recallPayloadKeys {
 		if _, exists := event[key]; !exists {
 			if value, ok := msg[key]; ok {
 				event[key] = value
@@ -469,14 +581,15 @@ func recallEventFromGroupMessage(message any) (map[string]any, bool) {
 	return event, true
 }
 
-// groupRecallDedupKey 群撤回去重键：group_id|sorted(message_ids)。
+// groupRecallDedupKey 群撤回去重键：group_id + 原始消息标识。
 //
 // 一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
-// (group_id, sorted message_ids) 已能唯一标识一次撤回。
+// (group_id, sorted message_ids) 已能唯一标识一次撤回；缺 message_ids 时按原消息 id/seq 兜底。
 // 去重键不含 recalled_at：占位/通知 tombstone（pull）与在线 push 三条通道对同一次撤回
 // 可能携带不同来源的时间戳（push 在事务后重取），纳入 recalled_at 会使去重失效、回调多次。
 // 注意 Go map 无序，message_ids 拼接前必须 sort.Strings 保证键稳定。
 func groupRecallDedupKey(groupID string, payload map[string]any) string {
+	normalizedGroupID := NormalizeGroupID(strings.TrimSpace(groupID), "")
 	idParts := []string{}
 	if rawIDs, ok := payload["message_ids"].([]any); ok {
 		for _, item := range rawIDs {
@@ -485,9 +598,45 @@ func groupRecallDedupKey(groupID string, payload map[string]any) string {
 				idParts = append(idParts, v)
 			}
 		}
+	} else if v := strings.TrimSpace(stringFromAny(payload["message_ids"])); v != "" {
+		idParts = append(idParts, v)
 	}
 	sort.Strings(idParts)
-	return groupID + "|" + strings.Join(idParts, ",")
+	if len(idParts) > 0 {
+		return normalizedGroupID + "|id:" + strings.Join(idParts, ",")
+	}
+	for _, key := range []string{"recalled_message_id", "target_message_id", "original_message_id"} {
+		value := strings.TrimSpace(getStr(payload, key, ""))
+		if value != "" {
+			return normalizedGroupID + "|id:" + value
+		}
+	}
+	seqParts := []string{}
+	if rawSeqs, ok := payload["target_message_seqs"].([]any); ok {
+		for _, item := range rawSeqs {
+			v := strings.TrimSpace(stringFromAny(item))
+			if v != "" {
+				seqParts = append(seqParts, v)
+			}
+		}
+	} else {
+		for _, key := range []string{"target_message_seqs", "original_seq"} {
+			value := strings.TrimSpace(stringFromAny(payload[key]))
+			if value != "" {
+				seqParts = append(seqParts, value)
+				break
+			}
+		}
+	}
+	sort.Strings(seqParts)
+	if len(seqParts) > 0 {
+		return normalizedGroupID + "|seq:" + strings.Join(seqParts, ",")
+	}
+	tombstoneID := firstNonEmptyDelivery(getStr(payload, "tombstone_message_id", ""), getStr(payload, "message_id", ""))
+	if tombstoneID != "" {
+		return normalizedGroupID + "|tombstone:" + tombstoneID
+	}
+	return fmt.Sprintf("%s|unknown:%p", normalizedGroupID, payload)
 }
 
 // publishGroupRecallTombstone 归一化并按去重键发布一次 group.message_recalled。
@@ -498,7 +647,12 @@ func (d *messageDeliveryEngine) publishGroupRecallTombstone(groupID string, seq 
 	if !ok {
 		return false
 	}
-	dedupKey := groupRecallDedupKey(groupID, eventPayload)
+	rawGroupID := firstNonEmptyDelivery(getStr(eventPayload, "group_id", ""), groupID)
+	dedupGroupID := NormalizeGroupID(strings.TrimSpace(rawGroupID), "")
+	if dedupGroupID != "" {
+		eventPayload["group_id"] = dedupGroupID
+	}
+	dedupKey := groupRecallDedupKey(dedupGroupID, eventPayload)
 	c.groupRecallSeenMu.Lock()
 	if c.groupRecallSeen == nil {
 		c.groupRecallSeen = make(map[string]int64)
@@ -669,6 +823,62 @@ func (d *messageDeliveryEngine) onRawMessageReceived(data any) {
 		c.log.Debug("onRawMessageReceived exit: elapsed=%dms", time.Since(tStart).Milliseconds())
 	}()
 	go c.processAndPublishMessage(data)
+}
+
+func (c *AUNClient) onRawMessageRecalled(data any) {
+	dataMap, ok := data.(map[string]any)
+	if !ok {
+		return
+	}
+	msg := copyMapShallow(dataMap)
+	if _, ok := msg["type"]; !ok {
+		msg["type"] = "message.recalled"
+	}
+	if !c.messageTargetsCurrentInstance(msg) {
+		return
+	}
+	seq := int(toInt64(msg["seq"]))
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if seq <= 0 || myAID == "" {
+		c.delivery().publishMessageRecallTombstone(seq, msg)
+		return
+	}
+	ns := "p2p:" + myAID
+	c.seqTracker.UpdateMaxSeen(ns, seq)
+	contigBefore := c.seqTracker.GetContiguousSeq(ns)
+	seqNeedsPull := c.seqTracker.OnMessageSeq(ns, seq)
+	published := c.publishOrderedMessage("message.recalled", ns, seq, msg)
+	contigAfter := c.seqTracker.GetContiguousSeq(ns)
+	if seqNeedsPull && !published {
+		go c.fillP2pGap()
+	}
+	contig := c.seqTracker.GetContiguousSeq(ns)
+	if contig > 0 {
+		ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(contig))
+		go func() {
+			ackCtx, ackCancel := context.WithTimeout(contextWithRPCBackground(context.Background()), 5*time.Second)
+			defer ackCancel()
+			var ackErr error
+			if c.v2GetState() != nil {
+				_, ackErr = c.ackV2(ackCtx, ackSeq)
+			} else {
+				_, ackErr = c.transport.Call(ackCtx, "message.ack", map[string]any{
+					"seq":             ackSeq,
+					"device_id":       c.deviceID,
+					"slot_id":         c.slotID,
+					"_rpc_background": true,
+				})
+			}
+			if ackErr != nil {
+				c.log.Warn("P2P recall auto-ack failed: %v", ackErr)
+			}
+		}()
+	}
+	if contigAfter != contigBefore {
+		c.persistSeq(ns)
+	}
 }
 
 func (d *messageDeliveryEngine) processAndPublishMessage(data any) {
@@ -1952,6 +2162,10 @@ func (d *messageDeliveryEngine) publishOrderedQueueItem(ns, event string, seq in
 		d.publishOrderedGroupChanged(payload)
 		return
 	}
+	if event == "message.recalled" {
+		d.publishMessageRecallTombstone(seq, payload)
+		return
+	}
 	c.publishAppEventSync(event, payload)
 }
 
@@ -2008,6 +2222,9 @@ func (d *messageDeliveryEngine) publishPulledMessage(event, ns string, seq int, 
 	c := d.runtime.client
 	if ns == "" || seq <= 0 {
 		c.log.Debug("publish pulled direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
+		if event == "message.recalled" {
+			return d.publishMessageRecallTombstone(seq, payload)
+		}
 		c.publishAppEventSync(event, payload)
 		return true
 	}
@@ -2017,6 +2234,12 @@ func (d *messageDeliveryEngine) publishPulledMessage(event, ns string, seq int, 
 		return false
 	}
 	c.removePendingOrderedSeq(ns, seq)
+	if event == "message.recalled" {
+		published := d.publishMessageRecallTombstone(seq, payload)
+		c.markPushedSeq(ns, seq)
+		c.log.Debug("publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq)
+		return published
+	}
 	c.publishAppEventSync(event, payload)
 	c.markPushedSeq(ns, seq)
 	c.log.Debug("publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq)

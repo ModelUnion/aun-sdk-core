@@ -105,6 +105,14 @@ async def _add_member(client: AUNClient, group_id: str, aid: str) -> None:
     await client.call("group.add_member", {"group_id": group_id, "aid": aid})
 
 
+def _recall_events_for(events: list[dict], group_id: str, message_id: str) -> list[dict]:
+    return [
+        event for event in events
+        if str(event.get("group_id") or "") == str(group_id or "")
+        and message_id in (event.get("message_ids") or [])
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # test_group_recall_plaintext: 明文消息撤回，bob 收到 group.message_recalled 事件一次
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,17 +167,19 @@ async def test_group_recall_plaintext():
         await bob.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 50, "force": True})
         await asyncio.sleep(0.5)
 
-        # SDK 去重：group.message_recalled 恰好一次
-        if len(recall_events) == 1:
-            _ok("SDK dedup one callback", f"message_ids={recall_events[0].get('message_ids')}")
-            if msg_id in (recall_events[0].get("message_ids") or []):
+        # SDK 去重：当前群、当前消息的 group.message_recalled 恰好一次
+        current_recall_events = _recall_events_for(recall_events, group_id, msg_id)
+        if len(current_recall_events) == 1:
+            _ok("SDK dedup one callback", f"message_ids={current_recall_events[0].get('message_ids')}")
+            if msg_id in (current_recall_events[0].get("message_ids") or []):
                 _ok("recall event carries original message_id")
             else:
-                _fail("recall event carries original message_id", f"event={recall_events[0]}")
-        elif len(recall_events) == 0:
-            _fail("SDK dedup one callback", "no group.message_recalled callback received")
+                _fail("recall event carries original message_id", f"event={current_recall_events[0]}")
+        elif len(current_recall_events) == 0:
+            _fail("SDK dedup one callback", f"no callback for current message; total={len(recall_events)}")
         else:
-            _fail("SDK dedup one callback", f"expected 1 callback, got {len(recall_events)}: {recall_events}")
+            _fail("SDK dedup one callback",
+                  f"expected 1 current callback, got {len(current_recall_events)}: {current_recall_events}")
 
         # 验证服务端双 tombstone：用 raw_call 直查 group.v2.pull 原始消息
         # （V2-only SDK 的规范读取路径，会合并 group_messages 的 V1 明文行）
@@ -372,11 +382,13 @@ async def test_group_recall_encrypted():
         else:
             _fail("V2 placeholder tombstone present", f"no tombstone: seqs={[m.get('seq') for m in raw_msgs]}")
 
-        # SDK 去重
-        if len(recall_events_bob) <= 1:
-            _ok("SDK dedup (<=1 callback)", f"count={len(recall_events_bob)}")
+        # SDK 去重：只统计当前 encrypted 消息，避免连接后的历史 gap-fill 事件污染本用例
+        current_recall_events = _recall_events_for(recall_events_bob, group_id, msg_id)
+        if len(current_recall_events) <= 1:
+            _ok("SDK dedup (<=1 callback)",
+                f"current_count={len(current_recall_events)} total={len(recall_events_bob)}")
         else:
-            _fail("SDK dedup", f"expected <=1, got {len(recall_events_bob)}")
+            _fail("SDK dedup", f"expected <=1 current callback, got {len(current_recall_events)}")
 
     except Exception as exc:
         _fail("test_group_recall_encrypted", str(exc))
@@ -428,12 +440,14 @@ async def test_group_recall_push_pull_recalled_at_consistency():
         await bob.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 50, "force": True})
         await asyncio.sleep(0.5)
 
-        # #1 核心：push 与 pull tombstone 的 recalled_at 一致 → SDK 只回调一次
-        if len(recall_events) == 1:
+        # #1 核心：push 与 pull tombstone 的 recalled_at 一致 → 当前消息只回调一次
+        current_recall_events = _recall_events_for(recall_events, group_id, msg_id)
+        if len(current_recall_events) == 1:
             _ok("online member recall callback exactly once", f"count=1")
         else:
             _fail("online member recall callback exactly once",
-                  f"expected 1, got {len(recall_events)} (push/pull recalled_at 可能不一致)")
+                  f"expected 1 current callback, got {len(current_recall_events)} "
+                  f"(total={len(recall_events)}, push/pull recalled_at 可能不一致)")
 
         # 直接对比：raw push 的 recalled_at 应等于服务端 tombstone 的 recalled_at
         push_recalled_at = None

@@ -766,7 +766,9 @@ export class AUNClient {
   private _pendingOrderedMsgs: Map<string, Map<number, { event: string; payload: EventPayload }>> = new Map();
   /** Lazy group sync：首次发送群消息前自动拉取历史 */
   private _groupSynced: Set<string> = new Set();
-  /** 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次 */
+  /** P2P 撤回去重：原始 message_id -> 时间戳，保证应用层只回调一次 */
+  _messageRecallSeen: Map<string, number> = new Map();
+  /** 群撤回去重：group_id|sorted(message_ids) -> 时间戳，保证应用层只回调一次 */
   _groupRecallSeen: Map<string, number> = new Map();
   /** 在线未读 hint 队列：同一 group 只保留最后一条，延迟 drain 降低登录瞬时拉取压力。 */
   private _onlineUnreadHintQueue: Map<string, JsonObject> = new Map();
@@ -928,6 +930,9 @@ export class AUNClient {
     this._dispatcher.subscribe('_raw.message.received', (data) => {
       this._onRawMessageReceived(data);
     });
+    this._dispatcher.subscribe('_raw.message.recalled', (data) => {
+      this._safeAsync(this._onRawMessageRecalled(data));
+    });
     // 群组消息推送：re-publish（V2 加密消息走 V2 push 路径）
     this._dispatcher.subscribe('_raw.group.message_created', (data) => {
       this._onRawGroupMessageCreated(data);
@@ -961,7 +966,7 @@ export class AUNClient {
       this._safeAsync(this._onGroupStateCommitted(data));
     });
     // 其他事件直接透传
-    for (const evt of ['message.recalled', 'message.ack', 'storage.object_changed']) {
+    for (const evt of ['message.ack', 'storage.object_changed']) {
       this._dispatcher.subscribe(`_raw.${evt}`, (data) => {
         this._dispatcher.publish(evt, data);
       });
@@ -1776,6 +1781,10 @@ export class AUNClient {
   /** 处理 transport 层推送的原始消息：re-publish 给用户（V2 加密消息走 _raw.peer.v2.message_received） */
   private _onRawMessageReceived(data: EventPayload): void {
     this._delivery.onRawMessageReceived(data);
+  }
+
+  private async _onRawMessageRecalled(data: EventPayload): Promise<void> {
+    return this._delivery.onRawMessageRecalled(data);
   }
 
   /** 处理群组消息推送：re-publish（V2 加密消息走 V2 push 路径） */

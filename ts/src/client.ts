@@ -684,7 +684,10 @@ export class AUNClient {
   /** 惰性群同步：已同步过的 group_id 集合 */
   private _groupSynced: Set<string> = new Set();
 
-  /** 群撤回去重：group_id|sorted(message_ids)|recalled_at -> 时间戳，保证应用层只回调一次 */
+  /** P2P 撤回去重：原始 message_id -> 时间戳，保证应用层只回调一次 */
+  _messageRecallSeen: Map<string, number> = new Map();
+
+  /** 群撤回去重：group_id|sorted(message_ids) -> 时间戳，保证应用层只回调一次 */
   _groupRecallSeen: Map<string, number> = new Map();
 
   /** 补洞去重：已完成/进行中的 key -> 开始时间戳，防止重复 pull 同一区间 */
@@ -875,6 +878,8 @@ export class AUNClient {
     }
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
+    // P2P 消息撤回推送：在线 push 与 pull tombstone 去重后再发布给应用层
+    this._dispatcher.subscribe('_raw.message.recalled', (data) => this._safeAsync(this._onRawMessageRecalled(data)));
     // V2 P2P 推送通知：收到通知后自动走 message.v2.pull 拉取并解密
     this._dispatcher.subscribe('_raw.peer.v2.message_received', (data) => this._safeAsync(this._onV2PushNotification(data)));
     // V2 群组消息推送通知：收到通知后自动走 group.v2.pull 拉取并解密
@@ -892,7 +897,7 @@ export class AUNClient {
     // 群组状态提交事件：验证 state_hash 链并更新本地存储
     this._dispatcher.subscribe('_raw.group.state_committed', (data) => this._onGroupStateCommitted(data));
     // 其他事件直接透传
-    for (const evt of ['message.recalled', 'message.ack', 'storage.object_changed']) {
+    for (const evt of ['message.ack', 'storage.object_changed']) {
       this._dispatcher.subscribe(`_raw.${evt}`, (data) => this._dispatcher.publish(evt, data));
     }
     // 服务端主动断开通知：记录日志并标记不重连
@@ -1782,6 +1787,10 @@ export class AUNClient {
   /** 处理 transport 层推送的原始 P2P 消息 */
   private async _onRawMessageReceived(data: EventPayload): Promise<void> {
     return this._delivery.onRawMessageReceived(data);
+  }
+
+  private async _onRawMessageRecalled(data: EventPayload): Promise<void> {
+    return this._delivery.onRawMessageRecalled(data);
   }
 
   /** 处理群组消息推送：自动解密后 re-publish */

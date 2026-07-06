@@ -96,6 +96,43 @@ def test_recall_from_group_message_preserves_extra_fields():
     assert result["reason"] == "oops"
 
 
+def test_recall_from_group_message_top_level_fields():
+    """在线 push 只在顶层携带 recall 字段时，也应归一化出原消息 id。"""
+    msg = {
+        "message_id": "notice-1",
+        "group_id": "grp-1",
+        "seq": 5,
+        "type": "group.message_recalled",
+        "message_ids": ["m-aaa"],
+        "target_message_seqs": [3],
+        "recalled_by": "alice.agentid.pub",
+        "recalled_at": 1000,
+    }
+    result = MessageDeliveryEngine.recall_event_from_group_message(msg)
+    assert result is not None
+    assert result["message_ids"] == ["m-aaa"]
+    assert result["target_message_seqs"] == [3]
+    assert result["recalled_by"] == "alice.agentid.pub"
+
+
+def test_recall_from_message_top_level_fields():
+    """P2P 在线 push 只在顶层携带 recall 字段时，也应归一化出原消息 id。"""
+    msg = {
+        "message_id": "notice-1",
+        "seq": 5,
+        "type": "message.recalled",
+        "message_ids": ["m-aaa"],
+        "target_message_seqs": [3],
+        "recalled_by": "alice.agentid.pub",
+        "recalled_at": 1000,
+    }
+    result = MessageDeliveryEngine.recall_event_from_message(msg)
+    assert result is not None
+    assert result["message_ids"] == ["m-aaa"]
+    assert result["target_message_seqs"] == [3]
+    assert result["recalled_by"] == "alice.agentid.pub"
+
+
 # ── 去重：同一 (group_id, original_message_id) 只回调一次 ──────────────────
 
 @pytest.mark.asyncio
@@ -206,7 +243,63 @@ def test_group_recall_dedup_key_ignores_recalled_at():
     key_push = MessageDeliveryEngine.group_recall_dedup_key(
         "grp-1", {"message_ids": ["m-aaa"], "recalled_at": 1007},  # push 重取，晚几毫秒
     )
-    assert key_pull == key_push == "grp-1|m-aaa"
+    assert key_pull == key_push == "grp-1|id:m-aaa"
+
+
+def test_group_recall_dedup_key_falls_back_to_target_seq():
+    key_placeholder = MessageDeliveryEngine.group_recall_dedup_key(
+        "grp-1", {"message_id": "ph-1", "target_message_seqs": [3]},
+    )
+    key_notice = MessageDeliveryEngine.group_recall_dedup_key(
+        "grp-1", {"message_id": "notice-1", "target_message_seqs": [3]},
+    )
+    assert key_placeholder == key_notice == "grp-1|seq:3"
+
+
+def test_message_recall_dedup_key_ignores_recalled_at():
+    key_push = MessageDeliveryEngine.message_recall_dedup_key(
+        {"message_ids": ["m-aaa"], "recalled_at": 1007},
+    )
+    key_pull = MessageDeliveryEngine.message_recall_dedup_key(
+        {"message_ids": ["m-aaa"], "recalled_at": 1000},
+    )
+    assert key_push == key_pull == "p2p|id:m-aaa"
+
+
+@pytest.mark.asyncio
+async def test_message_recall_dedup_across_push_and_pull():
+    published: list = []
+
+    class FakeClient:
+        _device_id = "dev-1"
+        _slot_id = ""
+        _log = type("L", (), {
+            "debug": lambda *a, **k: None,
+            "warn": lambda *a, **k: None,
+            "info": lambda *a, **k: None,
+        })()
+
+        async def _publish_app_event(self, event, payload, *, source="direct"):
+            published.append((event, payload))
+
+    engine = MessageDeliveryEngine(FakeClient())
+
+    await engine.publish_message_recall_tombstone(5, {
+        "message_id": "recall-push",
+        "seq": 5,
+        "type": "message.recalled",
+        "payload": {"type": "message.recalled", "message_ids": ["m-aaa"], "recalled_at": 1007},
+    })
+    await engine.publish_message_recall_tombstone(6, {
+        "message_id": "recall-pull",
+        "seq": 6,
+        "type": "message.recalled",
+        "payload": {"type": "message.recalled", "message_ids": ["m-aaa"], "recalled_at": 1000},
+    })
+
+    recall_events = [p for e, p in published if e == "message.recalled"]
+    assert len(recall_events) == 1
+    assert recall_events[0]["message_ids"] == ["m-aaa"]
 
 
 @pytest.mark.asyncio
@@ -253,3 +346,42 @@ async def test_group_recall_dedup_across_push_and_pull_different_recalled_at():
 
     recall_events = [p for e, p in published if e == "group.message_recalled"]
     assert len(recall_events) == 1, f"push/pull recalled_at 不同源仍应只回调一次，实际 {len(recall_events)}"
+
+
+@pytest.mark.asyncio
+async def test_group_recall_dedup_normalizes_group_identifier():
+    published: list = []
+
+    class FakeClient:
+        _device_id = "dev-1"
+        _slot_id = ""
+        _log = type("L", (), {
+            "debug": lambda *a, **k: None,
+            "warn": lambda *a, **k: None,
+            "info": lambda *a, **k: None,
+        })()
+
+        async def _publish_app_event(self, event, payload, *, source="direct"):
+            published.append((event, payload))
+
+        def _normalize_published_message_payload(self, event, payload):
+            return payload
+
+        def _is_instance_scoped_message_event(self, e):
+            return MessageDeliveryEngine.is_instance_scoped_message_event(e)
+
+    engine = MessageDeliveryEngine(FakeClient())
+    await engine.publish_group_recall_tombstone("group.example.com/room1", 5, {
+        "message_id": "notice-1", "group_id": "group.example.com/room1", "seq": 5,
+        "type": "group.message_recalled",
+        "payload": {"type": "group.message_recalled", "message_ids": ["m-aaa"]},
+    })
+    await engine.publish_group_recall_tombstone("room1.example.com", 3, {
+        "message_id": "ph-1", "group_id": "room1.example.com", "seq": 3,
+        "type": "group.message_recalled",
+        "payload": {"type": "group.message_recalled", "message_ids": ["m-aaa"]},
+    })
+
+    recall_events = [p for e, p in published if e == "group.message_recalled"]
+    assert len(recall_events) == 1
+    assert recall_events[0]["group_id"] == "room1.example.com"

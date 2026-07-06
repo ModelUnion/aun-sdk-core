@@ -678,8 +678,10 @@ class AUNClient:
         self._dispatcher.subscribe("_raw.group.v2.state_confirmed", self._on_v2_state_confirmed)
         # 群组状态提交事件：验证 state_hash 链并更新本地存储
         self._dispatcher.subscribe("_raw.group.state_committed", self._on_group_state_committed)
+        # P2P 消息撤回推送：在线 push 与 pull tombstone 去重后再发布给应用层
+        self._dispatcher.subscribe("_raw.message.recalled", self._on_raw_message_recalled)
         # 其他事件直接透传
-        for evt in ("message.recalled", "message.ack", "storage.object_changed"):
+        for evt in ("message.ack", "storage.object_changed"):
             self._dispatcher.subscribe(f"_raw.{evt}", lambda data, e=evt: self._dispatcher.publish(e, data))
         # 服务端主动断开通知：记录日志并标记不重连
         self._server_kicked = False
@@ -1734,6 +1736,9 @@ class AUNClient:
 
     async def _on_raw_message_received(self, data: Any) -> None:
         return await self._delivery().on_raw_message_received(data)
+
+    async def _on_raw_message_recalled(self, data: Any) -> None:
+        return await self._delivery().on_raw_message_recalled(data)
 
     async def _process_and_publish_message(self, data: Any) -> None:
         return await self._delivery().process_and_publish_message(data)

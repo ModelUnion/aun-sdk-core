@@ -6,6 +6,7 @@ import type { ClientRuntime } from './runtime.js';
 
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
+const MESSAGE_RECALL_SEEN_LIMIT = 10_000;
 const GROUP_RECALL_SEEN_LIMIT = 10_000;
 const SEQ_TRACKER_PERSIST_FLUSH_DELAY_MS = 200;
 const P2P_GAP_FILL_RETRY_LIMIT = 12;
@@ -16,6 +17,13 @@ const APP_MESSAGE_ENVELOPE_KEYS = [
   'from', 'from_aid', 'sender_aid', 'to', 'to_aid', 'group_id',
   'timestamp', 'created_at', 'encrypted',
   'context', 'protected_headers', 'headers', 'payload_type',
+];
+const RECALL_PAYLOAD_KEYS = [
+  'message_ids', 'target_message_seqs',
+  'recalled_message_id', 'target_message_id', 'original_message_id',
+  'target_seq', 'original_seq',
+  'notice_message_id', 'notice_seq', 'event_seq',
+  'sender_aid', 'recalled_by', 'recalled_at', 'reason',
 ];
 const APP_SEND_ENVELOPE_METHODS = new Set([
   'message.send',
@@ -143,6 +151,10 @@ export class MessageDeliveryEngine {
     const client = this.runtime.client;
     if (event === 'group.changed' && this.isGroupEventNamespace(ns)) {
       await this.publishOrderedGroupChanged(payload);
+      return;
+    }
+    if (event === 'message.recalled') {
+      await this.publishMessageRecallTombstone(seq, payload);
       return;
     }
     await client._publishAppEvent(event, payload);
@@ -349,6 +361,11 @@ export class MessageDeliveryEngine {
         event[key] = msg[key] as JsonValue;
       }
     }
+    for (const key of RECALL_PAYLOAD_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(msg, key) && !(key in event)) {
+        event[key] = msg[key] as JsonValue;
+      }
+    }
     const rawIds = event.message_ids;
     let messageIds = Array.isArray(rawIds)
       ? rawIds.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -384,6 +401,54 @@ export class MessageDeliveryEngine {
     return { event: 'message.received', payload: message };
   }
 
+  messageRecallDedupKey(payload: JsonObject): string {
+    const ids = payload.message_ids;
+    const idPart = Array.isArray(ids)
+      ? ids.map((i) => String(i ?? '').trim()).filter(Boolean).sort().join(',')
+      : String(ids ?? '').trim();
+    if (idPart) return `p2p|id:${idPart}`;
+    for (const key of ['recalled_message_id', 'target_message_id', 'original_message_id']) {
+      const value = String(payload[key] ?? '').trim();
+      if (value) return `p2p|id:${value}`;
+    }
+    const rawSeqs = payload.target_message_seqs;
+    const seqPart = Array.isArray(rawSeqs)
+      ? rawSeqs.map((seq) => String(seq ?? '').trim()).filter(Boolean).sort().join(',')
+      : String(rawSeqs ?? payload.target_seq ?? payload.original_seq ?? '').trim();
+    if (seqPart) {
+      const fromAid = String(payload.from ?? payload.from_aid ?? payload.sender_aid ?? '').trim();
+      const toAid = String(payload.to ?? payload.to_aid ?? '').trim();
+      return `p2p|from:${fromAid}|to:${toAid}|seq:${seqPart}`;
+    }
+    const tombstoneId = String(payload.tombstone_message_id ?? payload.message_id ?? '').trim();
+    if (tombstoneId) return `p2p|tombstone:${tombstoneId}`;
+    return `p2p|unknown:${Date.now()}:${Math.random()}`;
+  }
+
+  async publishMessageRecallTombstone(seq: unknown, message: EventPayload): Promise<boolean> {
+    const client = this.runtime.client;
+    const eventPayload = this.recallEventFromMessage(message);
+    if (!eventPayload) return false;
+    const dedupKey = this.messageRecallDedupKey(eventPayload);
+    let seen = client._messageRecallSeen as Map<string, number> | undefined;
+    if (!seen) {
+      seen = new Map<string, number>();
+      client._messageRecallSeen = seen;
+    }
+    if (seen.has(dedupKey)) {
+      client._clientLog.debug(`message.recalled dedup suppressed: seq=${String(seq)} key=${dedupKey}`);
+      return false;
+    }
+    seen.set(dedupKey, Date.now());
+    if (seen.size > MESSAGE_RECALL_SEEN_LIMIT) {
+      const drop = [...seen.entries()].sort((a, b) => a[1] - b[1]).slice(0, seen.size - MESSAGE_RECALL_SEEN_LIMIT);
+      for (const [oldKey] of drop) seen.delete(oldKey);
+    }
+    await client._publishAppEvent('message.recalled', eventPayload as EventPayload);
+    client._clientLog.debug(`message.recalled published: seq=${String(seq)} ids=${JSON.stringify(eventPayload.message_ids)}`);
+    return true;
+  }
+
   recallEventFromGroupMessage(message: EventPayload): JsonObject | null {
     if (!isJsonObject(message)) return null;
     const msg = message as JsonObject;
@@ -394,6 +459,11 @@ export class MessageDeliveryEngine {
     if (msgType !== 'group.message_recalled' && payloadType !== 'group.message_recalled') return null;
     const event: JsonObject = { ...payload };
     for (const key of APP_MESSAGE_ENVELOPE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(msg, key) && !(key in event)) {
+        event[key] = msg[key] as JsonValue;
+      }
+    }
+    for (const key of RECALL_PAYLOAD_KEYS) {
       if (Object.prototype.hasOwnProperty.call(msg, key) && !(key in event)) {
         event[key] = msg[key] as JsonValue;
       }
@@ -425,23 +495,39 @@ export class MessageDeliveryEngine {
   }
 
   groupRecallDedupKey(groupId: string, payload: JsonObject): string {
-    // 群撤回去重键：group_id + 排序后的 message_ids。
+    // 群撤回去重键：group_id + 原始消息标识。
     // 一条消息只能被撤回一次（服务端 group_message_recalls uk_recall_msg_id 唯一约束），
-    // (group_id, sorted message_ids) 已能唯一标识一次撤回。
+    // (group_id, sorted message_ids) 已能唯一标识一次撤回；缺 message_ids 时按原消息 id/seq 兜底。
     // 去重键不含 recalled_at：占位/通知 tombstone（pull）与在线 push 三条通道对同一次撤回
     // 可能携带不同来源的时间戳（push 在事务后重取），纳入 recalled_at 会使去重失效、回调多次。
+    const normalizedGroupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     const ids = payload.message_ids;
     const idPart = Array.isArray(ids)
       ? ids.map((i) => String(i ?? '').trim()).filter(Boolean).sort().join(',')
-      : String(ids ?? '');
-    return `${groupId}|${idPart}`;
+      : String(ids ?? '').trim();
+    if (idPart) return `${normalizedGroupId}|id:${idPart}`;
+    for (const key of ['recalled_message_id', 'target_message_id', 'original_message_id']) {
+      const value = String(payload[key] ?? '').trim();
+      if (value) return `${normalizedGroupId}|id:${value}`;
+    }
+    const rawSeqs = payload.target_message_seqs;
+    const seqPart = Array.isArray(rawSeqs)
+      ? rawSeqs.map((seq) => String(seq ?? '').trim()).filter(Boolean).sort().join(',')
+      : String(rawSeqs ?? payload.original_seq ?? '').trim();
+    if (seqPart) return `${normalizedGroupId}|seq:${seqPart}`;
+    const tombstoneId = String(payload.tombstone_message_id ?? payload.message_id ?? '').trim();
+    if (tombstoneId) return `${normalizedGroupId}|tombstone:${tombstoneId}`;
+    return `${normalizedGroupId}|unknown:${Date.now()}:${Math.random()}`;
   }
 
   async publishGroupRecallTombstone(groupId: string, seq: unknown, message: EventPayload): Promise<boolean> {
     const client = this.runtime.client;
     const eventPayload = this.recallEventFromGroupMessage(message);
     if (!eventPayload) return false;
-    const dedupKey = this.groupRecallDedupKey(groupId, eventPayload);
+    const rawGroupId = String(eventPayload.group_id ?? groupId ?? '').trim();
+    const dedupGroupId = normalizeGroupId(rawGroupId) || rawGroupId;
+    if (dedupGroupId) eventPayload.group_id = dedupGroupId;
+    const dedupKey = this.groupRecallDedupKey(dedupGroupId, eventPayload);
     let seen = client._groupRecallSeen as Map<string, number> | undefined;
     if (!seen) {
       seen = new Map<string, number>();
@@ -575,6 +661,39 @@ export class MessageDeliveryEngine {
     client._clientLog.debug(`_onRawMessageReceived enter: from=${(data as any)?.from ?? '-'} mid=${(data as any)?.message_id ?? '-'} seq=${(data as any)?.seq ?? '-'}`);
     client._safeAsync(this.processAndPublishMessage(data));
     client._clientLog.debug('_onRawMessageReceived exit: elapsed=0ms (dispatched async)');
+  }
+
+  async onRawMessageRecalled(data: EventPayload): Promise<void> {
+    const client = this.runtime.client;
+    if (!isJsonObject(data)) return;
+    const msg: JsonObject = { ...(data as JsonObject) };
+    if (!('type' in msg)) msg.type = 'message.recalled';
+    if (!this.messageTargetsCurrentInstance(msg as EventPayload)) return;
+    const seq = msg.seq as number | undefined;
+    if (seq !== undefined && seq !== null && client._aid) {
+      const ns = `p2p:${client._aid}`;
+      if (seq > 0) client._seqTracker.updateMaxSeen(ns, seq);
+      const contigBefore = client._seqTracker.getContiguousSeq(ns);
+      const seqNeedsPull = client._seqTracker.onMessageSeq(ns, seq);
+      const published = await this.publishOrderedMessage('message.recalled', ns, seq, msg as EventPayload);
+      const contigAfter = client._seqTracker.getContiguousSeq(ns);
+      if (seqNeedsPull && !published) {
+        client._safeAsync(this.fillP2pGap());
+      }
+      const contig = client._seqTracker.getContiguousSeq(ns);
+      if (contig > 0) {
+        const ackSeq = this.clampAckSeq('message.ack', 'seq', ns, contig);
+        client._transport.call('message.ack', {
+          seq: ackSeq,
+          device_id: client._deviceId,
+          slot_id: client._slotId,
+          _rpc_background: true,
+        }).catch((e: unknown) => { client._clientLog.warn(`P2P recall auto-ack failed:${String(e)}`); });
+      }
+      if (contigAfter !== contigBefore) this.persistSeq(ns);
+      return;
+    }
+    await this.publishMessageRecallTombstone(seq, msg as EventPayload);
   }
 
   async processAndPublishMessage(data: EventPayload): Promise<void> {
@@ -1662,6 +1781,9 @@ export class MessageDeliveryEngine {
     const client = this.runtime.client;
     const seqNum = Number(seq);
     if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0 || !ns) {
+      if (event === 'message.recalled') {
+        return this.publishMessageRecallTombstone(seq, payload);
+      }
       await client._publishAppEvent(event, payload);
       return true;
     }
@@ -1673,6 +1795,11 @@ export class MessageDeliveryEngine {
     }
     queue?.delete(seqNum);
     if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
+    if (event === 'message.recalled') {
+      const published = await this.publishMessageRecallTombstone(seqNum, payload);
+      this.markPublishedSeq(ns, seqNum);
+      return published;
+    }
     await client._publishAppEvent(event, payload);
     this.markPublishedSeq(ns, seqNum);
     return true;
