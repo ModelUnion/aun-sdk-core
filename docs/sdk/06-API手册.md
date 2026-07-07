@@ -347,13 +347,278 @@ headers = client.get_protected_headers()
 - `getInfo()` — 查询群组信息（扁平化格式，提升常用字段到顶层），**推荐外部使用**
 - `info()` — 查询群组详细信息（带权限控制，非成员只能看公开群，成员能看 seq/epoch 等运行时状态）
 
-**群设置便利方法**：`GroupFacade` 提供向后兼容的便利方法，基于 `group.set_settings` / `group.get_settings` 实现：
+**群设置便利方法**：`GroupFacade` 提供向后兼容的便利方法：
 
 - `getAnnouncement()` / `updateAnnouncement()` — 群公告
 - `getRules()` / `updateRules()` — 群规则
 - `getJoinRequirements()` / `updateJoinRequirements()` — 入群要求
 
-便利方法返回旧格式（嵌套对象 `{announcement: {content, attachments}}`），屏蔽 `settings` 数组的繁琐。新代码建议直接使用 `group.set_settings` / `group.get_settings` 以获得更灵活的批量操作能力（一次调用可设置多个键）。
+读取方法优先返回 SDK 本地缓存；本地没有对应值时才读取相应 settings 做初始化。便利读取从服务端拿到 canonical `group_aid` 后，会同时以 canonical `group_aid` 和本次入参 `group_id` 写入 settings cache，避免 legacy/base `group_id` 下一次读取直接 cache miss。即使 `checkGroupIndex` 观察到远端 etag 与本地 etag 不一致，`getAnnouncement()` / `getRules()` / `getJoinRequirements()` 也不会自动拉取远端版本覆盖本地缓存。`updateAnnouncement()` / `updateRules()` / `updateJoinRequirements()` 属于 indexed 写入，内部会调用 `updateGroupIndex` 生成签名 `group.index` 并带 `expected_index_etag` CAS 提交。
+
+**Group Index 高级同步方法**：`group.index` 是 SDK 内部签名 manifest，用于记录群公告、群规则、入群要求及附件稳定引用的版本。SDK 观察 `_meta.group_indexes` 后只记录远端 etag；etag 不一致只表示本地与观察到的远端版本不同，可能是远端更新，也可能是本地有未提交修改。应用层需要显式选择 pull 远端或 push 本地。
+
+| 语义 | Python | TS/JS | Go | 说明 |
+|------|--------|-------|----|------|
+| 检查 index 是否不同步 | `client.group.check_group_index({...})` | `client.group.checkGroupIndex({...})` | `client.Group().CheckGroupIndex(ctx, params)` | 本地判断，不发网络请求；返回 `local_found/remote_found/local_etag/remote_etag/in_sync/needs_update/last_modified/status/cached` |
+| 显式 pull 远端 index | `client.group.get_group_index({...})` | `client.group.getGroupIndex({...})` | `client.Group().GetGroupIndex(ctx, params)` | 调用 `group.get_settings(keys=["group.index"])` 摘取 manifest，并按 entry etag 只拉取变化的 db settings 写入本地缓存 |
+| 显式 push 本地 indexed settings + index | `client.group.update_group_index({...})` | `client.group.updateGroupIndex({...})` | `client.Group().UpdateGroupIndex(ctx, params)` | 先读取当前 index 得到 `expected_index_etag`，在远端基线上合并本地变更，生成签名 `group.index` 后 CAS push |
+
+`getGroupIndex` pull 验签成功后会持久化本地视图。Python / TypeScript(Node) / Go 使用 `{aun_path}/AIDs/{local_aid}/groups/{group_aid}/index.jsonl` 保存签名 `group.index.body` 原文，并用同目录 `group-index-cache.json` 保存 `local_etag`、`remote_meta`、`settings`、`entry_etags` 等 cache envelope。浏览器 JavaScript 使用 IndexedDB `group_index_cache` store 的等价记录，按 `local_aid + group_aid` 隔离。普通便利读取可额外写入本次请求 `group_id` 的 settings cache alias；签名正文和 `getGroupIndex` 视图仍以 canonical `group_aid` 为准。不要使用 `{aun_path}/AIDs/{group_aid}/`，也不要使用旧单文件 `group-index.json`。
+
+#### checkGroupIndex — 检查 index 同步状态
+
+**本地判断**，不发网络请求。基于 SDK 观察到的 `_meta.group_indexes` 远端 etag 与本地缓存 etag 对比，返回同步状态。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组标识（支持 `group_aid` 格式） |
+
+**返回值**：
+
+```python
+{
+  "group_id": "g-team.agentid.pub",
+  "group_aid": "g-team.agentid.pub",
+  "local_found": true,          # 本地是否有缓存 etag
+  "remote_found": true,         # 是否观察到远端 _meta.group_indexes
+  "local_etag": "\"sha256:...\"",  # 本地缓存 etag（带引号）
+  "remote_etag": "\"sha256:...\"", # 远端 etag（带引号）
+  "in_sync": false,             # local_etag == remote_etag
+  "needs_update": true,         # remote_found && !in_sync（建议 pull）
+  "last_modified": 1780000000000, # 远端 last_modified（若有）
+  "schema": "aun.group.index.v1", # 远端 schema（若有）
+  "status": "stale"             # "fresh" / "stale" / "unknown"
+}
+```
+
+**使用场景**：
+
+- 群列表展示同步状态图标（如"本地有未同步修改"或"远端有更新"）
+- 判断是否需要调用 `getGroupIndex` pull 远端
+
+**示例**：
+
+```python
+# Python
+status = await client.group.check_group_index(group_id="g-team.agentid.pub")
+if status["needs_update"]:
+    print("远端有更新，建议 pull")
+```
+
+```typescript
+// TypeScript/JavaScript
+const status = await client.group.checkGroupIndex({ group_id: 'g-team.agentid.pub' });
+if (status.needs_update) {
+  console.log('远端有更新，建议 pull');
+}
+```
+
+```go
+// Go
+status, err := client.Group().CheckGroupIndex(ctx, map[string]any{
+    "group_id": "g-team.agentid.pub",
+})
+if status["needs_update"].(bool) {
+    fmt.Println("远端有更新，建议 pull")
+}
+```
+
+---
+
+#### getGroupIndex — 拉取远端 index 并更新本地缓存
+
+调用 `group.get_settings(keys=["group.index"])` 摘取远端签名 manifest，验签后按 entry etag 只拉取变化的 indexed settings，更新本地缓存。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组标识（支持 `group_aid` 格式） |
+
+**返回值**：
+
+```python
+{
+  "group_id": "g-team.agentid.pub",
+  "group_aid": "g-team.agentid.pub",
+  "group_index": {              # 完整的 group.index 值
+    "body": "...",              # 签名 JSONL 原文
+    "meta": {...},              # 解析出的 meta 行
+    "entries": [...]            # 解析出的 entries 行数组
+  },
+  "meta": {                     # 从 meta 行提取的关键字段
+    "etag": "\"sha256:...\"",
+    "last_modified": 1780000000000,
+    "schema": "aun.group.index.v1"
+  },
+  "entries": [...],             # 同 group_index.entries
+  "settings": {                 # 水合后的 indexed settings 值
+    "rules.content": "...",
+    "announcement.content": "...",
+    ...
+  }
+}
+```
+
+**行为**：
+
+1. 调用 `group.get_settings(keys=["group.index"])` 获取远端 manifest
+2. 解析 JSONL，验证 `signed_by` / `body_hash` / `etag` / 签名（当前仅支持 **ECDSA-P256-SHA256**）
+3. 按 entry etag 对比本地缓存，只拉取变化的 settings（如 `rules.content`、`announcement.content` 等）
+4. 持久化 `index.jsonl` 和 `group-index-cache.json`（或 IndexedDB）
+5. 调用 `client.mark_group_index_fresh(group_aid, etag)` 标记本地与远端同步
+
+**错误处理**：
+
+- **签名验证失败**：抛异常，不更新本地缓存
+- **不支持的 `sig_alg`**：当前四语言 SDK 仅支持 `ECDSA-P256-SHA256`，其他算法（Ed25519/RSA）会被拒绝
+- **网络错误**：透传底层 RPC 错误
+
+**使用场景**：
+
+- 群成员首次进群后拉取群公告、群规则
+- `checkGroupIndex` 发现远端有更新时主动 pull
+- 冲突解决：放弃本地修改，以远端为准
+
+**示例**：
+
+```python
+# Python
+result = await client.group.get_group_index(group_id="g-team.agentid.pub")
+print(f"拉取成功，etag: {result['meta']['etag']}")
+print(f"群公告: {result['settings'].get('announcement.content')}")
+```
+
+```typescript
+// TypeScript/JavaScript
+const result = await client.group.getGroupIndex({ group_id: 'g-team.agentid.pub' });
+console.log(`拉取成功，etag: ${result.meta.etag}`);
+console.log(`群公告: ${result.settings['announcement.content']}`);
+```
+
+```go
+// Go
+result, err := client.Group().GetGroupIndex(ctx, map[string]any{
+    "group_id": "g-team.agentid.pub",
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("拉取成功，etag: %s\n", result["meta"].(map[string]any)["etag"])
+```
+
+---
+
+#### updateGroupIndex — 推送本地 indexed settings 修改
+
+在远端基线上合并本地 indexed settings 修改，生成签名 `group.index` 后通过 CAS（Compare-And-Swap）机制提交。支持自动重试 etag 冲突。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组标识（支持 `group_aid` 格式） |
+| `settings` | object | ✅ | 要更新的 indexed settings（key-value 对象） |
+| `signer` | AID | ❌ | 签名者身份（默认 `client.current_aid`） |
+| `last_modified` | int | ❌ | 时间戳毫秒（默认 `Date.now()` / `time.time()*1000`） |
+| `max_attempts` | int | ❌ | CAS 冲突最大重试次数（默认 2） |
+
+**支持的 indexed settings keys**：
+
+- `rules.content` / `rules.attachments` — 群规则及附件
+- `announcement.content` / `announcement.attachments` — 群公告及附件
+- `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` — 入群要求
+
+**返回值**：
+
+```python
+{
+  "group_id": "g-team.agentid.pub",
+  "group_aid": "g-team.agentid.pub",
+  "updated_keys": ["announcement.content", "group.index"],
+  "_meta": {
+    "group_indexes": {
+      "g-team.agentid.pub": {
+        "etag": "\"sha256:...\"",     # 推送成功后的新 etag
+        "last_modified": 1780000000000,
+        "schema": "aun.group.index.v1"
+      }
+    }
+  }
+}
+```
+
+**行为**：
+
+1. 调用 `group.get_settings(keys=["group.index"])` 获取当前远端 etag（作为 CAS 基线）
+2. 解析远端 `group.index` 的 entries，保留不在 `settings` 中的条目
+3. 为 `settings` 中每个 key 计算新的 entry（包含 `etag: "sha256:<value的sha256>"`）
+4. 合并远端保留条目和新 entries，生成新的 canonical JSONL
+5. 用 `signer` 签名生成完整的 `group.index`（包含 meta 行的 `signature` 字段）
+6. 调用 `group.set_settings(settings={...修改的key..., "group.index": {...}}, expected_index_etag=<远端etag>)`
+7. **CAS 冲突自动重试**：若返回 "etag conflict" 错误，回到步骤 1 重新拉取基线（最多 `max_attempts` 次）
+8. 推送成功后调用 `client.mark_group_index_fresh()` 和 `client.cache_group_index_settings()` 更新本地缓存
+
+**错误处理**：
+
+- **CAS 冲突重试耗尽**：抛出最后一次的 "etag conflict" 异常
+- **非 CAS 错误**：立即抛出（如权限不足、签名失败）
+- **`signer` 与 RPC `actor` 不一致**：服务端会拒绝（`signed_by` 必须等于 `actor_aid`）
+
+**使用场景**：
+
+- 群主/管理员修改群公告、群规则后推送
+- 冲突解决：本地修改优先，覆盖远端（若冲突次数超限需人工介入）
+
+**示例**：
+
+```python
+# Python - 更新群公告
+result = await client.group.update_group_index(
+    group_id="g-team.agentid.pub",
+    settings={
+        "announcement.content": "新公告内容",
+        "announcement.attachments": []
+    }
+)
+print(f"推送成功，新 etag: {result['_meta']['group_indexes']['g-team.agentid.pub']['etag']}")
+```
+
+```typescript
+// TypeScript/JavaScript - 更新群规则
+const result = await client.group.updateGroupIndex({
+  group_id: 'g-team.agentid.pub',
+  settings: {
+    'rules.content': '1. 禁止广告\n2. 尊重他人',
+    'rules.attachments': []
+  }
+});
+console.log(`推送成功，新 etag: ${result._meta.group_indexes['g-team.agentid.pub'].etag}`);
+```
+
+```go
+// Go - 更新入群要求
+result, err := client.Group().UpdateGroupIndex(ctx, map[string]any{
+    "group_id": "g-team.agentid.pub",
+    "settings": map[string]any{
+        "join.mode": "approval",
+        "join.question": "你是如何知道本群的？",
+    },
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("推送成功\n")
+```
+
+**注意事项**：
+
+1. **权限要求**：写入 indexed settings 需要 admin 及以上权限
+2. **签名算法限制**：当前版本仅支持 ECDSA-P256-SHA256，使用其他算法的 AID 无法签名
+3. **CAS 冲突策略**：默认重试 2 次，高并发场景建议增加 `max_attempts`
+4. **`signer` 必须是当前连接身份**：服务端强制校验 `signed_by == actor_aid`，传入其他 AID 会被拒绝
 
 ---
 

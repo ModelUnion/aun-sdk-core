@@ -109,10 +109,10 @@ async def test_update_announcement_has_signature():
         bob.on("group.changed", _on_changed)
 
         # Alice 更新公告
-        ann_result = await alice.call("group.update_announcement", {
-            "group_id": group_id,
-            "content": f"签名测试公告 {rid}",
-        })
+        ann_result = await alice.group.update_announcement(
+            group_id=group_id,
+            content=f"签名测试公告 {rid}",
+        )
         _result("update_announcement 返回成功", ann_result is not None)
 
         # 等待 Bob 收到事件
@@ -169,10 +169,10 @@ async def test_update_rules_has_signature():
 
         bob.on("group.changed", _on_changed)
 
-        await alice.call("group.update_rules", {
-            "group_id": group_id,
-            "max_members": 50,
-        })
+        await alice.group.update_rules(
+            group_id=group_id,
+            content=f"签名测试规则 {rid}",
+        )
 
         try:
             await asyncio.wait_for(event_ready.wait(), timeout=5.0)

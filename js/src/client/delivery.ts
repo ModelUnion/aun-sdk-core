@@ -656,10 +656,35 @@ export class MessageDeliveryEngine {
     return true;
   }
 
+  async runPushProcessSerialized(ns: string, operation: () => Promise<void>): Promise<void> {
+    const client = this.runtime.client;
+    if (!ns) {
+      await operation();
+      return;
+    }
+    let queues = client._pushProcessQueues as Map<string, Promise<void>> | undefined;
+    if (!queues) {
+      queues = new Map();
+      client._pushProcessQueues = queues;
+    }
+    const previous = queues.get(ns) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    const stored = current.then(() => undefined, () => undefined);
+    queues.set(ns, stored);
+    try {
+      await current;
+    } finally {
+      if (queues.get(ns) === stored) queues.delete(ns);
+    }
+  }
+
   onRawMessageReceived(data: EventPayload): void {
     const client = this.runtime.client;
     client._clientLog.debug(`_onRawMessageReceived enter: from=${(data as any)?.from ?? '-'} mid=${(data as any)?.message_id ?? '-'} seq=${(data as any)?.seq ?? '-'}`);
-    client._safeAsync(this.processAndPublishMessage(data));
+    const ns = isJsonObject(data) && client._aid && (data as JsonObject).seq !== undefined
+      ? `p2p:${client._aid}`
+      : '';
+    client._safeAsync(this.runPushProcessSerialized(ns, () => this.processAndPublishMessage(data)));
     client._clientLog.debug('_onRawMessageReceived exit: elapsed=0ms (dispatched async)');
   }
 
@@ -763,7 +788,8 @@ export class MessageDeliveryEngine {
   onRawGroupMessageCreated(data: EventPayload): void {
     const client = this.runtime.client;
     client._clientLog.debug(`_onRawGroupMessageCreated enter: group_id=${(data as any)?.group_id ?? '-'} from=${(data as any)?.from ?? '-'} seq=${(data as any)?.seq ?? '-'}`);
-    client._safeAsync(this.processAndPublishGroupMessage(data));
+    const groupId = isJsonObject(data) ? String((data as JsonObject).group_id ?? '').trim() : '';
+    client._safeAsync(this.runPushProcessSerialized(groupId ? `group:${groupId}` : '', () => this.processAndPublishGroupMessage(data)));
     client._clientLog.debug('_onRawGroupMessageCreated exit: elapsed=0ms (dispatched async)');
   }
 
@@ -1793,6 +1819,7 @@ export class MessageDeliveryEngine {
       if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
       return false;
     }
+    await this.drainOrderedMessages(ns, seqNum);
     queue?.delete(seqNum);
     if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
     if (event === 'message.recalled') {

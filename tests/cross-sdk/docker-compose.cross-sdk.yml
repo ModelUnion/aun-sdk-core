@@ -126,6 +126,7 @@ services:
     volumes:
       - ./runner:/cross-sdk/runner:ro
       - ./cases.single-domain.json:/cross-sdk/cases.single-domain.json:ro
+      - ./cases.group-index-only.json:/cross-sdk/cases.group-index-only.json:ro
       - ./cases.group-storage-only.json:/cross-sdk/cases.group-storage-only.json:ro
       - ./cases.inbox-migration.json:/cross-sdk/cases.inbox-migration.json:ro
       - ./artifacts:/artifacts

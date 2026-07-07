@@ -671,6 +671,28 @@ export class MessageDeliveryEngine {
     return true;
   }
 
+  async runPushProcessSerialized(ns: string, operation: () => Promise<void>): Promise<void> {
+    const client = this.runtime.client;
+    if (!ns) {
+      await operation();
+      return;
+    }
+    let queues = client._pushProcessQueues as Map<string, Promise<void>> | undefined;
+    if (!queues) {
+      queues = new Map();
+      client._pushProcessQueues = queues;
+    }
+    const previous = queues.get(ns) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    const stored = current.then(() => undefined, () => undefined);
+    queues.set(ns, stored);
+    try {
+      await current;
+    } finally {
+      if (queues.get(ns) === stored) queues.delete(ns);
+    }
+  }
+
   async onRawMessageReceived(data: EventPayload): Promise<void> {
     const client = this.runtime.client;
     const tStart = Date.now();
@@ -680,7 +702,10 @@ export class MessageDeliveryEngine {
     } else {
       client._clientLog.debug('_onRawMessageReceived enter: non-object payload');
     }
-    this.processAndPublishMessage(data).catch((exc) => {
+    const ns = isJsonObject(data as JsonValue | object | null | undefined) && client._aid && (data as JsonObject).seq !== undefined
+      ? `p2p:${client._aid}`
+      : '';
+    this.runPushProcessSerialized(ns, () => this.processAndPublishMessage(data)).catch((exc) => {
       client._clientLog.warn(`P2P message decrypt failed: ${formatDeliveryError(exc)}`);
       if (isJsonObject(data as JsonValue | object | null | undefined)) {
         const src = data as JsonObject;
@@ -784,7 +809,10 @@ export class MessageDeliveryEngine {
     } else {
       client._clientLog.debug('_onRawGroupMessageCreated enter: non-object payload');
     }
-    this.processAndPublishGroupMessage(data).catch((exc) => {
+    const groupNs = isJsonObject(data as JsonValue | object | null | undefined)
+      ? String((data as JsonObject).group_id ?? '').trim()
+      : '';
+    this.runPushProcessSerialized(groupNs ? `group:${groupNs}` : '', () => this.processAndPublishGroupMessage(data)).catch((exc) => {
       client._clientLog.warn(`group message decrypt failed: ${formatDeliveryError(exc)}`);
       if (isJsonObject(data as JsonValue | object | null | undefined)) {
         const src = data as JsonObject;
@@ -1823,13 +1851,13 @@ export class MessageDeliveryEngine {
       if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
       return false;
     }
+    await this.drainOrderedMessages(ns, seqNum, true);
     queue?.delete(seqNum);
     if (queue && queue.size === 0) client._pendingOrderedMsgs.delete(ns);
     if (event === 'message.recalled') {
       const recallPublished = await this.publishMessageRecallTombstone(seqNum, payload);
       this.markPublishedSeq(ns, seqNum);
       client._markPulledSeqDelivered(ns, seqNum);
-      await this.drainOrderedMessages(ns, undefined, true);
       client._clientLog.debug(`publish pulled delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
       return recallPublished;
     }
@@ -1837,7 +1865,6 @@ export class MessageDeliveryEngine {
     if (isPromiseLike(published)) await published;
     this.markPublishedSeq(ns, seqNum);
     client._markPulledSeqDelivered(ns, seqNum);
-    await this.drainOrderedMessages(ns, undefined, true);
     client._clientLog.debug(`publish pulled delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
     return true;
   }

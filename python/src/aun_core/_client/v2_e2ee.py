@@ -780,6 +780,7 @@ class V2E2EECoordinator:
                 msg for msg in raw_page_messages
                 if isinstance(msg, dict) and int(msg.get("seq") or 0) > next_after_seq
             ]
+            raw_messages.sort(key=lambda msg: int(msg.get("seq") or 0))
             total_raw_count += len(raw_messages)
             client._log.debug(
                 "client",
@@ -2508,6 +2509,7 @@ class V2E2EECoordinator:
                 msg for msg in raw_page_messages
                 if isinstance(msg, dict) and int(msg.get("seq") or 0) > next_after_seq
             ]
+            raw_messages.sort(key=lambda msg: int(msg.get("seq") or 0))
             total_raw_count += len(raw_messages)
             cursor = result.get("cursor") if isinstance(result.get("cursor"), dict) else {}
             client._log.debug(

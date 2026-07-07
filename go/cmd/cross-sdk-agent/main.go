@@ -584,7 +584,13 @@ func (a *CrossSdkGoAgent) handleGroupCall(res http.ResponseWriter, req *http.Req
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
 	defer cancel()
-	result, err := a.client.Call(ctx, method, params)
+	var result any
+	var err error
+	if method == "sdk.update_group_index" {
+		result, err = a.client.Group().UpdateGroupIndex(ctx, params)
+	} else {
+		result, err = a.client.Call(ctx, method, params)
+	}
 	if err != nil {
 		out := map[string]any{"ok": false, "trace_id": traceID, "method": method, "error_code": errorCode(err), "error_message": err.Error()}
 		a.recordTrace(traceID, map[string]any{"stage": "group_call_error", "method": method, "error": out})

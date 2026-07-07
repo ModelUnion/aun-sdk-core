@@ -37,7 +37,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `status` | string | `"active"` / `"suspended"` / `"dissolved"` |
 | `description` | string | 群组描述 |
 | `metadata` | object | 自定义元数据 |
-| `dispatch_mode` | string | 群分发模式：`"broadcast"`（默认）/ `"mention"`，详见 [10.2.x 群分发模式](#1023-群分发模式dispatch_mode) |
+| `dispatch_mode` | string | 群分发模式：`"broadcast"`（默认）/ `"mention"`，详见 [10.2.3 群分发模式](#1023-群分发模式dispatch_mode) |
 | `member_count` | integer | 成员数量 |
 | `message_seq` | integer | 最新消息序号 |
 | `event_seq` | integer | 最新事件序号 |
@@ -567,7 +567,130 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ---
 
-## 10.13 事件
+## 10.13 群设置与 `group.index`
+
+`group.set_settings` / `group.get_settings` 是群公告、群规则、入群要求、分发模式等群级设置的统一 RPC。`group.index` 是保留设置 key，用于保存 owner/admin SDK 生成并签名的群索引 JSONL。
+
+### Indexed Settings
+
+以下设置属于 indexed settings，修改时必须同包提交新的签名 `group.index`：
+
+| key | 说明 |
+|-----|------|
+| `rules.content` | 群规则正文 |
+| `rules.attachments` | 群规则附件稳定引用 |
+| `announcement.content` | 群公告正文 |
+| `announcement.attachments` | 群公告附件稳定引用 |
+| `join.mode` | 入群模式 |
+| `join.question` | 入群问题 |
+| `join.auto_approve_patterns` | 自动批准规则 |
+| `join.max_pending` | 最大待审批数量 |
+
+`dispatch_mode`、`name`、`description`、`visibility` 等设置不属于 indexed settings，可继续通过普通 `group.set_settings` 写入，不要求 `group.index`。
+
+### `group.index` 正文
+
+`group.index` 的值是对象，当前至少包含 `body` 字段。`body` 是 canonical JSONL：
+
+```jsonl
+{"type":"index_meta","group_aid":"g-abc123.agentid.pub","etag":"\"sha256:...\"","last_modified":1780000000000,"schema":"aun.group.index.v1","body_hash":"sha256:...","signed_by":"alice.agentid.pub","sig_alg":"ECDSA-P256-SHA256","signature":"base64..."}
+{"key":"rules.content","source":"db","etag":"\"sha256:...\"","last_modified":1780000000000}
+```
+
+规则：
+
+- 第一行必须是 `type=index_meta`。
+- `schema` 当前为 `aun.group.index.v1`。
+- `etag` 是正文条目的 canonical JSONL bytes 的 SHA-256，格式为 `"sha256:<hex>"`（meta 行与 entries 行的 etag 字段均采用此格式）。
+- `body_hash` 是同一正文条目 bytes 的 SHA-256，格式为 `sha256:<hex>`（不带引号）。
+- `signed_by` 必须等于本次 RPC actor AID。
+- `signature` 覆盖去掉 `signature` 字段后的 `index_meta` 和正文条目的 canonical JSONL bytes。
+- canonical JSONL 使用 AUN V2 canonical JSON 规则：对象 key 按 Unicode code point 排序，非 ASCII 直出，数字不用科学计数法，整数值 float 输出为整数 token，NaN/Infinity 和超过安全整数范围的数字必须拒绝。
+- 当前 P-256 身份使用 `sig_alg=ECDSA-P256-SHA256`；服务端校验实现已支持 Ed25519（`sig_alg=Ed25519`）和 RSA（`sig_alg=RSA-PKCS1v15-SHA256`）签名算法，**但当前版本四个语言 SDK 的 `verifyGroupIndex` / `buildSignedGroupIndex` 仅支持 ECDSA-P256-SHA256**。使用 Ed25519 或 RSA 算法签名的 `group.index` 无法被 SDK 侧验证，建议统一使用 P-256 身份。
+
+Group 服务不根据 DB 状态生成 `group.index` 正文，只校验、CAS 保存和返回 owner/admin SDK 提交的签名正文。
+
+### `group.set_settings`
+
+需要 admin 及以上权限。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
+| `settings` | object | ✅ | 要写入的设置键值 |
+| `expected_index_etag` | string | 写 `group.index` 时必填 | CAS 期望旧 etag；空字符串表示只允许创建首个 `group.index` |
+
+写入约束：
+
+- 只更新非 indexed settings 时，不需要 `group.index` 和 `expected_index_etag`。
+- 更新任意 indexed setting 时，`settings` 必须同时包含 `group.index`。
+- 写入 `group.index` 时必须传 `expected_index_etag`。
+- 服务端在同一事务内比较当前 `group.index` etag、写 indexed settings、写 `group.index`；同请求内混入的普通 settings 和可事务化群元数据也一起提交或回滚。
+- CAS 失败返回错误，错误消息包含 `group.index etag conflict`；SDK 应重新 `getGroupIndex`，合并本地修改并重新签名后再提交。
+
+响应示例：
+
+```json
+{
+  "group_id": "g-abc123.agentid.pub",
+  "group_aid": "g-abc123.agentid.pub",
+  "updated_keys": ["announcement.content", "group.index"],
+  "_meta": {
+    "group_indexes": {
+      "g-abc123.agentid.pub": {
+        "etag": "\"sha256:...\"",
+        "last_modified": 1780000000000,
+        "schema": "aun.group.index.v1"
+      }
+    }
+  }
+}
+```
+
+### `group.get_settings`
+
+成员可读。`keys=["group.index"]` 用于从服务端摘取当前签名 `group.index`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `group_id` | string | ✅ | 群组标识兼容字段，值语义为 `group_aid` |
+| `keys` | string[] | ❌ | 只读取指定 key；读取 `group.index` 时服务端强制返回对应 `_meta.group_indexes` |
+
+响应示例：
+
+```json
+{
+  "group_id": "g-abc123.agentid.pub",
+  "group_aid": "g-abc123.agentid.pub",
+  "settings": [
+    {"key": "group.index", "value": {"body": "..."}, "updated_by": "alice.agentid.pub", "updated_at": 1780000000000}
+  ],
+  "_meta": {
+    "group_indexes": {
+      "g-abc123.agentid.pub": {
+        "etag": "\"sha256:...\"",
+        "last_modified": 1780000000000,
+        "schema": "aun.group.index.v1"
+      }
+    }
+  }
+}
+```
+
+### `_meta.group_indexes`
+
+`_meta.group_indexes` 是版本提示，不是 index 正文：
+
+- key 是 canonical `group_aid`。
+- value 当前包含 `etag`、`last_modified`、`schema`。
+- Group 服务负责注入；Gateway/Message 最多透传或合并 `_meta`，不得计算、生成或改写 group index。
+- 普通 settings 读取会按 actor/device/slot + group + etag 做注入频率控制；显式读取 `group.index` 和写入成功时强制注入。
+- SDK 观察到新 `etag` 只记录远端版本提示；etag 不一致只表示本地与远端不同步，不表示远端一定应覆盖本地。
+- 是否调用 `getGroupIndex` pull 远端，或调用 `updateGroupIndex` push 本地修改，由应用层决定。
+
+---
+
+## 10.14 事件
 
 Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 
@@ -661,7 +784,7 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 
 ---
 
-## 10.12 错误码
+## 10.15 错误码
 
 | 错误码 | 说明 | 客户端处理 |
 |--------|------|-----------|
@@ -679,11 +802,15 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 | -33008 | Invite code invalid or expired | 获取新邀请码 |
 | -33009 | Join rejected | 不重试 |
 
+`group.index etag conflict` 表示 `expected_index_etag` 与服务端当前 `group.index` etag 不一致。客户端应先重新读取 `group.index`，在最新 index 上合并本地修改并重新签名后再提交。
+
 ---
 
-## 10.13 设计约束与实现说明
+## 10.16 设计约束与实现说明
 
 - **Group Service 是独立 AID 持有者**：所有 `group.*` 方法都通过 Group Service 的 AID 暴露，不内嵌于 Gateway。
+- **group.index 由 SDK 生成**：Group 服务只校验、CAS 保存和注入 meta，不根据 DB 状态拼装 `group.index`。
+- **Gateway/Message 不承载 group.index 业务语义**：只能转发或合并 `_meta`，不能生成或改写 `_meta.group_indexes`。
 - **消息 seq 单调递增**：per-group 粒度，确保顺序一致性，`ack_seq` 仅增不减。
 - **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立；消息增量拉取使用 `group.pull`，事件增量拉取使用 `group.pull_events`。
 - **duty 模式**：`duty_mode` 非 `"none"` 且 `duty_human_message_policy = "dispatch"` 时，消息先推送给当班成员处理，回复后再广播；`group.pull` 始终可拉取全量消息。

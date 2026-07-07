@@ -88,7 +88,7 @@ func TestIntegration_GroupSetSettings(t *testing.T) {
 	t.Logf("set_settings(name+description) 成功: updated_keys=%v", updatedKeys1)
 
 	// ---- owner set_settings: rules.content + announcement.content ----
-	r2, err := owner.Call(ctx, "group.set_settings", map[string]any{
+	r2, err := owner.Group().UpdateGroupIndex(ctx, map[string]any{
 		"group_id": groupID,
 		"settings": map[string]any{
 			"rules.content":        "群规内容",
@@ -166,11 +166,20 @@ func TestIntegration_GroupGetSettings(t *testing.T) {
 
 	// ---- 设置若干字段 ----
 	setName := fmt.Sprintf("GS-Name-%s", rid)
-	_, err = owner.Call(ctx, "group.set_settings", map[string]any{
+	_, err = owner.Group().SetSettings(ctx, map[string]any{
 		"group_id": groupID,
 		"settings": map[string]any{
 			"name":                 setName,
 			"description":         "测试描述",
+		},
+	})
+	skipIfNotImplemented(t, err, "group.set_settings")
+	if err != nil {
+		t.Fatalf("set_settings(name/description) 失败: %v", err)
+	}
+	_, err = owner.Group().UpdateGroupIndex(ctx, map[string]any{
+		"group_id": groupID,
+		"settings": map[string]any{
 			"rules.content":       "测试群规",
 			"announcement.content": "测试公告",
 		},

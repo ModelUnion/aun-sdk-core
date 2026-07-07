@@ -794,7 +794,7 @@ export class V2E2EECoordinator {
       const messages = pageMessages.filter((msg) => {
         const seq = Number(msg.seq ?? 0);
         return Number.isFinite(seq) && seq > nextAfterSeq;
-      });
+      }).sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
       client._clientLog.debug(`message.v2.pull page response: page=${pageCount}, raw_count=${messages.length}, stale_count=${Math.max(0, pageMessages.length - messages.length)}, has_more=${String(result.has_more ?? '')}, server_ack_seq=${String(result.server_ack_seq ?? '')}`);
       const seqs = messages
         .map((msg) => Number(msg.seq ?? 0))
@@ -1066,7 +1066,7 @@ export class V2E2EECoordinator {
       const messages = pageMessages.filter((msg) => {
         const seq = Number(msg.seq ?? 0);
         return Number.isFinite(seq) && seq > nextAfterSeq;
-      });
+      }).sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
       const seqs = messages
         .map((msg) => Number(msg.seq ?? 0))
         .filter((seq) => Number.isFinite(seq) && seq > 0);

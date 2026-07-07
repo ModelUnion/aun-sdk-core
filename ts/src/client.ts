@@ -43,6 +43,7 @@ import { validateAIDFormat, validateGroupIDFormat } from './validators.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { AgentMdManager } from './agent-md.js';
+import { GroupIndexMetaCache } from './group-index.js';
 import { SeqTracker } from './seq-tracker.js';
 import { ClientRuntime } from './client/runtime.js';
 import { MessageDeliveryEngine } from './client/delivery.js';
@@ -676,6 +677,7 @@ export class AUNClient {
   private _certCache: Map<string, CachedPeerCert> = new Map();
 
   private _agentMdManager!: AgentMdManager;
+  private _groupIndexMetaCache: GroupIndexMetaCache = new GroupIndexMetaCache();
 
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
@@ -701,6 +703,8 @@ export class AUNClient {
   private _pushedSeqs: Map<string, Set<number>> = new Map();
   /** 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq） */
   private _pendingOrderedMsgs: Map<string, Map<number, { event: string; payload: EventPayload }>> = new Map();
+  /** push 处理队列：按 P2P / group namespace 串行化异步解密与有序投递。 */
+  private _pushProcessQueues: Map<string, Promise<void>> = new Map();
   /** P2P pull 进行中到达的纯通知 push 上界；pull gate 释放后需要补拉一次。 */
   private _pendingP2pPullUpper: Map<string, number> = new Map();
   /** 在线未读 hint 队列：同一 group 只保留最后一条，延迟 drain 降低登录瞬时拉取压力。 */
@@ -774,6 +778,7 @@ export class AUNClient {
       rawConfig.debug = inputAid.debug;
     }
     this._configModel = configFromMap(rawConfig);
+    this._groupIndexMetaCache = new GroupIndexMetaCache(this._configModel.aunPath);
     const initAid = (inputAid && inputAid.isPrivateKeyValid()) ? inputAid.aid : null;
     this.config = {
       aun_path: this._configModel.aunPath,
@@ -1062,6 +1067,7 @@ export class AUNClient {
     }
 
     this._configModel = nextConfig;
+    this._groupIndexMetaCache = new GroupIndexMetaCache(this._configModel.aunPath);
     this.config.aun_path = nextConfig.aunPath;
     this.config.root_ca_path = nextConfig.rootCaPath;
     this.config.seed_password = nextConfig.seedPassword;
@@ -1175,6 +1181,44 @@ export class AUNClient {
   /** transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。 */
   private _observeRpcMeta(meta: Record<string, unknown>): void {
     this._agentMdManager.observeRpcMeta(meta, this._aid);
+    this._groupIndexMetaCache.observeRpcMeta(meta, { localAid: this._aid ?? '' });
+  }
+
+  isGroupIndexStale(groupAid: string): boolean {
+    return this._groupIndexMetaCache.isStale(this._aid ?? '', groupAid);
+  }
+
+  markGroupIndexFresh(groupAid: string, options: { etag: string }): void {
+    this._groupIndexMetaCache.markFresh(this._aid ?? '', groupAid, options);
+  }
+
+  getGroupIndexRemoteMeta(groupAid: string): Record<string, unknown> | null {
+    return this._groupIndexMetaCache.remoteMeta(this._aid ?? '', groupAid);
+  }
+
+  getGroupIndexLocalEtag(groupAid: string): string {
+    return this._groupIndexMetaCache.localEtag(this._aid ?? '', groupAid);
+  }
+
+  getGroupIndexCachedSettings(groupAid: string, keys: string[]): Record<string, unknown> | null {
+    return this._groupIndexMetaCache.cachedSettings(this._aid ?? '', groupAid, keys.map((item) => String(item)));
+  }
+
+  getGroupIndexCachedSettingsByEntries(groupAid: string, keys: string[], entries: Array<Record<string, unknown>>) {
+    return this._groupIndexMetaCache.cachedSettingsByEntries(
+      this._aid ?? '',
+      groupAid,
+      keys.map((item) => String(item)),
+      entries as any,
+    );
+  }
+
+  cacheGroupIndexSettings(
+    groupAid: string,
+    settings: Record<string, unknown>,
+    options?: { entries?: Array<Record<string, unknown>>; etag?: string; groupIndex?: unknown },
+  ): void {
+    this._groupIndexMetaCache.cacheSettings(this._aid ?? '', groupAid, settings, options as any);
   }
   /** 连接状态 */
   get state(): ConnectionState {

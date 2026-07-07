@@ -6,6 +6,37 @@
 
 ---
 
+## 0.5.3 — 2026-07-07
+
+### 新功能
+
+#### group.index 签名索引
+- 新增 Python SDK `group.index` 支持，可为 indexed group settings 生成、解析、验签和缓存签名索引。
+- `client.group` 新增 `check_group_index()`、`get_group_index()`、`update_group_index()`，支持 etag/CAS 写入、冲突重试、本地 fresh/stale 状态和 settings 缓存。
+- 公告、群规则、入群要求 facade 更新路径改为写入 signed `group.index`，避免裸写 indexed settings。
+
+### 修复
+
+#### 撤回事件去重
+- P2P `message.recalled` 在线 push 与 pull tombstone 统一归一化，并按原消息标识去重，避免重复回调。
+- 群 `group.message_recalled` 去重键改为 group + 原消息标识，fallback 到原 seq / tombstone id，忽略 `recalled_at` 差异，并归一化 group id。
+- pull 批投递前补 drain ordered queue，降低撤回 tombstone 与普通消息乱序发布风险。
+
+#### V2 拉取
+- `message.v2.pull` 和 `group.v2.pull` 对 raw messages 按 seq 排序后处理，避免服务端返回顺序不稳定影响投递/ack 状态。
+
+### 改进
+
+- SDK 包版本和运行时 `__version__` 更新为 `0.5.3`。
+
+### 测试
+
+- 新增 group.index 单元、facade、集成和 E2E 测试，覆盖签名体稳定性、篡改检测、缓存持久化、etag CAS 冲突和裸写拒绝。
+- 扩展撤回测试，覆盖 P2P push/pull 去重、群撤回 fallback 去重键和 group id 归一。
+- 签名审计与群设置测试改用 facade helper，验证公告、规则、入群要求更新仍携带 `client_signature`。
+
+---
+
 ## 0.5.2 — 2026-07-05
 
 ### 新功能

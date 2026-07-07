@@ -9,8 +9,8 @@ import type { JsonObject } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 const KEYSTORE_DB_NAME = 'aun-keystore';
-const KEYSTORE_DB_VERSION = 8;
-const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'group_state', 'agent_md_cache', 'pending_identities', 'pending_binds'];
+const KEYSTORE_DB_VERSION = 9;
+const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'group_state', 'agent_md_cache', 'group_index_cache', 'pending_identities', 'pending_binds'];
 
 async function withStore<T>(
   storeName: string,

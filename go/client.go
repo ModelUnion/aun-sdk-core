@@ -652,7 +652,8 @@ type AUNClient struct {
 	// 旧 namespace 仅作为内部适配实现，不再作为 AUNClient 公开字段暴露。
 	authNamespace *namespace.AuthNamespace
 
-	agentMDManager *AgentMdManager
+	agentMDManager      *AgentMdManager
+	groupIndexMetaCache *GroupIndexMetaCache
 
 	// 日志
 	logger *AUNLogger
@@ -886,6 +887,46 @@ func (c *AUNClient) agentMD() *AgentMdManager {
 
 func (c *AUNClient) observeRPCMeta(meta map[string]any) {
 	c.agentMD().ObserveRPCMeta(meta)
+	c.groupIndexCache().ObserveRPCMeta(meta, c.aid)
+}
+
+func (c *AUNClient) groupIndexCache() *GroupIndexMetaCache {
+	if c.groupIndexMetaCache == nil {
+		aunPath := ""
+		if c.configModel != nil {
+			aunPath = c.configModel.AUNPath
+		}
+		c.groupIndexMetaCache = NewGroupIndexMetaCache(aunPath)
+	}
+	return c.groupIndexMetaCache
+}
+
+func (c *AUNClient) IsGroupIndexStale(groupAID string) bool {
+	return c.groupIndexCache().IsStale(c.aid, groupAID)
+}
+
+func (c *AUNClient) MarkGroupIndexFresh(groupAID, etag string) {
+	c.groupIndexCache().MarkFresh(c.aid, groupAID, etag)
+}
+
+func (c *AUNClient) GroupIndexRemoteMeta(groupAID string) map[string]any {
+	return c.groupIndexCache().RemoteMeta(c.aid, groupAID)
+}
+
+func (c *AUNClient) GroupIndexLocalEtag(groupAID string) string {
+	return c.groupIndexCache().LocalEtag(c.aid, groupAID)
+}
+
+func (c *AUNClient) GetGroupIndexCachedSettings(groupAID string, keys []string) map[string]any {
+	return c.groupIndexCache().CachedSettings(c.aid, groupAID, keys)
+}
+
+func (c *AUNClient) GetGroupIndexCachedSettingsByEntries(groupAID string, keys []string, entries []map[string]any) (map[string]any, []string) {
+	return c.groupIndexCache().CachedSettingsByEntries(c.aid, groupAID, keys, entries)
+}
+
+func (c *AUNClient) CacheGroupIndexSettings(groupAID string, settings map[string]any, entries []map[string]any, etag string, groupIndex ...any) {
+	c.groupIndexCache().CacheSettings(c.aid, groupAID, settings, entries, etag, groupIndex...)
 }
 
 func (c *AUNClient) observeAgentMDFromEnvelope(envelope map[string]any) {
@@ -3773,6 +3814,7 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 	c.config = nextRaw
 	c.configModel = nextCfg
 	c.agentMD().setAgentMDPath(filepath.Join(nextCfg.AUNPath, "AIDs"))
+	c.groupIndexMetaCache = NewGroupIndexMetaCache(nextCfg.AUNPath)
 	deviceID := strings.TrimSpace(aid.DeviceID)
 	if deviceID == "" {
 		deviceID = nextCfg.DeviceID()

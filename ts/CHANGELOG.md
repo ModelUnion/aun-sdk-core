@@ -6,6 +6,38 @@
 
 ---
 
+## 0.5.3 — 2026-07-07
+
+### 新功能
+
+#### Group Index / 群设置索引
+- 新增 `group.index` JSONL 索引支持，提供 `GROUP_INDEX_KEY`、`buildSignedGroupIndex`、`verifyGroupIndex`、`prepareGroupSettingsWithIndex`、`GroupIndexMetaCache` 等导出能力。
+- `GroupFacade` 新增 `checkGroupIndex` / `getGroupIndex` / `updateGroupIndex`，支持带签名的群设置索引写入、`expected_index_etag` CAS 防并发覆盖、etag conflict 自动重试。
+- 群设置高级 facade（群规、公告、入群要求）改为通过 `updateGroupIndex` 写入 indexed settings，并支持本地 settings cache 与 entry etag 局部回源。
+- `AUNClient` 观察 RPC `_meta.group_indexes`，暴露 group index stale/fresh、远端 meta、本地 etag 与 settings cache helper。
+- Cross-SDK agent 新增 `sdk.update_group_index` 调用入口，用于跨 SDK group index 一致性测试。
+
+### 修复
+
+- 修复 P2P `message.recalled` push/pull tombstone 可能重复投递的问题，按原消息 id/seq 生成去重键并统一发布应用层 `message.recalled`。
+- 增强群撤回去重：去重键不再包含 `recalled_at`，缺少 `message_ids` 时按 `target_message_seqs` / 原消息 id / tombstone id 兜底，避免 push 与 pull tombstone 重复回调。
+- `message.v2.pull` / `group.v2.pull` 对页内消息按 `seq` 升序处理，降低服务端乱序返回导致的投递与 ack 风险。
+
+### 改进
+
+- 同一 P2P / group namespace 的 push 解密与应用层投递改为串行处理，提升在线 push 有序性。
+- 拉取 `group.index` 后先校验签名、body hash 与 etag，校验失败不更新本地缓存。
+- SDK 包版本和运行时 `VERSION` 更新为 `0.5.3`。
+
+### 测试
+
+- 新增 group index 单元测试，覆盖 JSONL canonical hash/etag、签名构建与验证、settings 合并、meta cache 持久化。
+- 新增 GroupFacade group index 单元测试，覆盖 CAS 写入、etag conflict 重试、tamper reject、settings cache 和高级 facade 写入路径。
+- 新增 group index 集成测试，覆盖 signed `group.index` 写入、裸 indexed settings 拒绝、CAS conflict 与 `updateGroupIndex` 重试。
+- 扩展 group settings、signature audit、delivery 去重相关测试，覆盖 `updateGroupIndex`、签名审计、P2P/群撤回去重与顶层撤回字段归一化。
+
+---
+
 ## 0.5.2 — 2026-07-05
 
 ### 新功能

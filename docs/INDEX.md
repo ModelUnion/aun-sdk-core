@@ -21,6 +21,7 @@
 | [消息收件箱统一迁移方案](design/消息收件箱统一迁移方案.md) | P2P `message_inbox` 与群消息 `group_inbox` 的统一读模型、后台回填和旧表清理方案 |
 | [AUN 反向代理服务方案与 TDD 实施计划](design/AUN反向代理服务方案与TDD实施计划.md) | AUN Service Proxy、service_proxy 服务模块、SDK service-proxy-client、URL 路由、隧道协议、Web 边界和分阶段 TDD 落地计划 |
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、Gateway `_meta.agent_md_etags` 角色、消息信封 ETag 和注入节流方案 |
+| [群索引版本提示与附件引用方案](design/群索引版本提示与附件引用方案.md) | `group.index` 签名索引、`_meta.group_indexes` 版本提示、CAS 更新、服务端缓存注入和附件稳定引用 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE、Storage VFS、Group FS 和 Collab 的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
 | [AUN CLI 手册](cli/CLI手册.md) | Python CLI 源码位置、安装运行入口、全局选项、profile 配置和主要命令集 |
@@ -76,6 +77,7 @@
 - `client.notify()` 在线轻量通知、AID/群路由、跨域 federation 和不离线存储边界 → [Notify 通知方案](sdk/Notify通知方案.md)
 - 协议细节、子协议和消息格式 → [协议文档目录](protocol/)
 - agent.md 远程缓存、`remote_etag` / `local_etag`、`requester` / `peer` / `group` 角色、消息信封与 Gateway `_meta` ETag 透传 → [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md)
+- `group.index` owner/admin SDK 生成签名索引、`_meta.group_indexes` 观察、`expected_index_etag` CAS、服务端正/负缓存与注入频率控制 → [群索引版本提示与附件引用方案](design/群索引版本提示与附件引用方案.md)、[SDK 文档索引](sdk/INDEX.md)
 
 ### Service Proxy 与服务暴露
 
@@ -105,7 +107,7 @@
 
 ### aun测试运行指南
 
-记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵，Python / TypeScript / Go / JavaScript 跨语言容器 E2E 的 83 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三/四成员同群矩阵、storage ticket/ACL、group.fs 与 group.fs POSIX、collab 与 collab ACL、连续消息、ack、预期失败和混合明文/E2EE 场景，另包含固定身份目录、bench-pairs16 性能身份池、uvloop bench 环境变量、Gateway 客户端 mock 网络延迟、`--perf-trace` 开关、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口、message/group WAL 回归检查和数据保护规则。
+记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript 四语言测试矩阵和跨语言容器 E2E，覆盖 group.index 签名/CAS/meta 观察、P2P 明文/E2EE、群聊 pairwise 明文/E2EE、三/四成员同群矩阵、storage ticket/ACL、group.fs 与 group.fs POSIX、collab 与 collab ACL、连续消息、ack、预期失败和混合明文/E2EE 场景，另包含固定身份目录、bench-pairs16 性能身份池、uvloop bench 环境变量、Gateway 客户端 mock 网络延迟、`--perf-trace` 开关、容器名、典型命令、浏览器 E2E、双域 federation 测试、Service Proxy 单域/双域 E2E 入口、message/group WAL 回归检查和数据保护规则。
 
 ### AUN SDK 重构修改清单
 
@@ -151,9 +153,13 @@
 
 定义每个远程 AID 在 SDK 内存和本地持久化记录中维护一条 agent.md 状态：Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`，浏览器 JavaScript 使用 IndexedDB logical key。方案规定 Gateway 在 RPC response / event push 的 `_meta.agent_md_etags` 中按 `requester`、`peer`、`group` 注入元数据，保留旧别名兼容，并通过 300 秒正缓存、60 秒负缓存和默认 60 秒发送节流控制热路径开销；Message Service V2 P2P 信封携带 `agent_md.sender`。四端 SDK 自动观察 `_meta` 和信封 `agent_md.sender/group`，写入 `remote_etag` / `last_modified`，并遵守按需下载、无条件 GET、304 兼容、竞态和跨 SDK 一致性规则。
 
+### 群索引版本提示与附件引用方案
+
+定义 `group.index` 的 owner/admin SDK 生成、canonical JSONL、签名、`etag` / `body_hash`、`expected_index_etag` CAS、`_meta.group_indexes` 版本提示、Gateway/Message 转发边界、服务端正/负缓存、singleflight、写后失效/刷新、注入频率控制，以及 DB 保存核心设置、group.fs 保存大附件、附件稳定引用和 SDK `check/get/updateGroupIndex` 语义。
+
 ### SDK 文档索引
 
-`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE V2、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group FS、Collab GC/reflog/reset 和各类 RPC 手册。
+`docs/sdk/INDEX.md` 是 SDK 手册的三层子索引，覆盖快速开始、WebSocket 协议、核心概念、连接认证、E2EE V2、API 手册、错误处理、最佳实践、payload、Service Proxy、Storage VFS、Group FS、Group Index、Collab GC/reflog/reset 和各类 RPC 手册。
 
 ### Service Proxy RPC 手册
 

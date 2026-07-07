@@ -1000,6 +1000,7 @@ class MessageDeliveryEngine:
                 if not pending:
                     client._pending_ordered().pop(ns, None)
             return False
+        await client._drain_ordered_messages(ns, before_seq=seq_i)
         pending = client._pending_ordered().get(ns)
         if pending:
             pending.pop(seq_i, None)

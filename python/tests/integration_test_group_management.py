@@ -363,10 +363,7 @@ async def test_join_requirements_and_batch_review():
             raise AssertionError(f"拒绝审批返回异常: {rejected}")
         _ok("单个审批拒绝路径")
 
-        await alice.call("group.set_settings", {
-            "group_id": group_question,
-            "settings": {"join.mode": "open"},
-        })
+        await alice.group.update_join_requirements(group_id=group_question, mode="open")
         joined = await bobb.call("group.request_join", {
             "group_id": group_question,
             "message": "open join",

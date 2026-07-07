@@ -2233,6 +2233,7 @@ func (d *messageDeliveryEngine) publishPulledMessage(event, ns string, seq int, 
 		c.removePendingOrderedSeq(ns, seq)
 		return false
 	}
+	c.drainOrderedMessages(ns, seq)
 	c.removePendingOrderedSeq(ns, seq)
 	if event == "message.recalled" {
 		published := d.publishMessageRecallTombstone(seq, payload)

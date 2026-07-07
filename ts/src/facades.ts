@@ -1,5 +1,6 @@
 import { GroupFSVFS } from './group-fs.js';
-import type { RpcParams, RpcResult } from './types.js';
+import { GROUP_INDEX_KEY, parseGroupIndex, prepareGroupSettingsWithIndex, verifyGroupIndex } from './group-index.js';
+import type { JsonValue, RpcParams, RpcResult } from './types.js';
 import { validateAIDFormat, validateGroupIDFormat } from './validators.js';
 
 export interface FacadeRpcClient {
@@ -34,6 +35,14 @@ function settingsToMap(result: RpcResult): Record<string, any> {
     settings[s.key] = s.value;
   }
   return settings;
+}
+
+function indexUpdateParams(groupId: unknown, settings: Record<string, any>, merged: Record<string, any>): FacadeParams {
+  const out: Record<string, any> = { group_id: groupId, settings };
+  for (const key of ['signer', 'last_modified', 'max_attempts']) {
+    if (key in merged) out[key] = merged[key];
+  }
+  return out;
 }
 
 abstract class RpcFacade {
@@ -168,9 +177,8 @@ export class GroupFacade extends RpcFacade {
     const merged = params || {};
     const groupId = merged.group_id;
     if (!groupId) throw new Error('group_id is required');
-    const result = await this.getSettings({ group_id: groupId, keys: ['rules.content', 'rules.attachments'] });
-    const settings = settingsToMap(result);
-    return { group_id: (result as Record<string, any>).group_id, rules: { group_id: (result as Record<string, any>).group_id, content: settings['rules.content'] || '', attachments: settings['rules.attachments'] || [], updated_by: settings['rules.content.updated_by'] || '', updated_at: settings['rules.content.updated_at'] || 0 } };
+    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['rules.content', 'rules.attachments']);
+    return { group_id: resultGroupId, rules: { group_id: resultGroupId, content: settings['rules.content'] || '', attachments: settings['rules.attachments'] || [], updated_by: settings['rules.content.updated_by'] || '', updated_at: settings['rules.content.updated_at'] || 0 } };
   }
 
   async updateRules(params?: FacadeParams): Promise<RpcResult> {
@@ -180,7 +188,7 @@ export class GroupFacade extends RpcFacade {
     if (content === undefined) throw new Error('content is required');
     const settingsUpdate: Record<string, any> = { 'rules.content': content };
     if (attachments !== undefined) settingsUpdate['rules.attachments'] = attachments;
-    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
     return { group_id: (result as Record<string, any>).group_id, rules: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
   }
 
@@ -188,9 +196,8 @@ export class GroupFacade extends RpcFacade {
     const merged = params || {};
     const groupId = merged.group_id;
     if (!groupId) throw new Error('group_id is required');
-    const result = await this.getSettings({ group_id: groupId, keys: ['announcement.content', 'announcement.attachments'] });
-    const settings = settingsToMap(result);
-    return { group_id: (result as Record<string, any>).group_id, announcement: { group_id: (result as Record<string, any>).group_id, content: settings['announcement.content'] || '', attachments: settings['announcement.attachments'] || [], updated_by: settings['announcement.content.updated_by'] || '', updated_at: settings['announcement.content.updated_at'] || 0 } };
+    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['announcement.content', 'announcement.attachments']);
+    return { group_id: resultGroupId, announcement: { group_id: resultGroupId, content: settings['announcement.content'] || '', attachments: settings['announcement.attachments'] || [], updated_by: settings['announcement.content.updated_by'] || '', updated_at: settings['announcement.content.updated_at'] || 0 } };
   }
 
   async updateAnnouncement(params?: FacadeParams): Promise<RpcResult> {
@@ -200,7 +207,7 @@ export class GroupFacade extends RpcFacade {
     if (content === undefined) throw new Error('content is required');
     const settingsUpdate: Record<string, any> = { 'announcement.content': content };
     if (attachments !== undefined) settingsUpdate['announcement.attachments'] = attachments;
-    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
     return { group_id: (result as Record<string, any>).group_id, announcement: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
   }
 
@@ -213,9 +220,8 @@ export class GroupFacade extends RpcFacade {
     const merged = params || {};
     const groupId = merged.group_id;
     if (!groupId) throw new Error('group_id is required');
-    const result = await this.getSettings({ group_id: groupId, keys: ['join.mode', 'join.question', 'join.auto_approve_patterns', 'join.max_pending'] });
-    const settings = settingsToMap(result);
-    return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: settings['join.mode'] || 'open', question: settings['join.question'] || '', auto_approve_patterns: settings['join.auto_approve_patterns'] || [], max_pending: settings['join.max_pending'] || 100, updated_by: settings['join.mode.updated_by'] || '', updated_at: settings['join.mode.updated_at'] || 0 } };
+    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['join.mode', 'join.question', 'join.auto_approve_patterns', 'join.max_pending']);
+    return { group_id: resultGroupId, join_requirements: { group_id: resultGroupId, mode: settings['join.mode'] || 'open', question: settings['join.question'] || '', auto_approve_patterns: settings['join.auto_approve_patterns'] || [], max_pending: settings['join.max_pending'] || 100, updated_by: settings['join.mode.updated_by'] || '', updated_at: settings['join.mode.updated_at'] || 0 } };
   }
 
   async updateJoinRequirements(params?: FacadeParams): Promise<RpcResult> {
@@ -228,7 +234,7 @@ export class GroupFacade extends RpcFacade {
     if ('auto_approve_patterns' in merged) settingsUpdate['join.auto_approve_patterns'] = merged.auto_approve_patterns;
     if ('max_pending' in merged) settingsUpdate['join.max_pending'] = merged.max_pending;
     if (Object.keys(settingsUpdate).length === 0) throw new Error('at least one field to update is required');
-    const result = await this.setSettings({ group_id: groupId, settings: settingsUpdate });
+    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
     return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: merged.mode, question: merged.question, auto_approve_patterns: merged.auto_approve_patterns, max_pending: merged.max_pending } };
   }
 
@@ -257,6 +263,192 @@ export class GroupFacade extends RpcFacade {
   dissolve(params?: FacadeParams): Promise<RpcResult> { return this.call('group.dissolve', params); }
   setSettings(params?: FacadeParams): Promise<RpcResult> { return this.call('group.set_settings', params); }
   getSettings(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_settings', params); }
+
+  async checkGroupIndex(params?: FacadeParams): Promise<RpcResult> {
+    const merged = stripNil(params ?? {});
+    const groupAid = String(merged.group_aid ?? merged.group_id ?? '').trim();
+    if (!groupAid) throw new Error('group_aid is required');
+    const clientAny = this.client as any;
+    const stale = typeof clientAny.isGroupIndexStale === 'function'
+      ? Boolean(clientAny.isGroupIndexStale(groupAid))
+      : false;
+    const remoteMeta = typeof clientAny.getGroupIndexRemoteMeta === 'function'
+      ? clientAny.getGroupIndexRemoteMeta(groupAid) ?? {}
+      : {};
+    const localEtag = typeof clientAny.getGroupIndexLocalEtag === 'function'
+      ? String(clientAny.getGroupIndexLocalEtag(groupAid) ?? '')
+      : '';
+    const remoteEtag = String(remoteMeta?.etag ?? '');
+    const localFound = Boolean(localEtag);
+    const remoteFound = Boolean(remoteEtag);
+    const inSync = localFound && remoteFound && localEtag === remoteEtag;
+    return {
+      group_aid: groupAid,
+      local_found: localFound,
+      remote_found: remoteFound,
+      local_etag: localEtag,
+      remote_etag: remoteEtag,
+      in_sync: inSync,
+      needs_update: Boolean(stale || (remoteFound && !inSync)),
+      last_modified: remoteMeta?.last_modified,
+      status: remoteFound ? 200 : 404,
+      cached: true,
+    };
+  }
+
+  async getGroupIndex(params?: FacadeParams): Promise<RpcResult> {
+    const merged = stripNil(params ?? {});
+    const groupId = String(merged.group_id ?? '').trim();
+    if (!groupId) throw new Error('group_id is required');
+    const result = await this.getSettings({ group_id: groupId, keys: [GROUP_INDEX_KEY] });
+    const groupAid = String((result as Record<string, any>).group_aid ?? groupId);
+    let groupIndex: any = null;
+    for (const item of (result as Record<string, any>).settings ?? []) {
+      if (item?.key !== GROUP_INDEX_KEY) continue;
+      groupIndex = item.value;
+      break;
+    }
+    if (!groupIndex) {
+      return { group_id: (result as Record<string, any>).group_id, group_aid: groupAid, group_index: null, meta: {}, entries: [] };
+    }
+    const parsed = parseGroupIndex(groupIndex);
+    await this.verifyPulledGroupIndex(groupIndex, parsed);
+    const etag = String(parsed.meta.etag ?? '');
+    const settings = await this.hydrateGroupIndexSettings(groupId, groupAid, parsed.entries as any, etag, groupIndex);
+    const clientAny = this.client as any;
+    if (etag && typeof clientAny.markGroupIndexFresh === 'function') {
+      clientAny.markGroupIndexFresh(groupAid, { etag });
+    }
+    return {
+      group_id: (result as Record<string, any>).group_id,
+      group_aid: groupAid,
+      group_index: groupIndex,
+      meta: parsed.meta as unknown as JsonValue,
+      entries: parsed.entries as unknown as JsonValue,
+      settings: settings as JsonValue,
+    };
+  }
+
+  private async verifyPulledGroupIndex(groupIndex: unknown, parsed: { meta: Record<string, any>; entries: Array<Record<string, any>> }): Promise<void> {
+    const signedBy = String(parsed.meta?.signed_by ?? '').trim();
+    if (!signedBy) throw new Error('group.index signed_by is required');
+    const clientAny = this.client as any;
+    let signer = clientAny.currentAid?.aid === signedBy ? clientAny.currentAid : null;
+    if (!signer && typeof clientAny.lookupPeer === 'function') {
+      signer = await clientAny.lookupPeer(signedBy);
+    }
+    if (!signer) throw new Error(`group.index signer is unavailable: ${signedBy}`);
+    const verified = verifyGroupIndex(groupIndex as any, signer);
+    if (!verified.ok) throw new Error(verified.error.message || 'group.index verification failed');
+    if (!verified.data.valid) throw new Error(`group.index verification failed: ${verified.data.reason || 'invalid signature'}`);
+  }
+
+  async updateGroupIndex(params?: FacadeParams): Promise<RpcResult> {
+    const merged = stripNil(params ?? {});
+    const groupId = String(merged.group_id ?? '').trim();
+    const settings = merged.settings;
+    if (!groupId) throw new Error('group_id is required');
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings) || Object.keys(settings as Record<string, unknown>).length === 0) {
+      throw new Error('settings must be a non-empty object');
+    }
+    const signer = merged.signer ?? (this.client as any).currentAid;
+    if (!signer) throw new Error('signer is required');
+    const lastModified = Math.trunc(Number(merged.last_modified ?? Date.now()));
+    const maxAttempts = Math.max(1, Math.trunc(Number(merged.max_attempts ?? 2)));
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const current = await this.getSettings({ group_id: groupId, keys: [GROUP_INDEX_KEY] });
+      const groupAid = String((current as Record<string, any>).group_aid ?? groupId);
+      let currentIndex: unknown = null;
+      let expectedEtag = '';
+      for (const item of (current as Record<string, any>).settings ?? []) {
+        if (item?.key !== GROUP_INDEX_KEY) continue;
+        currentIndex = item.value;
+        if (currentIndex) expectedEtag = String(parseGroupIndex(currentIndex as any).meta.etag ?? '');
+        break;
+      }
+      const signedSettings = prepareGroupSettingsWithIndex({
+        groupAid,
+        settings: settings as Record<string, unknown>,
+        signer: signer as any,
+        lastModified,
+        baseIndex: currentIndex as any,
+      });
+      try {
+        const result = await this.setSettings({
+          group_id: groupId,
+          settings: signedSettings as JsonValue,
+          expected_index_etag: expectedEtag,
+        });
+        const pushedEtag = String(parseGroupIndex((signedSettings as Record<string, unknown>)[GROUP_INDEX_KEY] as any).meta.etag ?? '');
+        const clientAny = this.client as any;
+        if (pushedEtag && typeof clientAny.markGroupIndexFresh === 'function') {
+          clientAny.markGroupIndexFresh(groupAid, { etag: pushedEtag });
+        }
+        if (typeof clientAny.cacheGroupIndexSettings === 'function') {
+          const parsed = parseGroupIndex((signedSettings as Record<string, unknown>)[GROUP_INDEX_KEY] as any);
+          clientAny.cacheGroupIndexSettings(groupAid, settings as Record<string, unknown>, { entries: parsed.entries, etag: pushedEtag, groupIndex: signedSettings[GROUP_INDEX_KEY] });
+        }
+        return result;
+      } catch (exc) {
+        if (!String((exc as Error)?.message ?? exc).includes('etag conflict')) throw exc;
+        lastError = exc;
+      }
+    }
+    if (lastError) throw lastError;
+    throw new Error('updateGroupIndex failed');
+  }
+
+  private async getIndexedSettings(groupId: string, keys: string[]): Promise<{ groupId: string; settings: Record<string, any> }> {
+    const clientAny = this.client as any;
+    if (typeof clientAny.getGroupIndexCachedSettings === 'function') {
+      const cached = clientAny.getGroupIndexCachedSettings(groupId, keys);
+      if (cached && typeof cached === 'object') return { groupId, settings: cached };
+    }
+    const result = await this.getSettings({ group_id: groupId, keys });
+    const resultMap = result as Record<string, any>;
+    const settings = settingsToMap(result);
+    if (typeof clientAny.cacheGroupIndexSettings === 'function') {
+      const groupAid = String(resultMap.group_aid ?? groupId);
+      clientAny.cacheGroupIndexSettings(groupAid, settings);
+      if (groupAid !== groupId) {
+        clientAny.cacheGroupIndexSettings(groupId, settings);
+      }
+    }
+    return { groupId: String(resultMap.group_id ?? groupId), settings };
+  }
+
+  private async hydrateGroupIndexSettings(
+    groupId: string,
+    groupAid: string,
+    entries: Array<Record<string, any>>,
+    etag: string,
+    groupIndex: unknown = null,
+  ): Promise<Record<string, any>> {
+    const keys = entries
+      .filter((item) => String(item.source ?? 'db') === 'db' && String(item.key ?? ''))
+      .map((item) => String(item.key));
+    if (keys.length === 0) return {};
+    const clientAny = this.client as any;
+    let cached: Record<string, any> = {};
+    let missing = [...keys];
+    if (typeof clientAny.getGroupIndexCachedSettingsByEntries === 'function') {
+      const value = clientAny.getGroupIndexCachedSettingsByEntries(groupAid, keys, entries);
+      cached = { ...(value?.cached ?? {}) };
+      missing = [...(value?.missing ?? [])].map((item) => String(item));
+    }
+    let fetched: Record<string, any> = {};
+    if (missing.length > 0) {
+      fetched = settingsToMap(await this.getSettings({ group_id: groupId, keys: missing }));
+    }
+    const settings = { ...cached, ...fetched };
+    if (typeof clientAny.cacheGroupIndexSettings === 'function') {
+      clientAny.cacheGroupIndexSettings(groupAid, settings, { entries, etag, groupIndex });
+    }
+    return settings;
+  }
+
   getOnlineMembers(params?: FacadeParams): Promise<RpcResult> { return this.call('group.get_online_members', params); }
 }
 

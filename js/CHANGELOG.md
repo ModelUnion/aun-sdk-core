@@ -6,6 +6,42 @@
 
 ---
 
+## 0.5.3 — 2026-07-07
+
+### 新功能
+
+#### group.index 索引化群设置
+- 新增浏览器 `group.index` JSONL 工具：支持 canonical entries、body hash、etag、ECDSA P-256 签名/验签，以及将 settings 更新合并为带 `group.index` 的原子写入。
+- `GroupFacade` 新增 `checkGroupIndex` / `getGroupIndex` / `updateGroupIndex`，写入时携带 `expected_index_etag` 做 CAS，并在冲突后重拉索引重试。
+- 浏览器 IndexedDB TokenStore 新增 `group_index_cache`，按 local AID + group AID 持久化 index JSONL、remote meta、本地 etag、settings cache 和 entry etags。
+- 入口导出 `GROUP_INDEX_KEY`、`GROUP_INDEX_SCHEMA`、`GroupIndexMetaCache`、`buildSignedGroupIndex`、`verifyGroupIndex`、`prepareGroupSettingsWithIndex` 等 group.index API。
+
+### 修复
+
+#### 撤回去重与有序投递
+- `message.recalled` 改为专用处理路径，支持 P2P 撤回 tombstone 的有序投递、自动 ack、gap fill 和按原消息标识去重，避免 push / pull 对同一次撤回重复回调。
+- 群撤回去重键改为规范化 group id + 原消息 id/seq，忽略 `recalled_at`，并补齐顶层 recall 字段归一化。
+- 群消息 pull / legacy fallback 识别 `group.message_recalled` tombstone，避免把撤回通知作为普通群消息投递。
+- P2P 与群 push 按 namespace 串行化处理，降低异步解密和投递导致的乱序风险。
+- V2 P2P / Group pull 页内消息按 `seq` 排序后处理，避免服务端返回无序时影响本地 seq 推进。
+
+### 改进
+
+- `RPCTransport` 的 `_meta` observer 支持异步回调；RPC 成功响应会等待 observer 完成，事件/通知路径统一走安全的 meta observer 分发。
+- `getAnnouncement` / `getRules` / `getJoinRequirements` 优先使用 group.index settings cache；`updateAnnouncement` / `updateRules` / `updateJoinRequirements` 改走 `updateGroupIndex`，保持索引与设置同步。
+- cross-sdk JS agent 支持 `sdk.update_group_index` 调用，便于跨 SDK 测试索引化群设置。
+- SDK 包版本、运行时 `VERSION` 和 conformance 期望版本更新为 `0.5.3`。
+
+### 测试
+
+- 新增 group.index 单元测试，覆盖 hash/etag、签名/验签、settings merge、RPC meta stale/fresh、async meta observer 和 IndexedDB 持久化恢复。
+- 新增 GroupFacade group.index 单元测试，覆盖 CAS 写入、冲突重试、远端索引验签、tamper 拒绝、settings cache 和便利方法索引化写入。
+- 新增浏览器 E2E：验证签名 `group.index` 写入、裸 settings 写入拒绝、CAS 冲突重试和最终 settings 一致性。
+- 扩展撤回投递测试，覆盖 P2P/group recall 顶层字段归一化、push/pull tombstone 去重和有序投递。
+- 更新 group settings 与签名审计 E2E，使公告/群规等索引化 settings 通过 `updateGroupIndex` 写入。
+
+---
+
 ## 0.5.2 — 2026-07-05
 
 ### 新功能

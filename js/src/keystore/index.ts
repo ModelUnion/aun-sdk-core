@@ -28,6 +28,19 @@ export interface AgentMdCacheRecord {
 
 export type AgentMdCacheUpsert = Partial<Omit<AgentMdCacheRecord, 'aid' | 'updated_at'>>;
 
+export interface GroupIndexCacheRecord {
+  local_aid: string;
+  group_aid: string;
+  index_jsonl: string;
+  remote_meta: Record<string, unknown>;
+  local_etag: string;
+  settings: Record<string, unknown>;
+  entry_etags: Record<string, string>;
+  updated_at: number;
+}
+
+export type GroupIndexCacheUpsert = Partial<Omit<GroupIndexCacheRecord, 'local_aid' | 'group_aid' | 'updated_at'>>;
+
 /**
  * 不含私钥操作的存储接口（浏览器版本 — 所有方法均为异步）。
  * AuthFlow / AUNClient 持有此类型。
@@ -80,6 +93,10 @@ export interface TokenStore {
   loadAgentMdCache?(ownerAid: string, targetAid: string): Promise<AgentMdCacheRecord | null>;
   /** 更新本地持久化的某个远端/自身 agent.md 缓存记录 */
   upsertAgentMdCache?(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): Promise<AgentMdCacheRecord>;
+  /** 加载本地持久化的某个 group.index cache 记录 */
+  loadGroupIndexCache?(localAid: string, groupAid: string): Promise<GroupIndexCacheRecord | null>;
+  /** 更新本地持久化的某个 group.index cache 记录 */
+  upsertGroupIndexCache?(localAid: string, groupAid: string, fields: GroupIndexCacheUpsert): Promise<GroupIndexCacheRecord>;
   /** 列出指定 AIDs 逻辑根目录下已有正文文件对应的 aid */
   listAgentMdContentAids?(agentMdPath: string): Promise<string[]>;
   /** 保存群组状态快照 */

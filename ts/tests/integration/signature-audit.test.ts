@@ -112,7 +112,7 @@ describe('签名审计: 更新公告携带签名', () => {
 
       // ---- Alice 更新公告 ----
       try {
-        await alice.call('group.set_settings', {
+        await alice.group.updateGroupIndex({
           group_id: groupId,
           settings: {
             'announcement.content': `签名测试公告 ${rid}`,

@@ -274,6 +274,11 @@ test.describe('Group Settings: set/get（浏览器）', () => {
             settings: {
               name: `Filtered-${rid}`,
               description: `FilterDesc-${rid}`,
+            },
+          });
+          await owner.group.updateGroupIndex({
+            group_id: groupId,
+            settings: {
               'rules.content': '测试群规',
             },
           });
@@ -683,6 +688,11 @@ test.describe('Group Settings: 同步（浏览器）', () => {
             settings: {
               name: updatedName,
               description: updatedDesc,
+            },
+          });
+          await owner.group.updateGroupIndex({
+            group_id: groupId,
+            settings: {
               'rules.content': updatedRules,
             },
           });

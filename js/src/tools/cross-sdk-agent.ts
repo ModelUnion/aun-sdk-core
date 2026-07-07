@@ -455,7 +455,9 @@ class CrossSdkJsAgent {
       return;
     }
     try {
-      const result = await this.client.call(method, params as RpcParams);
+      const result = method === 'sdk.update_group_index'
+        ? await this.client.group.updateGroupIndex(params as RpcParams)
+        : await this.client.call(method, params as RpcParams);
       const response: JsonObject = { ok: true, trace_id: traceId, method, result: jsonSafe(result) as never };
       this.recordTrace(traceId, { stage: 'group_call', method, result: response });
       sendJson(res, 200, response);

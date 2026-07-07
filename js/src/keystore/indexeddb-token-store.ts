@@ -8,7 +8,7 @@
 import type { ModuleLogger } from '../logger.js';
 import { pemToArrayBuffer } from '../crypto.js';
 import { convertToGroupAid } from '../group-id.js';
-import type { AgentMdCacheRecord, AgentMdCacheUpsert, TokenStore, GroupStateRecord } from './index.js';
+import type { AgentMdCacheRecord, AgentMdCacheUpsert, GroupIndexCacheRecord, GroupIndexCacheUpsert, TokenStore, GroupStateRecord } from './index.js';
 import {
   _noopLog,
   STORE_CERTS,
@@ -16,6 +16,7 @@ import {
   STORE_INSTANCE_STATE,
   STORE_GROUP_STATE,
   STORE_AGENT_MD_CACHE,
+  STORE_GROUP_INDEX_CACHE,
   safeAid,
   encodePart,
   deepClone,
@@ -29,9 +30,12 @@ import {
   seqTrackerStoreKey,
   agentMdCachePrefix,
   agentMdCacheStoreKey,
+  groupIndexCacheStoreKey,
   stripStructuredFields,
   normalizeAgentMdCacheRecord,
   mergeAgentMdCacheRecord,
+  normalizeGroupIndexCacheRecord,
+  mergeGroupIndexCacheRecord,
   idbGet,
   idbGetAllByPrefix,
   idbPut,
@@ -287,6 +291,29 @@ export class IndexedDBTokenStore implements TokenStore {
       if (aid) aids.add(aid);
     }
     return [...aids].sort();
+  }
+
+  // ── group.index Cache ───────────────────────────────────
+
+  async loadGroupIndexCache(localAid: string, groupAid: string): Promise<GroupIndexCacheRecord | null> {
+    const local = String(localAid ?? '').trim();
+    const group = String(groupAid ?? '').trim();
+    if (!local || !group) return null;
+    const data = await idbGet<JsonObject>(STORE_GROUP_INDEX_CACHE, groupIndexCacheStoreKey(local, group));
+    const record = normalizeGroupIndexCacheRecord(local, group, data);
+    return record ? deepClone(record) : null;
+  }
+
+  async upsertGroupIndexCache(localAid: string, groupAid: string, fields: GroupIndexCacheUpsert): Promise<GroupIndexCacheRecord> {
+    const local = String(localAid ?? '').trim();
+    const group = String(groupAid ?? '').trim();
+    if (!local || !group) {
+      throw new Error('upsertGroupIndexCache requires localAid and groupAid');
+    }
+    const current = await this.loadGroupIndexCache(local, group);
+    const record = mergeGroupIndexCacheRecord(local, group, current, fields ?? {});
+    await idbPut(STORE_GROUP_INDEX_CACHE, groupIndexCacheStoreKey(local, group), record);
+    return deepClone(record);
   }
 
   // ── Group State（群组状态快照） ─────────────────────────────

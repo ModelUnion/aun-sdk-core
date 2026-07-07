@@ -42,6 +42,7 @@ AUN 协议采用**主协议 + 子协议**架构：
 | Peer 直连认证 | 04-Peer-子协议.md |
 | Relay 中继 | 05-Relay-子协议.md |
 | 消息收发、搜索、任务 | 06-服务协议.md |
+| 群组、group.index 签名索引和 CAS | 10-Group-子协议.md |
 | 错误码和状态机 | 07-错误码与状态机.md |
 | E2EE 加密 | ../sdk/E2EE_V2消息通信时序图.md / 08-AUN-E2EE-Group.md；旧信封查 08-AUN-E2EE.md |
 | 安全威胁和防护 | 09-安全考虑.md |

@@ -48,6 +48,23 @@ export {
   splitGroupId,
   buildDiscoveryHost,
 } from './group-id.js';
+export {
+  GROUP_INDEX_KEY,
+  GROUP_INDEX_SCHEMA,
+  GROUP_INDEX_SIG_ALG,
+  GroupIndexMetaCache,
+  buildSignedGroupIndex,
+  computeGroupIndexBodyHash,
+  groupIndexEtag,
+  groupIndexSigningPayload,
+  parseGroupIndex,
+  prepareGroupSettingsWithIndex,
+  verifyGroupIndex,
+  type GroupIndexEntry,
+  type GroupIndexMeta,
+  type GroupIndexSigner,
+  type SignedGroupIndex,
+} from './group-index.js';
 
 // ── 事件 ─────────────────────────────────────────────────────
 export { EventDispatcher, Subscription, type EventHandler } from './events.js';

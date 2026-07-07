@@ -17,7 +17,7 @@ const MAX_RPC_INFLIGHT = 16;
 const MAX_BACKGROUND_RPC_INFLIGHT = 8;
 
 type PendingRpc = {
-  resolve: (value: RpcMessage) => void;
+  resolve: (value: RpcMessage) => void | Promise<void>;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof globalThis.setTimeout>;
 };
@@ -282,7 +282,7 @@ export class RPCTransport {
   private _sendChain: Promise<void> = Promise.resolve();
   // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
   // 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
-  private _metaObserver: ((meta: JsonObject) => void) | null = null;
+  private _metaObserver: ((meta: JsonObject) => void | Promise<void>) | null = null;
   // Trace 模式：off / log / diag
   private _traceMode: string = 'off';
   // Trace observer：observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用
@@ -309,8 +309,19 @@ export class RPCTransport {
    * Gateway 注入的 `_meta` 与业务无关（如 `agent_md_etag`），observer 抛异常会被吞掉，
    * 不影响 RPC result 返回。
    */
-  setMetaObserver(observer: ((meta: JsonObject) => void) | null): void {
+  setMetaObserver(observer: ((meta: JsonObject) => void | Promise<void>) | null): void {
     this._metaObserver = observer;
+  }
+
+  private async _notifyMetaObserver(message: Record<string, unknown>): Promise<void> {
+    if (this._metaObserver === null) return;
+    const meta = message._meta;
+    if (!isJsonObject(meta)) return;
+    try {
+      await this._metaObserver(meta as JsonObject);
+    } catch (exc) {
+      this._log.debug(`meta_observer raised: ${String(exc)}`);
+    }
   }
 
   /** 设置 trace 模式：off / log / diag */
@@ -545,7 +556,7 @@ export class RPCTransport {
       }, effectiveTimeout);
 
       const pending: PendingRpc = {
-        resolve: (response) => {
+        resolve: async (response) => {
           clearTimeout(timer);
           const elapsed = Date.now() - tStart;
           if (response.error !== undefined) {
@@ -563,17 +574,7 @@ export class RPCTransport {
             if (traceId) {
               this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=ok`);
             }
-            // 透传 envelope._meta 给 observer
-            if (this._metaObserver !== null) {
-              const meta = (response as Record<string, unknown>)._meta;
-              if (isJsonObject(meta)) {
-                try {
-                  this._metaObserver(meta as JsonObject);
-                } catch (exc) {
-                  this._log.debug(`meta_observer raised: ${String(exc)}`);
-                }
-              }
-            }
+            await this._notifyMetaObserver(response as Record<string, unknown>);
             // 处理 success 路径的 _trace
             const respTrace = (response as Record<string, unknown>)._trace;
             if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
@@ -867,14 +868,7 @@ export class RPCTransport {
       const protocolEvent = method.slice(6);
       const sdkEvent = EVENT_NAME_MAP[protocolEvent] ?? protocolEvent;
       this._log.debug(`event recv: event=${sdkEvent} ${summarizeDict(message.params, DIAG_RESULT_FIELDS)}`);
-      const meta = (message as Record<string, unknown>)._meta;
-      if (this._metaObserver !== null && isJsonObject(meta)) {
-        try {
-          this._metaObserver(meta as JsonObject);
-        } catch (exc) {
-          this._log.debug(`event meta_observer raised: ${String(exc)}`);
-        }
-      }
+      void this._notifyMetaObserver(message as Record<string, unknown>);
       // 提取事件中的 _trace 并回调 observer，然后从 params 中剥离
       const params = (message.params ?? {}) as Record<string, unknown>;
       if ('_trace' in params) {
@@ -900,14 +894,7 @@ export class RPCTransport {
     }
 
     // 其他通知
-    const meta = (message as Record<string, unknown>)._meta;
-    if (this._metaObserver !== null && isJsonObject(meta)) {
-      try {
-        this._metaObserver(meta as JsonObject);
-      } catch (exc) {
-        this._log.debug(`notification meta_observer raised: ${String(exc)}`);
-      }
-    }
+    void this._notifyMetaObserver(message as Record<string, unknown>);
     this._log.debug(`notification recv: method=${method || '<no-method>'}`);
     this._dispatcher.publish('notification', message);
   }

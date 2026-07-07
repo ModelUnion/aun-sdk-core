@@ -8,6 +8,42 @@
 
 ---
 
+## 0.5.3 — 2026-07-07
+
+### 新功能
+
+#### Group Index 签名索引
+- 新增 `group.index` 签名索引能力，支持 `aun.group.index.v1` JSONL body、`body_hash` / `etag`、`signed_by`、`ECDSA-P256-SHA256` 签名与验签。
+- `GroupFacade` 新增 `CheckGroupIndex()` / `GetGroupIndex()` / `UpdateGroupIndex()`；`UpdateGroupIndex()` 支持拉取旧索引、合并 settings、签名、携带 `expected_index_etag` CAS 写入，并在 etag conflict 时重试。
+- 新增 group index 本地 meta/cache，自动观察 RPC `_meta.group_indexes`，维护 stale/local etag，并缓存 indexed settings 与 `index.jsonl`。
+
+#### Group Settings Facade
+- `UpdateAnnouncement()` / `UpdateRules()` / `UpdateJoinRequirements()` 改为通过 `UpdateGroupIndex()` 写入 indexed settings，保证公告、群规、入群条件更新携带签名索引。
+- `GetAnnouncement()` / `GetRules()` / `GetJoinRequirements()` 支持优先使用 indexed settings cache，缺失时按 key 拉取并回填缓存。
+- cross-sdk-agent 增加 `sdk.update_group_index`，便于跨 SDK 测试调用 Go SDK 的签名索引更新流程。
+
+### 修复
+
+- 修复 P2P 撤回事件直接透传导致的重复回调问题；`message.recalled` 现在统一归一化、按原消息 id/seq/tombstone 去重，并参与有序投递与自动 ack。
+- 修复群撤回去重键过窄问题；去重键不再受 `recalled_at` 影响，缺 `message_ids` 时按原消息 id、target seq 或 tombstone id 兜底，并规范化 group id。
+- 修复 pull / gap-fill 路径中撤回 tombstone 可能被误当作普通群消息投递的问题。
+- 修复 V2 P2P / Group pull 对服务端乱序消息敏感的问题；拉取结果在解密和投递前按 `seq` 稳定排序。
+
+### 改进
+
+- SDK `Version()` 和 V2 E2EE envelope `sdk_version` 更新为 `0.5.3`。
+- `group.index` 以 JSON map 形态进入 RPC settings，避免签名 hash 与序列化形态不一致。
+- indexed settings cache 支持按 entry etag 命中、按缺失 key 补拉，并在身份路径切换时重建 cache。
+
+### 测试
+
+- 新增 group index 单元测试，覆盖 hash/etag、签名 JSONL、验签、base index 合并、JSON map 形态、本地 meta/cache 与磁盘持久化。
+- 新增 group index facade 单元测试，覆盖 CAS 写入、冲突重试、篡改拒绝、cache 命中/缺失、settings helper 走 `UpdateGroupIndex()`。
+- 新增 `TestIntegration_GroupIndexCASAndMeta`，覆盖 stale meta、裸写 indexed settings 拒绝、CAS 冲突与重试、最终签名者和 entries。
+- 扩展撤回回归测试，覆盖 P2P/group 撤回去重键忽略 `recalled_at` 以及顶层 recall 字段归一化。
+
+---
+
 ## 0.5.2 — 2026-07-05
 
 ### 新功能

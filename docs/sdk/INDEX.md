@@ -10,16 +10,16 @@
 |------|------|
 | [01-快速开始](01-快速开始.md) | 安装 · 三主体模型 · 最小示例 · 多语言构造 |
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · JSON-RPC 消息格式 · 裸 WebSocket 示例 |
-| [03-核心概念](03-核心概念.md) | AID · AIDStore · AUNClient · 九态状态机 · E2EE |
+| [03-核心概念](03-核心概念.md) | AID · AIDStore · AUNClient · 九态状态机 · E2EE · Group Index 观察模型 |
 | [04-连接与认证](04-连接与认证.md) | 注册加载 · 认证连接 · 网关发现 · 事件 · agent.md 自动观察 |
 | [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE V2 消息 · ProtectedHeaders · agent.md 版本提示 · recipient wrap |
 | [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md) | V2 P2P/GROUP 明文与加密主链路 |
 | [06-API手册](06-API手册.md) | AIDStore · AID · AUNClient · 事件 · agent.md · E2EE 高级 API · RPC 索引 |
 | [07-错误处理](07-错误处理.md) | Result · 错误类层级 · 错误码 · 重试 |
-| [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · 测试数据保护 |
+| [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · group.index 更新流程 · 测试数据保护 |
 | [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
 | [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
-| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group_aid` / `group_id` 兼容规范、`group.fs.*` 群文件系统 RPC、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义） |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC（含 `group_aid` / `group_id` 兼容规范、`group.index` 签名索引与 CAS、`group.fs.*` 群文件系统 RPC、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义） |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC（对象 + POSIX VFS / 卷 / 软链 / ACL / token） |
 | [09-collab-rpc-manual](09-collab-rpc-manual.md) | 协作 RPC（版本化文档 / 乐观锁 / 三方合并 / 标签 / GC / reflog / revert） |
 | [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md) | `client.group.fs.*` / `aun group fs` / `group.fs.*` 群文件系统设计，含群自有区角色 ACL、`parents` 和 JS string 语义 |
@@ -64,7 +64,7 @@
 - `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
 - `client.notify()` 在线轻量通知、跨域 federation、在线/离线边界 → [Notify通知方案](Notify通知方案.md)
 - Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
-- Group RPC、`group_aid` / `group_id` 兼容规范、群文件系统 `group.fs.*` 控制面、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
+- Group RPC、`group_aid` / `group_id` 兼容规范、`group.index` 签名索引、`_meta.group_indexes` 观察、`expected_index_etag` CAS、群文件系统 `group.fs.*` 控制面、群自有区角色 ACL 授权/撤销/查询和 `parents` 语义 → [09-group-rpc-manual](09-group-rpc-manual.md)
 - 下一版群文件系统 `group.fs.*`、`client.group.fs.*`、`aun group fs`、`cp/mv` POSIX 化语义和 JS string 差异 → [group.fs POSIX 化详细设计](../aun-fs/group-fs/group.fs-POSIX化详细设计.md)、[分阶段实施计划](../aun-fs/group-fs/group.fs-POSIX化分阶段实施计划.md)
 - Storage 架构、SDK VFS、控制面/数据面分离、类 Linux 权限和 mount/symlink → [AUN Storage架构设计](<AUN Storage架构设计.md>)
 - Storage RPC（对象 + `storage.fs.*` / `storage.volume.*` / `storage.fs.touch` / 软链 / ACL / token）→ [09-storage-rpc-manual](09-storage-rpc-manual.md)
@@ -95,7 +95,7 @@
 
 ### 03-核心概念
 
-解释 AID 身份、三主体职责、device_id / slot_id 隔离键、九态状态机、认证挑战-响应、默认 E2EE 行为和 RPC/事件模型。
+解释 AID 身份、三主体职责、device_id / slot_id 隔离键、九态状态机、认证挑战-响应、默认 E2EE 行为、RPC/事件模型，以及 `group.index` 的 `_meta.group_indexes` 观察、不同步标记和应用层 pull/push 边界。
 
 ### 04-连接与认证
 
@@ -107,19 +107,19 @@
 
 ### 06-API手册
 
-列出 AIDStore、AID、AUNClient、事件、agent.md、ServiceProxyClient、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
+列出 AIDStore、AID、AUNClient、事件、agent.md、ServiceProxyClient、E2EE 高级 API、Group Index facade 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
 
 ### 07-错误处理
 
-说明 Result 字典、AUNError 异常层级、错误码映射、重试策略和常见错误场景。
+说明 Result 字典、AUNError 异常层级、错误码映射、重试策略、`group.index etag conflict` CAS 冲突处理和常见错误场景。
 
 ### 08-最佳实践
 
-给出幂等加载身份、连接、关闭、多 AID 管理、protected_headers、Flow Control 和测试数据保护建议。
+给出幂等加载身份、连接、关闭、多 AID 管理、protected_headers、Flow Control、Group Index 更新流程和测试数据保护建议。
 
 ### 09-*-rpc-manual
 
-各业务服务的 RPC 参数、响应和错误语义。Storage、Collab、Group FS、Service Proxy 等明确提供高层门面的能力应优先使用门面；需要精确控制底层参数时再通过 `client.call()` 调用业务 RPC。
+各业务服务的 RPC 参数、响应和错误语义。Group RPC 覆盖 `group.index` 签名索引、`expected_index_etag` CAS 和 `_meta.group_indexes` 观察。Storage、Collab、Group FS、Service Proxy 等明确提供高层门面的能力应优先使用门面；需要精确控制底层参数时再通过 `client.call()` 调用业务 RPC。
 
 ### AUN Storage架构设计
 

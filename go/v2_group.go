@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -503,6 +504,9 @@ func (v *v2E2EECoordinator) pullGroupV2WithOptions(ctx context.Context, groupID 
 			messages = append(messages, msg)
 		}
 	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		return toInt64(messages[i]["seq"]) < toInt64(messages[j]["seq"])
+	})
 	serverAckSeq := int64(0)
 	hasServerAckSeq := false
 	if cursor, ok := result["cursor"].(map[string]any); ok {

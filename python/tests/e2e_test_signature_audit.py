@@ -163,12 +163,10 @@ async def test_full_lifecycle_signature_audit():
 
         sub_ann = bob.on("group.changed", _on_ann)
 
-        await alice.call("group.set_settings", {
-            "group_id": group_id,
-            "settings": {
-                "announcement.content": f"审计测试公告 {rid}",
-            }
-        })
+        await alice.group.update_announcement(
+            group_id=group_id,
+            content=f"审计测试公告 {rid}",
+        )
         await _wait_event(events, ready)
 
         if events:
@@ -190,12 +188,10 @@ async def test_full_lifecycle_signature_audit():
 
         sub_rules = bob.on("group.changed", _on_rules)
 
-        await alice.call("group.set_settings", {
-            "group_id": group_id,
-            "settings": {
-                "rules.content": "审计测试规则",
-            }
-        })
+        await alice.group.update_rules(
+            group_id=group_id,
+            content="审计测试规则",
+        )
         await _wait_event(events, ready)
 
         if events:
@@ -217,12 +213,10 @@ async def test_full_lifecycle_signature_audit():
 
         sub_join = bob.on("group.changed", _on_join_req)
 
-        await alice.call("group.set_settings", {
-            "group_id": group_id,
-            "settings": {
-                "join.mode": "approval",
-            }
-        })
+        await alice.group.update_join_requirements(
+            group_id=group_id,
+            mode="approval",
+        )
         await _wait_event(events, ready)
 
         if events:

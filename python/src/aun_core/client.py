@@ -50,6 +50,7 @@ from .errors import (
     ValidationError,
 )
 from .events import EventDispatcher, Subscription
+from .group_index import GroupIndexMetaCache
 from .group_id import normalize_group_id as _normalize_group_id
 from .validators import validate_aid_format as _validate_aid_format, validate_group_id_format as _validate_group_id_format
 from .keystore.local_token_store import LocalTokenStore
@@ -563,6 +564,7 @@ class AUNClient:
         self._prekey_pending_replenish: int = 0
         # agent.md 存储路径由 AgentMdManager 固定管理为 {aun_path}/AIDs/{aid}/。
         self._agent_md_manager = _build_client_runtime_manager(self)
+        self._group_index_meta_cache = GroupIndexMetaCache(self._config_model.aun_path)
         # 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传。
         # connect 成功后上传的 prekey 记录为活跃；历史 prekey 被消费不触发上传。
         self._active_prekey_id: str = ""
@@ -920,6 +922,53 @@ class AUNClient:
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
         self._agent_md_manager.observe_rpc_meta(meta, owner_aid=self._aid or "")
+        self._group_index_meta_cache.observe_rpc_meta(meta, local_aid=self._aid or "")
+
+    def is_group_index_stale(self, group_aid: str) -> bool:
+        return self._group_index_meta_cache.is_stale(self._aid or "", group_aid)
+
+    def mark_group_index_fresh(self, group_aid: str, *, etag: str) -> None:
+        self._group_index_meta_cache.mark_fresh(self._aid or "", group_aid, etag=etag)
+
+    def get_group_index_remote_meta(self, group_aid: str) -> dict | None:
+        return self._group_index_meta_cache.remote_meta(self._aid or "", group_aid)
+
+    def get_group_index_local_etag(self, group_aid: str) -> str:
+        return self._group_index_meta_cache.local_etag(self._aid or "", group_aid)
+
+    def get_group_index_cached_settings(self, group_aid: str, keys: list[str]) -> dict | None:
+        return self._group_index_meta_cache.cached_settings(self._aid or "", group_aid, [str(key) for key in keys])
+
+    def get_group_index_cached_settings_by_entries(
+        self,
+        group_aid: str,
+        keys: list[str],
+        entries: list[dict],
+    ) -> tuple[dict, list[str]]:
+        return self._group_index_meta_cache.cached_settings_by_entries(
+            self._aid or "",
+            group_aid,
+            [str(key) for key in keys],
+            entries,
+        )
+
+    def cache_group_index_settings(
+        self,
+        group_aid: str,
+        settings: dict,
+        *,
+        entries: list[dict] | None = None,
+        etag: str = "",
+        group_index: object | None = None,
+    ) -> None:
+        self._group_index_meta_cache.cache_settings(
+            self._aid or "",
+            group_aid,
+            dict(settings),
+            entries=entries,
+            etag=etag,
+            group_index=group_index,
+        )
 
     def set_trace_mode(self, mode: str) -> None:
         """设置会话级 trace mode（off/log/diag），影响后续所有 RPC 调用。"""

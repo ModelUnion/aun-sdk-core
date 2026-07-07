@@ -159,7 +159,7 @@ describe('Group Settings: set_settings', () => {
 
       let setResult: Record<string, unknown>;
       try {
-        setResult = await owner.call('group.set_settings', {
+        setResult = await owner.group.updateGroupIndex({
           group_id: groupId,
           settings: {
             'rules.content': '请遵守测试群规',
@@ -336,11 +336,16 @@ describe('Group Settings: get_settings', () => {
 
       // 先写入一些设置
       try {
-        await owner.call('group.set_settings', {
+        await owner.group.setSettings({
           group_id: groupId,
           settings: {
             name: `GetAll-${rid}`,
             description: '全量读取测试',
+          },
+        });
+        await owner.group.updateGroupIndex({
+          group_id: groupId,
+          settings: {
             'rules.content': '测试群规',
             'announcement.content': '测试公告',
           },
@@ -414,11 +419,16 @@ describe('Group Settings: get_settings', () => {
 
       // 写入多个字段
       try {
-        await owner.call('group.set_settings', {
+        await owner.group.setSettings({
           group_id: groupId,
           settings: {
             name: `Filtered-${rid}`,
             description: '过滤测试',
+          },
+        });
+        await owner.group.updateGroupIndex({
+          group_id: groupId,
+          settings: {
             'rules.content': '过滤群规',
             'announcement.content': '过滤公告',
           },
@@ -497,10 +507,15 @@ describe('Group Settings: get_settings', () => {
       const expectedAnnouncement = '值匹配测试公告';
 
       try {
-        await owner.call('group.set_settings', {
+        await owner.group.setSettings({
           group_id: groupId,
           settings: {
             name: expectedName,
+          },
+        });
+        await owner.group.updateGroupIndex({
+          group_id: groupId,
+          settings: {
             'rules.content': expectedRules,
             'announcement.content': expectedAnnouncement,
           },
@@ -766,10 +781,15 @@ describe('Group: 设置同步', () => {
       const syncedAnnouncement = '同步测试公告';
 
       try {
-        await owner.call('group.set_settings', {
+        await owner.group.setSettings({
           group_id: groupId,
           settings: {
             name: syncedName,
+          },
+        });
+        await owner.group.updateGroupIndex({
+          group_id: groupId,
+          settings: {
             'rules.content': syncedRules,
             'announcement.content': syncedAnnouncement,
           },

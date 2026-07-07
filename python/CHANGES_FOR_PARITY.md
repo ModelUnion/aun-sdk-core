@@ -1,10 +1,169 @@
-# Python SDK 变更清单（v0.3.3 → v0.5.2）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.5.3）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) → `9eadd3a8` (v0.5.1 发布基线) + 工作区 (v0.5.2)。
+涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) → `9eadd3a8` (v0.5.1 发布基线) → `b8b8a1b1` (v0.5.2 发布基线) + 当前工作区 (v0.5.3)。
+
+---
+
+## v0.5.3 — 相对于 v0.5.2 发布基线的变更
+
+> 基线：`b8b8a1b1`（v0.5.2 对外发布提交）vs 当前工作区（目标版本 v0.5.3，`pyproject.toml` / `version.py` 已标 0.5.3）。
+>
+> 行号说明：本节所有 `Lx` / `Lx~Ly` 均指**当前工作区文件行号**。定位格式统一为 `file:func:line`；模块级常量或版本号使用 `file:<module>:line`。
+>
+> 变更块：**① 版本号**、**② group.index 签名索引**、**③ Client / GroupFacade 接入**、**④ 撤回去重与有序投递**、**⑤ V2 pull 排序**、**⑥ 测试覆盖与对齐优先级**。
+
+### 版本号
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `pyproject.toml:<module>:L7` | 修改 | Python 包版本升级为 `0.5.3` |
+| `src/aun_core/version.py:<module>:L1` | 修改 | SDK 运行时 `__version__` 升级为 `0.5.3` |
+
+### 块① group.index 签名索引
+
+#### 数据格式、签名与验签
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/group_index.py:<module>:L14~16` | 新增 | 定义 `aun.group.index.v1`、`group.index`、`ECDSA-P256-SHA256` 三个 group index 常量 |
+| `src/aun_core/group_index.py:_canonical_json:L208` | 新增 | 复用 V2 canonical JSON，确保跨语言 body hash / 签名载荷稳定 |
+| `src/aun_core/group_index.py:compute_group_index_body_hash:L218` | 新增 | 对 canonical entries JSONL 计算 `sha256:` body hash |
+| `src/aun_core/group_index.py:group_index_etag:L222` | 新增 | 以 entries JSONL hash 生成带引号的 `\"sha256:...\"` etag |
+| `src/aun_core/group_index.py:group_index_signing_payload:L226` | 新增 | 签名载荷为 canonical meta（不含 signature）+ canonical entries JSONL |
+| `src/aun_core/group_index.py:build_signed_group_index:L234` | 新增 | 构造 signed `group.index`：meta 含 `etag/body_hash/signed_by/sig_alg/signature`，body 为 JSONL |
+| `src/aun_core/group_index.py:parse_group_index:L263` | 新增 | 解析 JSONL body，要求首行为 `index_meta`，后续行为 entries |
+| `src/aun_core/group_index.py:verify_group_index:L276` | 新增 | 校验 signature、`signed_by`、`sig_alg`、body hash、etag；失败时返回结构化 reason |
+| `src/aun_core/group_index.py:prepare_group_settings_with_index:L315` | 新增 | 将 settings 与 signed `group.index` 合并为一次 `group.set_settings` payload，并保留 base index 未更新 entries |
+
+**对齐要点**：四语言必须使用同一 canonical entries JSONL、同一签名载荷和同一 etag/body_hash 口径。`signature` 字段不得参与待签名 meta；`group.index` 需要作为 map/object 进入 RPC settings，避免字符串序列化差异影响签名 hash。
+
+#### 本地 meta/cache
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/group_index.py:GroupIndexMetaCache.observe_rpc_meta:L28` | 新增 | 观察 RPC `_meta.group_indexes`，记录远端 `etag/last_modified/schema` 并按 local aid + group aid 标记 stale |
+| `src/aun_core/group_index.py:GroupIndexMetaCache.mark_fresh:L45` | 新增 | 本地 index 成功拉取或写入后记录 local etag，并清除 stale |
+| `src/aun_core/group_index.py:GroupIndexMetaCache.cached_settings:L67` | 新增 | 按 keys 返回完整命中的本地 indexed settings cache |
+| `src/aun_core/group_index.py:GroupIndexMetaCache.cached_settings_by_entries:L80` | 新增 | 按 entry etag 局部命中 settings cache，返回 cached/missing 分组 |
+| `src/aun_core/group_index.py:GroupIndexMetaCache.cache_settings:L101` | 新增 | 缓存 settings、entry etags、local etag，并可同步保存 group index body |
+| `src/aun_core/group_index.py:GroupIndexMetaCache._save_key:L171` | 新增 | 持久化 `group-index-cache.json`，内容包括 remote meta、local etag、settings、entry etags |
+| `src/aun_core/group_index.py:GroupIndexMetaCache._save_group_index_body:L188` | 新增 | 持久化 `index.jsonl`，作为本地 group index body 缓存 |
+
+**对齐要点**：缓存维度必须包含 local aid 和 group aid，不能跨身份复用。远端 etag 与本地 etag 不一致时必须视为 stale；读取 settings 时应优先按 entry etag 局部命中，缺失 key 再回源。
+
+### 块② Client / GroupFacade 接入
+
+#### AUNClient meta 观察和 cache helper
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/client.py:AUNClient.__init__:L567` | 新增 | 初始化 `GroupIndexMetaCache(self._config_model.aun_path)` |
+| `src/aun_core/client.py:AUNClient._observe_rpc_meta:L922` | 修改 | RPC meta 同时喂给 agent.md manager 和 group index meta cache |
+| `src/aun_core/client.py:AUNClient.is_group_index_stale:L927` | 新增 | 暴露 group index stale 查询给 facade |
+| `src/aun_core/client.py:AUNClient.mark_group_index_fresh:L930` | 新增 | 暴露 mark fresh，供拉取/写入成功后刷新 local etag |
+| `src/aun_core/client.py:AUNClient.get_group_index_remote_meta:L933` | 新增 | 读取最近观察到的远端 group index meta |
+| `src/aun_core/client.py:AUNClient.get_group_index_local_etag:L936` | 新增 | 读取本地 group index etag |
+| `src/aun_core/client.py:AUNClient.get_group_index_cached_settings:L939` | 新增 | 读取完整命中的 cached settings |
+| `src/aun_core/client.py:AUNClient.get_group_index_cached_settings_by_entries:L942` | 新增 | 按 entries + entry etag 局部命中 cached settings |
+| `src/aun_core/client.py:AUNClient.cache_group_index_settings:L955` | 新增 | 将拉取或写入后的 settings / entries / etag / index body 写入本地缓存 |
+
+#### GroupFacade 索引化设置
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/facades.py:GroupFacade.check_group_index:L165` | 新增 | 不发 RPC，直接基于本地/远端 etag 返回 `in_sync/needs_update/cached` 状态 |
+| `src/aun_core/facades.py:GroupFacade.get_group_index:L195` | 新增 | 拉取 `group.index`，解析、验签、按 entries 补齐 settings，并 mark fresh/cache |
+| `src/aun_core/facades.py:GroupFacade._verify_group_index:L226` | 新增 | 优先用当前 AID 校验；否则通过 `lookup_peer()` 获取 signer AID 后验签 |
+| `src/aun_core/facades.py:GroupFacade.update_group_index:L248` | 新增 | 拉取当前 index，合并 settings，生成 signed `group.index`，携带 `expected_index_etag` CAS 写入；etag conflict 最多重试一次 |
+| `src/aun_core/facades.py:GroupFacade._index_update_params:L305` | 新增 | 统一构造高级 facade 写入 group index 所需参数 |
+| `src/aun_core/facades.py:GroupFacade._hydrate_group_index_settings:L339` | 新增 | 根据 index entries 读取缺失 settings，并回填 cache |
+| `src/aun_core/facades.py:GroupFacade._get_indexed_settings:L374` | 新增 | 公告/规则/入群要求读取路径优先查本地 cache，缺失再 RPC 拉 key |
+| `src/aun_core/facades.py:GroupFacade.get_announcement:L390` | 修改 | 公告读取改为使用 `_get_indexed_settings()` |
+| `src/aun_core/facades.py:GroupFacade.update_announcement:L412` | 修改 | 公告写入改为 `update_group_index()`，不再裸写 `group.set_settings` |
+| `src/aun_core/facades.py:GroupFacade.get_rules:L439` | 修改 | 群规读取改为使用 `_get_indexed_settings()` |
+| `src/aun_core/facades.py:GroupFacade.update_rules:L461` | 修改 | 群规写入改为 `update_group_index()` |
+| `src/aun_core/facades.py:GroupFacade.get_join_requirements:L488` | 修改 | 入群要求读取改为使用 `_get_indexed_settings()` |
+| `src/aun_core/facades.py:GroupFacade.update_join_requirements:L512` | 修改 | 入群要求写入改为 `update_group_index()` |
+
+**对齐要点**：indexed settings 的高级写入路径必须生成 signed `group.index` 并携带 `expected_index_etag`。裸写 `rules.content`、`announcement.content`、`join.*` 等 indexed settings 的行为应视为不推荐或由服务端拒绝。
+
+### 块③ 撤回去重与有序投递
+
+#### P2P `message.recalled`
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/client.py:AUNClient.__init__:L683~687` | 修改 | `_raw.message.recalled` 改为专门处理器，不再直接透传到应用层 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.__init__:L68` | 新增 | 初始化 P2P recall 去重锁和 per-group recall 去重锁 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_ordered_queue_item:L172` | 修改 | ordered queue 中的 `message.recalled` 进入 tombstone 专用发布逻辑 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.recall_event_from_message:L484` | 新增/扩展 | P2P recall tombstone 归一化，兼容顶层 recall 字段和 payload 字段 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.message_recall_dedup_key:L536` | 新增 | P2P 去重键优先使用原消息 ids，fallback 到原消息 id、target seq、tombstone id |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_message_recall_tombstone:L565` | 新增 | P2P push/pull tombstone 只发布一次 `message.recalled`，并限制去重表大小 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_pulled_message:L978` | 修改 | pull 批中的 `message.recalled` 使用 tombstone 专用发布，且投递前 drain ordered queue |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_raw_message_recalled:L1164` | 新增 | 在线 P2P recall push 支持实例过滤、seq tracking、有序发布、gap fill 和 auto ack |
+
+#### Group `group.message_recalled`
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.recall_event_from_group_message:L600` | 修改 | 群 recall tombstone 归一化补齐顶层 recall 字段 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.group_recall_dedup_key:L649` | 修改 | 去重键改为 group + 原消息标识；缺少 `message_ids` 时 fallback 到原消息 id / target seq / tombstone id；忽略 `recalled_at` |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine._group_recall_dedup_lock:L686` | 新增 | 每个 group 独立去重锁，避免并发 push/pull 重复发布 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_group_recall_tombstone:L694` | 修改 | 发布前 normalize group id，并在 per-group lock 内去重 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_raw_group_message_recalled:L1325` | 修改 | 在线 group recall push 包装为统一 tombstone 形态后进入去重发布 |
+| `src/aun_core/_client/delivery.py:MessageDeliveryEngine.on_raw_group_message_created_inner:L1501~1503` | 修改 | 普通群消息 push 路径遇到 recall tombstone 时不再当作 `group.message_created` 投递 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2566~2569` | 修改 | V2 group pull 遇到 recall tombstone 时归一化发布 `group.message_recalled` |
+
+**对齐要点**：P2P 和 Group recall 都必须按“原消息标识”去重，不可把 `recalled_at` 纳入去重键。push、pull、gap-fill、V2 pull 四条路径对同一次撤回只能触发一次应用层回调。
+
+### 块④ V2 pull 排序
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L783` | 修改 | `message.v2.pull` raw messages 按 `seq` 排序后处理 |
+| `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2512` | 修改 | `group.v2.pull` raw messages 按 `seq` 排序后处理 |
+
+**对齐要点**：服务端返回顺序不应影响 SDK 本地投递、解密和 ack 推进。其他语言 SDK 需要在处理页内 raw messages 前按 `seq` 做稳定排序。
+
+### 块⑤ 测试覆盖与跨 SDK 对齐优先级
+
+#### 新增/重点测试入口
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `tests/unit/test_group_index.py:test_group_index_body_hash_is_stable_for_dict_order:L54` | 新增 | group index body hash 不受 dict key 顺序影响 |
+| `tests/unit/test_group_index.py:test_group_index_body_hash_uses_v2_canonical_json_for_numbers:L67` | 新增 | group index hash 使用 V2 canonical JSON 数字格式 |
+| `tests/unit/test_group_index.py:test_signed_group_index_roundtrip_and_tamper_detection:L85` | 新增 | signed index 往返解析、验签与篡改检测 |
+| `tests/unit/test_group_index.py:test_group_index_meta_cache_persists_index_jsonl_and_cache_envelope:L151` | 新增 | cache envelope 和 `index.jsonl` 持久化 / 恢复 |
+| `tests/unit/test_group_index_facade.py:test_update_group_index_sends_expected_index_etag_and_signed_index:L154` | 新增 | `update_group_index()` 同时写 settings、signed `group.index` 和 `expected_index_etag` |
+| `tests/unit/test_group_index_facade.py:test_get_group_index_rejects_tampered_remote_index_before_cache_update:L221` | 新增 | 远端 index 被篡改时拒绝并不更新 cache |
+| `tests/unit/test_group_index_facade.py:test_update_group_index_reloads_index_and_retries_once_on_cas_conflict:L347` | 新增 | etag CAS 冲突后重拉 index 并重试 |
+| `tests/unit/test_group_index_facade.py:test_indexed_settings_helpers_write_signed_group_index:L372` | 新增 | 公告、群规、入群要求 helper 都走 signed `group.index` 写入 |
+| `tests/integration_test_group_index.py:main:L78` | 新增 | 集成覆盖 signed `group.index`、裸写 indexed settings 拒绝、旧 etag CAS 失败、SDK 重试合并保存 |
+| `tests/e2e_test_group_index.py:<module>:L5` | 新增 | E2E 入口复用 group index 集成场景 |
+| `tests/unit/test_group_recall.py:test_recall_from_message_top_level_fields:L118` | 新增 | P2P recall 顶层字段归一化 |
+| `tests/unit/test_group_recall.py:test_message_recall_dedup_across_push_and_pull:L270` | 新增 | P2P recall push/pull 同一次撤回只回调一次 |
+| `tests/unit/test_group_recall.py:test_group_recall_dedup_normalizes_group_identifier:L352` | 新增 | 群 recall 去重前 normalize group id |
+| `tests/integration_test_group_settings.py:main:L155~168` | 修改 | settings 集成测试改用 `update_group_index()` 写 indexed settings |
+| `tests/integration_test_signature.py:test_update_announcement_has_signature:L112` | 修改 | 公告签名测试改用 `group.update_announcement()` facade helper |
+| `tests/integration_test_signature.py:test_update_rules_has_signature:L172` | 修改 | 群规签名测试改用 `group.update_rules()` facade helper |
+| `tests/e2e_test_signature_audit.py:test_full_lifecycle_signature_audit:L166/L191/L216` | 修改 | 签名审计 E2E 的公告/规则/入群要求更新改用 facade helper |
+
+#### 跨语言对齐优先级
+
+| 优先级 | 对齐项 | Python 参考定位 |
+|--------|--------|----------------|
+| P0 | `group.index` JSONL 格式、canonical hash/etag、签名载荷、验签 reason | `src/aun_core/group_index.py:build_signed_group_index:L234`; `src/aun_core/group_index.py:verify_group_index:L276` |
+| P0 | indexed settings 写入必须带 signed `group.index` 与 `expected_index_etag` | `src/aun_core/facades.py:GroupFacade.update_group_index:L248` |
+| P0 | P2P/Group recall push/pull/gap-fill 去重，去重键不含 `recalled_at` | `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_message_recall_tombstone:L565`; `src/aun_core/_client/delivery.py:MessageDeliveryEngine.publish_group_recall_tombstone:L694` |
+| P1 | group index 本地 cache、fresh/stale、entry etag 局部命中 | `src/aun_core/group_index.py:GroupIndexMetaCache.cached_settings_by_entries:L80`; `src/aun_core/group_index.py:GroupIndexMetaCache.cache_settings:L101` |
+| P1 | 公告/群规/入群要求读取优先本地 cache，缺失再 RPC | `src/aun_core/facades.py:GroupFacade._get_indexed_settings:L374`; `src/aun_core/facades.py:GroupFacade._hydrate_group_index_settings:L339` |
+| P1 | V2 P2P / Group pull 页内 raw messages 按 seq 排序 | `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_v2_internal:L783`; `src/aun_core/_client/v2_e2ee.py:V2E2EECoordinator.pull_group_v2_internal:L2512` |
+| P2 | 测试对齐：group index、facade CAS、撤回去重、签名审计 facade helper | `tests/unit/test_group_index.py:test_signed_group_index_roundtrip_and_tamper_detection:L85`; `tests/unit/test_group_index_facade.py:test_update_group_index_reloads_index_and_retries_once_on_cas_conflict:L347`; `tests/unit/test_group_recall.py:test_message_recall_dedup_across_push_and_pull:L270` |
 
 ---
 

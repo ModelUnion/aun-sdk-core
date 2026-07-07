@@ -19,7 +19,7 @@
 | E2EE | [08-AUN-E2EE.md](08-AUN-E2EE.md) | Legacy P2P E2EE 信封说明；当前默认主路径见 SDK V2 多设备 wrap 文档 |
 | E2EE-Group | [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE V2：消息级密钥、逐设备密钥包裹、成员状态签名验证 |
 | 09 | [09-安全考虑.md](09-安全考虑.md) | 威胁模型、防护措施、升级安全、验签时序 |
-| 10 | [10-Group-子协议.md](10-Group-子协议.md) | `group.*` 群组管理、群消息、邀请码、资源共享、在线状态 |
+| 10 | [10-Group-子协议.md](10-Group-子协议.md) | `group.*` 群组管理、群消息、`group.index` 签名索引、邀请码、资源共享、在线状态 |
 | 11 | [11-Storage-子协议.md](11-Storage-子协议.md) | `storage.*` 对象存储、大文件上传下载、预签名 URL |
 | 12 | [12-Stream-子协议.md](12-Stream-子协议.md) | `stream.*` 实时流式传输、WebSocket 推流、HTTP SSE 拉流、跨域拉流 |
 | 15 | [15-离线推送通知协议.md](15-离线推送通知协议.md) | `push.*` 离线推送、push_notify_aid 代理、事件通知 + 背压 ack、白名单与去重 |
@@ -54,7 +54,8 @@
 | 跨域消息路由 | 06 §6.7 |
 | E2EE 端到端加密 | AUN-E2EE, 06 §6.6 |
 | 群组管理（group.*） | 10 |
-| 群消息收发（group.send/pull） | 10 §10.5 |
+| 群索引（group.index / _meta.group_indexes / CAS） | 10 §10.13 |
+| 群消息收发（group.send/pull） | 10 §10.6 |
 | 群成员权限（owner/admin/member） | 10 §10.2 |
 | 邀请码（group.create_invite_code） | 10 §10.7 |
 | 群文件系统（group.fs.*） | 10 §10.9 |
@@ -114,7 +115,7 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 威胁模型、传输层安全、认证安全、JWT 信任模型分析、连接升级安全（降级攻击/假地址注入/信令重放）、公开 AP 同步安全、证书轮换验签时序。
 
 ### 10-Group-子协议
-`group.*` 命名空间完整协议规范。群组生命周期（create/suspend/resume/dissolve）、成员管理（add/kick/set_role/transfer_owner）、群消息（send/pull/ack、`payload.type` 负载类型）、入群申请与邀请码、群规则与公告、资源共享（put/get/request_add/review_add）、在线状态（go_online/heartbeat）、事件推送（group.created/changed/message_created）、错误码（-33001~-33009）。Group Service 作为独立 AID 持有者运行。
+`group.*` 命名空间完整协议规范。群组生命周期（create/suspend/resume/dissolve）、成员管理（add/kick/set_role/transfer_owner）、群消息（send/pull/ack、`payload.type` 负载类型）、`group.index` 签名索引与 `expected_index_etag` CAS、`_meta.group_indexes` 版本提示、入群申请与邀请码、群规则与公告、资源共享、在线状态、事件推送（group.created/changed/message_created）、错误码（-33001~-33009）。Group Service 作为独立 AID 持有者运行，Gateway/Message 不生成或改写 group index。
 
 ### 11-Storage-子协议
 `storage.*` 命名空间完整协议规范。控制面与数据面分离（小对象内联 RPC，大对象预签名 URL HTTP 传输）、per-AID 隔离、对象键路径化、版本化 CAS 并发控制。方法：put_object / get_object / delete_object / list_objects / create_upload_session / create_download_ticket。

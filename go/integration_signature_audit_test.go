@@ -50,7 +50,7 @@ func verifySignatureFields(t *testing.T, event map[string]any, label string) boo
 
 // ---------------------------------------------------------------------------
 // TestIntegration_SignatureAudit_UpdateAnnouncement
-// group.set_settings(announcement) 应携带签名
+// updateGroupIndex(announcement) 应携带签名
 // ---------------------------------------------------------------------------
 
 func TestIntegration_SignatureAudit_UpdateAnnouncement(t *testing.T) {
@@ -119,7 +119,7 @@ func TestIntegration_SignatureAudit_UpdateAnnouncement(t *testing.T) {
 	})
 
 	// ---- Alice 修改公告 ----
-	_, err = alice.Call(ctx, "group.set_settings", map[string]any{
+	_, err = alice.Group().UpdateGroupIndex(ctx, map[string]any{
 		"group_id": groupID,
 		"settings": map[string]any{
 			"announcement.content": fmt.Sprintf("签名测试公告 %s", rid),
@@ -127,7 +127,7 @@ func TestIntegration_SignatureAudit_UpdateAnnouncement(t *testing.T) {
 	})
 	skipIfNotImplemented(t, err, "group.set_settings")
 	if err != nil {
-		t.Fatalf("set_settings(announcement) 失败: %v", err)
+		t.Fatalf("updateGroupIndex(announcement) 失败: %v", err)
 	}
 	t.Logf("Alice 更新公告成功")
 

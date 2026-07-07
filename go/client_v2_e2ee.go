@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1296,6 +1297,9 @@ func (v *v2E2EECoordinator) pullV2WithForce(ctx context.Context, afterSeq int64,
 			messages = append(messages, msg)
 		}
 	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		return toInt64(messages[i]["seq"]) < toInt64(messages[j]["seq"])
+	})
 	_, hasServerAckSeq := result["server_ack_seq"]
 	serverAckSeq := toInt64(result["server_ack_seq"])
 	meta = v2PullPageMeta{

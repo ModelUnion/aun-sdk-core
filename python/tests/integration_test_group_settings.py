@@ -3,7 +3,7 @@
 
 覆盖：
   1. set_settings 写入 groups 表字段（name, visibility）
-  2. set_settings 写入 settings 表字段（rules.content, announcement.content, duty.config）
+  2. update_group_index 写入 indexed settings（rules.content, announcement.content）
   3. set_settings 混合写入
   4. set_settings 未知 key 被拒绝
   5. set_settings 非管理员被拒绝
@@ -152,15 +152,15 @@ async def main():
         _check("updated_keys 包含 description", "description" in r1.get("updated_keys", []))
         print()
 
-        # ── 2. set_settings: settings 表字段 ──
-        print("--- 2. set_settings: rules.content + announcement.content ---")
-        r2 = await alice.call("group.set_settings", {
-            "group_id": group_id,
-            "settings": {
+        # ── 2. update_group_index: indexed settings ──
+        print("--- 2. update_group_index: rules.content + announcement.content ---")
+        r2 = await alice.group.update_group_index(
+            group_id=group_id,
+            settings={
                 "rules.content": "请遵守测试群规",
                 "announcement.content": "欢迎来到测试群",
             },
-        })
+        )
         _check("set rules+announcement 成功", r2.get("group_id") == group_id)
         _check("updated_keys 含 rules.content",
                "rules.content" in r2.get("updated_keys", []))

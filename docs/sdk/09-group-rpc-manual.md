@@ -103,7 +103,7 @@
 | [group.set_settings](#groupset_settings) | 统一设置群参数（含公告、规则、入群要求、dispatch_mode 等） |
 | [group.get_settings](#groupget_settings) | 统一读取群参数 |
 
-**便利方法**：SDK 提供向后兼容的便利方法（`getAnnouncement`/`updateAnnouncement`/`getRules`/`updateRules`/`getJoinRequirements`/`updateJoinRequirements`），内部调用 `set_settings`/`get_settings`，返回旧格式。新代码建议直接使用 `set_settings`/`get_settings`。
+**便利方法**：SDK 提供向后兼容的便利方法（`getAnnouncement`/`updateAnnouncement`/`getRules`/`updateRules`/`getJoinRequirements`/`updateJoinRequirements`）。读取方法优先返回 SDK 本地缓存，本地没有对应值时才调用 `get_settings` 初始化；即使观察到远端 etag 不一致也不会自动 pull 远端。indexed 写入方法内部调用 `updateGroupIndex` 生成签名 `group.index` 并通过 `set_settings` CAS 提交。
 
 ### 群文件系统
 
@@ -953,6 +953,8 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 
 统一写入群参数。需要 admin 及以上权限。`dispatch_mode` 是群消息的应用层分发模式标签，会随 `group.send` 生成的消息持久化，并由 SDK 在解密后注入到消息顶层和 `payload.dispatch_mode`。
 
+`group.index` 是保留设置 key，用于保存 owner/admin SDK 生成并签名的群索引。更新 indexed settings 时必须同包提交新的签名 `group.index`，并通过 `expected_index_etag` 做 CAS。
+
 `dispatch_mode` 不是 `group.send` 的单次入参；要修改后续消息的模式，请通过 `group.set_settings` 更新群设置。
 
 **参数**：
@@ -961,9 +963,11 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 |------|------|------|------|
 | `group_id` | string | 是 | 群组标识；兼容字段，值语义为目标态 `group_aid` |
 | `settings` | object | 是 | 要写入的设置键值 |
+| `expected_index_etag` | string | 写 `group.index` 时必填 | CAS 期望旧 etag；空字符串表示只允许创建首个 `group.index` |
 | `settings["dispatch_mode"]` | string | 否 | `"broadcast"` / `"mention"`，默认 `"broadcast"` |
 | `settings["rules.content"]` | string | 否 | 群规则正文 |
 | `settings["announcement.content"]` | string | 否 | 群公告正文 |
+| `settings["group.index"]` | object | 更新 indexed settings 时必填 | 签名 group index，当前结构至少包含 `body` |
 
 **预定义群级参数**：
 
@@ -981,6 +985,23 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 | `join.auto_approve_patterns` | array | `[]` | 自动批准 AID 匹配规则 |
 | `join.max_pending` | integer | `100` | 最大待审批入群申请数 |
 | `dispatch_mode` | string | `"broadcast"` | 群消息分发标签：`"broadcast"` / `"mention"`；未显式设置时 `get_settings` 仍返回默认值 |
+| `group.index` | object | — | 保留 key；签名 JSONL 群索引，由 SDK 生成，服务端只校验、CAS 保存和返回 |
+
+**indexed settings**：
+
+| key | 说明 |
+|-----|------|
+| `rules.content` / `rules.attachments` | 群规则正文与附件稳定引用 |
+| `announcement.content` / `announcement.attachments` | 群公告正文与附件稳定引用 |
+| `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` | 入群要求配置 |
+
+写入规则：
+
+- 只更新非 indexed settings 时，继续直接调用 `set_settings`，不需要 `group.index`。
+- 更新任意 indexed setting 时，必须在同一次 `settings` 中携带签名 `group.index`。
+- 写入 `group.index` 时必须传 `expected_index_etag`。
+- 服务端在同一事务内比较当前 `group.index` etag、写 indexed settings、写 `group.index`。
+- CAS 失败时错误消息包含 `group.index etag conflict`；SDK 的 `updateGroupIndex` 会重新读取当前 index、重建签名并按 `max_attempts` 重试。
 
 ```python
 await client.call("group.set_settings", {
@@ -994,31 +1015,84 @@ await client.call("group.set_settings", {
 ```json
 {
     "group_id": "g-abc123.agentid.pub",
+    "group_aid": "g-abc123.agentid.pub",
     "updated_keys": ["dispatch_mode"]
 }
 ```
 
+写入 `group.index` 成功时，响应顶层会强制携带 `_meta.group_indexes`：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "group_aid": "g-abc123.agentid.pub",
+    "updated_keys": ["announcement.content", "group.index"],
+    "_meta": {
+        "group_indexes": {
+            "g-abc123.agentid.pub": {
+                "etag": "\"sha256:...\"",
+                "last_modified": 1780000000000,
+                "schema": "aun.group.index.v1"
+            }
+        }
+    }
+}
+```
+
+`group.index` 的正文格式：
+
+```jsonl
+{"type":"index_meta","group_aid":"g-abc123.agentid.pub","etag":"\"sha256:...\"","last_modified":1780000000000,"schema":"aun.group.index.v1","body_hash":"sha256:...","signed_by":"alice.agentid.pub","sig_alg":"ECDSA-P256-SHA256","signature":"base64..."}
+{"key":"announcement.content","source":"db","etag":"\"sha256:...\"","last_modified":1780000000000}
+```
+
+`etag` 和 `body_hash` 都由 index 条目的 canonical JSONL bytes 计算。`signature` 覆盖去掉 `signature` 字段后的 `index_meta` 和正文条目，`signed_by` 必须等于本次 RPC actor AID。服务端不会根据 DB 状态生成 `group.index`。
+
 ### group.get_settings
 
-统一读取群参数。成员可读；不传 `keys` 时返回核心群资料和 settings 表中的全部设置。未显式设置 `dispatch_mode` 时，服务端仍返回默认值 `"broadcast"`。
+统一读取群参数。成员可读；不传 `keys` 时返回核心群资料和 settings 表中的全部设置。未显式设置 `dispatch_mode` 时，服务端仍返回默认值 `"broadcast"`。读取 `keys=["group.index"]` 可从服务端摘取当前签名 `group.index`。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `group_id` | string | 是 | 群组标识；兼容字段，值语义为目标态 `group_aid` |
-| `keys` | array | 否 | 只读取指定 key，如 `["dispatch_mode", "rules.content"]` |
+| `keys` | array | 否 | 只读取指定 key，如 `["dispatch_mode", "rules.content"]`；读取 `["group.index"]` 时强制返回 `_meta.group_indexes` |
 
 **响应**：
 
 ```json
 {
     "group_id": "g-abc123.agentid.pub",
+    "group_aid": "g-abc123.agentid.pub",
     "settings": [
         {"key": "dispatch_mode", "value": "broadcast", "updated_at": 1234567890000}
     ]
 }
 ```
+
+如果服务端已保存 `group.index`，普通 settings 读取可能在顶层返回 `_meta.group_indexes`。该 meta 受服务端注入频率控制；显式读取 `group.index` 时会强制返回：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "group_aid": "g-abc123.agentid.pub",
+    "settings": [
+        {"key": "group.index", "value": {"body": "..."}, "updated_by": "alice.agentid.pub", "updated_at": 1780000000000}
+    ],
+    "_meta": {
+        "group_indexes": {
+            "g-abc123.agentid.pub": {
+                "etag": "\"sha256:...\"",
+                "last_modified": 1780000000000,
+                "schema": "aun.group.index.v1"
+            }
+        }
+    }
+}
+```
+
+SDK 观察到 `_meta.group_indexes` 只记录远端 etag，不会自动覆盖本地 index 或业务缓存。etag 不一致只表示本地与观察到的远端版本不同，方向由应用层决定：`checkGroupIndex` 用于检查是否不同步，`getGroupIndex` 用于显式 pull 远端 manifest 并同步本地缓存，`updateGroupIndex` 用于显式 CAS push 本地 indexed settings。
 
 ## 消息
 

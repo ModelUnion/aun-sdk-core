@@ -35,7 +35,7 @@ import {
 } from './crypto.js';
 import type { ProtectedHeadersInput } from './protected-headers.js';
 import { IndexedDBTokenStore } from './keystore/indexeddb-token-store.js';
-import type { TokenStore } from './keystore/index.js';
+import type { GroupIndexCacheUpsert, TokenStore } from './keystore/index.js';
 import { V2Session, V2KeyStore, type CallFn } from './v2/session/index.js';
 import {
   decryptMessage,
@@ -44,6 +44,7 @@ import {
 import { ecdsaVerifyRaw } from './v2/crypto/ecdsa.js';
 import { AUNLogger, type ModuleLogger } from './logger.js';
 import { AgentMdManager } from './agent-md.js';
+import { GroupIndexMetaCache } from './group-index.js';
 import { certMatchesFingerprint, normalizeFingerprintHex } from './cert-utils.js';
 import {
   AUNError,
@@ -107,6 +108,14 @@ function attachGatewayProximity(message: JsonObject, source: Record<string, unkn
       message[key] = source[key] as JsonValue;
     }
   }
+}
+
+function groupIndexBodyText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && !Array.isArray(value) && 'body' in value) {
+    return String((value as { body?: unknown }).body ?? '');
+  }
+  return '';
 }
 
 /** 默认会话选项 */
@@ -755,6 +764,8 @@ export class AUNClient {
   private _v2LazyProposeTriggered: Map<string, number> = new Map();
   /** agent.md 运行时管理器，负责上传、下载、缓存和 RPC 元数据观察。 */
   private _agentMdManager!: AgentMdManager;
+  private _groupIndexMetaCache: GroupIndexMetaCache = new GroupIndexMetaCache();
+  private _groupIndexCacheLoaded: Set<string> = new Set();
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
   private _seqTrackerContext: string | null = null;
@@ -764,6 +775,8 @@ export class AUNClient {
   private _pushedSeqs: Map<string, Set<number>> = new Map();
   /** 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq） */
   private _pendingOrderedMsgs: Map<string, Map<number, { event: string; payload: EventPayload }>> = new Map();
+  /** push 处理队列：按 P2P / group namespace 串行化异步解密与有序投递。 */
+  private _pushProcessQueues: Map<string, Promise<void>> = new Map();
   /** Lazy group sync：首次发送群消息前自动拉取历史 */
   private _groupSynced: Set<string> = new Set();
   /** P2P 撤回去重：原始 message_id -> 时间戳，保证应用层只回调一次 */
@@ -887,11 +900,11 @@ export class AUNClient {
       timeout: DEFAULT_SESSION_OPTIONS.timeouts.call,
       onDisconnect: (error, closeCode) => this._handleTransportDisconnect(error, closeCode),
     });
-    this._transport.setMetaObserver((meta) => {
-      void this._observeRpcMeta(meta).catch((exc) => {
-        this._clientLog.debug(`agent.md meta observer skipped: ${String(exc)}`);
-      });
-    });
+    this._transport.setMetaObserver((meta) =>
+      this._observeRpcMeta(meta).catch((exc) => {
+        this._clientLog.debug(`rpc meta observer skipped: ${String(exc)}`);
+      }),
+    );
     this._runtime = new ClientRuntime(this);
     this._identityRuntime = new IdentityRuntimeManager(this._runtime);
     this._peerDirectory = new PeerDirectory(this._runtime);
@@ -1019,7 +1032,109 @@ export class AUNClient {
 
   /** transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。 */
   private async _observeRpcMeta(meta: JsonObject): Promise<void> {
+    const groupIndexes = isJsonObject(meta.group_indexes as JsonValue | object | null | undefined)
+      ? meta.group_indexes as Record<string, unknown>
+      : {};
+    for (const groupAid of Object.keys(groupIndexes)) {
+      await this._loadGroupIndexCache(groupAid);
+    }
+    this._groupIndexMetaCache.observeRpcMeta(meta, { localAid: this._aid ?? '' });
     await this._agentMdManager.observeRpcMeta(meta, this._aid);
+    for (const groupAid of Object.keys(groupIndexes)) {
+      await this._persistGroupIndexCache(groupAid, {
+        remote_meta: this._groupIndexMetaCache.remoteMeta(this._aid ?? '', groupAid) ?? {},
+        local_etag: this._groupIndexMetaCache.localEtag(this._aid ?? '', groupAid),
+      });
+    }
+  }
+
+  isGroupIndexStale(groupAid: string): boolean {
+    return this._groupIndexMetaCache.isStale(this._aid ?? '', groupAid);
+  }
+
+  markGroupIndexFresh(groupAid: string, options: { etag: string }): void {
+    this._groupIndexMetaCache.markFresh(this._aid ?? '', groupAid, options);
+    void this._persistGroupIndexCache(groupAid, { local_etag: String(options.etag ?? '') });
+  }
+
+  getGroupIndexRemoteMeta(groupAid: string): Record<string, unknown> | null {
+    return this._groupIndexMetaCache.remoteMeta(this._aid ?? '', groupAid);
+  }
+
+  getGroupIndexLocalEtag(groupAid: string): string {
+    return this._groupIndexMetaCache.localEtag(this._aid ?? '', groupAid);
+  }
+
+  async getGroupIndexCachedSettings(groupAid: string, keys: string[]): Promise<Record<string, unknown> | null> {
+    await this._loadGroupIndexCache(groupAid);
+    return this._groupIndexMetaCache.cachedSettings(this._aid ?? '', groupAid, keys.map((item) => String(item)));
+  }
+
+  async getGroupIndexCachedSettingsByEntries(groupAid: string, keys: string[], entries: Array<Record<string, unknown>>) {
+    await this._loadGroupIndexCache(groupAid);
+    return this._groupIndexMetaCache.cachedSettingsByEntries(
+      this._aid ?? '',
+      groupAid,
+      keys.map((item) => String(item)),
+      entries as any,
+    );
+  }
+
+  cacheGroupIndexSettings(
+    groupAid: string,
+    settings: Record<string, unknown>,
+    options?: { entries?: Array<Record<string, unknown>>; etag?: string; groupIndex?: unknown },
+  ): Promise<void> {
+    this._groupIndexMetaCache.cacheSettings(this._aid ?? '', groupAid, settings, options as any);
+    const entryEtags: Record<string, string> = {};
+    for (const item of options?.entries ?? []) {
+      const key = String(item.key ?? '');
+      if (key) entryEtags[key] = String(item.etag ?? '');
+    }
+    const fields: GroupIndexCacheUpsert = {
+      settings,
+      entry_etags: entryEtags,
+      remote_meta: this._groupIndexMetaCache.remoteMeta(this._aid ?? '', groupAid) ?? {},
+      local_etag: String(options?.etag ?? this._groupIndexMetaCache.localEtag(this._aid ?? '', groupAid) ?? ''),
+    };
+    const indexJsonl = groupIndexBodyText(options?.groupIndex);
+    if (indexJsonl) fields.index_jsonl = indexJsonl;
+    return this._persistGroupIndexCache(groupAid, fields);
+  }
+
+  private _groupIndexCacheKey(groupAid: string): string {
+    return `${this._aid ?? ''}\x00${String(groupAid ?? '')}`;
+  }
+
+  private async _loadGroupIndexCache(groupAid: string): Promise<void> {
+    const localAid = String(this._aid ?? '').trim();
+    const group = String(groupAid ?? '').trim();
+    if (!localAid || !group || typeof this._tokenStore.loadGroupIndexCache !== 'function') return;
+    const key = this._groupIndexCacheKey(group);
+    if (this._groupIndexCacheLoaded.has(key)) return;
+    this._groupIndexCacheLoaded.add(key);
+    const record = await this._tokenStore.loadGroupIndexCache(localAid, group);
+    if (!record) return;
+    this._groupIndexMetaCache.restore(localAid, group, {
+      remote_meta: record.remote_meta,
+      local_etag: record.local_etag,
+      settings: record.settings,
+      entry_etags: record.entry_etags,
+    });
+  }
+
+  private async _persistGroupIndexCache(groupAid: string, fields: GroupIndexCacheUpsert): Promise<void> {
+    const localAid = String(this._aid ?? '').trim();
+    const group = String(groupAid ?? '').trim();
+    if (!localAid || !group || typeof this._tokenStore.upsertGroupIndexCache !== 'function') return;
+    const record = await this._tokenStore.upsertGroupIndexCache(localAid, group, fields);
+    this._groupIndexCacheLoaded.add(this._groupIndexCacheKey(group));
+    this._groupIndexMetaCache.restore(localAid, group, {
+      remote_meta: record.remote_meta,
+      local_etag: record.local_etag,
+      settings: record.settings,
+      entry_etags: record.entry_etags,
+    });
   }
 
   get state(): ConnectionState {
@@ -1188,11 +1303,11 @@ export class AUNClient {
       timeout: DEFAULT_SESSION_OPTIONS.timeouts.call,
       onDisconnect: (error, closeCode) => this._handleTransportDisconnect(error, closeCode),
     });
-    this._transport.setMetaObserver((meta) => {
-      void this._observeRpcMeta(meta).catch((exc) => {
-        this._clientLog.debug(`agent.md meta observer skipped: ${String(exc)}`);
-      });
-    });
+    this._transport.setMetaObserver((meta) =>
+      this._observeRpcMeta(meta).catch((exc) => {
+        this._clientLog.debug(`rpc meta observer skipped: ${String(exc)}`);
+      }),
+    );
     this._auth.setLogger(this._logAuth);
     this._transport.setLogger(this._logTransport);
     this._dispatcher.setLogger(this._logEvents);

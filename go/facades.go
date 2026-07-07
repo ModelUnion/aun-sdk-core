@@ -3,7 +3,9 @@ package aun
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 )
 
 type rpcFacade struct {
@@ -245,6 +247,248 @@ func (f *GroupFacade) GetSettings(ctx context.Context, params map[string]any) (a
 	return f.call(ctx, "get_settings", params)
 }
 
+func (f *GroupFacade) CheckGroupIndex(ctx context.Context, params map[string]any) (any, error) {
+	merged := facadeParams(params)
+	groupAID := strings.TrimSpace(firstNonEmpty(stringValue(merged["group_aid"]), stringValue(merged["group_id"])))
+	if groupAID == "" {
+		return nil, fmt.Errorf("group_aid is required")
+	}
+	stale := false
+	if checker, ok := f.client.(interface{ IsGroupIndexStale(string) bool }); ok {
+		stale = checker.IsGroupIndexStale(groupAID)
+	}
+	remoteMeta := map[string]any{}
+	if provider, ok := f.client.(interface{ GroupIndexRemoteMeta(string) map[string]any }); ok {
+		if meta := provider.GroupIndexRemoteMeta(groupAID); meta != nil {
+			remoteMeta = meta
+		}
+	}
+	localEtag := ""
+	if provider, ok := f.client.(interface{ GroupIndexLocalEtag(string) string }); ok {
+		localEtag = provider.GroupIndexLocalEtag(groupAID)
+	}
+	remoteEtag := stringValue(remoteMeta["etag"])
+	localFound := localEtag != ""
+	remoteFound := remoteEtag != ""
+	inSync := localFound && remoteFound && localEtag == remoteEtag
+	return map[string]any{
+		"group_aid":     groupAID,
+		"local_found":   localFound,
+		"remote_found":  remoteFound,
+		"local_etag":    localEtag,
+		"remote_etag":   remoteEtag,
+		"in_sync":       inSync,
+		"needs_update":  stale || (remoteFound && !inSync),
+		"last_modified": remoteMeta["last_modified"],
+		"status":        map[bool]int{true: 200, false: 404}[remoteFound],
+		"cached":        true,
+	}, nil
+}
+
+func (f *GroupFacade) GetGroupIndex(ctx context.Context, params map[string]any) (any, error) {
+	merged := facadeParams(params)
+	groupID := strings.TrimSpace(stringValue(merged["group_id"]))
+	if groupID == "" {
+		return nil, fmt.Errorf("group_id is required")
+	}
+	current, err := f.GetSettings(ctx, map[string]any{"group_id": groupID, "keys": []string{GroupIndexKey}})
+	if err != nil {
+		return nil, err
+	}
+	currentMap, _ := mapFromAny(current)
+	groupAID := strings.TrimSpace(stringValue(currentMap["group_aid"]))
+	if groupAID == "" {
+		groupAID = groupID
+	}
+	var currentIndex any
+	for _, item := range anySlice(currentMap["settings"]) {
+		itemMap, ok := mapFromAny(item)
+		if !ok || stringValue(itemMap["key"]) != GroupIndexKey {
+			continue
+		}
+		currentIndex = itemMap["value"]
+		break
+	}
+	result := map[string]any{
+		"group_id":    currentMap["group_id"],
+		"group_aid":   groupAID,
+		"group_index": nil,
+		"meta":        map[string]any{},
+		"entries":     []map[string]any{},
+	}
+	if currentIndex == nil {
+		return result, nil
+	}
+	parsed, err := ParseGroupIndex(currentIndex)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyPulledGroupIndex(ctx, currentIndex, parsed); err != nil {
+		return nil, err
+	}
+	etag := stringValue(parsed.Meta["etag"])
+	settings, err := f.hydrateGroupIndexSettings(ctx, groupID, groupAID, parsed.Entries, etag, currentIndex)
+	if err != nil {
+		return nil, err
+	}
+	if etag != "" {
+		if marker, ok := f.client.(interface{ MarkGroupIndexFresh(string, string) }); ok {
+			marker.MarkGroupIndexFresh(groupAID, etag)
+		}
+	}
+	result["group_index"] = currentIndex
+	result["meta"] = parsed.Meta
+	result["entries"] = parsed.Entries
+	result["settings"] = settings
+	return result, nil
+}
+
+func (f *GroupFacade) verifyPulledGroupIndex(ctx context.Context, currentIndex any, parsed *ParsedGroupIndex) error {
+	signedBy := strings.TrimSpace(stringValue(parsed.Meta["signed_by"]))
+	if signedBy == "" {
+		return fmt.Errorf("group.index signed_by is required")
+	}
+	var signer GroupIndexSigner
+	if resolver, ok := f.client.(interface {
+		ResolveGroupIndexSigner(context.Context, string) (GroupIndexSigner, error)
+	}); ok {
+		resolved, err := resolver.ResolveGroupIndexSigner(ctx, signedBy)
+		if err != nil {
+			return err
+		}
+		signer = resolved
+	}
+	if signer == nil {
+		if provider, ok := f.client.(interface{ CurrentAID() *AID }); ok {
+			current := provider.CurrentAID()
+			if current != nil && current.Aid == signedBy {
+				signer = current
+			}
+		}
+	}
+	if signer == nil {
+		if provider, ok := f.client.(interface {
+			LookupPeer(context.Context, string) (*AID, error)
+		}); ok {
+			peer, err := provider.LookupPeer(ctx, signedBy)
+			if err != nil {
+				return err
+			}
+			signer = peer
+		}
+	}
+	if signer == nil {
+		return fmt.Errorf("group.index signer is unavailable: %s", signedBy)
+	}
+	verified, err := VerifyGroupIndex(currentIndex, signer)
+	if err != nil {
+		return err
+	}
+	if verified == nil || !verified.Valid {
+		reason := "invalid signature"
+		if verified != nil && verified.Reason != "" {
+			reason = verified.Reason
+		}
+		return fmt.Errorf("group.index verification failed: %s", reason)
+	}
+	return nil
+}
+
+func (f *GroupFacade) UpdateGroupIndex(ctx context.Context, params map[string]any) (any, error) {
+	merged := facadeParams(params)
+	groupID := strings.TrimSpace(stringValue(merged["group_id"]))
+	if groupID == "" {
+		return nil, fmt.Errorf("group_id is required")
+	}
+	settings, ok := mapFromAny(merged["settings"])
+	if !ok || len(settings) == 0 {
+		return nil, fmt.Errorf("settings must be a non-empty object")
+	}
+	signer, _ := merged["signer"].(GroupIndexSigner)
+	if signer == nil {
+		if provider, ok := f.client.(interface{ CurrentAID() *AID }); ok {
+			signer = provider.CurrentAID()
+		}
+	}
+	if signer == nil {
+		return nil, fmt.Errorf("signer is required")
+	}
+	lastModified := groupIndexInt64(merged["last_modified"], time.Now().UnixMilli())
+	maxAttempts := int(groupIndexInt64(merged["max_attempts"], 2))
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		current, err := f.GetSettings(ctx, map[string]any{"group_id": groupID, "keys": []string{GroupIndexKey}})
+		if err != nil {
+			return nil, err
+		}
+		currentMap, _ := mapFromAny(current)
+		groupAID := strings.TrimSpace(stringValue(currentMap["group_aid"]))
+		if groupAID == "" {
+			groupAID = groupID
+		}
+		var currentIndex any
+		expectedEtag := ""
+		for _, item := range anySlice(currentMap["settings"]) {
+			itemMap, ok := mapFromAny(item)
+			if !ok || stringValue(itemMap["key"]) != GroupIndexKey {
+				continue
+			}
+			currentIndex = itemMap["value"]
+			if currentIndex != nil {
+				parsed, err := ParseGroupIndex(currentIndex)
+				if err != nil {
+					return nil, err
+				}
+				expectedEtag = stringValue(parsed.Meta["etag"])
+			}
+			break
+		}
+		signedSettings, err := PrepareGroupSettingsWithIndex(GroupSettingsWithIndexOptions{
+			GroupAID:     groupAID,
+			Settings:     settings,
+			Signer:       signer,
+			LastModified: lastModified,
+			BaseIndex:    currentIndex,
+		})
+		if err != nil {
+			return nil, err
+		}
+		result, err := f.SetSettings(ctx, map[string]any{
+			"group_id":            groupID,
+			"settings":            signedSettings,
+			"expected_index_etag": expectedEtag,
+		})
+		if err == nil {
+			if parsed, parseErr := ParseGroupIndex(signedSettings[GroupIndexKey]); parseErr == nil {
+				pushedEtag := stringValue(parsed.Meta["etag"])
+				if marker, ok := f.client.(interface{ MarkGroupIndexFresh(string, string) }); ok {
+					if pushedEtag != "" {
+						marker.MarkGroupIndexFresh(groupAID, pushedEtag)
+					}
+				}
+				if cache, ok := f.client.(interface {
+					CacheGroupIndexSettings(string, map[string]any, []map[string]any, string, ...any)
+				}); ok {
+					cache.CacheGroupIndexSettings(groupAID, settings, parsed.Entries, pushedEtag, signedSettings[GroupIndexKey])
+				}
+			}
+			return result, nil
+		}
+		if !strings.Contains(err.Error(), "etag conflict") {
+			return nil, err
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("UpdateGroupIndex failed")
+}
+
 // groupSettingsToMap 将 GetSettings 返回的 settings 数组转为 {key: value} 映射
 func groupSettingsToMap(resultMap map[string]any) map[string]any {
 	settings := make(map[string]any)
@@ -258,6 +502,94 @@ func groupSettingsToMap(resultMap map[string]any) map[string]any {
 		}
 	}
 	return settings
+}
+
+func groupIndexUpdateParams(groupID any, settings map[string]any, merged map[string]any) map[string]any {
+	out := map[string]any{"group_id": groupID, "settings": settings}
+	for _, key := range []string{"signer", "last_modified", "max_attempts"} {
+		if value, ok := merged[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func (f *GroupFacade) getIndexedSettings(ctx context.Context, groupID string, keys []string) (string, map[string]any, error) {
+	if cache, ok := f.client.(interface {
+		GetGroupIndexCachedSettings(string, []string) map[string]any
+	}); ok {
+		if cached := cache.GetGroupIndexCachedSettings(groupID, keys); cached != nil {
+			return groupID, cached, nil
+		}
+	}
+	result, err := f.GetSettings(ctx, map[string]any{"group_id": groupID, "keys": keys})
+	if err != nil {
+		return "", nil, err
+	}
+	resultMap, _ := result.(map[string]any)
+	settings := groupSettingsToMap(resultMap)
+	groupAID := strings.TrimSpace(stringValue(resultMap["group_aid"]))
+	if groupAID == "" {
+		groupAID = groupID
+	}
+	if cache, ok := f.client.(interface {
+		CacheGroupIndexSettings(string, map[string]any, []map[string]any, string, ...any)
+	}); ok {
+		cache.CacheGroupIndexSettings(groupAID, settings, nil, "")
+		if groupAID != groupID {
+			cache.CacheGroupIndexSettings(groupID, settings, nil, "")
+		}
+	}
+	resultGroupID := strings.TrimSpace(stringValue(resultMap["group_id"]))
+	if resultGroupID == "" {
+		resultGroupID = groupID
+	}
+	return resultGroupID, settings, nil
+}
+
+func (f *GroupFacade) hydrateGroupIndexSettings(ctx context.Context, groupID string, groupAID string, entries []map[string]any, etag string, groupIndex any) (map[string]any, error) {
+	keys := []string{}
+	for _, entry := range entries {
+		if strings.TrimSpace(stringValue(entry["source"])) != "" && strings.TrimSpace(stringValue(entry["source"])) != "db" {
+			continue
+		}
+		key := strings.TrimSpace(stringValue(entry["key"]))
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return map[string]any{}, nil
+	}
+	cached := map[string]any{}
+	missing := keys
+	if cache, ok := f.client.(interface {
+		GetGroupIndexCachedSettingsByEntries(string, []string, []map[string]any) (map[string]any, []string)
+	}); ok {
+		cached, missing = cache.GetGroupIndexCachedSettingsByEntries(groupAID, keys, entries)
+	}
+	fetched := map[string]any{}
+	if len(missing) > 0 {
+		result, err := f.GetSettings(ctx, map[string]any{"group_id": groupID, "keys": missing})
+		if err != nil {
+			return nil, err
+		}
+		resultMap, _ := result.(map[string]any)
+		fetched = groupSettingsToMap(resultMap)
+	}
+	settings := map[string]any{}
+	for key, value := range cached {
+		settings[key] = value
+	}
+	for key, value := range fetched {
+		settings[key] = value
+	}
+	if cache, ok := f.client.(interface {
+		CacheGroupIndexSettings(string, map[string]any, []map[string]any, string, ...any)
+	}); ok {
+		cache.CacheGroupIndexSettings(groupAID, settings, entries, etag, groupIndex)
+	}
+	return settings, nil
 }
 
 func (f *GroupFacade) UpdateAnnouncement(ctx context.Context, params map[string]any) (any, error) {
@@ -276,10 +608,7 @@ func (f *GroupFacade) UpdateAnnouncement(ctx context.Context, params map[string]
 		settingsUpdate["announcement.attachments"] = attachments
 	}
 
-	result, err := f.SetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"settings": settingsUpdate,
-	})
+	result, err := f.UpdateGroupIndex(ctx, groupIndexUpdateParams(groupID, settingsUpdate, params))
 	if err != nil {
 		return nil, err
 	}
@@ -336,16 +665,10 @@ func (f *GroupFacade) GetAnnouncement(ctx context.Context, params map[string]any
 		return nil, fmt.Errorf("group_id is required")
 	}
 
-	result, err := f.GetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"keys":     []string{"announcement.content", "announcement.attachments"},
-	})
+	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"announcement.content", "announcement.attachments"})
 	if err != nil {
 		return nil, err
 	}
-
-	resultMap, _ := result.(map[string]any)
-	settings := groupSettingsToMap(resultMap)
 
 	content := ""
 	if v, ok := settings["announcement.content"].(string); ok {
@@ -357,9 +680,9 @@ func (f *GroupFacade) GetAnnouncement(ctx context.Context, params map[string]any
 	}
 
 	return map[string]any{
-		"group_id": resultMap["group_id"],
+		"group_id": resultGroupID,
 		"announcement": map[string]any{
-			"group_id":    resultMap["group_id"],
+			"group_id":    resultGroupID,
 			"content":     content,
 			"attachments": attachments,
 		},
@@ -373,16 +696,10 @@ func (f *GroupFacade) GetRules(ctx context.Context, params map[string]any) (any,
 		return nil, fmt.Errorf("group_id is required")
 	}
 
-	result, err := f.GetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"keys":     []string{"rules.content", "rules.attachments"},
-	})
+	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"rules.content", "rules.attachments"})
 	if err != nil {
 		return nil, err
 	}
-
-	resultMap, _ := result.(map[string]any)
-	settings := groupSettingsToMap(resultMap)
 
 	content := ""
 	if v, ok := settings["rules.content"].(string); ok {
@@ -394,9 +711,9 @@ func (f *GroupFacade) GetRules(ctx context.Context, params map[string]any) (any,
 	}
 
 	return map[string]any{
-		"group_id": resultMap["group_id"],
+		"group_id": resultGroupID,
 		"rules": map[string]any{
-			"group_id":    resultMap["group_id"],
+			"group_id":    resultGroupID,
 			"content":     content,
 			"attachments": attachments,
 		},
@@ -419,10 +736,7 @@ func (f *GroupFacade) UpdateRules(ctx context.Context, params map[string]any) (a
 		settingsUpdate["rules.attachments"] = attachments
 	}
 
-	result, err := f.SetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"settings": settingsUpdate,
-	})
+	result, err := f.UpdateGroupIndex(ctx, groupIndexUpdateParams(groupID, settingsUpdate, params))
 	if err != nil {
 		return nil, err
 	}
@@ -449,16 +763,10 @@ func (f *GroupFacade) GetJoinRequirements(ctx context.Context, params map[string
 		return nil, fmt.Errorf("group_id is required")
 	}
 
-	result, err := f.GetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"keys":     []string{"join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"},
-	})
+	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"})
 	if err != nil {
 		return nil, err
 	}
-
-	resultMap, _ := result.(map[string]any)
-	settings := groupSettingsToMap(resultMap)
 
 	mode := "open"
 	if v, ok := settings["join.mode"].(string); ok {
@@ -478,9 +786,9 @@ func (f *GroupFacade) GetJoinRequirements(ctx context.Context, params map[string
 	}
 
 	return map[string]any{
-		"group_id": resultMap["group_id"],
+		"group_id": resultGroupID,
 		"join_requirements": map[string]any{
-			"group_id":              resultMap["group_id"],
+			"group_id":              resultGroupID,
 			"mode":                  mode,
 			"question":              question,
 			"auto_approve_patterns": patterns,
@@ -514,10 +822,7 @@ func (f *GroupFacade) UpdateJoinRequirements(ctx context.Context, params map[str
 		return nil, fmt.Errorf("at least one field to update is required")
 	}
 
-	result, err := f.SetSettings(ctx, map[string]any{
-		"group_id": groupID,
-		"settings": settingsUpdate,
-	})
+	result, err := f.UpdateGroupIndex(ctx, groupIndexUpdateParams(groupID, settingsUpdate, params))
 	if err != nil {
 		return nil, err
 	}

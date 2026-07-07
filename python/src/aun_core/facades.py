@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
+from .group_index import GROUP_INDEX_KEY, parse_group_index, prepare_group_settings_with_index, verify_group_index
 from .validators import validate_group_id_format
 
 
@@ -160,6 +162,153 @@ class GroupFacade(_RpcFacade):
     async def get_settings(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return await self._call("get_settings", params, **kwargs)
 
+    async def check_group_index(self, params: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        merged = self._params(params, **kwargs)
+        group_aid = str(merged.get("group_aid") or merged.get("group_id") or "").strip()
+        if not group_aid:
+            raise ValueError("group_aid is required")
+        stale_fn = getattr(self._client, "is_group_index_stale", None)
+        meta_fn = getattr(self._client, "get_group_index_remote_meta", None)
+        local_fn = getattr(self._client, "get_group_index_local_etag", None)
+        stale = bool(stale_fn(group_aid)) if callable(stale_fn) else False
+        remote_meta = meta_fn(group_aid) if callable(meta_fn) else None
+        if not isinstance(remote_meta, dict):
+            remote_meta = {}
+        remote_etag = str(remote_meta.get("etag") or "")
+        local_etag = str(local_fn(group_aid) if callable(local_fn) else "")
+        local_found = bool(local_etag)
+        remote_found = bool(remote_etag)
+        in_sync = local_found and remote_found and local_etag == remote_etag
+        return {
+            "group_aid": group_aid,
+            "local_found": local_found,
+            "remote_found": remote_found,
+            "local_etag": local_etag,
+            "remote_etag": remote_etag,
+            "in_sync": in_sync,
+            "needs_update": bool(stale or (remote_found and not in_sync)),
+            "last_modified": remote_meta.get("last_modified"),
+            "status": 200 if remote_found else 404,
+            "cached": True,
+        }
+
+    async def get_group_index(self, params: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        merged = self._params(params, **kwargs)
+        group_id = str(merged.get("group_id") or "").strip()
+        if not group_id:
+            raise ValueError("group_id is required")
+        result = await self.get_settings(group_id=group_id, keys=[GROUP_INDEX_KEY])
+        group_aid = str(result.get("group_aid") or group_id)
+        group_index = None
+        for item in result.get("settings", []) or []:
+            if item.get("key") == GROUP_INDEX_KEY:
+                group_index = item.get("value")
+                break
+        if not group_index:
+            return {"group_id": result["group_id"], "group_aid": group_aid, "group_index": None, "meta": {}, "entries": []}
+        parsed = parse_group_index(group_index)
+        await self._verify_group_index(group_index, parsed)
+        etag = str(parsed["meta"].get("etag") or "")
+        entries = parsed["entries"]
+        settings_map = await self._hydrate_group_index_settings(group_id, group_aid, entries, etag, group_index=group_index)
+        mark_fresh = getattr(self._client, "mark_group_index_fresh", None)
+        if callable(mark_fresh) and etag:
+            mark_fresh(group_aid, etag=etag)
+        return {
+            "group_id": result["group_id"],
+            "group_aid": group_aid,
+            "group_index": group_index,
+            "meta": parsed["meta"],
+            "entries": entries,
+            "settings": settings_map,
+        }
+
+    async def _verify_group_index(self, group_index: Any, parsed: dict[str, Any]) -> None:
+        signed_by = str((parsed.get("meta") or {}).get("signed_by") or "").strip()
+        if not signed_by:
+            raise ValueError("group.index signed_by is required")
+        signer = None
+        current = getattr(self._client, "current_aid", None)
+        if current is not None and getattr(current, "aid", "") == signed_by:
+            signer = current
+        if signer is None:
+            lookup_peer = getattr(self._client, "lookup_peer", None)
+            if callable(lookup_peer):
+                signer = await lookup_peer(signed_by)
+        if signer is None:
+            raise ValueError(f"group.index signer is unavailable: {signed_by}")
+        verified = verify_group_index(group_index, signer)
+        if not verified.ok:
+            message = verified.error.message if verified.error else "group.index verification failed"
+            raise ValueError(message)
+        data = verified.data or {}
+        if not data.get("valid"):
+            raise ValueError(f"group.index verification failed: {data.get('reason') or 'invalid signature'}")
+
+    async def update_group_index(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        merged = self._params(params, **kwargs)
+        group_id = str(merged.get("group_id") or "").strip()
+        settings = merged.get("settings")
+        if not group_id:
+            raise ValueError("group_id is required")
+        if not isinstance(settings, dict) or not settings:
+            raise ValueError("settings must be a non-empty object")
+        signer = merged.get("signer") or getattr(self._client, "current_aid", None)
+        if signer is None:
+            raise ValueError("signer is required")
+        last_modified = int(merged.get("last_modified") or time.time() * 1000)
+        max_attempts = max(1, int(merged.get("max_attempts") or 2))
+
+        last_error = None
+        for _attempt in range(max_attempts):
+            current = await self.get_settings(group_id=group_id, keys=[GROUP_INDEX_KEY])
+            group_aid = str(current.get("group_aid") or group_id)
+            current_index = None
+            expected_etag = ""
+            for item in current.get("settings", []) or []:
+                if item.get("key") == GROUP_INDEX_KEY:
+                    current_index = item.get("value")
+                    if current_index:
+                        expected_etag = str(parse_group_index(current_index)["meta"].get("etag") or "")
+                    break
+            signed_settings = prepare_group_settings_with_index(
+                group_aid=group_aid,
+                settings=settings,
+                signer=signer,
+                last_modified=last_modified,
+                base_index=current_index,
+            )
+            try:
+                result = await self.set_settings(
+                    group_id=group_id,
+                    settings=signed_settings,
+                    expected_index_etag=expected_etag,
+                )
+                pushed = parse_group_index(signed_settings[GROUP_INDEX_KEY])
+                pushed_etag = str(pushed["meta"].get("etag") or "")
+                mark_fresh = getattr(self._client, "mark_group_index_fresh", None)
+                if callable(mark_fresh) and pushed_etag:
+                    mark_fresh(group_aid, etag=pushed_etag)
+                cache_settings = getattr(self._client, "cache_group_index_settings", None)
+                if callable(cache_settings):
+                    cache_settings(group_aid, settings, entries=pushed["entries"], etag=pushed_etag, group_index=signed_settings[GROUP_INDEX_KEY])
+                return result
+            except Exception as exc:
+                if "etag conflict" not in str(exc):
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("update_group_index failed")
+
+    @staticmethod
+    def _index_update_params(group_id: Any, settings: dict[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {"group_id": group_id, "settings": settings}
+        for key in ("signer", "last_modified", "max_attempts"):
+            if key in merged:
+                out[key] = merged[key]
+        return out
+
     async def send(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         merged = self._params(params, **kwargs)
         validate_group_id_format(merged.get("group_id"))
@@ -187,6 +336,57 @@ class GroupFacade(_RpcFacade):
         """将 get_settings 返回的 settings 数组转为 {key: value} 映射"""
         return {s["key"]: s["value"] for s in result.get("settings", [])}
 
+    async def _hydrate_group_index_settings(
+        self,
+        group_id: str,
+        group_aid: str,
+        entries: list[dict[str, Any]],
+        etag: str,
+        group_index: Any | None = None,
+    ) -> dict[str, Any]:
+        keys = [
+            str(item.get("key") or "")
+            for item in entries
+            if str(item.get("source") or "db") == "db" and str(item.get("key") or "")
+        ]
+        if not keys:
+            return {}
+        cached: dict[str, Any] = {}
+        missing = list(keys)
+        cache_by_entries = getattr(self._client, "get_group_index_cached_settings_by_entries", None)
+        if callable(cache_by_entries):
+            maybe = cache_by_entries(group_aid, keys, entries)
+            if isinstance(maybe, tuple) and len(maybe) == 2:
+                cached, missing = dict(maybe[0] or {}), [str(item) for item in maybe[1] or []]
+            elif isinstance(maybe, dict):
+                cached = dict(maybe.get("cached") or {})
+                missing = [str(item) for item in maybe.get("missing") or []]
+        fetched: dict[str, Any] = {}
+        if missing:
+            result = await self.get_settings(group_id=group_id, keys=missing)
+            fetched = self._settings_to_map(result)
+        settings = {**cached, **fetched}
+        cache_settings = getattr(self._client, "cache_group_index_settings", None)
+        if callable(cache_settings):
+            cache_settings(group_aid, settings, entries=entries, etag=etag, group_index=group_index)
+        return settings
+
+    async def _get_indexed_settings(self, group_id: str, keys: list[str]) -> tuple[str, dict[str, Any]]:
+        cached_fn = getattr(self._client, "get_group_index_cached_settings", None)
+        if callable(cached_fn):
+            cached = cached_fn(group_id, keys)
+            if isinstance(cached, dict):
+                return group_id, cached
+        result = await self.get_settings(group_id=group_id, keys=keys)
+        group_aid = str(result.get("group_aid") or group_id)
+        settings = self._settings_to_map(result)
+        cache_settings = getattr(self._client, "cache_group_index_settings", None)
+        if callable(cache_settings):
+            cache_settings(group_aid, settings)
+            if group_aid != str(group_id):
+                cache_settings(str(group_id), settings)
+        return str(result.get("group_id") or group_id), settings
+
     async def get_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """便利方法：获取群公告（基于 get_settings）"""
         merged = self._params(params, **kwargs)
@@ -194,16 +394,14 @@ class GroupFacade(_RpcFacade):
         if not group_id:
             raise ValueError("group_id is required")
 
-        result = await self.get_settings(
-            group_id=group_id,
-            keys=["announcement.content", "announcement.attachments"],
+        result_group_id, settings = await self._get_indexed_settings(
+            str(group_id),
+            ["announcement.content", "announcement.attachments"],
         )
-
-        settings = self._settings_to_map(result)
         return {
-            "group_id": result["group_id"],
+            "group_id": result_group_id,
             "announcement": {
-                "group_id": result["group_id"],
+                "group_id": result_group_id,
                 "content": settings.get("announcement.content", ""),
                 "attachments": settings.get("announcement.attachments", []),
                 "updated_by": settings.get("announcement.content.updated_by", ""),
@@ -227,7 +425,7 @@ class GroupFacade(_RpcFacade):
         if attachments is not None:
             settings_update["announcement.attachments"] = attachments
 
-        result = await self.set_settings(group_id=group_id, settings=settings_update)
+        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
 
         return {
             "group_id": result["group_id"],
@@ -245,16 +443,14 @@ class GroupFacade(_RpcFacade):
         if not group_id:
             raise ValueError("group_id is required")
 
-        result = await self.get_settings(
-            group_id=group_id,
-            keys=["rules.content", "rules.attachments"],
+        result_group_id, settings = await self._get_indexed_settings(
+            str(group_id),
+            ["rules.content", "rules.attachments"],
         )
-
-        settings = self._settings_to_map(result)
         return {
-            "group_id": result["group_id"],
+            "group_id": result_group_id,
             "rules": {
-                "group_id": result["group_id"],
+                "group_id": result_group_id,
                 "content": settings.get("rules.content", ""),
                 "attachments": settings.get("rules.attachments", []),
                 "updated_by": settings.get("rules.content.updated_by", ""),
@@ -278,7 +474,7 @@ class GroupFacade(_RpcFacade):
         if attachments is not None:
             settings_update["rules.attachments"] = attachments
 
-        result = await self.set_settings(group_id=group_id, settings=settings_update)
+        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
 
         return {
             "group_id": result["group_id"],
@@ -296,16 +492,14 @@ class GroupFacade(_RpcFacade):
         if not group_id:
             raise ValueError("group_id is required")
 
-        result = await self.get_settings(
-            group_id=group_id,
-            keys=["join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"],
+        result_group_id, settings = await self._get_indexed_settings(
+            str(group_id),
+            ["join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"],
         )
-
-        settings = self._settings_to_map(result)
         return {
-            "group_id": result["group_id"],
+            "group_id": result_group_id,
             "join_requirements": {
-                "group_id": result["group_id"],
+                "group_id": result_group_id,
                 "mode": settings.get("join.mode", "open"),
                 "question": settings.get("join.question", ""),
                 "auto_approve_patterns": settings.get("join.auto_approve_patterns", []),
@@ -336,7 +530,7 @@ class GroupFacade(_RpcFacade):
         if not settings_update:
             raise ValueError("at least one field to update is required")
 
-        result = await self.set_settings(group_id=group_id, settings=settings_update)
+        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
 
         return {
             "group_id": result["group_id"],

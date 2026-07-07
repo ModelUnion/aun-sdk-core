@@ -1,7 +1,7 @@
 // ── Playwright E2E 浏览器测试：群操作签名审计 ─────────────────
 //
 // 覆盖：
-//   1. 更新公告携带签名 — set_settings(announcement.content) 事件包含 actor_aid + client_signature
+//   1. 更新公告携带签名 — updateGroupIndex(announcement.content) 事件包含 actor_aid + client_signature
 //   2. 踢人操作携带签名 — kick 事件包含 actor_aid + client_signature
 //   3. 只读操作安全 — group.get_info / group.list_my 无需签名即可正常执行
 //
@@ -117,7 +117,7 @@ test.describe('签名审计: 更新公告携带签名（浏览器）', () => {
     await installP0Helpers(page);
   });
 
-  test('set_settings(announcement.content) 事件包含 actor_aid + client_signature', async ({ page }) => {
+  test('updateGroupIndex(announcement.content) 事件包含 actor_aid + client_signature', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const { sleep, makeAndConnect, ensureConnected, runId } = (window as any).__aunP0;
       const rid = runId();
@@ -185,7 +185,7 @@ test.describe('签名审计: 更新公告携带签名（浏览器）', () => {
 
         // Alice 通过 set_settings 更新公告
         try {
-          await alice.call('group.set_settings', {
+          await alice.group.updateGroupIndex({
             group_id: groupId,
             settings: {
               'announcement.content': `签名测试公告 ${rid}`,

@@ -3,7 +3,7 @@
 import { pemToArrayBuffer } from '../crypto.js';
 import { normalizeInstanceId, slotIsolationKey } from '../config.js';
 import type { ModuleLogger } from '../logger.js';
-import type { AgentMdCacheRecord, AgentMdCacheUpsert, GroupStateRecord } from './index.js';
+import type { AgentMdCacheRecord, AgentMdCacheUpsert, GroupIndexCacheRecord, GroupIndexCacheUpsert, GroupStateRecord } from './index.js';
 import {
   isJsonObject,
   type JsonObject,
@@ -20,11 +20,12 @@ export const STORE_METADATA = 'metadata';
 export const STORE_INSTANCE_STATE = 'instance_state';
 export const STORE_GROUP_STATE = 'group_state';
 export const STORE_AGENT_MD_CACHE = 'agent_md_cache';
+export const STORE_GROUP_INDEX_CACHE = 'group_index_cache';
 export const STORE_PENDING_IDENTITIES = 'pending_identities';
 export const STORE_PENDING_BINDS = 'pending_binds';
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 8;
+const DB_VERSION = 9;
 
 // ── 工具函数 ──────────────────────────────────────────────────────
 
@@ -107,6 +108,14 @@ export function agentMdCacheStoreKey(ownerAid: string, targetAid: string): strin
   return `${agentMdCachePrefix(ownerAid)}${encodePart(targetAid)}`;
 }
 
+export function groupIndexCachePrefix(localAid: string): string {
+  return `${safeAid(localAid)}|`;
+}
+
+export function groupIndexCacheStoreKey(localAid: string, groupAid: string): string {
+  return `${groupIndexCachePrefix(localAid)}${encodePart(groupAid)}`;
+}
+
 export function pendingIdentityPrefix(aid: string): string {
   return `${safeAid(aid)}-`;
 }
@@ -160,6 +169,67 @@ export function mergeAgentMdCacheRecord(aid: string, current: AgentMdCacheRecord
       const n = Number(fields[key] ?? 0);
       out[key] = Number.isFinite(n) ? Math.trunc(n) : 0;
     }
+  }
+  out.updated_at = Date.now();
+  return out;
+}
+
+export function defaultGroupIndexCacheRecord(localAid: string, groupAid: string): GroupIndexCacheRecord {
+  return {
+    local_aid: localAid,
+    group_aid: groupAid,
+    index_jsonl: '',
+    remote_meta: {},
+    local_etag: '',
+    settings: {},
+    entry_etags: {},
+    updated_at: 0,
+  };
+}
+
+export function normalizeGroupIndexCacheRecord(localAid: string, groupAid: string, value: unknown): GroupIndexCacheRecord | null {
+  if (!isRecord(value)) return null;
+  const out = defaultGroupIndexCacheRecord(localAid, groupAid);
+  out.local_aid = String(value.local_aid ?? localAid).trim() || localAid;
+  out.group_aid = String(value.group_aid ?? groupAid).trim() || groupAid;
+  out.index_jsonl = String(value.index_jsonl ?? '');
+  out.local_etag = String(value.local_etag ?? '');
+  out.remote_meta = isRecord(value.remote_meta) ? deepClone(value.remote_meta) : {};
+  out.settings = isRecord(value.settings) ? deepClone(value.settings) : {};
+  if (isRecord(value.entry_etags)) {
+    out.entry_etags = Object.fromEntries(Object.entries(value.entry_etags).map(([key, etag]) => [key, String(etag ?? '')]));
+  }
+  const updatedAt = Number(value.updated_at ?? 0);
+  out.updated_at = Number.isFinite(updatedAt) ? Math.trunc(updatedAt) : 0;
+  return out;
+}
+
+export function mergeGroupIndexCacheRecord(
+  localAid: string,
+  groupAid: string,
+  current: GroupIndexCacheRecord | null,
+  fields: GroupIndexCacheUpsert,
+): GroupIndexCacheRecord {
+  const out = current ? deepClone(current) : defaultGroupIndexCacheRecord(localAid, groupAid);
+  out.local_aid = localAid;
+  out.group_aid = groupAid;
+  if (Object.prototype.hasOwnProperty.call(fields, 'index_jsonl') && fields.index_jsonl !== undefined && fields.index_jsonl !== null) {
+    out.index_jsonl = String(fields.index_jsonl ?? '');
+  }
+  if (Object.prototype.hasOwnProperty.call(fields, 'local_etag') && fields.local_etag !== undefined && fields.local_etag !== null) {
+    out.local_etag = String(fields.local_etag ?? '');
+  }
+  if (isRecord(fields.remote_meta)) {
+    out.remote_meta = { ...out.remote_meta, ...deepClone(fields.remote_meta) };
+  }
+  if (isRecord(fields.settings)) {
+    out.settings = { ...out.settings, ...deepClone(fields.settings) };
+  }
+  if (isRecord(fields.entry_etags)) {
+    out.entry_etags = {
+      ...out.entry_etags,
+      ...Object.fromEntries(Object.entries(fields.entry_etags).map(([key, etag]) => [key, String(etag ?? '')])),
+    };
   }
   out.updated_at = Date.now();
   return out;
@@ -234,7 +304,7 @@ export function openDB(): Promise<IDBDatabase> {
       const db = request.result;
       for (const name of [
         STORE_KEY_PAIRS, STORE_CERTS, STORE_METADATA, STORE_INSTANCE_STATE,
-        STORE_GROUP_STATE, STORE_AGENT_MD_CACHE, STORE_PENDING_IDENTITIES, STORE_PENDING_BINDS,
+        STORE_GROUP_STATE, STORE_AGENT_MD_CACHE, STORE_GROUP_INDEX_CACHE, STORE_PENDING_IDENTITIES, STORE_PENDING_BINDS,
       ]) {
         if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
       }

@@ -17,7 +17,7 @@ import (
 
 const (
 	e2eeSDKLang    = "go"
-	e2eeSDKVersion = "0.5.2"
+	e2eeSDKVersion = "0.5.3"
 )
 
 // EncryptP2PMessage 构造完整的 V2 P2P 加密 envelope（type=e2ee.p2p_encrypted）。

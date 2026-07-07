@@ -41,6 +41,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 | [07-错误码与状态机.md](07-错误码与状态机.md) | 错误码分层汇总、各模式状态机、可重试/不可重试分类 |
 | [08-AUN-E2EE.md](08-AUN-E2EE.md) | Legacy P2P E2EE 信封说明；当前默认主路径见 SDK V2 多设备 wrap 文档 |
 | [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE V2：消息级密钥、逐设备密钥包裹、成员状态签名验证 |
+| [10-Group-子协议.md](10-Group-子协议.md) | `group.*` 群组管理、群消息、`group.index` 签名索引、`_meta.group_indexes` 和 CAS 更新 |
 | [16-系统目录保护方案.md](16-系统目录保护方案.md) | `memberdata` 与 `group_data` 的系统目录保护、`group_data` 目录树隐藏与读下载/写保护边界、Group FS 授权路径和配额归属 |
 
 ### 附录
