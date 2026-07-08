@@ -1859,6 +1859,7 @@ export class MessageDeliveryEngine {
       this.markPublishedSeq(ns, seqNum);
       client._markPulledSeqDelivered(ns, seqNum);
       client._clientLog.debug(`publish pulled delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
+      await this.drainOrderedMessages(ns, undefined, true);
       return recallPublished;
     }
     const published = client._withPullResponseProcessing(ns, () => client._publishAppEvent(event, payload, 'pull'));
@@ -1866,6 +1867,7 @@ export class MessageDeliveryEngine {
     this.markPublishedSeq(ns, seqNum);
     client._markPulledSeqDelivered(ns, seqNum);
     client._clientLog.debug(`publish pulled delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
+    await this.drainOrderedMessages(ns, undefined, true);
     return true;
   }
 }

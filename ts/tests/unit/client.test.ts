@@ -3247,7 +3247,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 });
 
 describe('有序消息发布', () => {
-  it('P2P push 越过空洞时应挂起，补洞后按 contiguous_seq 顺序放行', async () => {
+  it('P2P push 越过空洞时应挂起，pull 补洞后应继续 drain pending 消息', async () => {
     const client = new AUNClient();
     const ns = 'p2p:alice.aid.com';
     (client as any)._aid = 'alice.aid.com';
