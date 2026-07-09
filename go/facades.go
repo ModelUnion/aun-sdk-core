@@ -3,10 +3,26 @@ package aun
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+var indexedDocumentSettingKeyNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
+
+var indexedDocumentSettingReservedBases = map[string]struct{}{
+	"join":          {},
+	"dispatch_mode": {},
+	"duty":          {},
+	"e2ee":          {},
+	"group":         {},
+	"group_index":   {},
+	"index":         {},
+	"name":          {},
+	"description":   {},
+	"visibility":    {},
+}
 
 type rpcFacade struct {
 	client StorageRPCClient
@@ -514,6 +530,55 @@ func groupIndexUpdateParams(groupID any, settings map[string]any, merged map[str
 	return out
 }
 
+func indexedDocumentKeyName(params map[string]any) (string, error) {
+	var raw any
+	if value, ok := params["keyName"]; ok {
+		raw = value
+	} else {
+		raw = params["key_name"]
+	}
+	keyName := strings.TrimSpace(stringValue(raw))
+	if keyName == "" || !indexedDocumentSettingKeyNamePattern.MatchString(keyName) {
+		return "", fmt.Errorf("keyName must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+	}
+	if _, reserved := indexedDocumentSettingReservedBases[strings.ToLower(keyName)]; reserved {
+		return "", fmt.Errorf("keyName must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+	}
+	return keyName, nil
+}
+
+func documentSettingResult(groupID, keyName string, settings map[string]any) map[string]any {
+	contentKey := keyName + ".content"
+	attachmentsKey := keyName + ".attachments"
+	content, ok := settings[contentKey]
+	if !ok {
+		content = ""
+	}
+	attachments := any([]any{})
+	if value, ok := settings[attachmentsKey]; ok {
+		attachments = value
+	}
+	updatedBy := ""
+	if value, ok := settings[contentKey+".updated_by"]; ok {
+		updatedBy = stringValue(value)
+	}
+	updatedAt := any(0)
+	if value, ok := settings[contentKey+".updated_at"]; ok {
+		updatedAt = value
+	}
+	return map[string]any{
+		"group_id": groupID,
+		"setting": map[string]any{
+			"group_id":    groupID,
+			"key_name":    keyName,
+			"content":     content,
+			"attachments": attachments,
+			"updated_by":  updatedBy,
+			"updated_at":  updatedAt,
+		},
+	}
+}
+
 func (f *GroupFacade) getIndexedSettings(ctx context.Context, groupID string, keys []string) (string, map[string]any, error) {
 	if cache, ok := f.client.(interface {
 		GetGroupIndexCachedSettings(string, []string) map[string]any
@@ -592,38 +657,82 @@ func (f *GroupFacade) hydrateGroupIndexSettings(ctx context.Context, groupID str
 	return settings, nil
 }
 
-func (f *GroupFacade) UpdateAnnouncement(ctx context.Context, params map[string]any) (any, error) {
-	// 便利方法：基于 SetSettings
-	groupID, ok := params["group_id"].(string)
-	if !ok || groupID == "" {
+func (f *GroupFacade) GetSettingWithIndex(ctx context.Context, params map[string]any) (any, error) {
+	groupID := strings.TrimSpace(stringValue(params["group_id"]))
+	if groupID == "" {
 		return nil, fmt.Errorf("group_id is required")
+	}
+	keyName, err := indexedDocumentKeyName(params)
+	if err != nil {
+		return nil, err
+	}
+
+	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{keyName + ".content", keyName + ".attachments"})
+	if err != nil {
+		return nil, err
+	}
+	return documentSettingResult(resultGroupID, keyName, settings), nil
+}
+
+func (f *GroupFacade) UpdateSettingWithIndex(ctx context.Context, params map[string]any) (any, error) {
+	groupID := strings.TrimSpace(stringValue(params["group_id"]))
+	if groupID == "" {
+		return nil, fmt.Errorf("group_id is required")
+	}
+	keyName, err := indexedDocumentKeyName(params)
+	if err != nil {
+		return nil, err
 	}
 	content, ok := params["content"]
 	if !ok {
 		return nil, fmt.Errorf("content is required")
 	}
 
-	settingsUpdate := map[string]any{"announcement.content": content}
-	if attachments, exists := params["attachments"]; exists {
-		settingsUpdate["announcement.attachments"] = attachments
+	settingsUpdate := map[string]any{keyName + ".content": content}
+	attachments := any([]any{})
+	if value, exists := params["attachments"]; exists {
+		attachments = value
+		settingsUpdate[keyName+".attachments"] = value
 	}
 
 	result, err := f.UpdateGroupIndex(ctx, groupIndexUpdateParams(groupID, settingsUpdate, params))
 	if err != nil {
 		return nil, err
 	}
-
 	resultMap, _ := result.(map[string]any)
-	attachmentsList := params["attachments"]
-	if attachmentsList == nil {
-		attachmentsList = []any{}
+	resultGroupID := strings.TrimSpace(stringValue(resultMap["group_id"]))
+	if resultGroupID == "" {
+		resultGroupID = groupID
 	}
+	return map[string]any{
+		"group_id": resultGroupID,
+		"setting": map[string]any{
+			"group_id":    resultGroupID,
+			"key_name":    keyName,
+			"content":     content,
+			"attachments": attachments,
+			"updated_by":  "",
+			"updated_at":  0,
+		},
+	}, nil
+}
+
+func (f *GroupFacade) UpdateAnnouncement(ctx context.Context, params map[string]any) (any, error) {
+	// 便利方法：基于 SetSettings
+	merged := cloneMap(params)
+	merged["keyName"] = "announcement"
+	result, err := f.UpdateSettingWithIndex(ctx, merged)
+	if err != nil {
+		return nil, err
+	}
+	resultMap := result.(map[string]any)
+	setting := resultMap["setting"].(map[string]any)
 	return map[string]any{
 		"group_id": resultMap["group_id"],
 		"announcement": map[string]any{
 			"group_id":    resultMap["group_id"],
-			"content":     content,
-			"attachments": attachmentsList,
+			"content":     setting["content"],
+			"attachments": setting["attachments"],
 		},
 	}, nil
 }
@@ -660,98 +769,60 @@ func (f *GroupFacade) AckEvents(ctx context.Context, params map[string]any) (any
 
 func (f *GroupFacade) GetAnnouncement(ctx context.Context, params map[string]any) (any, error) {
 	// 便利方法：基于 GetSettings
-	groupID, ok := params["group_id"].(string)
-	if !ok || groupID == "" {
-		return nil, fmt.Errorf("group_id is required")
-	}
-
-	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"announcement.content", "announcement.attachments"})
+	merged := cloneMap(params)
+	merged["keyName"] = "announcement"
+	result, err := f.GetSettingWithIndex(ctx, merged)
 	if err != nil {
 		return nil, err
 	}
-
-	content := ""
-	if v, ok := settings["announcement.content"].(string); ok {
-		content = v
-	}
-	attachments := []any{}
-	if v, ok := settings["announcement.attachments"].([]any); ok {
-		attachments = v
-	}
-
+	resultMap := result.(map[string]any)
+	setting := resultMap["setting"].(map[string]any)
 	return map[string]any{
-		"group_id": resultGroupID,
+		"group_id": resultMap["group_id"],
 		"announcement": map[string]any{
-			"group_id":    resultGroupID,
-			"content":     content,
-			"attachments": attachments,
+			"group_id":    setting["group_id"],
+			"content":     setting["content"],
+			"attachments": setting["attachments"],
 		},
 	}, nil
 }
 
 func (f *GroupFacade) GetRules(ctx context.Context, params map[string]any) (any, error) {
 	// 便利方法：基于 GetSettings
-	groupID, ok := params["group_id"].(string)
-	if !ok || groupID == "" {
-		return nil, fmt.Errorf("group_id is required")
-	}
-
-	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"rules.content", "rules.attachments"})
+	merged := cloneMap(params)
+	merged["keyName"] = "rules"
+	result, err := f.GetSettingWithIndex(ctx, merged)
 	if err != nil {
 		return nil, err
 	}
-
-	content := ""
-	if v, ok := settings["rules.content"].(string); ok {
-		content = v
-	}
-	attachments := []any{}
-	if v, ok := settings["rules.attachments"].([]any); ok {
-		attachments = v
-	}
-
+	resultMap := result.(map[string]any)
+	setting := resultMap["setting"].(map[string]any)
 	return map[string]any{
-		"group_id": resultGroupID,
+		"group_id": resultMap["group_id"],
 		"rules": map[string]any{
-			"group_id":    resultGroupID,
-			"content":     content,
-			"attachments": attachments,
+			"group_id":    setting["group_id"],
+			"content":     setting["content"],
+			"attachments": setting["attachments"],
 		},
 	}, nil
 }
 
 func (f *GroupFacade) UpdateRules(ctx context.Context, params map[string]any) (any, error) {
 	// 便利方法：基于 SetSettings
-	groupID, ok := params["group_id"].(string)
-	if !ok || groupID == "" {
-		return nil, fmt.Errorf("group_id is required")
-	}
-	content, ok := params["content"]
-	if !ok {
-		return nil, fmt.Errorf("content is required")
-	}
-
-	settingsUpdate := map[string]any{"rules.content": content}
-	if attachments, exists := params["attachments"]; exists {
-		settingsUpdate["rules.attachments"] = attachments
-	}
-
-	result, err := f.UpdateGroupIndex(ctx, groupIndexUpdateParams(groupID, settingsUpdate, params))
+	merged := cloneMap(params)
+	merged["keyName"] = "rules"
+	result, err := f.UpdateSettingWithIndex(ctx, merged)
 	if err != nil {
 		return nil, err
 	}
-
-	resultMap, _ := result.(map[string]any)
-	attachmentsList := params["attachments"]
-	if attachmentsList == nil {
-		attachmentsList = []any{}
-	}
+	resultMap := result.(map[string]any)
+	setting := resultMap["setting"].(map[string]any)
 	return map[string]any{
 		"group_id": resultMap["group_id"],
 		"rules": map[string]any{
 			"group_id":    resultMap["group_id"],
-			"content":     content,
-			"attachments": attachmentsList,
+			"content":     setting["content"],
+			"attachments": setting["attachments"],
 		},
 	}, nil
 }
@@ -763,7 +834,7 @@ func (f *GroupFacade) GetJoinRequirements(ctx context.Context, params map[string
 		return nil, fmt.Errorf("group_id is required")
 	}
 
-	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"})
+	resultGroupID, settings, err := f.getIndexedSettings(ctx, groupID, []string{"join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending", "join.attachments"})
 	if err != nil {
 		return nil, err
 	}
@@ -784,6 +855,10 @@ func (f *GroupFacade) GetJoinRequirements(ctx context.Context, params map[string
 	if v, ok := settings["join.max_pending"].(float64); ok {
 		maxPending = int(v)
 	}
+	attachments := []any{}
+	if v, ok := settings["join.attachments"].([]any); ok {
+		attachments = v
+	}
 
 	return map[string]any{
 		"group_id": resultGroupID,
@@ -793,6 +868,7 @@ func (f *GroupFacade) GetJoinRequirements(ctx context.Context, params map[string
 			"question":              question,
 			"auto_approve_patterns": patterns,
 			"max_pending":           maxPending,
+			"attachments":           attachments,
 		},
 	}, nil
 }
@@ -817,6 +893,9 @@ func (f *GroupFacade) UpdateJoinRequirements(ctx context.Context, params map[str
 	if maxPending, exists := params["max_pending"]; exists {
 		settingsUpdate["join.max_pending"] = maxPending
 	}
+	if attachments, exists := params["attachments"]; exists {
+		settingsUpdate["join.attachments"] = attachments
+	}
 
 	if len(settingsUpdate) == 0 {
 		return nil, fmt.Errorf("at least one field to update is required")
@@ -828,6 +907,10 @@ func (f *GroupFacade) UpdateJoinRequirements(ctx context.Context, params map[str
 	}
 
 	resultMap, _ := result.(map[string]any)
+	attachmentsList := params["attachments"]
+	if attachmentsList == nil {
+		attachmentsList = []any{}
+	}
 	return map[string]any{
 		"group_id": resultMap["group_id"],
 		"join_requirements": map[string]any{
@@ -836,6 +919,7 @@ func (f *GroupFacade) UpdateJoinRequirements(ctx context.Context, params map[str
 			"question":              params["question"],
 			"auto_approve_patterns": params["auto_approve_patterns"],
 			"max_pending":           params["max_pending"],
+			"attachments":           attachmentsList,
 		},
 	}, nil
 }

@@ -104,13 +104,24 @@ async def main() -> None:
         print("Bob 已加入并设为 admin\n")
 
         print("--- 1. SDK update_group_index 写入签名 group.index ---")
+        rules_v1_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/rules/rules-v1-{_run_id}.md",
+                "name": "rules-v1.md",
+            }
+        ]
         r1 = await alice.group.update_group_index(
             group_id=group_id,
-            settings={"rules.content": f"群规 v1 {_run_id}"},
+            settings={
+                "rules.content": f"群规 v1 {_run_id}",
+                "rules.attachments": rules_v1_attachments,
+            },
             last_modified=int(time.time() * 1000),
         )
         _check("updated_keys 含 group.index", GROUP_INDEX_KEY in r1.get("updated_keys", []), str(r1))
         _check("updated_keys 含 rules.content", "rules.content" in r1.get("updated_keys", []), str(r1))
+        _check("updated_keys 含 rules.attachments", "rules.attachments" in r1.get("updated_keys", []), str(r1))
 
         got1 = await bob.group.get_settings(group_id=group_id, keys=[GROUP_INDEX_KEY])
         group_aid = str(got1.get("group_aid") or group_id)
@@ -167,7 +178,10 @@ async def main() -> None:
         )
         _check("Bob SDK 重试路径保存成功", GROUP_INDEX_KEY in r4.get("updated_keys", []), str(r4))
 
-        got4 = await alice.group.get_settings(group_id=group_id, keys=[GROUP_INDEX_KEY, "rules.content", "announcement.content"])
+        got4 = await alice.group.get_settings(
+            group_id=group_id,
+            keys=[GROUP_INDEX_KEY, "rules.content", "rules.attachments", "announcement.content"],
+        )
         settings4 = _settings_map(got4)
         index4 = settings4.get(GROUP_INDEX_KEY)
         parsed4 = parse_group_index(index4)
@@ -175,8 +189,10 @@ async def main() -> None:
         verify4 = verify_group_index(index4, bob.current_aid)
         _check("最新 index 由 Bob 签名且验签通过", bool(verify4.ok and verify4.data.get("valid")), str(verify4))
         _check("最新 index 保留 Alice 的 rules.content", "rules.content" in keys4, str(keys4))
+        _check("最新 index 保留 Alice 的 rules.attachments", "rules.attachments" in keys4, str(keys4))
         _check("最新 index 包含 Bob 的 announcement.content", "announcement.content" in keys4, str(keys4))
         _check("DB rules.content 是 Alice v2", settings4.get("rules.content") == f"群规 v2 {_run_id}", str(settings4))
+        _check("DB rules.attachments 保留 Alice v1", settings4.get("rules.attachments") == rules_v1_attachments, str(settings4))
         _check("DB announcement.content 是 Bob v2", settings4.get("announcement.content") == f"公告 v2 {_run_id}", str(settings4))
 
     except Exception as exc:

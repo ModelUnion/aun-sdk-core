@@ -103,7 +103,7 @@
 | [group.set_settings](#groupset_settings) | 统一设置群参数（含公告、规则、入群要求、dispatch_mode 等） |
 | [group.get_settings](#groupget_settings) | 统一读取群参数 |
 
-**便利方法**：SDK 提供向后兼容的便利方法（`getAnnouncement`/`updateAnnouncement`/`getRules`/`updateRules`/`getJoinRequirements`/`updateJoinRequirements`）。读取方法优先返回 SDK 本地缓存，本地没有对应值时才调用 `get_settings` 初始化；即使观察到远端 etag 不一致也不会自动 pull 远端。indexed 写入方法内部调用 `updateGroupIndex` 生成签名 `group.index` 并通过 `set_settings` CAS 提交。
+**便利方法**：SDK 提供向后兼容的便利方法（`getAnnouncement`/`updateAnnouncement`/`getRules`/`updateRules`/`getJoinRequirements`/`updateJoinRequirements`），并提供通用文档型方法（`getSettingWithIndex`/`updateSettingWithIndex`，Python 为 `get_setting_with_index`/`update_setting_with_index`，Go 为 `GetSettingWithIndex`/`UpdateSettingWithIndex`）。读取方法优先返回 SDK 本地缓存，本地没有对应值时才调用 `get_settings` 初始化；即使观察到远端 etag 不一致也不会自动 pull 远端。indexed 写入方法内部调用 `updateGroupIndex` 生成签名 `group.index` 并通过 `set_settings` CAS 提交。
 
 ### 群文件系统
 
@@ -493,7 +493,7 @@ SDK 发起 `group.*` 调用时会把传入的 `group_id` / `groupId` / `group_ai
 
 ### group.set_role
 
-设置成员角色。需要 **owner** 权限。不能改变 owner 角色。该 RPC 只改变 membership 中的角色事实，不授予或撤销群自有区写 ACL；`role:admin` 是否可写群自有区由 `group.fs.set_acl` / `group.fs.remove_acl` 显式控制。
+设置成员角色。`owner` 可将普通成员设为 `admin`，也可将 `admin` 设回 `member`；`admin` 不能修改其它成员角色，只能将自己的角色降为 `member`。不能通过 `group.set_role` 改变 `owner` 角色；群主只在建群或 `group.transfer_owner` 中变更。该 RPC 改变 membership 中的角色事实；`owner/admin` 默认拥有群自有区写权限，`member` 默认没有写权限。成员级群协作目录应通过 `group.fs.set_acl` 显式授予 `role:member` 的 `rw` 权限。
 
 **参数**：
 
@@ -966,7 +966,12 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 | `expected_index_etag` | string | 写 `group.index` 时必填 | CAS 期望旧 etag；空字符串表示只允许创建首个 `group.index` |
 | `settings["dispatch_mode"]` | string | 否 | `"broadcast"` / `"mention"`，默认 `"broadcast"` |
 | `settings["rules.content"]` | string | 否 | 群规则正文 |
+| `settings["rules.attachments"]` | array | 否 | 群规则附件稳定引用 |
 | `settings["announcement.content"]` | string | 否 | 群公告正文 |
+| `settings["announcement.attachments"]` | array | 否 | 群公告附件稳定引用 |
+| `settings["join.attachments"]` | array | 否 | 入群要求附件稳定引用 |
+| `settings["{keyName}.content"]` | string | 否 | 通用文档型 indexed setting 正文；`keyName` 需满足受控命名规则 |
+| `settings["{keyName}.attachments"]` | array | 否 | 通用文档型 indexed setting 附件稳定引用 |
 | `settings["group.index"]` | object | 更新 indexed settings 时必填 | 签名 group index，当前结构至少包含 `body` |
 
 **预定义群级参数**：
@@ -984,6 +989,7 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 | `join.question` | string | `""` | 入群问题 |
 | `join.auto_approve_patterns` | array | `[]` | 自动批准 AID 匹配规则 |
 | `join.max_pending` | integer | `100` | 最大待审批入群申请数 |
+| `join.attachments` | array | `[]` | 入群材料附件稳定引用 |
 | `dispatch_mode` | string | `"broadcast"` | 群消息分发标签：`"broadcast"` / `"mention"`；未显式设置时 `get_settings` 仍返回默认值 |
 | `group.index` | object | — | 保留 key；签名 JSONL 群索引，由 SDK 生成，服务端只校验、CAS 保存和返回 |
 
@@ -993,15 +999,18 @@ aun-group-aid-renew-v1|{group_id}|{group_aid}|{sha256(old_public_key)}|{sha256(n
 |-----|------|
 | `rules.content` / `rules.attachments` | 群规则正文与附件稳定引用 |
 | `announcement.content` / `announcement.attachments` | 群公告正文与附件稳定引用 |
-| `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` | 入群要求配置 |
+| `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` / `join.attachments` | 入群要求配置与附件稳定引用 |
+| `{keyName}.content` / `{keyName}.attachments` | 通用文档型设置正文与附件稳定引用 |
 
 写入规则：
 
 - 只更新非 indexed settings 时，继续直接调用 `set_settings`，不需要 `group.index`。
 - 更新任意 indexed setting 时，必须在同一次 `settings` 中携带签名 `group.index`。
+- 服务端只接受受控动态文档 key：`{keyName}.content` / `{keyName}.attachments`，其中 `keyName` 匹配 `^[A-Za-z][A-Za-z0-9_-]{0,63}$`，且不能使用 `join` 等保留前缀。调用方不能用该机制写任意 settings key。
 - 写入 `group.index` 时必须传 `expected_index_etag`。
 - 服务端在同一事务内比较当前 `group.index` etag、写 indexed settings、写 `group.index`。
 - CAS 失败时错误消息包含 `group.index etag conflict`；SDK 的 `updateGroupIndex` 会重新读取当前 index、重建签名并按 `max_attempts` 重试。
+- `rules.attachments`、`announcement.attachments`、`join.attachments` 和 `{keyName}.attachments` 只保存附件引用；附件实体应先写入群自有区，推荐路径为 `group_aid:/.group/attachments/{rules|announcement|join|<keyName>}/...`。群自有区默认允许 `owner/admin` 写入，`member` 默认不可写；`.group/` 是系统控制目录，不允许授予 `role:member` 写权限。
 
 ```python
 await client.call("group.set_settings", {
@@ -1386,8 +1395,9 @@ result = await client.call("group.thought.get", {
 
 权限与签名约束：
 
-- 群自有区是除 `memberdata` 等系统保留路径外的整个 `group_aid` namespace。`group_aid` 当前证书签名可写；`role:owner` 默认可写；`role:admin` 需要 owner 通过 `group.fs.set_acl` 显式授权后才可写。
-- `group.fs.set_acl` / `group.fs.remove_acl` / `group.fs.get_acl` / `group.fs.list_acl` 只能由当前 group owner 调用，且当前只允许管理或查询 `grantee_aid="role:admin"` 的群自有区角色 ACL；成员升降级、退群、踢出不会联动授权或撤销。
+- 群自有区是除 `memberdata` 等系统保留路径外的整个 `group_aid` namespace。`group_aid` 当前证书签名可写；成员角色中 `owner/admin` 默认可写，`member` 默认不可写。`group_aid:/.group/` 是系统控制目录，用于群公告、群规则、入群要求附件，默认允许 `owner/admin` 写入。
+- 老群如果缺少 `.group/` 默认 ACL，group 服务会在该群首次被 RPC 访问时 best-effort 触发 namespace/ACL lazy repair；只有本次 baseline ACL 全部同步成功才记录本进程已检查，失败会在后续访问继续重试。
+- `group.fs.set_acl` / `group.fs.remove_acl` / `group.fs.get_acl` / `group.fs.list_acl` 只能由当前 group `owner/admin` 调用。当前支持 `grantee_aid="role:admin"` 与 `grantee_aid="role:member"`；`role:member` 只能授予具体业务目录的 `rw` 权限，不能授予根目录或 `.group/`，也不能获得删除、移动、重命名权限。成员升降级、退群、踢出不会联动授权或撤销目录 ACL。
 - `memberdata/{member_ref}` 写入默认只允许该成员本人；SDK 只传 group path，不拼接真实 storage 路径。
 - 上传控制面会透传 `parents` 到 storage：默认 `parents=true` 时可递归创建父目录，显式 `parents=false` 时父目录必须已存在。
 - JavaScript 浏览器版 `cp(string, group)` 默认把 string 当文本内容上传；Node 本地路径需显式传 `sourceType: "path"`、`localPath: true` 或使用 `local:` 前缀。Python、TypeScript 和 Go 默认把 string 当本地路径。
@@ -1418,21 +1428,21 @@ result = await client.call("group.thought.get", {
 
 ### group.fs.set_acl
 
-授予群自有区角色 ACL。需要当前 group owner 身份签名调用；底层由 group 服务以内部门面写入 `storage.set_acl`。
+授予群自有区角色 ACL。需要当前 group `owner/admin` 身份调用；底层由 group 服务以内部门面写入 `storage.set_acl`。
 
-参数：`path` 必填，指向群自有区路径；`grantee_aid` 只能为 `role:admin`；`perms` 默认 `rwx`，必须包含写权限。`path` 可传 `group_aid:/archive` 等 group path。服务端写入 storage 内部权限位时会把 POSIX 删除位 `x` 映射为内部 `d`，对外响应仍显示 `rwx`。
+参数：`path` 必填，指向群自有区路径；`grantee_aid` 可为 `role:admin` 或 `role:member`。`role:admin` 默认 `rwx`；`role:member` 只能为 `rw`，且只能授到具体业务目录，不能授到根目录或 `.group/`。`path` 可传 `group_aid:/archive` 等 group path。服务端写入 storage 内部权限位时会把 POSIX 删除位 `x` 映射为内部 `d`，对外响应仍显示 `rwx`；不授删除、移动、重命名权限时使用 `rw`。
 
 ### group.fs.remove_acl
 
-撤销群自有区角色 ACL。需要当前 group owner 身份签名调用；底层由 group 服务以内部门面写入 `storage.remove_acl`。
+撤销群自有区角色 ACL。需要当前 group `owner/admin` 身份调用；底层由 group 服务以内部门面写入 `storage.remove_acl`。
 
-参数：`path` 必填，指向群自有区路径；`grantee_aid` 只能为 `role:admin`。撤销后，当前 admin 角色成员不再因该路径的 `role:admin` ACL 获得写权限。
+参数：`path` 必填，指向群自有区路径；`grantee_aid` 可为 `role:admin` 或 `role:member`。撤销 `role:member` 后，member 不再因该目录 ACL 获得创建/写入权限。
 
 ### group.fs.get_acl
 
-查询群自有区角色 ACL。需要当前 group owner 身份签名调用；普通 admin/member 不能查询。参数：`path` 必填，指向群自有区路径；可传裸路径 + `group_id`，也可传完整 `group_aid:/...`。
+查询群自有区角色 ACL。需要当前 group `owner/admin` 身份调用；普通 member 不能查询。参数：`path` 必填，指向群自有区路径；可传裸路径 + `group_id`，也可传完整 `group_aid:/...`。
 
-响应包含 `group_id`、`group_aid`、`path`、`area`、`storage` 和 `acls`。`acls[].perms` 使用 POSIX 视图，删除权限显示为 `x`，因此 owner 授权 `role:admin:rwx` 后查询也返回 `rwx`。
+响应包含 `group_id`、`group_aid`、`path`、`area`、`storage` 和 `acls`。`acls[].perms` 使用 POSIX 视图，删除权限显示为 `x`，因此授权 `role:admin:rwx` 后查询也返回 `rwx`；`role:member` 只应返回 `rw`。
 
 ### group.fs.list_acl
 

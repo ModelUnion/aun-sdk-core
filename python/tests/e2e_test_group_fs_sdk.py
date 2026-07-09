@@ -133,7 +133,7 @@ async def test_group_fs_sdk_facade_roundtrip(tmp_path: Path) -> None:
         await owner.close()
 
 
-async def test_group_fs_admin_role_acl_grant_and_revoke(tmp_path: Path) -> None:
+async def test_group_fs_admin_default_write_and_member_acl_management(tmp_path: Path) -> None:
     rid = uuid.uuid4().hex[:8]
     owner_aid = f"gfs-acl-owner-{rid}.{_ISSUER}"
     admin_aid = f"gfs-acl-admin-{rid}.{_ISSUER}"
@@ -163,18 +163,23 @@ async def test_group_fs_admin_role_acl_grant_and_revoke(tmp_path: Path) -> None:
         granted.write_text(granted_body, encoding="utf-8")
         after.write_text(f"after revoke {rid}", encoding="utf-8")
 
-        with pytest.raises(Exception):
-            await admin.group.fs.cp(str(before), f"{base_dir}/before.txt", force=True, parents=True)
+        uploaded_before = await admin.group.fs.cp(str(before), f"{base_dir}/before.txt", force=True, parents=True)
+        if str(uploaded_before.get("type") or "") != "file":
+            raise AssertionError(f"admin 默认写入异常: {uploaded_before}")
 
-        grant = await owner.group.fs.set_acl(base_dir, grantee_aid="role:admin", perms="rwx")
+        grant = await admin.group.fs.set_acl(base_dir, grantee_aid="role:member", perms="rw")
         if grant.get("acl_action") != "set_acl":
             raise AssertionError(f"group.fs.set_acl 返回异常: {grant}")
+        if grant.get("grantee_aid") != "role:member" or grant.get("perms") != "rw":
+            raise AssertionError(f"group.fs.set_acl 未返回 role:member:rw: {grant}")
+        with pytest.raises(Exception):
+            await admin.group.fs.set_acl(base_dir, grantee_aid="role:member", perms="rwx")
         acl = await owner.group.fs.get_acl(base_dir)
-        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:admin" and item.get("perms") == "rwx" for item in acl.get("acls", [])):
-            raise AssertionError(f"group.fs.get_acl 未返回 role:admin:rwx: {acl}")
+        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:member" and item.get("perms") == "rw" for item in acl.get("acls", [])):
+            raise AssertionError(f"group.fs.get_acl 未返回 role:member:rw: {acl}")
         listed_acl = await owner.group.fs.list_acl(base_dir)
-        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:admin" and item.get("perms") == "rwx" for item in listed_acl.get("acls", [])):
-            raise AssertionError(f"group.fs.list_acl 未返回 role:admin:rwx: {listed_acl}")
+        if not any(isinstance(item, dict) and item.get("grantee_aid") == "role:member" and item.get("perms") == "rw" for item in listed_acl.get("acls", [])):
+            raise AssertionError(f"group.fs.list_acl 未返回 role:member:rw: {listed_acl}")
 
         uploaded = await admin.group.fs.cp(str(granted), f"{base_dir}/granted.txt", force=True, parents=True)
         if str(uploaded.get("type") or "") != "file":
@@ -185,12 +190,13 @@ async def test_group_fs_admin_role_acl_grant_and_revoke(tmp_path: Path) -> None:
         if not getattr(result, "verified", False) or downloaded.read_text(encoding="utf-8") != granted_body:
             raise AssertionError(f"owner 读取 admin 写入内容异常: {result}")
 
-        revoked = await owner.group.fs.remove_acl(base_dir, grantee_aid="role:admin")
+        revoked = await admin.group.fs.remove_acl(base_dir, grantee_aid="role:member")
         if revoked.get("acl_action") != "remove_acl":
             raise AssertionError(f"group.fs.remove_acl 返回异常: {revoked}")
 
-        with pytest.raises(Exception):
-            await admin.group.fs.cp(str(after), f"{base_dir}/after.txt", force=True, parents=True)
+        uploaded_after = await admin.group.fs.cp(str(after), f"{base_dir}/after.txt", force=True, parents=True)
+        if str(uploaded_after.get("type") or "") != "file":
+            raise AssertionError(f"admin 撤销 role:member ACL 后默认写入异常: {uploaded_after}")
     finally:
         if group_id:
             try:
@@ -200,4 +206,64 @@ async def test_group_fs_admin_role_acl_grant_and_revoke(tmp_path: Path) -> None:
         if store is not None:
             store.close()
         await admin.close()
+        await owner.close()
+
+
+async def test_group_fs_member_rw_acl_allows_create_but_not_remove_or_move(tmp_path: Path) -> None:
+    rid = uuid.uuid4().hex[:8]
+    owner_aid = f"gfs-member-owner-{rid}.{_ISSUER}"
+    member_aid = f"gfs-member-{rid}.{_ISSUER}"
+    group_name = f"gfsmem{rid}"
+    owner = _make_client()
+    member = _make_client()
+    group_id = ""
+    store: AIDStore | None = None
+    try:
+        await ensure_connected_identity(member, member_aid)
+        group_id, group_aid, store = await _create_named_group(owner, owner_aid, group_name)
+        await owner.call("group.add_member", {"group_id": group_id, "aid": member_aid, "role": "member"})
+        try:
+            await owner.call("group.fs.namespace_ready", {"group_id": group_id})
+        except Exception:
+            pass
+
+        base_dir = f"{group_aid}:/public/member-rw-{rid}"
+        before = tmp_path / "before-member.txt"
+        source = tmp_path / "member.txt"
+        before.write_text(f"before member grant {rid}", encoding="utf-8")
+        body = f"member rw write {rid}"
+        source.write_text(body, encoding="utf-8")
+
+        with pytest.raises(Exception):
+            await member.group.fs.cp(str(before), f"{base_dir}/before.txt", force=True, parents=True)
+
+        grant = await owner.group.fs.set_acl(base_dir, grantee_aid="role:member", perms="rw")
+        if grant.get("acl_action") != "set_acl" or grant.get("perms") != "rw":
+            raise AssertionError(f"group.fs.set_acl role:member:rw 返回异常: {grant}")
+
+        made_dir = await member.group.fs.mkdir(f"{base_dir}/subdir", parents=True)
+        if made_dir.get("type") != "dir":
+            raise AssertionError(f"member 授权后 mkdir 异常: {made_dir}")
+        uploaded = await member.group.fs.cp(str(source), f"{base_dir}/member.txt", force=True, parents=True)
+        if str(uploaded.get("type") or "") != "file":
+            raise AssertionError(f"member 授权后上传异常: {uploaded}")
+
+        downloaded = tmp_path / "member-downloaded.txt"
+        result = await owner.group.fs.cp(f"{base_dir}/member.txt", f"local:{downloaded}", force=True)
+        if not getattr(result, "verified", False) or downloaded.read_text(encoding="utf-8") != body:
+            raise AssertionError(f"owner 读取 member 写入内容异常: {result}")
+
+        with pytest.raises(Exception):
+            await member.group.fs.mv(f"{base_dir}/member.txt", f"{base_dir}/renamed.txt", force=True)
+        with pytest.raises(Exception):
+            await member.group.fs.rm(f"{base_dir}/member.txt", force=True)
+    finally:
+        if group_id:
+            try:
+                await owner.call("group.dissolve", {"group_id": group_id})
+            except Exception:
+                pass
+        if store is not None:
+            store.close()
+        await member.close()
         await owner.close()

@@ -317,6 +317,87 @@ describe('browser GroupFacade.updateGroupIndex', () => {
     expect(client.cachedGroupEtag).toBeTruthy();
   });
 
+  it('getJoinRequirements returns cached attachments', async () => {
+    const client = new FakeClient([]);
+    client.stale = true;
+    client.cachedSettings = {
+      'join.mode': 'approval',
+      'join.question': '为什么加入？',
+      'join.auto_approve_patterns': [],
+      'join.max_pending': 20,
+      'join.attachments': [{ type: 'group.fs', path: '/.group/attachments/join/guide.pdf' }],
+    };
+    const facade = new GroupFacade(client);
+
+    const result = await facade.getJoinRequirements({ group_id: 'g-team.example.test' });
+
+    expect((result as any).join_requirements.attachments).toEqual([
+      { type: 'group.fs', path: '/.group/attachments/join/guide.pdf' },
+    ]);
+    expect(client.calls).toEqual([]);
+  });
+
+  it('updateJoinRequirements writes attachments through updateGroupIndex', async () => {
+    const signer = fakeSigner();
+    const oldIndex = await baseIndex(signer, 'old');
+    const client = new FakeClient([oldIndex]);
+    client.currentAid = signer;
+    const facade = new GroupFacade(client);
+    const attachments = [{ type: 'group.fs', path: '/.group/attachments/join/guide.pdf' }];
+
+    const result = await facade.updateJoinRequirements({
+      group_id: 'g-team.example.test',
+      attachments,
+      last_modified: 2000,
+    });
+
+    const setCall = client.calls.find((item) => item.method === 'group.set_settings')?.params;
+    expect(setCall?.settings['join.attachments']).toEqual(attachments);
+    expect((result as any).join_requirements.attachments).toEqual(attachments);
+  });
+
+  it('getSettingWithIndex returns cached document setting', async () => {
+    const client = new FakeClient([]);
+    client.stale = true;
+    client.cachedSettings = {
+      'docs.content': '协作文档',
+      'docs.attachments': [{ type: 'group.fs', path: '/.group/attachments/docs/guide.pdf' }],
+    };
+    const facade = new GroupFacade(client);
+
+    const result = await facade.getSettingWithIndex({ group_id: 'g-team.example.test', keyName: 'docs' });
+
+    expect((result as any).setting.key_name).toBe('docs');
+    expect((result as any).setting.content).toBe('协作文档');
+    expect((result as any).setting.attachments).toEqual([{ type: 'group.fs', path: '/.group/attachments/docs/guide.pdf' }]);
+    expect(client.calls).toEqual([]);
+  });
+
+  it('updateSettingWithIndex writes content and attachments through updateGroupIndex', async () => {
+    const signer = fakeSigner();
+    const oldIndex = await baseIndex(signer, 'old');
+    const client = new FakeClient([oldIndex]);
+    client.currentAid = signer;
+    const facade = new GroupFacade(client);
+    const attachments = [{ type: 'group.fs', path: '/.group/attachments/docs/guide.pdf' }];
+
+    const result = await facade.updateSettingWithIndex({
+      group_id: 'g-team.example.test',
+      keyName: 'docs',
+      content: '协作文档',
+      attachments,
+      last_modified: 2000,
+    });
+
+    const setCall = client.calls.find((item) => item.method === 'group.set_settings')?.params;
+    expect(setCall?.settings['docs.content']).toBe('协作文档');
+    expect(setCall?.settings['docs.attachments']).toEqual(attachments);
+    expect(setCall?.settings['group.index']).toBeDefined();
+    expect((result as any).setting.key_name).toBe('docs');
+    expect((result as any).setting.content).toBe('协作文档');
+    expect((result as any).setting.attachments).toEqual(attachments);
+  });
+
   it('updateGroupIndex pulls, merges, and pushes with CAS', async () => {
     const signer = fakeSigner();
     const oldIndex = await baseIndex(signer, 'old');

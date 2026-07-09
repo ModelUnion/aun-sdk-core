@@ -312,6 +312,90 @@ async def test_update_rules_refreshes_indexed_settings_cache_after_push():
 
 
 @pytest.mark.asyncio
+async def test_get_join_requirements_returns_cached_attachments():
+    owner = _aid()
+    client = FakeClient(owner, [])
+    client.stale = True
+    client.cached_settings = {
+        "join.mode": "approval",
+        "join.question": "为什么加入？",
+        "join.auto_approve_patterns": [],
+        "join.max_pending": 20,
+        "join.attachments": [{"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"}],
+    }
+    facade = GroupFacade(client)
+
+    result = await facade.get_join_requirements(group_id="g-team.example.test")
+
+    assert result["join_requirements"]["attachments"] == [
+        {"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"}
+    ]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_join_requirements_writes_attachments_through_group_index():
+    owner = _aid()
+    old_index = _index(owner, "old")
+    client = FakeClient(owner, [old_index])
+    facade = GroupFacade(client)
+    attachments = [{"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"}]
+
+    result = await facade.update_join_requirements(
+        group_id="g-team.example.test",
+        attachments=attachments,
+        last_modified=2000,
+    )
+
+    set_call = [item for item in client.calls if item[0] == "group.set_settings"][0][1]
+    assert set_call["settings"]["join.attachments"] == attachments
+    assert result["join_requirements"]["attachments"] == attachments
+
+
+@pytest.mark.asyncio
+async def test_get_setting_with_index_returns_cached_document_setting():
+    client = FakeClient(_aid(), [])
+    client.stale = True
+    client.cached_settings = {
+        "docs.content": "协作文档",
+        "docs.attachments": [{"type": "group.fs", "path": "/.group/attachments/docs/guide.pdf"}],
+    }
+    facade = GroupFacade(client)
+
+    result = await facade.get_setting_with_index(group_id="g-team.example.test", key_name="docs")
+
+    assert result["setting"]["key_name"] == "docs"
+    assert result["setting"]["content"] == "协作文档"
+    assert result["setting"]["attachments"] == [{"type": "group.fs", "path": "/.group/attachments/docs/guide.pdf"}]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_setting_with_index_writes_content_and_attachments_through_group_index():
+    owner = _aid()
+    old_index = _index(owner, "old")
+    client = FakeClient(owner, [old_index])
+    facade = GroupFacade(client)
+    attachments = [{"type": "group.fs", "path": "/.group/attachments/docs/guide.pdf"}]
+
+    result = await facade.update_setting_with_index(
+        group_id="g-team.example.test",
+        key_name="docs",
+        content="协作文档",
+        attachments=attachments,
+        last_modified=2000,
+    )
+
+    set_call = [item for item in client.calls if item[0] == "group.set_settings"][0][1]
+    assert set_call["settings"]["docs.content"] == "协作文档"
+    assert set_call["settings"]["docs.attachments"] == attachments
+    assert "group.index" in set_call["settings"]
+    assert result["setting"]["key_name"] == "docs"
+    assert result["setting"]["content"] == "协作文档"
+    assert result["setting"]["attachments"] == attachments
+
+
+@pytest.mark.asyncio
 async def test_update_group_index_pulls_merges_and_pushes_with_cas():
     owner = _aid()
     old_index = _index(owner, "old")

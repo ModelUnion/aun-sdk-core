@@ -6,6 +6,45 @@
 
 ---
 
+## 0.5.4 — 2026-07-09
+
+### 新功能
+
+#### 通用 indexed document settings
+- `GroupFacade` 新增 `get_setting_with_index()` / `update_setting_with_index()`，支持按 `key_name` 管理 `{key_name}.content` 与 `{key_name}.attachments` 两类文档型 indexed settings。
+- `key_name` 增加统一校验：必须匹配 `^[A-Za-z][A-Za-z0-9_-]{0,63}$`，并拒绝 `join`、`group`、`index`、`visibility` 等保留基名。
+- 公告与群规 facade 复用通用 indexed document setting 路径，继续通过 signed `group.index` + `expected_index_etag` CAS 写入。
+
+#### 入群要求附件
+- `get_join_requirements()` / `update_join_requirements()` 支持 `attachments`，对应服务端 `join.attachments` indexed setting。
+- `join.attachments` 与公告/群规附件保持同一类 `group.fs` 引用结构，可通过 group.index 签名索引同步。
+
+#### Group FS 角色 ACL
+- 服务端 group.fs 命名空间新增受保护 `.group` 控制目录，并为 owner/admin 同步基线角色 ACL。
+- owner/admin 默认可写群自有区；admin 可管理群自有区角色 ACL。
+- `role:member` 支持按具体业务目录授予 `rw`，允许成员创建/上传，但不允许删除、重命名或移动群自有区内容。
+
+### 修复
+
+- 修复 Storage 直接入口对群自有区删除/移动/重命名权限检查不足的问题，删除类操作统一走 `delete` 权限判定。
+- 修复旧 group AID 证书类型仍为 normal 时，Storage 无法通过 group resolver 判定群空间的问题。
+- 兼容 CA 续期时 PEM 公钥与 SPKI base64 的等价比较，并兼容托管续期返回 `cert_pem` / `new_cert` 字段。
+
+### 改进
+
+- message/group WAL writer 的 `micro_wait` 支持 auto 预算模型，并扩展性能统计输出，便于观察批量写入队列深度与 pending 状态。
+- group.fs 命名空间在读取 group 记录时支持懒修复，缺失 baseline ACL 时可重试同步。
+- SDK 包版本和运行时 `__version__` 更新为 `0.5.4`。
+
+### 测试
+
+- 扩展 group.index facade 单元测试，覆盖通用 indexed document setting、`join.attachments` 缓存读取和 group.index 写入路径。
+- 扩展 group settings / group index 集成测试，覆盖 `rules.attachments`、`announcement.attachments`、通用 `docs.*` indexed settings 和 CAS 合并保留。
+- 扩展签名审计 E2E，验证公告、群规、入群要求附件可签名写入并读回。
+- 扩展 group.fs E2E，覆盖 admin 默认写入、admin 管理 `role:member:rw` ACL、member 只写不删不改名。
+
+---
+
 ## 0.5.3 — 2026-07-07
 
 ### 新功能

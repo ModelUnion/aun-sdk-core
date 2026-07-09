@@ -1,10 +1,162 @@
-# Python SDK 变更清单（v0.3.3 → v0.5.3）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.5.4）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript SDK 进行功能对齐时使用，详尽列出各版本 Python SDK 的实际变更，定位到具体类、函数与代码行。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
 
-涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) → `9eadd3a8` (v0.5.1 发布基线) → `b8b8a1b1` (v0.5.2 发布基线) + 当前工作区 (v0.5.3)。
+涉及提交：`5a962885` (v0.3.7) → ... → `1a92fbf6` (v0.5.0，对外发布基线；tag object 为 `b0328ef2`) → `42e1694b` (perf-quick-wins) → `3f3fa167` (storage 对齐) → `9eadd3a8` (v0.5.1 发布基线) → `b8b8a1b1` (v0.5.2 发布基线) → `58aea27d` (v0.5.3 发布基线) → `b9052842` (消息写入与证书续期兼容) + 当前工作区 (v0.5.4)。
+
+---
+
+## v0.5.4 — 相对于 v0.5.3 发布基线的变更
+
+> 基线：`58aea27d`（v0.5.3 对外发布提交）vs 当前工作区（目标版本 v0.5.4，`pyproject.toml` / `version.py` 已标 0.5.4）。
+>
+> Git 历史参考：`b9052842` 包含 message/group WAL writer、CA 续期兼容、TS pull 补洞 drain 等已提交变更；当前工作区包含四语言 facade、group.fs / storage 权限和测试补齐。
+>
+> 行号说明：本节所有 `Lx` / `Lx~Ly` 均指**当前工作区文件行号**。定位格式统一为 `file:func:line`；模块级常量或版本号使用 `file:<module>:line`。
+>
+> 变更块：**① 版本号**、**② 通用 indexed document settings**、**③ join.attachments 入群要求附件**、**④ group.fs / storage 角色 ACL 与命名空间**、**⑤ 服务端兼容性与写入性能**、**⑥ 测试覆盖与对齐优先级**。
+
+### 版本号
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `pyproject.toml:<module>:L7` | 修改 | Python 包版本升级为 `0.5.4` |
+| `src/aun_core/version.py:<module>:L1` | 修改 | SDK 运行时 `__version__` 升级为 `0.5.4` |
+
+### 块① 通用 indexed document settings
+
+#### Python SDK facade
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/facades.py:<module>:L10~23` | 新增 | 定义文档型 indexed setting 的 `key_name` 正则与保留基名集合 |
+| `src/aun_core/facades.py:GroupFacade._indexed_document_key_name:L406` | 新增 | 同时接受 `key_name` / `keyName`，校验 `^[A-Za-z][A-Za-z0-9_-]{0,63}$` 并拒绝保留基名 |
+| `src/aun_core/facades.py:GroupFacade._document_setting_result:L418` | 新增 | 统一返回 `{group_id, setting}`，setting 含 `key_name/content/attachments/updated_by/updated_at` |
+| `src/aun_core/facades.py:GroupFacade.get_setting_with_index:L438` | 新增 | 读取 `{key_name}.content` / `{key_name}.attachments`，优先走 group index cache，缺失再回源 |
+| `src/aun_core/facades.py:GroupFacade.update_setting_with_index:L451` | 新增 | 通过 `update_group_index()` 写入 `{key_name}.content` / `{key_name}.attachments`，并保留 signed `group.index` CAS 语义 |
+| `src/aun_core/facades.py:GroupFacade.get_announcement:L480` | 修改 | 公告读取改为 `get_setting_with_index(key_name="announcement")` |
+| `src/aun_core/facades.py:GroupFacade.update_announcement:L497` | 修改 | 公告写入改为 `update_setting_with_index(key_name="announcement")` |
+| `src/aun_core/facades.py:GroupFacade.get_rules:L512` | 修改 | 群规读取改为 `get_setting_with_index(key_name="rules")` |
+| `src/aun_core/facades.py:GroupFacade.update_rules:L529` | 修改 | 群规写入改为 `update_setting_with_index(key_name="rules")` |
+
+**对齐要点**：Go / TypeScript / JavaScript 已按同一模型新增 `GetSettingWithIndex` / `getSettingWithIndex` 与 `UpdateSettingWithIndex` / `updateSettingWithIndex`。语言必须保持相同 key name 规则、保留基名集合、返回结构和 signed `group.index` 写入路径。
+
+#### 服务端 settings 接入
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `../extensions/services/group/service.py:<module>:L63~76` | 新增 | 服务端定义动态 indexed document setting 的 key name 规则和保留基名 |
+| `../extensions/services/group/service.py:GroupService._SETTINGS_TABLE_KEYS:L11374` | 修改 | 内置 indexed settings 集合加入 `join.attachments` |
+| `../extensions/services/group/service.py:GroupService._is_dynamic_indexed_document_setting_key:L11388` | 新增 | 识别 `{key}.content` / `{key}.attachments` 动态 indexed document setting |
+| `../extensions/services/group/service.py:GroupService._is_indexed_setting_key:L11404` | 新增 | indexed setting 判断从固定集合扩展为固定集合 + 动态文档键 |
+| `../extensions/services/group/service.py:GroupService.set_settings:L11567` | 修改 | `group.set_settings` 接受动态文档键，但仍要求同时写入 signed `group.index` |
+| `../extensions/services/group/service.py:GroupService.set_settings:L11630` | 修改 | 动态 `{key}.attachments` 必须是 list，避免附件结构被写成标量 |
+
+**对齐要点**：SDK 侧可以开放通用文档 helper，但服务端仍只允许通过 signed `group.index` 更新 indexed settings。裸写 `{key}.content` / `{key}.attachments` 必须被拒绝。
+
+### 块② join.attachments 入群要求附件
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `src/aun_core/facades.py:GroupFacade.get_join_requirements:L544` | 修改 | 读取 key 列表加入 `join.attachments`，返回 `join_requirements.attachments` |
+| `src/aun_core/facades.py:GroupFacade.update_join_requirements:L569` | 修改 | 支持传入 `attachments` 并写入 `join.attachments` |
+| `../extensions/services/group/models.py:GroupJoinRequirements:L202` | 修改 | 入群要求模型新增 `attachments: list[dict[str, Any]]` |
+| `../extensions/services/group/repository.py:GroupRepository.update_join_requirements:L2405` | 修改 | 写入 `join.attachments` |
+| `../extensions/services/group/repository.py:GroupRepository.get_join_requirements:L2409` | 修改 | 读取 `join.attachments`，缺失时返回空列表 |
+| `../extensions/services/group/service.py:GroupService.set_settings:L11627` | 修改 | 校验 `join.attachments` 必须是 list |
+
+**对齐要点**：四语言的 `getJoinRequirements` / `updateJoinRequirements` 等价 API 都要保留 `attachments` 字段。返回默认值为空数组，不应返回 `null`。
+
+### 块③ group.fs / storage 角色 ACL 与命名空间
+
+#### group.fs 命名空间与默认角色
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `../extensions/services/group/service.py:<module>:L183` | 修改 | baseline 路径加入受保护 `.group` 控制目录 |
+| `../extensions/services/group/service.py:<module>:L187` | 修改 | baseline role ACL 从 owner 扩展为 owner/admin |
+| `../extensions/services/group/service.py:GroupService._ensure_group_storage_namespace:L5593` | 修改 | `.group` / `memberdata` 标记为 protected/system，返回 `baseline_role_acls_synced` |
+| `../extensions/services/group/service.py:GroupService._maybe_lazy_ensure_group_storage_namespace:L6108` | 新增 | 读取 group 记录时懒修复 group.fs namespace，并在 baseline ACL 未同步时允许后续重试 |
+| `../extensions/services/group/service.py:GroupService._try_ensure_group_storage_namespace:L5682` | 修改 | 群存储授权从 owner 放宽到 owner/admin |
+
+#### 角色 ACL 与写/删权限边界
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `../extensions/services/group/service.py:GroupService._ensure_group_fs_own_area_write_auth:L7102` | 修改 | 群自有区写入允许 group_aid、owner/admin，以及已授权 member role ACL |
+| `../extensions/services/group/service.py:GroupService._ensure_group_fs_own_area_delete_or_move_auth:L7111` | 新增 | 删除/移动/重命名限制为 group_aid 或 owner/admin；member `rw` 不包含删除/移动 |
+| `../extensions/services/group/service.py:GroupService._require_group_fs_role_acl_grantee:L7140` | 修改 | group.fs 角色 ACL 支持 `role:member` |
+| `../extensions/services/group/service.py:GroupService._normalize_group_fs_role_acl_perms:L7147` | 修改 | `role:member` 默认权限为 `rw`，非 member 默认仍是 `rwx` |
+| `../extensions/services/group/service.py:GroupService._normalize_group_fs_role_acl_perms:L7159` | 修改 | `role:member` 只能授予 `rw`，不能授予 `rwx` |
+| `../extensions/services/group/service.py:GroupService._ensure_group_fs_role_acl_storage_path:L7181` | 新增 | `role:member` ACL 只能作用于具体业务目录，不能授予根目录或 `.group` 控制目录 |
+| `../extensions/services/storage/service.py:StorageService._acl_allows:L1523` | 修改 | 群自有区成员写入改为查 `role:member` ACL |
+| `../extensions/services/storage/service.py:StorageService.delete_object:L3836` | 修改 | 按对象 id 删除时也检查 `delete` 权限，避免绕过群自有区限制 |
+| `../extensions/services/storage/service.py:StorageService.rename_folder:L4322` | 修改 | 文件夹重命名前检查源路径 `delete` 权限 |
+| `../extensions/services/storage/service.py:StorageService.move_folder:L4406` | 修改 | 文件夹移动前检查源路径 `delete` 权限 |
+| `../extensions/services/storage/service.py:StorageService.delete_folder:L4464` | 修改 | 文件夹删除前检查 `delete` 权限 |
+| `../extensions/services/storage/service.py:StorageService.set_acl:L4558` | 修改 | 内部 group caller 可设置 `role:member`，但仅允许具体业务目录 `rw` |
+| `../extensions/services/storage/service.py:StorageService.move_object:L6375` | 修改 | 对象移动前检查源路径 `delete` 权限 |
+
+**对齐要点**：SDK 行为上，owner/admin 不再依赖额外 role ACL 即可写群自有区；member 只有显式 `role:member:rw` 才可在授权目录创建/上传，且不能删除、移动或重命名。四语言 group.fs E2E 应按此权限边界断言。
+
+### 块④ 服务端兼容性与写入性能
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `../extensions/services/message/db.py:<module>:L53` | 修改 | message 写入路径适配 `message_inbox`，按设备 inbox 作为更直接的 pull 数据来源 |
+| `../extensions/services/message/entry.py:_wal_writer_loop:L15875` | 修改 | message WAL writer `micro_wait` 支持 auto 预算模型：`budget_ms / (1 + queue_depth)`，并受 max 限制 |
+| `../extensions/services/message/entry.py:_wal_writer_loop:L15794` | 修改 | message WAL writer 性能日志增加 queue depth、pending、micro wait 等统计 |
+| `../extensions/services/group/service.py:GroupService._group_wal_writer_loop:L1959` | 修改 | group WAL writer 同步采用 auto micro-wait 配置与预算模型 |
+| `../extensions/services/group/service.py:GroupService._group_wal_writer_loop:L1830` | 修改 | group WAL writer 性能日志增加 micro wait、queue depth、pending count |
+| `../extensions/services/ca/entry.py:_public_key_spki_b64_for_compare:L1302` | 新增 | CA 续期比较公钥时兼容 PEM public key 与 SPKI base64 |
+| `../extensions/services/ca/entry.py:_rpc_renew_cert:L1344` | 修改 | renew_cert 对 existing/requested 公钥统一转 SPKI base64 后比较 |
+| `../extensions/services/aid_custody/service.py:AidCustodyService.renew_cert:L549` | 修改 | 托管续期证书字段兼容 `cert` / `cert_pem` / `new_cert` |
+| `ts/src/client/delivery.ts:MessageDeliveryEngine.publishPulledMessage:L1862/L1870` | 修改 | TS 客户端 pull 补洞发布后继续 `drainOrderedMessages(..., pullResponse=true)`，修复 pending push 不放行 |
+
+**对齐要点**：这些多为服务端或 TS 专项修复。Python SDK 本身无需复制 TS drain 代码，但跨语言测试需要确保“pull 补洞后 pending push 可继续投递”的语义一致。
+
+### 块⑤ 测试覆盖与跨 SDK 对齐优先级
+
+#### Python SDK / E2E 测试入口
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `tests/unit/test_group_index_facade.py:test_get_join_requirements_returns_cached_attachments:L315` | 新增 | fresh cache 命中时读取 `join.attachments` 不发 RPC |
+| `tests/unit/test_group_index_facade.py:test_update_join_requirements_writes_attachments_through_group_index:L337` | 新增 | `update_join_requirements(attachments=...)` 通过 `group.index` 写入 `join.attachments` |
+| `tests/unit/test_group_index_facade.py:test_get_setting_with_index_returns_cached_document_setting:L356` | 新增 | 通用 `get_setting_with_index()` 读取 `{key}.content` / `{key}.attachments` |
+| `tests/unit/test_group_index_facade.py:test_update_setting_with_index_writes_content_and_attachments_through_group_index:L374` | 新增 | 通用 `update_setting_with_index()` 写入 content/attachments 和 signed `group.index` |
+| `tests/integration_test_group_settings.py:main:L187` | 修改 | 集成测试新增 `docs.content` / `docs.attachments` 通用 indexed document setting 场景 |
+| `tests/integration_test_group_index.py:main:L118` | 修改 | group index CAS 合并测试覆盖 `rules.attachments` 保留 |
+| `tests/e2e_test_signature_audit.py:test_full_lifecycle_signature_audit:L208/L248` | 修改 | 签名审计 E2E 覆盖规则附件和入群要求附件读回 |
+| `tests/e2e_test_group_fs_sdk.py:test_group_fs_admin_default_write_and_member_acl_management:L136` | 修改 | admin 默认写入、admin 管理 `role:member:rw` ACL |
+| `tests/e2e_test_group_fs_sdk.py:test_group_fs_member_rw_acl_allows_create_but_not_remove_or_move:L212` | 新增 | member `rw` ACL 允许创建/上传，但拒绝 remove/move |
+
+#### 服务端重点测试入口
+
+| 定位 | 类型 | 说明 |
+|------|------|------|
+| `../extensions/services/group/tests/test_grp041_group_aid_path_mapping.py:test_group_storage_namespace_grants_own_area_and_control_dir_to_owner_and_admin_roles:L412` | 新增/修改 | namespace 同步 owner/admin 基线 ACL 与 `.group` 控制目录 |
+| `../extensions/services/group/tests/test_grp041_group_aid_path_mapping.py:test_require_group_lazily_syncs_group_storage_namespace_once:L436` | 新增 | `_require_group()` 懒修复 namespace 只同步一次 |
+| `../extensions/services/group/tests/test_grp041_group_aid_path_mapping.py:test_require_group_retries_lazy_namespace_sync_after_acl_failure:L462` | 新增 | baseline ACL 同步失败后不标记 checked，后续可重试 |
+| `../extensions/services/group/tests/test_grp041_group_aid_path_mapping.py:test_group_fs_admin_can_set_member_rw_role_acl:L614` | 新增 | admin 可设置 `role:member:rw` |
+| `../extensions/services/group/tests/test_grp044_group_index_service.py:<module>:L236/L267` | 修改 | 服务端 group.index 覆盖 `join.attachments` 与动态 `docs.attachments` |
+| `../extensions/services/storage/test_storage_group_memberdata_unit.py:test_internal_group_set_acl_allows_member_rw_role_principal:L1957` | 新增 | Storage 内部 group caller 可设置 `role:member:rw` |
+| `../extensions/services/storage/test_storage_group_memberdata_unit.py:test_group_member_role_acl_allows_write_but_not_delete_or_rename:L2124` | 新增 | Storage 层验证 member `rw` 不含删除/改名权限 |
+| `../extensions/services/storage/test_storage_group_memberdata_unit.py:test_owner_is_group_space_falls_back_to_group_resolver_when_aid_type_stale_normal:L1987` | 新增 | group AID 证书类型过期为 normal 时仍可通过 group resolver 识别群空间 |
+
+#### 跨语言对齐优先级
+
+| 优先级 | 对齐项 | Python 参考定位 |
+|--------|--------|----------------|
+| P0 | 通用 indexed document setting API、key name 校验、返回结构 | `src/aun_core/facades.py:GroupFacade.get_setting_with_index:L438`; `src/aun_core/facades.py:GroupFacade.update_setting_with_index:L451` |
+| P0 | `join.attachments` 读写、默认空数组、通过 signed `group.index` 更新 | `src/aun_core/facades.py:GroupFacade.get_join_requirements:L544`; `src/aun_core/facades.py:GroupFacade.update_join_requirements:L569` |
+| P0 | 动态 `{key}.content` / `{key}.attachments` 服务端必须要求 `group.index`，裸写拒绝 | `../extensions/services/group/service.py:GroupService.set_settings:L11567`; `../extensions/services/group/service.py:GroupService._is_dynamic_indexed_document_setting_key:L11388` |
+| P1 | group.fs owner/admin 默认写；member `role:member:rw` 只允许创建/上传，不允许删除/移动 | `../extensions/services/group/service.py:GroupService._ensure_group_fs_own_area_write_auth:L7102`; `../extensions/services/group/service.py:GroupService._ensure_group_fs_own_area_delete_or_move_auth:L7111` |
+| P1 | `.group` 控制目录、baseline ACL、namespace 懒修复 | `../extensions/services/group/service.py:GroupService._ensure_group_storage_namespace:L5593`; `../extensions/services/group/service.py:GroupService._maybe_lazy_ensure_group_storage_namespace:L6108` |
+| P1 | Storage 直接入口 delete/move/rename 权限不可绕过 member `rw` 限制 | `../extensions/services/storage/service.py:StorageService.delete_object:L3836`; `../extensions/services/storage/service.py:StorageService.move_object:L6375` |
+| P2 | 服务端性能与兼容性：WAL auto micro-wait、CA SPKI 比较、托管续期字段兼容 | `../extensions/services/group/service.py:GroupService._group_wal_writer_loop:L1959`; `../extensions/services/ca/entry.py:_public_key_spki_b64_for_compare:L1302`; `../extensions/services/aid_custody/service.py:AidCustodyService.renew_cert:L549` |
 
 ---
 

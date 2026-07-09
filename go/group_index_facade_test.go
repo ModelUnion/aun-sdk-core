@@ -434,6 +434,117 @@ func TestGroupFacadeUpdateRulesRefreshesIndexedSettingsCacheAfterPush(t *testing
 	}
 }
 
+func TestGroupFacadeGetJoinRequirementsReturnsCachedAttachments(t *testing.T) {
+	ctx := context.Background()
+	attachments := []any{map[string]any{"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"}}
+	client := &fakeGroupIndexRPCClient{
+		stale: true,
+		cachedSettings: map[string]any{
+			"join.mode":                  "approval",
+			"join.question":              "为什么加入？",
+			"join.auto_approve_patterns": []any{},
+			"join.max_pending":           float64(20),
+			"join.attachments":           attachments,
+		},
+	}
+	group := newGroupFacade(client)
+
+	result, err := group.GetJoinRequirements(ctx, map[string]any{"group_id": "g-team.example.test"})
+	if err != nil {
+		t.Fatalf("GetJoinRequirements 失败: %v", err)
+	}
+	requirements := result.(map[string]any)["join_requirements"].(map[string]any)
+	if !reflect.DeepEqual(requirements["attachments"], attachments) {
+		t.Fatalf("attachments 不匹配: %#v", requirements)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("fresh cache 命中时不应发 RPC: %#v", client.calls)
+	}
+}
+
+func TestGroupFacadeUpdateJoinRequirementsWritesAttachmentsThroughGroupIndex(t *testing.T) {
+	ctx := context.Background()
+	signer := fakeGroupIndexSigner{aid: "owner.example.test"}
+	oldIndex := testBaseGroupIndex(t, signer, "old")
+	attachments := []any{map[string]any{"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"}}
+	client := &fakeGroupIndexRPCClient{getResults: []any{oldIndex}}
+	group := newGroupFacade(client)
+
+	result, err := group.UpdateJoinRequirements(ctx, map[string]any{
+		"group_id":      "g-team.example.test",
+		"attachments":   attachments,
+		"signer":        signer,
+		"last_modified": 2000,
+	})
+	if err != nil {
+		t.Fatalf("UpdateJoinRequirements 失败: %v", err)
+	}
+	setCall := client.calls[1].params
+	settings := setCall["settings"].(map[string]any)
+	if !reflect.DeepEqual(settings["join.attachments"], attachments) {
+		t.Fatalf("settings 未写入 join.attachments: %#v", settings)
+	}
+	requirements := result.(map[string]any)["join_requirements"].(map[string]any)
+	if !reflect.DeepEqual(requirements["attachments"], attachments) {
+		t.Fatalf("返回 attachments 不匹配: %#v", requirements)
+	}
+}
+
+func TestGroupFacadeGetSettingWithIndexReturnsCachedDocumentSetting(t *testing.T) {
+	ctx := context.Background()
+	attachments := []any{map[string]any{"type": "group.fs", "path": "/.group/attachments/docs/guide.pdf"}}
+	client := &fakeGroupIndexRPCClient{
+		stale: true,
+		cachedSettings: map[string]any{
+			"docs.content":     "协作文档",
+			"docs.attachments": attachments,
+		},
+	}
+	group := newGroupFacade(client)
+
+	result, err := group.GetSettingWithIndex(ctx, map[string]any{"group_id": "g-team.example.test", "key_name": "docs"})
+	if err != nil {
+		t.Fatalf("GetSettingWithIndex 失败: %v", err)
+	}
+	setting := result.(map[string]any)["setting"].(map[string]any)
+	if setting["key_name"] != "docs" || setting["content"] != "协作文档" || !reflect.DeepEqual(setting["attachments"], attachments) {
+		t.Fatalf("setting 不匹配: %#v", setting)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("fresh cache 命中时不应发 RPC: %#v", client.calls)
+	}
+}
+
+func TestGroupFacadeUpdateSettingWithIndexWritesContentAndAttachmentsThroughGroupIndex(t *testing.T) {
+	ctx := context.Background()
+	signer := fakeGroupIndexSigner{aid: "owner.example.test"}
+	oldIndex := testBaseGroupIndex(t, signer, "old")
+	attachments := []any{map[string]any{"type": "group.fs", "path": "/.group/attachments/docs/guide.pdf"}}
+	client := &fakeGroupIndexRPCClient{getResults: []any{oldIndex}}
+	group := newGroupFacade(client)
+
+	result, err := group.UpdateSettingWithIndex(ctx, map[string]any{
+		"group_id":      "g-team.example.test",
+		"keyName":       "docs",
+		"content":       "协作文档",
+		"attachments":   attachments,
+		"signer":        signer,
+		"last_modified": 2000,
+	})
+	if err != nil {
+		t.Fatalf("UpdateSettingWithIndex 失败: %v", err)
+	}
+	setCall := client.calls[1].params
+	settings := setCall["settings"].(map[string]any)
+	if settings["docs.content"] != "协作文档" || !reflect.DeepEqual(settings["docs.attachments"], attachments) || settings[GroupIndexKey] == nil {
+		t.Fatalf("settings 不匹配: %#v", settings)
+	}
+	setting := result.(map[string]any)["setting"].(map[string]any)
+	if setting["key_name"] != "docs" || setting["content"] != "协作文档" || !reflect.DeepEqual(setting["attachments"], attachments) {
+		t.Fatalf("返回 setting 不匹配: %#v", setting)
+	}
+}
+
 func TestGroupFacadeUpdateGroupIndexPullsMergesAndPushesWithCAS(t *testing.T) {
 	ctx := context.Background()
 	signer := fakeGroupIndexSigner{aid: "owner.example.test"}

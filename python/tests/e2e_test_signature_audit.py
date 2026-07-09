@@ -117,9 +117,9 @@ async def test_full_lifecycle_signature_audit():
 
     流程：
     1. Alice 创建群 → Bob 加入
-    2. Alice 更新公告 → Bob 收到带签名的事件
-    3. Alice 更新规则 → Bob 收到带签名的事件
-    4. Alice 更新入群要求 → Bob 收到带签名的事件
+    2. Alice 更新公告 content+attachments → Bob 收到带签名的事件并读回设置
+    3. Alice 更新规则 content+attachments → Bob 收到带签名的事件并读回设置
+    4. Alice 更新入群要求 content+attachments → Bob 收到带签名的事件并读回设置
     5. Alice 修改 Bob 角色 → Bob 收到带签名的事件
     6. Alice 踢 Charlie → Bob 收到带签名的事件
     """
@@ -163,9 +163,18 @@ async def test_full_lifecycle_signature_audit():
 
         sub_ann = bob.on("group.changed", _on_ann)
 
+        announcement_content = f"审计测试公告 {rid}"
+        announcement_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/announcement/audit-ann-{rid}.md",
+                "name": "audit-ann.md",
+            }
+        ]
         await alice.group.update_announcement(
             group_id=group_id,
-            content=f"审计测试公告 {rid}",
+            content=announcement_content,
+            attachments=announcement_attachments,
         )
         await _wait_event(events, ready)
 
@@ -173,6 +182,13 @@ async def test_full_lifecycle_signature_audit():
             _check_signature(events[0], _ALICE_AID, "公告更新")
         else:
             _result("公告更新: Bob 收到事件", False, "超时")
+
+        got_ann = await bob.group.get_announcement(group_id=group_id)
+        ann = got_ann.get("announcement") or {}
+        _result("公告 content 可读回", ann.get("content") == announcement_content,
+                f"got {ann.get('content')}")
+        _result("公告 attachments 可读回", ann.get("attachments") == announcement_attachments,
+                f"got {ann.get('attachments')}")
 
         sub_ann.unsubscribe()
 
@@ -188,9 +204,18 @@ async def test_full_lifecycle_signature_audit():
 
         sub_rules = bob.on("group.changed", _on_rules)
 
+        rules_content = f"审计测试规则 {rid}"
+        rules_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/rules/audit-rules-{rid}.md",
+                "name": "audit-rules.md",
+            }
+        ]
         await alice.group.update_rules(
             group_id=group_id,
-            content="审计测试规则",
+            content=rules_content,
+            attachments=rules_attachments,
         )
         await _wait_event(events, ready)
 
@@ -198,6 +223,13 @@ async def test_full_lifecycle_signature_audit():
             _check_signature(events[0], _ALICE_AID, "规则更新")
         else:
             _result("规则更新: Bob 收到事件", False, "超时")
+
+        got_rules = await bob.group.get_rules(group_id=group_id)
+        rules = got_rules.get("rules") or {}
+        _result("规则 content 可读回", rules.get("content") == rules_content,
+                f"got {rules.get('content')}")
+        _result("规则 attachments 可读回", rules.get("attachments") == rules_attachments,
+                f"got {rules.get('attachments')}")
 
         sub_rules.unsubscribe()
 
@@ -213,9 +245,18 @@ async def test_full_lifecycle_signature_audit():
 
         sub_join = bob.on("group.changed", _on_join_req)
 
+        join_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/join/audit-join-{rid}.md",
+                "name": "audit-join.md",
+            }
+        ]
         await alice.group.update_join_requirements(
             group_id=group_id,
             mode="approval",
+            question="请说明入群原因",
+            attachments=join_attachments,
         )
         await _wait_event(events, ready)
 
@@ -223,6 +264,13 @@ async def test_full_lifecycle_signature_audit():
             _check_signature(events[0], _ALICE_AID, "入群要求更新")
         else:
             _result("入群要求更新: Bob 收到事件", False, "超时")
+
+        got_join = await bob.group.get_join_requirements(group_id=group_id)
+        join_requirements = got_join.get("join_requirements") or {}
+        _result("入群要求 mode 可读回", join_requirements.get("mode") == "approval",
+                f"got {join_requirements.get('mode')}")
+        _result("入群要求 attachments 可读回", join_requirements.get("attachments") == join_attachments,
+                f"got {join_requirements.get('attachments')}")
 
         sub_join.unsubscribe()
 

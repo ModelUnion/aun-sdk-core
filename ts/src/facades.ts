@@ -12,6 +12,20 @@ export interface FacadeRpcClient {
 
 export type FacadeParams = RpcParams;
 
+const INDEXED_DOCUMENT_SETTING_KEY_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const INDEXED_DOCUMENT_SETTING_RESERVED_BASES = new Set([
+  'join',
+  'dispatch_mode',
+  'duty',
+  'e2ee',
+  'group',
+  'group_index',
+  'index',
+  'name',
+  'description',
+  'visibility',
+]);
+
 export function stripNil(params: FacadeParams = {}): FacadeParams {
   const out: FacadeParams = {};
   for (const [key, value] of Object.entries(params)) {
@@ -43,6 +57,15 @@ function indexUpdateParams(groupId: unknown, settings: Record<string, any>, merg
     if (key in merged) out[key] = merged[key];
   }
   return out;
+}
+
+function indexedDocumentKeyName(params: Record<string, any>): string {
+  const raw = 'keyName' in params ? params.keyName : params.key_name;
+  const keyName = String(raw ?? '').trim();
+  if (!keyName || INDEXED_DOCUMENT_SETTING_RESERVED_BASES.has(keyName.toLowerCase()) || !INDEXED_DOCUMENT_SETTING_KEY_NAME_RE.test(keyName)) {
+    throw new Error('keyName must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$');
+  }
+  return keyName;
 }
 
 abstract class RpcFacade {
@@ -173,42 +196,86 @@ export class GroupFacade extends RpcFacade {
     return this.call('group.complete_transfer', split.params);
   }
 
-  async getRules(params?: FacadeParams): Promise<RpcResult> {
+  private documentSettingResult(groupId: string, keyName: string, settings: Record<string, any>): RpcResult {
+    const contentKey = `${keyName}.content`;
+    const attachmentsKey = `${keyName}.attachments`;
+    return {
+      group_id: groupId,
+      setting: {
+        group_id: groupId,
+        key_name: keyName,
+        content: settings[contentKey] ?? '',
+        attachments: settings[attachmentsKey] ?? [],
+        updated_by: settings[`${contentKey}.updated_by`] ?? '',
+        updated_at: settings[`${contentKey}.updated_at`] ?? 0,
+      },
+    };
+  }
+
+  async getSettingWithIndex(params?: FacadeParams): Promise<RpcResult> {
     const merged = params || {};
     const groupId = merged.group_id;
     if (!groupId) throw new Error('group_id is required');
-    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['rules.content', 'rules.attachments']);
-    return { group_id: resultGroupId, rules: { group_id: resultGroupId, content: settings['rules.content'] || '', attachments: settings['rules.attachments'] || [], updated_by: settings['rules.content.updated_by'] || '', updated_at: settings['rules.content.updated_at'] || 0 } };
+    const keyName = indexedDocumentKeyName(merged);
+    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), [`${keyName}.content`, `${keyName}.attachments`]);
+    return this.documentSettingResult(resultGroupId, keyName, settings);
+  }
+
+  async updateSettingWithIndex(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const groupId = merged.group_id;
+    if (!groupId) throw new Error('group_id is required');
+    const keyName = indexedDocumentKeyName(merged);
+    if (!('content' in merged)) throw new Error('content is required');
+    const content = merged.content;
+    const attachments = merged.attachments ?? [];
+    const settingsUpdate: Record<string, any> = { [`${keyName}.content`]: content };
+    if ('attachments' in merged) settingsUpdate[`${keyName}.attachments`] = attachments;
+    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
+    const resultGroupId = String((result as Record<string, any>).group_id ?? groupId);
+    return {
+      group_id: resultGroupId,
+      setting: {
+        group_id: resultGroupId,
+        key_name: keyName,
+        content,
+        attachments,
+        updated_by: '',
+        updated_at: 0,
+      },
+    };
+  }
+
+  async getRules(params?: FacadeParams): Promise<RpcResult> {
+    const merged = params || {};
+    const result = await this.getSettingWithIndex({ ...merged, keyName: 'rules' });
+    const resultMap = result as Record<string, any>;
+    const setting = (result as Record<string, any>).setting;
+    return { group_id: resultMap.group_id, rules: { group_id: setting.group_id, content: setting.content, attachments: setting.attachments, updated_by: setting.updated_by, updated_at: setting.updated_at } };
   }
 
   async updateRules(params?: FacadeParams): Promise<RpcResult> {
     const merged = params || {};
-    const { group_id: groupId, content, attachments } = merged;
-    if (!groupId) throw new Error('group_id is required');
-    if (content === undefined) throw new Error('content is required');
-    const settingsUpdate: Record<string, any> = { 'rules.content': content };
-    if (attachments !== undefined) settingsUpdate['rules.attachments'] = attachments;
-    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
-    return { group_id: (result as Record<string, any>).group_id, rules: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
+    const result = await this.updateSettingWithIndex({ ...merged, keyName: 'rules' });
+    const resultMap = result as Record<string, any>;
+    const setting = (result as Record<string, any>).setting;
+    return { group_id: resultMap.group_id, rules: { group_id: resultMap.group_id, content: setting.content, attachments: setting.attachments } };
   }
 
   async getAnnouncement(params?: FacadeParams): Promise<RpcResult> {
     const merged = params || {};
-    const groupId = merged.group_id;
-    if (!groupId) throw new Error('group_id is required');
-    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['announcement.content', 'announcement.attachments']);
-    return { group_id: resultGroupId, announcement: { group_id: resultGroupId, content: settings['announcement.content'] || '', attachments: settings['announcement.attachments'] || [], updated_by: settings['announcement.content.updated_by'] || '', updated_at: settings['announcement.content.updated_at'] || 0 } };
+    const result = await this.getSettingWithIndex({ ...merged, keyName: 'announcement' });
+    const resultMap = result as Record<string, any>;
+    const setting = (result as Record<string, any>).setting;
+    return { group_id: resultMap.group_id, announcement: { group_id: setting.group_id, content: setting.content, attachments: setting.attachments, updated_by: setting.updated_by, updated_at: setting.updated_at } };
   }
 
   async updateAnnouncement(params?: FacadeParams): Promise<RpcResult> {
     const merged = params || {};
-    const { group_id: groupId, content, attachments } = merged;
-    if (!groupId) throw new Error('group_id is required');
-    if (content === undefined) throw new Error('content is required');
-    const settingsUpdate: Record<string, any> = { 'announcement.content': content };
-    if (attachments !== undefined) settingsUpdate['announcement.attachments'] = attachments;
-    const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
-    return { group_id: (result as Record<string, any>).group_id, announcement: { group_id: (result as Record<string, any>).group_id, content, attachments: attachments || [] } };
+    const result = await this.updateSettingWithIndex({ ...merged, keyName: 'announcement' });
+    const resultMap = result as Record<string, any>;
+    const setting = (result as Record<string, any>).setting;
+    return { group_id: resultMap.group_id, announcement: { group_id: resultMap.group_id, content: setting.content, attachments: setting.attachments } };
   }
 
   requestJoin(params?: FacadeParams): Promise<RpcResult> { return this.call('group.request_join', params); }
@@ -220,8 +287,8 @@ export class GroupFacade extends RpcFacade {
     const merged = params || {};
     const groupId = merged.group_id;
     if (!groupId) throw new Error('group_id is required');
-    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['join.mode', 'join.question', 'join.auto_approve_patterns', 'join.max_pending']);
-    return { group_id: resultGroupId, join_requirements: { group_id: resultGroupId, mode: settings['join.mode'] || 'open', question: settings['join.question'] || '', auto_approve_patterns: settings['join.auto_approve_patterns'] || [], max_pending: settings['join.max_pending'] || 100, updated_by: settings['join.mode.updated_by'] || '', updated_at: settings['join.mode.updated_at'] || 0 } };
+    const { groupId: resultGroupId, settings } = await this.getIndexedSettings(String(groupId), ['join.mode', 'join.question', 'join.auto_approve_patterns', 'join.max_pending', 'join.attachments']);
+    return { group_id: resultGroupId, join_requirements: { group_id: resultGroupId, mode: settings['join.mode'] || 'open', question: settings['join.question'] || '', auto_approve_patterns: settings['join.auto_approve_patterns'] || [], max_pending: settings['join.max_pending'] || 100, attachments: settings['join.attachments'] || [], updated_by: settings['join.mode.updated_by'] || '', updated_at: settings['join.mode.updated_at'] || 0 } };
   }
 
   async updateJoinRequirements(params?: FacadeParams): Promise<RpcResult> {
@@ -233,9 +300,10 @@ export class GroupFacade extends RpcFacade {
     if ('question' in merged) settingsUpdate['join.question'] = merged.question;
     if ('auto_approve_patterns' in merged) settingsUpdate['join.auto_approve_patterns'] = merged.auto_approve_patterns;
     if ('max_pending' in merged) settingsUpdate['join.max_pending'] = merged.max_pending;
+    if ('attachments' in merged) settingsUpdate['join.attachments'] = merged.attachments;
     if (Object.keys(settingsUpdate).length === 0) throw new Error('at least one field to update is required');
     const result = await this.updateGroupIndex(indexUpdateParams(groupId, settingsUpdate, merged));
-    return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: merged.mode, question: merged.question, auto_approve_patterns: merged.auto_approve_patterns, max_pending: merged.max_pending } };
+    return { group_id: (result as Record<string, any>).group_id, join_requirements: { group_id: (result as Record<string, any>).group_id, mode: merged.mode, question: merged.question, auto_approve_patterns: merged.auto_approve_patterns, max_pending: merged.max_pending, attachments: merged.attachments || [] } };
   }
 
   createInviteCode(params?: FacadeParams): Promise<RpcResult> { return this.call('group.create_invite_code', params); }

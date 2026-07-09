@@ -3,19 +3,17 @@
 
 覆盖：
   1. set_settings 写入 groups 表字段（name, visibility）
-  2. update_group_index 写入 indexed settings（rules.content, announcement.content）
-  3. set_settings 混合写入
-  4. set_settings 未知 key 被拒绝
-  5. set_settings 非管理员被拒绝
-  6. get_settings 全量读取
-  7. get_settings keys 过滤读取
-  8. info 基本信息（成员视角）
-  9. info 非成员看公开群
-  10. info 非成员看私有群被拒
-  11. 老方法写入 → 新方法能读到（兼容性）
-  12. 新方法写入 → 老方法能读到（兼容性）
-  13. 老方法返回含 _deprecated 字段
-  14. visibility=invite_only 向后兼容映射到 private
+  2. update_group_index 写入 indexed settings（rules/announcement 的 content + attachments）
+  3. update_setting_with_index 写入通用 indexed document setting（content + attachments）
+  4. set_settings 混合写入
+  5. set_settings 未知 key 被拒绝
+  6. set_settings 非管理员被拒绝
+  7. get_settings 全量读取
+  8. get_settings keys 过滤读取
+  9. info 基本信息（成员视角）
+  10. info 非成员看公开群
+  11. info 非成员看私有群被拒
+  12. visibility=invite_only 向后兼容映射到 private
 
 使用方法：
   AUN_DATA_ROOT="D:/modelunion/kite/docker-deploy/data/sdk-tester-aun" \
@@ -153,21 +151,67 @@ async def main():
         print()
 
         # ── 2. update_group_index: indexed settings ──
-        print("--- 2. update_group_index: rules.content + announcement.content ---")
+        print("--- 2. update_group_index: rules/announcement content + attachments ---")
+        rules_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/rules/rules-{_run_id}.md",
+                "name": "rules.md",
+            }
+        ]
+        announcement_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/announcement/announcement-{_run_id}.md",
+                "name": "announcement.md",
+            }
+        ]
         r2 = await alice.group.update_group_index(
             group_id=group_id,
             settings={
                 "rules.content": "请遵守测试群规",
+                "rules.attachments": rules_attachments,
                 "announcement.content": "欢迎来到测试群",
+                "announcement.attachments": announcement_attachments,
             },
         )
         _check("set rules+announcement 成功", r2.get("group_id") == group_id)
         _check("updated_keys 含 rules.content",
                "rules.content" in r2.get("updated_keys", []))
+        _check("updated_keys 含 rules.attachments",
+               "rules.attachments" in r2.get("updated_keys", []))
+        _check("updated_keys 含 announcement.attachments",
+               "announcement.attachments" in r2.get("updated_keys", []))
         print()
 
-        # ── 3. set_settings: 混合写入 ──
-        print("--- 3. set_settings: 混合写入（name + duty.config）---")
+        # ── 3. update_setting_with_index: 通用 indexed document setting ──
+        print("--- 3. update_setting_with_index: docs content + attachments ---")
+        docs_attachments = [
+            {
+                "type": "group.fs",
+                "path": f"/.group/attachments/docs/docs-{_run_id}.md",
+                "name": "docs.md",
+            }
+        ]
+        r2b = await alice.group.update_setting_with_index(
+            group_id=group_id,
+            key_name="docs",
+            content="协作文档正文",
+            attachments=docs_attachments,
+        )
+        _check("通用 indexed setting 写入成功", r2b.get("group_id") == group_id)
+        _check("返回 key_name=docs", (r2b.get("setting") or {}).get("key_name") == "docs")
+        _check("返回 docs.attachments 正确",
+               (r2b.get("setting") or {}).get("attachments") == docs_attachments)
+        r2b_read = await bob.group.get_setting_with_index(group_id=group_id, key_name="docs")
+        _check("成员可读 docs.content",
+               (r2b_read.get("setting") or {}).get("content") == "协作文档正文")
+        _check("成员可读 docs.attachments",
+               (r2b_read.get("setting") or {}).get("attachments") == docs_attachments)
+        print()
+
+        # ── 4. set_settings: 混合写入 ──
+        print("--- 4. set_settings: 混合写入（name + duty.config）---")
         r3 = await alice.call("group.set_settings", {
             "group_id": group_id,
             "settings": {
@@ -180,8 +224,8 @@ async def main():
         _check("updated_keys 含 duty.config", "duty.config" in r3.get("updated_keys", []))
         print()
 
-        # ── 4. set_settings: 未知 key 被拒 ──
-        print("--- 4. set_settings: 未知 key ---")
+        # ── 5. set_settings: 未知 key 被拒 ──
+        print("--- 5. set_settings: 未知 key ---")
         try:
             await alice.call("group.set_settings", {
                 "group_id": group_id,
@@ -193,8 +237,8 @@ async def main():
                    str(exc)[:80])
         print()
 
-        # ── 5. set_settings: 非管理员被拒 ──
-        print("--- 5. set_settings: Bob（非管理员）被拒 ---")
+        # ── 6. set_settings: 非管理员被拒 ──
+        print("--- 6. set_settings: Bob（非管理员）被拒 ---")
         try:
             await bob.call("group.set_settings", {
                 "group_id": group_id,
@@ -205,8 +249,8 @@ async def main():
             _check("非管理员被拒绝", True, str(exc)[:80])
         print()
 
-        # ── 6. get_settings: 全量 ──
-        print("--- 6. get_settings: 全量 ---")
+        # ── 7. get_settings: 全量 ──
+        print("--- 7. get_settings: 全量 ---")
         r6 = await alice.call("group.get_settings", {"group_id": group_id})
         settings_list = r6.get("settings", [])
         keys_returned = {s["key"] for s in settings_list}
@@ -214,7 +258,11 @@ async def main():
         _check("含 name", "name" in keys_returned)
         _check("含 visibility", "visibility" in keys_returned)
         _check("含 rules.content", "rules.content" in keys_returned)
+        _check("含 rules.attachments", "rules.attachments" in keys_returned)
         _check("含 announcement.content", "announcement.content" in keys_returned)
+        _check("含 announcement.attachments", "announcement.attachments" in keys_returned)
+        _check("含 docs.content", "docs.content" in keys_returned)
+        _check("含 docs.attachments", "docs.attachments" in keys_returned)
         _check("含 duty.config", "duty.config" in keys_returned)
 
         # 验证值正确性
@@ -223,13 +271,22 @@ async def main():
                f"got: {settings_map.get('name')}")
         _check("rules.content 值正确", settings_map.get("rules.content") == "请遵守测试群规",
                f"got: {settings_map.get('rules.content')}")
+        _check("rules.attachments 值正确", settings_map.get("rules.attachments") == rules_attachments,
+               f"got: {settings_map.get('rules.attachments')}")
         _check("announcement.content 值正确",
                settings_map.get("announcement.content") == "欢迎来到测试群",
                f"got: {settings_map.get('announcement.content')}")
+        _check("announcement.attachments 值正确",
+               settings_map.get("announcement.attachments") == announcement_attachments,
+               f"got: {settings_map.get('announcement.attachments')}")
+        _check("docs.content 值正确", settings_map.get("docs.content") == "协作文档正文",
+               f"got: {settings_map.get('docs.content')}")
+        _check("docs.attachments 值正确", settings_map.get("docs.attachments") == docs_attachments,
+               f"got: {settings_map.get('docs.attachments')}")
         print()
 
-        # ── 7. get_settings: keys 过滤 ──
-        print("--- 7. get_settings: keys 过滤 ---")
+        # ── 8. get_settings: keys 过滤 ──
+        print("--- 8. get_settings: keys 过滤 ---")
         r7 = await alice.call("group.get_settings", {
             "group_id": group_id,
             "keys": ["name", "rules.content"],
@@ -239,8 +296,8 @@ async def main():
                f"got: {keys_7}")
         print()
 
-        # ── 8. get_info: 成员视角 ──
-        print("--- 8. get_info: 成员视角 ---")
+        # ── 9. get_info: 成员视角 ──
+        print("--- 9. get_info: 成员视角 ---")
         r8 = await alice.call("group.get_info", {"group_id": group_id, "required": ["member"]})
         _check("get_info 返回 group_id", r8.get("group_id") == group_id)
         _check("get_info 含 name", r8.get("name") == f"Mixed-{_run_id}")
@@ -250,8 +307,8 @@ async def main():
         _check("get_info 含 updated_at", "updated_at" in r8)
         print()
 
-        # ── 9. get_info: 非成员看公开群 ──
-        print("--- 9. get_info: 非成员看公开群 ---")
+        # ── 10. get_info: 非成员看公开群 ──
+        print("--- 10. get_info: 非成员看公开群 ---")
         # Bob 不在 private 群里，但 public 群他是成员。用 private_gid 不行因为它是 private。
         # 创建另一个 public 群，Bob 不加入
         pub2_name = f"PubNoMember-{_run_id}"
@@ -271,8 +328,8 @@ async def main():
             pass
         print()
 
-        # ── 10. get_info: 非成员看私有群被拒 ──
-        print("--- 10. get_info: 非成员看私有群被拒 ---")
+        # ── 11. get_info: 非成员看私有群被拒 ──
+        print("--- 11. get_info: 非成员看私有群被拒 ---")
         try:
             await bob.call("group.get_info", {"group_id": private_gid})
             _check("非成员看私有群应被拒", False, "没有抛异常")
@@ -280,8 +337,8 @@ async def main():
             _check("非成员看私有群被拒", True, str(exc)[:80])
         print()
 
-        # ── 11. invite_only 向后兼容 ──
-        print("--- 11. visibility=invite_only 向后兼容 ---")
+        # ── 12. invite_only 向后兼容 ──
+        print("--- 12. visibility=invite_only 向后兼容 ---")
         await alice.call("group.set_settings", {
             "group_id": group_id,
             "settings": {"visibility": "invite_only"},

@@ -329,7 +329,7 @@ headers = client.get_protected_headers()
 | Collab | `client.collab` | `client.collab` | `client.Collab()` | 版本化文档、标签、`gc` / `reflog` / `revert` |
 | Group FS | `client.group.fs` | `client.group.fs` | `client.Group().FS()` | POSIX 风格群文件系统；`ls/find/stat/lstat/mkdir/rm/cp/mv/df/mount/umount`，以及 `set_acl/remove_acl/get_acl/list_acl` 角色 ACL 门面，上传下载数据面由 SDK 编排 |
 
-群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `group_data/{group_aid}` 的映射只在服务端完成。群自有区写入允许当前 `group_aid` 证书签名、默认 `role:owner`、以及 owner 通过 `group.fs.set_acl` 显式授权后的 `role:admin`；撤销使用 `group.fs.remove_acl`，查询使用 `group.fs.get_acl/list_acl`，这些角色 ACL 操作都要求当前 group owner 调用且对外权限位显示为 `rwx`。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
+群文件系统路径统一使用 `group_aid:/...`，成员数据区使用 `group_aid:/memberdata/{member_ref}/...`。SDK 不拼接真实 storage 路径，`memberdata` 到成员 `group_data/{group_aid}` 的映射只在服务端完成。群自有区写入允许当前 `group_aid` 证书签名；成员角色中 `owner/admin` 默认可写群自有区，`member` 默认不可写。`owner/admin` 可通过 `group.fs.set_acl` 对特定业务目录授予 `role:member` 的 `rw` 权限，用于后续群协作场景；`rw` 只允许创建/写入，不授予删除、移动、重命名权限。`rwd` 是 storage 内部权限位，SDK/RPC 对外按 POSIX 视图显示为 `rwx`，不给删除/移动/重命名权限时只使用 `rw`。`.group/` 是系统控制目录，默认给 `owner/admin` 写权限，用于群公告、群规则、入群要求附件，不能向 `role:member` 授权。老群如果缺少 `.group/` 默认 ACL，group 服务会在该群首次被 RPC 访问时 best-effort 触发 namespace/ACL lazy repair；ACL 同步全部成功后才记录本进程已检查，失败会在后续访问继续重试。JS 浏览器版上传中 `string` 默认表示文本内容，Node 本地路径需显式 `sourceType: "path"`、`localPath: true` 或 `local:` 前缀；Python/TS/Go 默认把 `string` 当本地路径。
 
 ### 消息与群组门面
 
@@ -352,8 +352,13 @@ headers = client.get_protected_headers()
 - `getAnnouncement()` / `updateAnnouncement()` — 群公告
 - `getRules()` / `updateRules()` — 群规则
 - `getJoinRequirements()` / `updateJoinRequirements()` — 入群要求
+- `getSettingWithIndex()` / `updateSettingWithIndex()` — 通用文档型 indexed setting（Python 为 `get_setting_with_index()` / `update_setting_with_index()`，Go 为 `GetSettingWithIndex()` / `UpdateSettingWithIndex()`）
 
-读取方法优先返回 SDK 本地缓存；本地没有对应值时才读取相应 settings 做初始化。便利读取从服务端拿到 canonical `group_aid` 后，会同时以 canonical `group_aid` 和本次入参 `group_id` 写入 settings cache，避免 legacy/base `group_id` 下一次读取直接 cache miss。即使 `checkGroupIndex` 观察到远端 etag 与本地 etag 不一致，`getAnnouncement()` / `getRules()` / `getJoinRequirements()` 也不会自动拉取远端版本覆盖本地缓存。`updateAnnouncement()` / `updateRules()` / `updateJoinRequirements()` 属于 indexed 写入，内部会调用 `updateGroupIndex` 生成签名 `group.index` 并带 `expected_index_etag` CAS 提交。
+读取方法优先返回 SDK 本地缓存；本地没有对应值时才读取相应 settings 做初始化。便利读取从服务端拿到 canonical `group_aid` 后，会同时以 canonical `group_aid` 和本次入参 `group_id` 写入 settings cache，避免 legacy/base `group_id` 下一次读取直接 cache miss。即使 `checkGroupIndex` 观察到远端 etag 与本地 etag 不一致，`getAnnouncement()` / `getRules()` / `getJoinRequirements()` / `getSettingWithIndex()` 也不会自动拉取远端版本覆盖本地缓存。`updateAnnouncement()` / `updateRules()` / `updateJoinRequirements()` / `updateSettingWithIndex()` 属于 indexed 写入，内部会调用 `updateGroupIndex` 生成签名 `group.index` 并带 `expected_index_etag` CAS 提交。
+
+`getSettingWithIndex()` / `updateSettingWithIndex()` 比三对预定义方法多一个 `keyName`（Python 可传 `key_name`，Go 同时接受 `keyName` / `key_name`）。SDK 会生成 `{keyName}.content` 和 `{keyName}.attachments` 两个 settings key；`keyName` 只能是受控文档名（`^[A-Za-z][A-Za-z0-9_-]{0,63}$`，且不能使用 `join` 等保留前缀）。`getRules()` / `updateRules()` 与 `getAnnouncement()` / `updateAnnouncement()` 是该通用方法在 `rules`、`announcement` 上的薄封装；`getJoinRequirements()` / `updateJoinRequirements()` 保持结构化 schema，不改成 `join.content`。
+
+这些 `update*` 便利方法只更新群设置元数据：`updateRules()` / `updateAnnouncement()` / `updateSettingWithIndex()` 写入 `*.content` 与 `*.attachments`，`updateJoinRequirements()` 写入 `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` / `join.attachments`。`attachments` 只保存稳定引用，附件实体应先上传到 group.fs 群自有区，推荐路径为 `group_aid:/.group/attachments/{rules|announcement|join|<keyName>}/...`。
 
 **Group Index 高级同步方法**：`group.index` 是 SDK 内部签名 manifest，用于记录群公告、群规则、入群要求及附件稳定引用的版本。SDK 观察 `_meta.group_indexes` 后只记录远端 etag；etag 不一致只表示本地与观察到的远端版本不同，可能是远端更新，也可能是本地有未提交修改。应用层需要显式选择 pull 远端或 push 本地。
 
@@ -529,7 +534,8 @@ fmt.Printf("拉取成功，etag: %s\n", result["meta"].(map[string]any)["etag"])
 
 - `rules.content` / `rules.attachments` — 群规则及附件
 - `announcement.content` / `announcement.attachments` — 群公告及附件
-- `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` — 入群要求
+- `join.mode` / `join.question` / `join.auto_approve_patterns` / `join.max_pending` / `join.attachments` — 入群要求及附件
+- `{keyName}.content` / `{keyName}.attachments` — 通用文档型 indexed setting；`keyName` 需满足 `^[A-Za-z][A-Za-z0-9_-]{0,63}$`，且不能使用 `join` 等保留前缀
 
 **返回值**：
 
@@ -605,6 +611,9 @@ result, err := client.Group().UpdateGroupIndex(ctx, map[string]any{
     "settings": map[string]any{
         "join.mode": "approval",
         "join.question": "你是如何知道本群的？",
+        "join.attachments": []any{
+            map[string]any{"type": "group.fs", "path": "/.group/attachments/join/guide.pdf"},
+        },
     },
 })
 if err != nil {
@@ -619,6 +628,7 @@ fmt.Printf("推送成功\n")
 2. **签名算法限制**：当前版本仅支持 ECDSA-P256-SHA256，使用其他算法的 AID 无法签名
 3. **CAS 冲突策略**：默认重试 2 次，高并发场景建议增加 `max_attempts`
 4. **`signer` 必须是当前连接身份**：服务端强制校验 `signed_by == actor_aid`，传入其他 AID 会被拒绝
+5. **附件字段只存引用**：`updateRules` / `updateAnnouncement` / `updateSettingWithIndex` 传入 `content` 和 `attachments` 元数据引用；`updateJoinRequirements` 传入结构化入群字段和 `attachments` 元数据引用。附件实体先上传到群自有区，推荐路径为 `group_aid:/.group/attachments/{rules|announcement|join|<keyName>}/...`。群自有区默认允许 `owner/admin` 写入，`member` 默认不可写；`.group/` 不允许授予 `role:member` 写权限。
 
 ---
 

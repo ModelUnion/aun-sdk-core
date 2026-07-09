@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
 from .group_index import GROUP_INDEX_KEY, parse_group_index, prepare_group_settings_with_index, verify_group_index
 from .validators import validate_group_id_format
+
+_INDEXED_DOCUMENT_SETTING_KEY_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_INDEXED_DOCUMENT_SETTING_RESERVED_BASES = {
+    "join",
+    "dispatch_mode",
+    "duty",
+    "e2ee",
+    "group",
+    "group_index",
+    "index",
+    "name",
+    "description",
+    "visibility",
+}
 
 
 class _RpcFacade:
@@ -387,101 +402,142 @@ class GroupFacade(_RpcFacade):
                 cache_settings(str(group_id), settings)
         return str(result.get("group_id") or group_id), settings
 
-    async def get_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
-        """便利方法：获取群公告（基于 get_settings）"""
+    @staticmethod
+    def _indexed_document_key_name(merged: dict[str, Any]) -> str:
+        raw = merged["key_name"] if "key_name" in merged else merged.get("keyName")
+        key_name = str(raw or "").strip()
+        if (
+            not key_name
+            or key_name.lower() in _INDEXED_DOCUMENT_SETTING_RESERVED_BASES
+            or not _INDEXED_DOCUMENT_SETTING_KEY_NAME_RE.fullmatch(key_name)
+        ):
+            raise ValueError("key_name must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+        return key_name
+
+    @staticmethod
+    def _document_setting_result(
+        *,
+        group_id: str,
+        key_name: str,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        content_key = f"{key_name}.content"
+        attachments_key = f"{key_name}.attachments"
+        return {
+            "group_id": group_id,
+            "setting": {
+                "group_id": group_id,
+                "key_name": key_name,
+                "content": settings.get(content_key, ""),
+                "attachments": settings.get(attachments_key, []),
+                "updated_by": settings.get(f"{content_key}.updated_by", ""),
+                "updated_at": settings.get(f"{content_key}.updated_at", 0),
+            },
+        }
+
+    async def get_setting_with_index(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        """获取文档型 indexed setting（{key_name}.content / {key_name}.attachments）。"""
         merged = self._params(params, **kwargs)
         group_id = merged.get("group_id")
         if not group_id:
             raise ValueError("group_id is required")
-
+        key_name = self._indexed_document_key_name(merged)
         result_group_id, settings = await self._get_indexed_settings(
             str(group_id),
-            ["announcement.content", "announcement.attachments"],
+            [f"{key_name}.content", f"{key_name}.attachments"],
         )
+        return self._document_setting_result(group_id=result_group_id, key_name=key_name, settings=settings)
+
+    async def update_setting_with_index(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        """更新文档型 indexed setting，并通过 group.index CAS 传播。"""
+        merged = self._params(params, **kwargs)
+        group_id = merged.get("group_id")
+        if not group_id:
+            raise ValueError("group_id is required")
+        key_name = self._indexed_document_key_name(merged)
+        if "content" not in merged:
+            raise ValueError("content is required")
+        content = merged["content"]
+        settings_update = {f"{key_name}.content": content}
+        attachments = merged.get("attachments", [])
+        if "attachments" in merged:
+            settings_update[f"{key_name}.attachments"] = attachments
+
+        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
+        result_group_id = str(result.get("group_id") or group_id)
         return {
             "group_id": result_group_id,
-            "announcement": {
+            "setting": {
                 "group_id": result_group_id,
-                "content": settings.get("announcement.content", ""),
-                "attachments": settings.get("announcement.attachments", []),
-                "updated_by": settings.get("announcement.content.updated_by", ""),
-                "updated_at": settings.get("announcement.content.updated_at", 0)
+                "key_name": key_name,
+                "content": content,
+                "attachments": attachments,
+                "updated_by": "",
+                "updated_at": 0,
+            },
+        }
+
+    async def get_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        """便利方法：获取群公告（基于 get_settings）"""
+        merged = self._params(params, **kwargs)
+        merged["key_name"] = "announcement"
+        result = await self.get_setting_with_index(merged)
+        setting = result["setting"]
+        return {
+            "group_id": result["group_id"],
+            "announcement": {
+                "group_id": setting["group_id"],
+                "content": setting["content"],
+                "attachments": setting["attachments"],
+                "updated_by": setting["updated_by"],
+                "updated_at": setting["updated_at"],
             }
         }
 
     async def update_announcement(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """便利方法：更新群公告（基于 set_settings）"""
         merged = self._params(params, **kwargs)
-        group_id = merged.get("group_id")
-        content = merged.get("content")
-        attachments = merged.get("attachments")
-
-        if not group_id:
-            raise ValueError("group_id is required")
-        if content is None:
-            raise ValueError("content is required")
-
-        settings_update = {"announcement.content": content}
-        if attachments is not None:
-            settings_update["announcement.attachments"] = attachments
-
-        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
-
+        merged["key_name"] = "announcement"
+        result = await self.update_setting_with_index(merged)
+        setting = result["setting"]
         return {
             "group_id": result["group_id"],
             "announcement": {
                 "group_id": result["group_id"],
-                "content": content,
-                "attachments": attachments or []
+                "content": setting["content"],
+                "attachments": setting["attachments"],
             }
         }
 
     async def get_rules(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """便利方法：获取群规则（基于 get_settings）"""
         merged = self._params(params, **kwargs)
-        group_id = merged.get("group_id")
-        if not group_id:
-            raise ValueError("group_id is required")
-
-        result_group_id, settings = await self._get_indexed_settings(
-            str(group_id),
-            ["rules.content", "rules.attachments"],
-        )
+        merged["key_name"] = "rules"
+        result = await self.get_setting_with_index(merged)
+        setting = result["setting"]
         return {
-            "group_id": result_group_id,
+            "group_id": result["group_id"],
             "rules": {
-                "group_id": result_group_id,
-                "content": settings.get("rules.content", ""),
-                "attachments": settings.get("rules.attachments", []),
-                "updated_by": settings.get("rules.content.updated_by", ""),
-                "updated_at": settings.get("rules.content.updated_at", 0)
+                "group_id": setting["group_id"],
+                "content": setting["content"],
+                "attachments": setting["attachments"],
+                "updated_by": setting["updated_by"],
+                "updated_at": setting["updated_at"],
             }
         }
 
     async def update_rules(self, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """便利方法：更新群规则（基于 set_settings）"""
         merged = self._params(params, **kwargs)
-        group_id = merged.get("group_id")
-        content = merged.get("content")
-        attachments = merged.get("attachments")
-
-        if not group_id:
-            raise ValueError("group_id is required")
-        if content is None:
-            raise ValueError("content is required")
-
-        settings_update = {"rules.content": content}
-        if attachments is not None:
-            settings_update["rules.attachments"] = attachments
-
-        result = await self.update_group_index(self._index_update_params(group_id, settings_update, merged))
-
+        merged["key_name"] = "rules"
+        result = await self.update_setting_with_index(merged)
+        setting = result["setting"]
         return {
             "group_id": result["group_id"],
             "rules": {
                 "group_id": result["group_id"],
-                "content": content,
-                "attachments": attachments or []
+                "content": setting["content"],
+                "attachments": setting["attachments"],
             }
         }
 
@@ -494,7 +550,7 @@ class GroupFacade(_RpcFacade):
 
         result_group_id, settings = await self._get_indexed_settings(
             str(group_id),
-            ["join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending"],
+            ["join.mode", "join.question", "join.auto_approve_patterns", "join.max_pending", "join.attachments"],
         )
         return {
             "group_id": result_group_id,
@@ -504,6 +560,7 @@ class GroupFacade(_RpcFacade):
                 "question": settings.get("join.question", ""),
                 "auto_approve_patterns": settings.get("join.auto_approve_patterns", []),
                 "max_pending": settings.get("join.max_pending", 100),
+                "attachments": settings.get("join.attachments", []),
                 "updated_by": settings.get("join.mode.updated_by", ""),
                 "updated_at": settings.get("join.mode.updated_at", 0)
             }
@@ -526,6 +583,8 @@ class GroupFacade(_RpcFacade):
             settings_update["join.auto_approve_patterns"] = merged["auto_approve_patterns"]
         if "max_pending" in merged:
             settings_update["join.max_pending"] = merged["max_pending"]
+        if "attachments" in merged:
+            settings_update["join.attachments"] = merged["attachments"]
 
         if not settings_update:
             raise ValueError("at least one field to update is required")
@@ -539,7 +598,8 @@ class GroupFacade(_RpcFacade):
                 "mode": merged.get("mode"),
                 "question": merged.get("question"),
                 "auto_approve_patterns": merged.get("auto_approve_patterns"),
-                "max_pending": merged.get("max_pending")
+                "max_pending": merged.get("max_pending"),
+                "attachments": merged.get("attachments", [])
             }
         }
 
